@@ -35,7 +35,7 @@ import { DocSpaceService } from './docspace.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
-import { UpsertDocDto, QueryDocDto, DocSearchDto, BatchUpsertDocsDto } from './dto';
+import { UpsertDocDto, QueryDocDto, DocSearchDto, BatchUpsertDocsDto, DocDetailQueryDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
 @ApiTags('Docs')
@@ -189,17 +189,36 @@ export class DocController {
   @ApiOperation({
     summary: 'Get document detail',
     description:
-      'Return document metadata + section outline (position, headingPath, headingLevel, tokenEstimate) ' +
-      'without body content. Designed for Agent consumption with minimal token cost.',
+      'Return document metadata + section outline (position, headingPath, headingLevel, tokenEstimate). ' +
+      'Small documents (tokenEstimate > 0 and ≤ 2000 by default, overridable via maxFullTokens) are ' +
+      'inlined with full content (mode:"full" + content) — Agent-friendly, no per-section round trips. ' +
+      'Large documents return mode:"outline" (metadata + section list without body) for targeted reading. ' +
+      'tokenEstimate=0 (legacy docs) never triggers full content.',
   })
   @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'maxFullTokens',
+    required: false,
+    description:
+      'Inline-full-content token threshold override (default 2000; 0 = force outline; max 100000 to prevent response amplification)',
+    type: Number,
+  })
   @ApiResponse({ status: 200, description: 'Document detail returned successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid maxFullTokens (non-integer or out of [0, 100000])' })
   @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND' })
-  async findOne(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+  async findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    // 双层校验（铁律 #21）层 1：ParseIntPipe 拦非整数格式（400）；
+    // 层 2：DocDetailQueryDto 的 @IsInt @Min(0) @Max(100000) 拦越界（400）。
+    // 非法值在 controller 层拦截，不得透传到 service。
+    @Query('maxFullTokens', new ParseIntPipe({ optional: true })) maxFullTokens: number | undefined,
+    @Query() _query: DocDetailQueryDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
     const doc = await this.docService.findById(id);
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
-    return this.docService.findOne(id);
+    return this.docService.findOne(id, maxFullTokens);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

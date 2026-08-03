@@ -49,11 +49,13 @@ const MESSAGE_KEPT_FIELDS = [
  *
  * @param msg      - 后端返回的原始消息对象
  * @param truncate - true 时对 content 应用 snippet 截断（仅 recent 用；unread 保持全文）
+ * @param maxChars - 截断上限（字符），缺省 SNIPPET_MAX_CHARS(300)；传 0 表示不截断返全文
  * @returns 投影后的消息对象；content 被截断时附加 contentTruncated: true
  */
 export function projectMessage(
   msg: Record<string, unknown>,
   truncate: boolean,
+  maxChars: number = SNIPPET_MAX_CHARS,
 ): Record<string, unknown> {
   const projected: Record<string, unknown> = {};
   for (const field of MESSAGE_KEPT_FIELDS) {
@@ -62,26 +64,40 @@ export function projectMessage(
     }
   }
 
-  // snippet 截断：>300 字符截到 300 + contentTruncated 标记；≤300 原样不加标记。
+  // snippet 截断：超过 maxChars（缺省 300）截到该长度 + contentTruncated 标记；
+  // ≤maxChars 原样不加标记；maxChars=0 是「不截断」哨兵（get_topic_digest 的
+  // maxContentLength=0 语义），跳过截断返全文。
   // 需要全文的 Agent 自行用原子工具 topic_controller_get_messages 翻页。
   if (
     truncate &&
+    maxChars !== 0 &&
     typeof projected.content === 'string' &&
-    projected.content.length > SNIPPET_MAX_CHARS
+    projected.content.length > maxChars
   ) {
-    projected.content = projected.content.slice(0, SNIPPET_MAX_CHARS);
+    projected.content = projected.content.slice(0, maxChars);
     projected.contentTruncated = true;
   }
 
   return projected;
 }
 
-/** 投影消息数组（逐条应用 projectMessage） */
-export function projectMessages(messages: unknown[], truncate: boolean): Record<string, unknown>[] {
+/**
+ * 投影消息数组（逐条应用 projectMessage）。
+ *
+ * @param messages - 原始消息数组
+ * @param truncate - 是否对 content 应用 snippet 截断
+ * @param maxChars - 截断上限（字符），缺省 SNIPPET_MAX_CHARS；0 = 不截断返全文
+ */
+export function projectMessages(
+  messages: unknown[],
+  truncate: boolean,
+  maxChars: number = SNIPPET_MAX_CHARS,
+): Record<string, unknown>[] {
   return messages.map((m) =>
     projectMessage(
       m !== null && typeof m === 'object' ? (m as Record<string, unknown>) : {},
       truncate,
+      maxChars,
     ),
   );
 }
@@ -94,15 +110,20 @@ export function projectMessages(messages: unknown[], truncate: boolean): Record<
  *
  * @param page     - GET /topics/:id/messages 的响应
  * @param truncate - 是否对 content 应用 snippet 截断
+ * @param maxChars - 截断上限（字符），缺省 SNIPPET_MAX_CHARS；0 = 不截断返全文
  */
-export function projectMessagesPage(page: unknown, truncate: boolean): unknown {
+export function projectMessagesPage(
+  page: unknown,
+  truncate: boolean,
+  maxChars: number = SNIPPET_MAX_CHARS,
+): unknown {
   if (Array.isArray(page)) {
-    return projectMessages(page, truncate);
+    return projectMessages(page, truncate, maxChars);
   }
   if (page !== null && typeof page === 'object') {
     const obj = page as Record<string, unknown>;
     if (Array.isArray(obj.messages)) {
-      return { ...obj, messages: projectMessages(obj.messages, truncate) };
+      return { ...obj, messages: projectMessages(obj.messages, truncate, maxChars) };
     }
   }
   // 无法识别的形状原样透传（保守，不破坏数据）

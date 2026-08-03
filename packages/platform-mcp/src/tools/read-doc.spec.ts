@@ -400,4 +400,100 @@ describe('read_doc', () => {
     expect(text).not.toContain('\n  ');
     expect(() => JSON.parse(text)).not.toThrow();
   });
+
+  // ─── 小文档内联全文（后端 mode/content 透传 + maxFullTokens）───
+
+  it('大纲模式后端返回 mode:full + content 时原样透传', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'docs/x.md',
+      title: 'X',
+      mode: 'full',
+      content: '# X\n\nInlined full content.',
+      sections: [{ position: 0, headingPath: 'X', headingLevel: 1, tokenEstimate: 50 }],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.mode).toBe('full');
+    expect(body.content).toBe('# X\n\nInlined full content.');
+    expect(body.sections).toHaveLength(1);
+  });
+
+  it('大纲模式后端返回 mode:outline（大文档）原样透传且无 content', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'docs/x.md',
+      title: 'X',
+      mode: 'outline',
+      sections: [{ position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 5000 }],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.mode).toBe('outline');
+    expect(body.content).toBeUndefined();
+  });
+
+  it('maxFullTokens 透传到后端 query（大纲模式）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'x.md',
+      title: 'X',
+      mode: 'full',
+      content: 'Inlined via threshold override.',
+      sections: [],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1', maxFullTokens: 5000 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.mode).toBe('full');
+    // GET /docs/:id 必须带 params { maxFullTokens: 5000 }
+    const outlineCall = request.mock.calls[0];
+    expect(outlineCall[1]).toBe('/docs/d1');
+    expect(outlineCall[2]).toEqual({ params: { maxFullTokens: 5000 } });
+  });
+
+  it('maxFullTokens=0 强制 outline 亦透传（0 是合法显式值）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'x.md',
+      title: 'X',
+      mode: 'outline',
+      sections: [{ position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 100 }],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1', maxFullTokens: 0 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const outlineCall = request.mock.calls[0];
+    expect(outlineCall[2]).toEqual({ params: { maxFullTokens: 0 } });
+    const body = JSON.parse(result.content[0].text);
+    expect(body.mode).toBe('outline');
+  });
+
+  it('大纲模式未传 maxFullTokens 时不带 options（保持原调用形态）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'x.md',
+      title: 'X',
+      sections: [],
+    });
+
+    await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    const outlineCall = request.mock.calls[0];
+    expect(outlineCall[2]).toBeUndefined();
+  });
 });

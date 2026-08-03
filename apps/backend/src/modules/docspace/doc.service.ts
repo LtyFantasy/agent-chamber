@@ -63,6 +63,16 @@ function slugify(name: string): string {
     .slice(0, 128);
 }
 
+/**
+ * 小文档全文内联的缺省 token 阈值（?maxFullTokens= 可覆盖，0 = 强制 outline）。
+ *
+ * rationale：无定位参数的 GET /docs/:id 面向 Agent 消费——小文档（约 2k tokens 内）
+ * 逐 section 精读需要 N 次 round-trip + N 段重复元数据，一次性内联全文对 Agent 更优；
+ * 大文档仍走 outline + section 精读，避免单次响应打爆 Agent 上下文。
+ * 上限 100000 由 DocDetailQueryDto 校验约束（防任意大文档全文内联 = 响应放大攻击面）。
+ */
+const FULL_CONTENT_TOKEN_THRESHOLD = 2000;
+
 @Injectable()
 export class DocService {
   /** NestJS 内置 Logger（fire-and-forget 异步任务的错误只记日志不透出，对齐仓内惯例） */
@@ -600,10 +610,17 @@ export class DocService {
   }
 
   /**
-   * Get document detail: metadata + section outline (no content).
+   * Get document detail: metadata + section outline (no content by default).
    * QB select explicitly excludes section content.
+   *
+   * 小文档全文内联（v1.39.x）：无定位调用时，tokenEstimate > 0 且 ≤ 阈值（缺省
+   * FULL_CONTENT_TOKEN_THRESHOLD，可 maxFullTokens 覆盖，0 = 强制 outline）→ 额外
+   * 第二次全量查询 sections 并重建全文，返回 mode:'full' + content；否则 mode:'outline'。
+   * tokenEstimate=0（存量未估算文档）守卫不触发全文，避免任意大文档误内联。
+   *
+   * @param maxFullTokens 覆盖阈值（≥0；0 = 强制 outline；非法值由 controller 双层校验拦截，不达此层）
    */
-  async findOne(id: string): Promise<DocDetail> {
+  async findOne(id: string, maxFullTokens?: number): Promise<DocDetail> {
     const doc = await this.findById(id);
 
     // 用 getMany 走实体 hydration 取大纲字段，规避 getRawMany 的 raw-key 命名陷阱
@@ -624,11 +641,31 @@ export class DocService {
     }));
 
     const base = this.toSummary(doc);
-    return {
+    const result: DocDetail = {
       ...base,
       sections: outline,
       linkHealth: doc.linkHealth as LinkHealth | null | undefined,
     };
+
+    // 生效阈值：显式 maxFullTokens 优先（0 = 强制 outline），缺省用模块常量
+    const threshold = maxFullTokens ?? FULL_CONTENT_TOKEN_THRESHOLD;
+
+    if (threshold > 0 && doc.tokenEstimate && doc.tokenEstimate > 0 && doc.tokenEstimate <= threshold) {
+      // full 分支独立第二次查询（全量 sections 含 content 大字段）——outline 分支零额外开销。
+      // 复用 reconstructContent 渲染去重语义（skipDuplicateTitle=true，与 web /content 默认一致）。
+      const fullSections = await this.sectionRepo
+        .createQueryBuilder('s')
+        .where('s.docId = :docId', { docId: id })
+        .orderBy('s.position', 'ASC')
+        .getMany();
+
+      result.mode = 'full';
+      result.content = this.reconstructContent(doc, fullSections, true);
+    } else {
+      result.mode = 'outline';
+    }
+
+    return result;
   }
 
   /**

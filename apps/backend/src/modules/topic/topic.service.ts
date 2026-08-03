@@ -8,11 +8,16 @@
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   JOINED-AT: joined_at 用 @CreateDateColumn（NOT NULL + DB DEFAULT NOW()），invited 行插入即写邀请时间；
+ *          sendMessage 的 TypeORM upsert DO UPDATE 每条消息把 joined_at 刷成消息时间且把 moderator 降级为 member。
+ *          修复：joined_at 改可空 + 语义=最近一次激活时间（invited NULL/激活写入/re-join 刷新），DB 加
+ *          CHECK (status != 'active' OR joined_at IS NOT NULL)；sendMessage 自动 join 改原生 SQL 原子条件
+ *          upsert（role 不进 SET 子句，仅 invited/left 行激活刷新 joinedAt）。
  *   E3-fix: JS Date 只有毫秒精度，PG timestamptz 是微秒——读回 JS 再绑回 SQL 比较会
  *         把锚点消息自身误算进增量；message_count 应用层 +1 与 trigger
  *         trg_topics_message_stats 双写导致计数翻倍。
@@ -26,8 +31,6 @@
  *   B-50: Topic/Board 列表接口在 Controller 层过滤，导致分页 total 与 items 不一致。
  *         修复：findAll 接收 actor，在 Service 层 QueryBuilder 加 IN 过滤，空白名单直接
  *         返回空分页，保持 total 与 items 同源。见 Plan §2.1 / §2.2。
- *   B-5: Topic/Board 缺少可见性控制，私密话题可公开访问。
- *         修复：canAccess() + findAll 过滤 + Visibility enum。见 memory/2026-05-25.md
  *
  *   OWNER-PROXY: v1.37 sendMessage private 硬校验放行条件扩展为
  *       senderRole===ADMIN || owner 代理 || ACTIVE participant（行为变更，见 docs/architecture.md §7.2）；
@@ -83,6 +86,36 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
+
+/**
+ * sendMessage 自动 join 的原子条件 upsert（v1.40 joinedAt 语义修复）。
+ *
+ * 为什么用原生 SQL 而非 TypeORM upsert：TypeORM 的 DO UPDATE 会覆盖
+ * role/status/joined_at 全部列——每条消息都会把 joinedAt 刷成消息时间，
+ * 且把 moderator 降级为 member。原生 SQL 的 ON CONFLICT DO UPDATE 只
+ * 条件更新 status/joined_at，role 不出现在 SET 子句（moderator 不被降级，
+ * active 行 joinedAt 不被刷新）。
+ *
+ * 状态机语义（与 join() re-join 一致）：
+ * - 新行（INSERT 分支）：role='member', status='active', joined_at=now()
+ * - invited 行发消息 → 隐式激活（status→active, joined_at→now()）
+ * - left 行发消息 → 视同重新加入（status→active, joined_at→now()）
+ * - active 行 → 两列均保持原值（不刷新 joinedAt）
+ *
+ * 原子性：单条 INSERT ... ON CONFLICT 语句，并发首消息/并发幂等重试
+ * 不会触发 PK (topic_id, participant_id) 冲突 23505（禁止 find/save
+ * 的读-改-写竞态）。事件一致性：本路径只发 NEW_MESSAGE，不新增
+ * AGENT_JOINED 事件（隐式激活不广播加入事件，与历史行为一致）。
+ */
+const AUTO_JOIN_PARTICIPANT_SQL = `
+  INSERT INTO topic_participants (topic_id, participant_id, role, status, joined_at)
+  VALUES ($1, $2, 'member', 'active', now())
+  ON CONFLICT (topic_id, participant_id) DO UPDATE SET
+    status = CASE WHEN topic_participants.status IN ('invited', 'left')
+                  THEN 'active' ELSE topic_participants.status END,
+    joined_at = CASE WHEN topic_participants.status IN ('invited', 'left')
+                     THEN now() ELSE topic_participants.joined_at END
+`;
 
 @Injectable()
 export class TopicService {
@@ -381,17 +414,20 @@ export class TopicService {
       });
       const savedTopic = (await this.topicRepo.save(topic)) as unknown as Topic;
 
-      // Add creator as participant
+      // Add creator as participant（creator 即 active，显式写 joinedAt；
+      // DB DEFAULT NOW() 已移除，active 行必须由应用写入 joinedAt）
       const participant = this.participantRepo.create({
         topicId: savedTopic.id,
         participantId: creatorId,
         participantType: creatorType,
         role: 'moderator',
         status: ParticipantStatus.ACTIVE,
+        joinedAt: new Date(),
       });
       await this.participantRepo.save(participant);
 
       // Insert invited agent rows with status='invited', role='member'
+      // invited 行有意不写 joinedAt（语义：受邀时 NULL，激活时才写入）
       if (invitedAgentIds.length > 0) {
         const rows = [...new Set(invitedAgentIds)]
           .filter((agentId) => agentId !== creatorId)
@@ -434,7 +470,7 @@ export class TopicService {
           entityId: saved.id,
         });
 
-        // 创建者自动成为参与者（在事务内）
+        // 创建者自动成为参与者（在事务内）；creator 即 active，显式写 joinedAt
         const participantRepo = manager.getRepository(TopicParticipant);
         const participant = participantRepo.create({
           topicId: saved.id,
@@ -442,10 +478,11 @@ export class TopicService {
           participantType: creatorType,
           role: 'moderator',
           status: ParticipantStatus.ACTIVE,
+          joinedAt: new Date(),
         });
         await participantRepo.save(participant);
 
-        // 受邀 Agent 行
+        // 受邀 Agent 行（invited 行有意不写 joinedAt，激活时才写入）
         if (invitedAgentIds.length > 0) {
           const rows = [...new Set(invitedAgentIds)]
             .filter((agentId) => agentId !== creatorId)
@@ -525,7 +562,7 @@ export class TopicService {
       });
       const existingIds = new Set(existingRows.map((p) => p.participantId));
 
-      // New IDs not in current: insert invited rows
+      // New IDs not in current: insert invited rows（有意不写 joinedAt，激活时才写入）
       const toAdd = [...newSet].filter((aid) => !currentSet.has(aid) && !existingIds.has(aid));
       if (toAdd.length > 0) {
         const rows = toAdd.map((agentId) =>
@@ -588,15 +625,20 @@ export class TopicService {
     });
 
     if (tp) {
+      // 激活已存在行（invited→active / left→re-join）：刷新 joinedAt 为本次激活时间。
+      // joinedAt 语义 = 最近一次实际激活时间（v1.40），left 行历史 joinedAt 不保留。
       tp.status = ParticipantStatus.ACTIVE;
       tp.leftAt = null;
+      tp.joinedAt = new Date();
     } else {
+      // 新行：显式写 joinedAt（NOT NULL + DB DEFAULT NOW() 已移除，必须由应用写入）
       tp = this.participantRepo.create({
         topicId,
         participantId,
         participantType,
         role: 'member',
         status: ParticipantStatus.ACTIVE,
+        joinedAt: new Date(),
       });
     }
     await this.participantRepo.save(tp);
@@ -1025,18 +1067,9 @@ export class TopicService {
           entityId: savedMsg.id,
         });
 
-        // 自动 join（在事务内）
-        await manager.getRepository(TopicParticipant).upsert(
-          {
-            topicId,
-            participantId: senderId,
-            participantType: actorType,
-            role: 'member',
-            status: ParticipantStatus.ACTIVE,
-            joinedAt: new Date(),
-          },
-          ['topicId', 'participantId'],
-        );
+        // 自动 join（事务内，原子条件 upsert 防 PK 冲突 23505；
+        // 不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释）
+        await manager.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId]);
 
         // topic 统计（message_count / last_message_at）由 DB trigger
         // trg_topics_message_stats 维护，应用层不写，避免双写。
@@ -1119,18 +1152,9 @@ export class TopicService {
     const savedRaw = await this.messageRepo.save(message);
     const saved = Array.isArray(savedRaw) ? savedRaw[0] : savedRaw;
 
-    // --- 4. 自动 join（upsert 防并发冲突） ---
-    await this.participantRepo.upsert(
-      {
-        topicId,
-        participantId: senderId,
-        participantType: actorType,
-        role: 'member',
-        status: ParticipantStatus.ACTIVE,
-        joinedAt: new Date(),
-      },
-      ['topicId', 'participantId'],
-    );
+    // --- 4. 自动 join（原子条件 upsert 防并发 PK 冲突 23505；
+    //         不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释） ---
+    await this.participantRepo.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId]);
 
     // --- 5. topic 统计由 DB trigger trg_topics_message_stats 维护，应用层不写 ---
 
@@ -1398,6 +1422,8 @@ export class TopicService {
       existingParticipant.lastReadMessageId = messageId;
       await this.participantRepo.save(existingParticipant);
     } else {
+      // 无参与者行 → insert ACTIVE 新行（自动 join 语义）；显式写 joinedAt
+      // （DB DEFAULT NOW() 已移除，active 行必须由应用写入 joinedAt）
       const newParticipant = this.participantRepo.create({
         topicId,
         participantId: actorId,
@@ -1405,6 +1431,7 @@ export class TopicService {
         role: 'member',
         status: ParticipantStatus.ACTIVE,
         lastReadMessageId: messageId,
+        joinedAt: new Date(),
       });
       await this.participantRepo.save(newParticipant);
     }
@@ -1477,7 +1504,7 @@ export class TopicService {
       tp.status = ParticipantStatus.INVITED;
       await this.participantRepo.save(tp);
     } else {
-      // No row: insert new invited row
+      // No row: insert new invited row（有意不写 joinedAt，激活时才写入）
       const newTp = this.participantRepo.create({
         topicId: id,
         participantId: agentId,

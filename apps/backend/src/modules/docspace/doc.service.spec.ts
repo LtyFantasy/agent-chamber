@@ -623,8 +623,9 @@ describe('DocService', () => {
   // ─── findOne ────────────────────────────────────────────────
 
   describe('findOne', () => {
-    it('returns doc with section outline (no content)', async () => {
-      const doc = makeDoc();
+    it('returns doc with section outline (no content) for large docs', async () => {
+      // 大文档（tokenEstimate > 2000 阈值）→ 仅大纲，零 content 开销
+      const doc = makeDoc({ tokenEstimate: 5000 });
       const docQb = createMockQueryBuilder([doc], 1);
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
 
@@ -648,6 +649,135 @@ describe('DocService', () => {
       });
       // Should NOT contain content field
       expect((result.sections![0] as any).content).toBeUndefined();
+      expect(result.mode).toBe('outline');
+      expect((result as any).content).toBeUndefined();
+      // outline 分支零额外开销：仅一次 section 查询
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('small doc (tokenEstimate ≤ threshold) → mode:full + content with dedup semantics', async () => {
+      // 小文档（tokenEstimate=100 ≤ 2000 阈值）→ 第二次全量查询 + reconstructContent(true) 去重
+      const doc = makeDoc({ tokenEstimate: 100 }); // title = 'Test Doc'
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const outlineQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 50 })],
+        1,
+      );
+      // full 分支：全量 sections（含 content）
+      const fullQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, content: 'Lead body.' })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(outlineQb)
+        .mockReturnValueOnce(fullQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.mode).toBe('full');
+      // 渲染去重语义：position 0 的 H1 与 doc.title 同名 → 不重复插标题行
+      expect(result.content).toBe('Lead body.');
+      expect(result.sections).toHaveLength(1);
+      // outline + full 两次 section 查询
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
+    });
+
+    it('threshold boundary: tokenEstimate=2000 triggers full', async () => {
+      const doc = makeDoc({ tokenEstimate: 2000 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const outlineQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 2000 })],
+        1,
+      );
+      const fullQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, content: 'Body.' })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(outlineQb)
+        .mockReturnValueOnce(fullQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.mode).toBe('full');
+      expect(result.content).toBe('Body.');
+    });
+
+    it('threshold boundary: tokenEstimate=2001 stays outline', async () => {
+      const doc = makeDoc({ tokenEstimate: 2001 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sectionQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 2001 })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.mode).toBe('outline');
+      expect((result as any).content).toBeUndefined();
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('tokenEstimate=0 (legacy unestimated doc) never triggers full content', async () => {
+      // 存量 tokenEstimate=0 的文档不触发全文（守卫保留），防止任意大文档误内联
+      const doc = makeDoc({ tokenEstimate: 0 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sectionQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 0 })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.mode).toBe('outline');
+      expect((result as any).content).toBeUndefined();
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('maxFullTokens=0 forces outline even for small docs', async () => {
+      const doc = makeDoc({ tokenEstimate: 100 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sectionQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Intro', headingLevel: 1, tokenEstimate: 50 })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
+
+      const result = await service.findOne('doc-1', 0);
+      expect(result.mode).toBe('outline');
+      expect((result as any).content).toBeUndefined();
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('maxFullTokens=5000 enlarges threshold (tokenEstimate=3000 inlined)', async () => {
+      const doc = makeDoc({ tokenEstimate: 3000 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const outlineQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Intro', headingLevel: 1, tokenEstimate: 3000 })],
+        1,
+      );
+      const fullQb = createMockQueryBuilder(
+        [makeSection({ position: 0, headingPath: 'Intro', headingLevel: 1, content: 'Big but inlined.' })],
+        1,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(outlineQb)
+        .mockReturnValueOnce(fullQb);
+
+      const result = await service.findOne('doc-1', 5000);
+      expect(result.mode).toBe('full');
+      expect(result.content).toBe('# Intro\n\nBig but inlined.');
+      expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
     });
   });
 

@@ -346,6 +346,126 @@ describe('get_topic_digest', () => {
     expect(m2.contentTruncated).toBeUndefined();
   });
 
+  // ==================== maxContentLength 可配置截断（get_topic_digest 新增参数） ====================
+
+  it('maxContentLength=1000 → 500 字符不截断；1500 字符截到 1000 + contentTruncated', async () => {
+    const request = mockRequest();
+    const recentPage = {
+      messages: [
+        { id: 'm1', content: 'a'.repeat(500) },
+        { id: 'm2', content: 'b'.repeat(1500) },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    };
+
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce(recentPage)
+      .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
+      .mockResolvedValueOnce({ advanced: false });
+
+    const result = await getTopicDigestTool.handler(
+      { topicId: 't1', maxContentLength: 1000 },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    const [m1, m2] = body.recentMessages.messages;
+    expect(m1.content).toBe('a'.repeat(500));
+    expect(m1.contentTruncated).toBeUndefined();
+    expect(m2.content).toBe('b'.repeat(1000));
+    expect(m2.contentTruncated).toBe(true);
+  });
+
+  it('maxContentLength=0 → 不截断返全文、不加 contentTruncated', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(500);
+    const recentPage = {
+      messages: [{ id: 'm1', content: longContent }],
+      nextCursor: null,
+      hasMore: false,
+    };
+
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce(recentPage)
+      .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
+      .mockResolvedValueOnce({ advanced: false });
+
+    const result = await getTopicDigestTool.handler(
+      { topicId: 't1', maxContentLength: 0 },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentMessages.messages[0].content).toBe(longContent);
+    expect(body.recentMessages.messages[0].contentTruncated).toBeUndefined();
+  });
+
+  it('maxContentLength 负数/非数字 → 按缺省 300 截断', async () => {
+    const request = mockRequest();
+    const recentPage = {
+      messages: [{ id: 'm1', content: 'd'.repeat(500) }],
+      nextCursor: null,
+      hasMore: false,
+    };
+
+    // 场景 1：负数
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce(recentPage)
+      .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
+      .mockResolvedValueOnce({ advanced: false });
+
+    const r1 = await getTopicDigestTool.handler(
+      { topicId: 't1', maxContentLength: -5 },
+      ctx(),
+    );
+    const b1 = JSON.parse(r1.content[0].text);
+    expect(b1.recentMessages.messages[0].content).toBe('d'.repeat(300));
+    expect(b1.recentMessages.messages[0].contentTruncated).toBe(true);
+
+    // 场景 2：非数字（字符串）
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce(recentPage)
+      .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
+      .mockResolvedValueOnce({ advanced: false });
+
+    const r2 = await getTopicDigestTool.handler(
+      { topicId: 't1', maxContentLength: 'abc' },
+      ctx(),
+    );
+    const b2 = JSON.parse(r2.content[0].text);
+    expect(b2.recentMessages.messages[0].content).toBe('d'.repeat(300));
+    expect(b2.recentMessages.messages[0].contentTruncated).toBe(true);
+  });
+
+  it('maxContentLength 超 50000 → 钳到 50000', async () => {
+    const request = mockRequest();
+    const recentPage = {
+      messages: [{ id: 'm1', content: 'e'.repeat(50001) }],
+      nextCursor: null,
+      hasMore: false,
+    };
+
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce(recentPage)
+      .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
+      .mockResolvedValueOnce({ advanced: false });
+
+    const result = await getTopicDigestTool.handler(
+      { topicId: 't1', maxContentLength: 999999 },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentMessages.messages[0].content).toBe('e'.repeat(50000));
+    expect(body.recentMessages.messages[0].contentTruncated).toBe(true);
+  });
+
   // ==================== Batch F：起步去重 + includeRecent ====================
 
   it('unreadCount>0 → 省略 recentMessages；includeRecent=true → 强制携带', async () => {

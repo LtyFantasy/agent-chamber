@@ -271,7 +271,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 |-----------|------|------|
 | `get_my_briefing` | get_me → 我的活跃任务 + 我的动态（并行） | Agent 启动简报，一次建立工作上下文；`me` 剔除 avatarUrl/apiKeyPrefix |
 | `follow_up_task` | task + blockers + 最近评论（后两个并行） | 任务跟进全景 |
-| `get_topic_digest` | topic + 最近消息 + 未读状态（三路并行） | 话题速览；返回按 Agent 消费模型投影（participants 无头像/加入时间、消息无 senderAvatar/topicId、紧凑 JSON）；`recentMessages` 为 `{messages,nextCursor,hasMore}` 分页对象，content 超 300 字符截断为 snippet（`contentTruncated: true`，全文用 `topic_controller_get_messages` 翻页）；`unread` 含未读计数与增量消息（全文不截断）；`unreadCount > 0` 时省略 recentMessages 去重，`includeRecent: true` 强制携带；`markRead` 默认 true（看速览即推进已读游标，设为 false 仅查看） |
+| `get_topic_digest` | topic + 最近消息 + 未读状态（三路并行） | 话题速览；返回按 Agent 消费模型投影（participants 无头像/加入时间、消息无 senderAvatar/topicId、紧凑 JSON）；`recentMessages` 为 `{messages,nextCursor,hasMore}` 分页对象，content 默认超 300 字符截断为 snippet（`contentTruncated: true`，可用 `maxContentLength` 调整截断长度、`0`=全文；全文用 `topic_controller_get_messages` 翻页）；`unread` 含未读计数与增量消息（全文不截断）；`unreadCount > 0` 时省略 recentMessages 去重，`includeRecent: true` 强制携带；`markRead` 默认 true（看速览即推进已读游标，设为 false 仅查看） |
 | `create_topic_with_board` | 建 topic → 建关联 board（含初始列） | 一站式立项；默认 private + 三列；board 失败返回已建 topic id（可补救） |
 | `report_task_result` | （可选评论，支持附 commitSha）→ 改状态 | 任务结果汇报，工作流最后一公里 |
 | `create_task` | 解析状态名→listId（三层）→ 解析成员名→assigneeId → 建任务 | 语义化建任务，免查 UUID；消歧失败返回候选列表 |
@@ -297,7 +297,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 | **计数字段** | `memberCount` |
 | **成员端点权限** | `add-editor` / `remove-editor` / `invite-agent` / `uninvite-agent` 四个端点均为 **creator-only**，操作后发事件 |
 | **leave 后失读** | 成员离开看板后失去读权限 |
-| **TopicDetail** | `participants` 列表含 `status` 字段 |
+| **TopicDetail** | `participants` 列表含 `status` 字段；`participantCount` 仅统计 `status='active'` 的参与者（invited/left 不计，DB trigger 维护），**≠ participants 数组长度**（数组含 invited 行） |
 
 ### 6.5 工具过滤与 Profile
 

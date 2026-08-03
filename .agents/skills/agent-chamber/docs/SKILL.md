@@ -69,11 +69,12 @@ search_docs { "spaceName": "...", "q": "权限模型", "limit": 5 }
 ### 2.3 read — 大纲 / 精读
 
 ```bash
-# 读大纲（无定位参数）
+# 读大纲（无定位参数）——小文档一次拿全文
 read_doc { "docId": "..." }                      # 或 { "spaceName": "...", "path": "docs/architecture.md" }
-# → 元数据 + sections[{position,headingPath,headingLevel,tokenEstimate}]，不含正文
+# → 小文档（tokenEstimate ≤ 2000，可 maxFullTokens 覆盖，0=强制 outline）：元数据 + sections + mode:'full' + content 全文
+# → 大文档：元数据 + sections[{position,headingPath,headingLevel,tokenEstimate}]，mode:'outline'，不含正文
 
-# 精读单 section（带 position，推荐）
+# 大文档按 section 精读（三级消费的第三级，带 position，推荐）
 read_doc { "docId": "...", "position": 7 }
 # → { docId, docPath, position, headingPath, headingLevel, content, tokenEstimate }
 
@@ -82,6 +83,7 @@ read_doc { "docId": "...", "headingPath": "3. 模块划分 § 3.2 模块详细�
 ```
 
 > 定位二选一：`(spaceName + path)` 精确路径 或 裸 `docId`。`position` 优先于 `headingPath`。
+> **消费模型**：小文档（约 ≤2000 tokens）无定位读取一次拿全文（`mode:'full'` + `content`），不再逐 section 请求；大文档按 `mode:'outline'` 大纲 + `position` 精读。全文仍不走 `/content` 通道。
 
 ---
 

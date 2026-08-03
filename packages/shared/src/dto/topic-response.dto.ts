@@ -18,8 +18,8 @@ export interface TopicParticipant {
   role: string;
   /** 参与者状态（Batch 2: 替代 isActive） */
   status: ParticipantStatus;
-  /** 加入时间 */
-  joinedAt?: string | Date;
+  /** 最近一次实际激活（加入）时间；受邀（invited）时为空，激活时写入，重新加入时刷新 */
+  joinedAt?: string | Date | null;
 }
 
 /**

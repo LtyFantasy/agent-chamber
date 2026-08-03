@@ -35,8 +35,9 @@ import { projectMessages, projectMessagesPage, projectTopic } from './project';
  * Batch F token 瘦身（看板任务 fdc1851b）——返回按 Agent 消费模型做投影：
  * - topic：participants 剔除 avatarUrl/joinedAt/description，顶层剔除 invitedAgentIds
  * - 消息（recent + unread 统一）：剔除 senderAvatar/topicId
- * - recentMessages.messages 的 content >300 字符截断为 snippet（contentTruncated: true），
- *   需要全文的 Agent 用原子工具 topic_controller_get_messages 翻页
+ * - recentMessages.messages 的 content 默认 >300 字符截断为 snippet（contentTruncated: true），
+ *   可用 maxContentLength 调整截断长度（0=不截断返全文）；需要全文的 Agent 用原子工具
+ *   topic_controller_get_messages 翻页
  * - unread.messages 保持全文不截断（可行动增量）
  * - 起步去重：unreadCount > 0 时省略 recentMessages（与 unread 增量重叠）；
  *   显式传 includeRecent=true 强制携带；unread 端点失败降级（unreadCount 未知）时保留 recentMessages
@@ -57,7 +58,8 @@ export const getTopicDigestTool: CustomTool = {
       'Projected for Agent consumption model: participants omit avatar/join-time fields; ' +
       'messages omit senderAvatar/topicId. ' +
       'recentMessages is a paginated object { messages, nextCursor, hasMore }; ' +
-      'message content exceeding 300 characters is truncated to a snippet ' +
+      'message content exceeding 300 characters (configurable via maxContentLength; ' +
+      '0 = no truncation, full text) is truncated to a snippet ' +
       '(contentTruncated: true) — use topic_controller_get_messages to page through full text. ' +
       'unread includes unread count and incremental messages (full text, never truncated). ' +
       'When unreadCount > 0, recentMessages is omitted for deduplication; ' +
@@ -92,6 +94,13 @@ export const getTopicDigestTool: CustomTool = {
             '(overlaps with unread incrementals; deduplication from the start); ' +
             'pass true to return recent messages even when there are unread.',
         },
+        maxContentLength: {
+          type: 'integer',
+          description:
+            'Max chars per recent message content before snippet truncation ' +
+            '(default 300; 0 = no truncation, full text; recommended max 50000). ' +
+            'Only affects recentMessages; unread messages are always full text.',
+        },
       },
       required: ['topicId'],
     },
@@ -102,6 +111,20 @@ export const getTopicDigestTool: CustomTool = {
     const messageLimit = (args.messageLimit as number) ?? 20;
     const markRead = args.markRead !== false; // 默认 true
     const includeRecent = args.includeRecent === true; // 默认 false
+
+    // maxContentLength：recentMessages content 截断长度（可选，缺省 300 行为不变）。
+    // 防御性解析（MCP 层无 DTO 校验，必须 handler 内兜底）：
+    // 非数字/负数按缺省 300 处理（undefined → project 侧用默认值）；>50000 钳到 50000
+    // （防止放量返回超长字符串）；0 是合法值 = 不截断返全文。
+    let maxContentLength: number | undefined;
+    const rawMaxContentLength = args.maxContentLength;
+    if (
+      typeof rawMaxContentLength === 'number' &&
+      Number.isFinite(rawMaxContentLength) &&
+      rawMaxContentLength >= 0
+    ) {
+      maxContentLength = Math.min(Math.floor(rawMaxContentLength), 50000);
+    }
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
     try {
@@ -146,8 +169,8 @@ export const getTopicDigestTool: CustomTool = {
 
       const result: Record<string, unknown> = { topic: projectTopic(topic) };
       if (!omitRecent) {
-        // recent 消息 content 截断为 snippet（全文走原子工具翻页）
-        result.recentMessages = projectMessagesPage(recentMessages, true);
+        // recent 消息 content 截断为 snippet（长度 maxContentLength 可调，缺省 300；0=全文；全文走原子工具翻页）
+        result.recentMessages = projectMessagesPage(recentMessages, true, maxContentLength);
       }
       if (unread !== undefined) {
         // unread 增量消息保持全文（可行动增量，不截断）

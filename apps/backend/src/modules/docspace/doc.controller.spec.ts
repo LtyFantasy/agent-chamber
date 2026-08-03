@@ -122,12 +122,32 @@ describe('DocController', () => {
       const doc = { id: 'doc-1', spaceId: 'space-1', path: 'test.md', title: 'Test' };
       docService.findById.mockResolvedValue(doc);
       docSpaceService.findById.mockResolvedValue(space);
-      const detail = { id: 'doc-1', sections: [] };
+      const detail = { id: 'doc-1', sections: [], mode: 'outline' };
       docService.findOne.mockResolvedValue(detail);
 
-      expect(await controller.findOne('doc-1', mockActor)).toBe(detail);
+      // 未传 maxFullTokens → 透传 undefined（service 缺省用模块常量阈值）
+      expect(await controller.findOne('doc-1', undefined, {}, mockActor)).toBe(detail);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(docService.findOne).toHaveBeenCalledWith('doc-1', undefined);
     });
+
+    it('passes maxFullTokens query value through to service (threshold override)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const detail = { id: 'doc-1', mode: 'full', content: '...' };
+      docService.findOne.mockResolvedValue(detail);
+
+      // 放大阈值（5000）与强制 outline（0）都必须原样透传
+      expect(await controller.findOne('doc-1', 5000, {}, mockActor)).toBe(detail);
+      expect(docService.findOne).toHaveBeenCalledWith('doc-1', 5000);
+
+      expect(await controller.findOne('doc-1', 0, {}, mockActor)).toBe(detail);
+      expect(docService.findOne).toHaveBeenCalledWith('doc-1', 0);
+    });
+    // 注：非法值（非整数 / 越界 [0, 100000]）由 ParseIntPipe + DocDetailQueryDto 在请求
+    // 管线层拦截返回 400（controller 单元测试直调不跑 pipe），DTO 校验见
+    // doc-detail-query.dto.spec.ts；service 层收不到非法值。
   });
 
   // ─── getContent ───────────────────────────────────────────

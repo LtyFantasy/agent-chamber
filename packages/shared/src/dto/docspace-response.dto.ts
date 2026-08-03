@@ -150,10 +150,23 @@ export interface LinkHealth {
 }
 
 export interface DocDetail extends DocSummary {
-  /** Section 大纲列表（仅元数据，不含 content） */
+  /** Section 大纲列表（仅元数据，不含 content；mode='full' 时仍返回以便定位） */
   sections?: DocSectionOutline[];
   /** 链接健康巡检结果（v1.35 Docs D1 Wave A；NULL = 尚未检查） */
   linkHealth?: LinkHealth | null;
+  /**
+   * 响应模式（增量字段，向后兼容——老客户端无此字段时按 outline 处理）：
+   * - 'full'：无定位调用（无 position/headingPath）+ 小文档（tokenEstimate > 0 且 ≤ 阈值）
+   *   时内联全文，`content` 同时返回；
+   * - 'outline'：大文档 / tokenEstimate=0（未估算）/ 强制 outline（maxFullTokens=0）——
+   *   仅大纲，无 content。
+   */
+  mode?: 'outline' | 'full';
+  /**
+   * mode='full' 时的全文。渲染去重语义与 web /content 默认一致：
+   * position 0 的 H1 若与 doc.title 同名则不重复插标题行（web header 已展示 title）。
+   */
+  content?: string;
 }
 
 /**

@@ -6,7 +6,6 @@ import {
   Entity,
   PrimaryColumn,
   Column,
-  CreateDateColumn,
   ManyToOne,
   JoinColumn,
   Index,
@@ -30,8 +29,15 @@ export class TopicParticipant {
   @Column({ type: 'varchar', length: 30, default: 'member' })
   role: string;
 
-  @CreateDateColumn({ type: 'timestamptz', name: 'joined_at' })
-  joinedAt: Date;
+  /**
+   * 最近一次实际激活（加入）时间。
+   * 语义（v1.40 修复）：受邀行（status='invited'）为 NULL；激活时写入；
+   * left→re-join 时刷新为本次激活时间。NOT NULL + DB DEFAULT NOW() 已移除，
+   * 否则 DB 默认值会兜底使 NULL 写入失效。DB 层有 CHECK 不变量
+   * (status != 'active' OR joined_at IS NOT NULL) 防回归。
+   */
+  @Column({ type: 'timestamptz', nullable: true, name: 'joined_at' })
+  joinedAt: Date | null;
 
   @Column({ type: 'timestamptz', nullable: true, name: 'left_at' })
   leftAt: Date | null;

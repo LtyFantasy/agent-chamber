@@ -158,6 +158,7 @@ describe('TopicService', () => {
   let mockResourceValidator: { exists: jest.Mock; existsMany: jest.Mock };
   let mockDataSource: jest.Mocked<DataSource>;
   let mockIdempotencyRepo: jest.Mocked<Repository<IdempotencyRecord>>;
+  let mockEntityManager: { getRepository: jest.Mock; query: jest.Mock };
 
   beforeEach(async () => {
     mockTopicRepo = createMockRepo<Topic>();
@@ -199,8 +200,9 @@ describe('TopicService', () => {
       getRepository: jest.fn(),
     } as unknown as jest.Mocked<DataSource>;
 
-    // EntityManager mock：getRepository 按类型返回对应 mock repo
-    const mockEntityManager = {
+    // EntityManager mock：getRepository 按类型返回对应 mock repo；
+    // query 用于 sendMessage 事务路径的原子条件 upsert（AUTO_JOIN_PARTICIPANT_SQL）
+    mockEntityManager = {
       getRepository: jest.fn((entityClass: unknown) => {
         if (entityClass === Topic) return mockTopicRepo;
         if (entityClass === TopicParticipant) return mockParticipantRepo;
@@ -208,6 +210,7 @@ describe('TopicService', () => {
         if (entityClass === IdempotencyRecord) return mockIdempotencyRepo;
         return createMockRepo();
       }),
+      query: jest.fn().mockResolvedValue([]),
     };
 
     // 默认 getRepository 行为（23505 replay 路径使用）
@@ -497,6 +500,7 @@ describe('TopicService', () => {
         participantType: 'human',
         role: 'moderator',
         status: ParticipantStatus.ACTIVE,
+        joinedAt: expect.any(Date), // creator 即 active，显式写 joinedAt
       });
       expect(mockParticipantRepo.save).toHaveBeenCalledWith(createdParticipant);
       expect(result).toEqual(savedTopic);
@@ -528,6 +532,11 @@ describe('TopicService', () => {
           role: 'member',
           status: ParticipantStatus.INVITED,
         }),
+      );
+      // invited 行有意不写 joinedAt（语义：受邀时 NULL，激活时才写入）
+      expect(mockParticipantRepo.create).toHaveBeenNthCalledWith(
+        2,
+        expect.not.objectContaining({ joinedAt: expect.anything() }),
       );
     });
 
@@ -781,12 +790,14 @@ describe('TopicService', () => {
 
       const result = await service.join('topic-1', 'user-2', ActorType.HUMAN);
 
+      // 新行显式写 joinedAt（DB DEFAULT NOW() 已移除，active 行必须由应用写入）
       expect(mockParticipantRepo.create).toHaveBeenCalledWith({
         topicId: 'topic-1',
         participantId: 'user-2',
         participantType: 'human',
         role: 'member',
         status: ParticipantStatus.ACTIVE,
+        joinedAt: expect.any(Date),
       });
       expect(result).toEqual({
         topicId: 'topic-1',
@@ -798,10 +809,13 @@ describe('TopicService', () => {
     it('should reactivate existing participant', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
+      // left 行带历史 joinedAt（旧激活时间）
+      const oldJoinedAt = new Date('2024-01-01T00:00:00Z');
       const existingParticipant = createMockParticipant({
         participantId: 'user-2',
         status: 'left',
         leftAt: new Date(),
+        joinedAt: oldJoinedAt,
       });
       mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
       mockParticipantRepo.save.mockResolvedValue(existingParticipant);
@@ -810,12 +824,40 @@ describe('TopicService', () => {
 
       expect(existingParticipant.status).toBe('active');
       expect(existingParticipant.leftAt).toBeNull();
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(existingParticipant);
+      // re-join 语义：joinedAt 刷新为本次激活时间（不再是 left 前的旧值）
+      expect(existingParticipant.joinedAt).toBeInstanceOf(Date);
+      expect(existingParticipant.joinedAt!.getTime()).toBeGreaterThan(oldJoinedAt.getTime());
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ joinedAt: existingParticipant.joinedAt }),
+      );
       expect(result).toEqual({
         topicId: 'topic-1',
         participantId: 'user-2',
         joinedAt: existingParticipant.joinedAt,
       });
+    });
+
+    it('should refresh joinedAt when invited participant joins', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      // invited 行 joined_at 应为 NULL（v1.40 语义：受邀时不记录加入时间）
+      const invitedParticipant = createMockParticipant({
+        participantId: 'agent-2',
+        participantType: ActorType.AGENT,
+        status: ParticipantStatus.INVITED,
+        joinedAt: null,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(invitedParticipant);
+      mockParticipantRepo.save.mockResolvedValue(invitedParticipant);
+
+      await service.join('topic-1', 'agent-2', ActorType.AGENT);
+
+      expect(invitedParticipant.status).toBe(ParticipantStatus.ACTIVE);
+      // 激活时写入 joinedAt
+      expect(invitedParticipant.joinedAt).toBeInstanceOf(Date);
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ joinedAt: expect.any(Date) }),
+      );
     });
 
     it('should throw BadRequestException when topic is closed', async () => {
@@ -1714,6 +1756,55 @@ describe('TopicService', () => {
       expect(mockTopicRepo.save).not.toHaveBeenCalled();
     });
 
+    it('should auto-join via atomic conditional upsert SQL without overwriting role (non-key path)', async () => {
+      // v1.40：sendMessage 自动 join 改用原生 SQL 原子条件 upsert——
+      // 禁止 find/save（并发首消息/幂等重试 PK 冲突 23505）；
+      // role 不出现在 SET 子句（moderator 不被降级）；
+      // status/joined_at 仅对 invited/left 行激活刷新（active 行保持原值）。
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const savedMsg = createMockMessage({ id: 'msg-1', content: 'Hello' });
+      mockMessageRepo.create.mockReturnValue(savedMsg);
+      mockMessageRepo.save.mockResolvedValue(savedMsg);
+      mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
+
+      await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Hello' });
+
+      expect(mockParticipantRepo.query).toHaveBeenCalledTimes(1);
+      const [sql, params] = mockParticipantRepo.query.mock.calls[0];
+      // 原子 upsert + 条件更新
+      expect(sql).toContain('INSERT INTO topic_participants');
+      expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
+      expect(sql).toContain('CASE WHEN topic_participants.status IN');
+      // SET 子句中不得出现 role（moderator 不被降级为 member）
+      expect(sql).not.toContain('SET role');
+      expect(sql).not.toMatch(/role\s*=/);
+      // 参数 = (topicId, senderId)
+      expect(params).toEqual(['topic-1', 'user-1']);
+    });
+
+    it('should auto-join via atomic conditional upsert SQL inside idempotency transaction', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const savedMsg = createMockMessage({ id: 'msg-idem-sql', content: 'Hello' });
+      mockMessageRepo.create.mockReturnValue(savedMsg);
+      mockMessageRepo.save.mockResolvedValue(savedMsg);
+      mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-sql' } as IdempotencyRecord);
+      mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
+
+      await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+        content: 'Hello',
+        clientRequestId: 'req-msg-sql',
+      });
+
+      // 事务路径同样走原生 SQL（manager.query），不做 TypeORM upsert
+      expect(mockEntityManager.query).toHaveBeenCalledTimes(1);
+      const [sql, params] = mockEntityManager.query.mock.calls[0];
+      expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
+      expect(sql).not.toMatch(/role\s*=/);
+      expect(params).toEqual(['topic-1', 'user-1']);
+    });
+
     it('should send message with idempotency key and write idempotency record', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
@@ -2079,6 +2170,8 @@ describe('TopicService', () => {
           participantType: ActorType.HUMAN,
           role: 'member',
           lastReadMessageId: 'msg-10',
+          // 无行时 insert ACTIVE 新行（自动 join 语义），显式写 joinedAt
+          joinedAt: expect.any(Date),
         }),
       );
       expect(result).toEqual({ topicId: 'topic-1', lastReadMessageId: 'msg-10', advanced: true });

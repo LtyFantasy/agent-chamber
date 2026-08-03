@@ -107,7 +107,9 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
  * read_doc — 文档精读
  *
  * 双通道定位：(spaceName+path) 精确匹配 或 裸 docId。
- * 无定位参数 → 返回大纲（GET /docs/:id）。
+ * 无定位参数 → GET /docs/:id：小文档（tokenEstimate ≤ 2000，可用 maxFullTokens
+ * 覆盖，0=强制 outline）直接内联全文（mode:'full' + content）；大文档返回大纲
+ * （mode:'outline'）+ 按 section 精读。
  * 带 position 或 headingPath → 返回对应 section 正文。
  * 不收 sectionId（不稳定契约），不走 /content 全文通道（仅 web 渲染用）。
  */
@@ -117,7 +119,10 @@ export const readDocTool: CustomTool = {
     description:
       'Read a document by dual-channel location: (spaceName + path) via exact path match, ' +
       'or bare docId via direct lookup. ' +
-      'Without position/headingPath: returns outline (metadata + section list without body). ' +
+      'Without position/headingPath: small documents (tokenEstimate ≤ 2000 by default; ' +
+      'override with maxFullTokens, 0 = force outline) are inlined with full content ' +
+      '(mode:"full" + content); large documents return outline (mode:"outline") for ' +
+      'per-section targeted reading. ' +
       'With position or headingPath: returns the matching section body. ' +
       'Does NOT accept sectionId (unstable — changes on every content update). ' +
       'Does NOT use the /content full-text channel (web rendering only).',
@@ -137,6 +142,13 @@ export const readDocTool: CustomTool = {
         docId: {
           type: 'string',
           description: 'Document ID (UUID). Required when using direct docId channel.',
+        },
+        maxFullTokens: {
+          type: 'integer',
+          description:
+            'Optional. Inline-full-content token threshold override for outline mode ' +
+            '(default 2000; 0 = force outline; range 0-100000, enforced server-side). ' +
+            'Only applies when no position/headingPath is given.',
         },
         position: {
           type: 'integer',
@@ -160,6 +172,7 @@ export const readDocTool: CustomTool = {
     const docId = args.docId as string | undefined;
     const position = args.position as number | undefined;
     const headingPath = args.headingPath as string | undefined;
+    const maxFullTokens = args.maxFullTokens as number | undefined;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
     // 参数校验：至少提供 (spaceName+path) 或 docId
@@ -270,11 +283,14 @@ export const readDocTool: CustomTool = {
       }
     }
 
-    // ─── 读取：无定位参数 → 大纲；有定位 → section 正文 ───
+    // ─── 读取：无定位参数 → 大纲（小文档内联全文）；有定位 → section 正文 ───
     if (position === undefined && headingPath === undefined) {
-      // 大纲模式
+      // 大纲模式：maxFullTokens 透传到后端覆盖内联阈值（0 = 强制 outline）；
+      // 未传时保持原调用形态（无 options），与既有行为一致
       try {
-        const doc = await client.request<Record<string, unknown>>('GET', `/docs/${resolvedDocId}`);
+        const options =
+          maxFullTokens !== undefined ? { params: { maxFullTokens } } : undefined;
+        const doc = await client.request<Record<string, unknown>>('GET', `/docs/${resolvedDocId}`, options);
         return {
           content: [{ type: 'text', text: JSON.stringify(doc) }],
         };
