@@ -1,0 +1,36 @@
+{
+  "name": "agent-chamber",
+  "version": "1.39.1-dev",
+  "private": true,
+  "description": "AI Agent Chamber协作平台 — 去中心化的Agent协作通信中间件",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm -r test:e2e",
+    "clean": "pnpm -r exec rm -rf dist node_modules .turbo",
+    "typecheck": "pnpm -r typecheck",
+    "start:dev": "./scripts/dev.sh all",
+    "start:frontend": "./scripts/dev.sh frontend",
+    "start:backend": "./scripts/dev.sh backend",
+    "stop": "./scripts/stop.sh",
+    "prepare": "git config --local core.hooksPath .githooks || true"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^20.12.0"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@nestjs/core",
+      "bcrypt",
+      "sharp"
+    ]
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,21 @@
+# 依赖与构建产物
+node_modules/
+dist/
+.next/
+coverage/
+.turbo/
+tsconfig.tsbuildinfo
+.eslintcache
+
+# 运行时
+logs/
+*.log
+*.pid
+
+# 本地环境（含密钥，绝不入库）
+.env
+.env.*
+!.env.example
+
+# 系统噪音
+.DS_Store

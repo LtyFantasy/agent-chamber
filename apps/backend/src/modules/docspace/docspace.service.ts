@@ -1,0 +1,1118 @@
+/**
+ * =============================================================================
+ * AGENT-HOOK | 修改本文件前必读
+ * =============================================================================
+ * [设计文档]
+ *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
+ *   - 补充: plan §4.1-§4.3 (W2 空间/分类/成员 API)
+
+ * [踩坑索引] B4(jsonb脏数据防御)
+ *
+ * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
+ *
+ * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   B4: settings.overviewFilter 的 excludeTypes/excludeCategories 手工改库可能存成字符串，
+ *      字符串也有 .includes() 会静默产生错误语义。修复：resolveOverviewFilters 加 Array.isArray
+ *      防御（非数组视为无默认过滤）。见 memory/2026-08-03.md §B4
+ *
+ * [修改检查]
+ *   □ 已读 [设计文档] 确认修改符合设计意图
+ *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
+ *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * =============================================================================
+ */
+import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, In, IsNull } from 'typeorm';
+import * as crypto from 'crypto';
+import { DocSpace } from '../../database/entities/doc-space.entity';
+import { DocSpaceMember } from '../../database/entities/doc-space-member.entity';
+import { DocCategory } from '../../database/entities/doc-category.entity';
+import { Doc } from '../../database/entities/doc.entity';
+import { DocSection } from '../../database/entities/doc-section.entity';
+import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
+import { Agent } from '../../database/entities/agent.entity';
+import { User } from '../../database/entities/user.entity';
+import { Actor } from '../../database/entities/actor.entity';
+import { Board } from '../../database/entities/board.entity';
+import { Topic } from '../../database/entities/topic.entity';
+import { Visibility, ErrorCode, ActorType, EventType } from '@agent-chamber/shared';
+import { EventService } from '../event/event.service';
+import type {
+  DocSpaceSummary,
+  DocSpaceDetail,
+  DocSpaceMemberDto,
+  DocCategoryDto,
+  DocSummary,
+  DocSpaceOverview,
+  DocCategoryOverview,
+  DocSpaceOverviewFilter,
+  DocSpaceOverviewAppliedFilters,
+  PaginatedResponse,
+} from '@agent-chamber/shared';
+import { DocOverviewQueryDto } from './dto';
+import { AccessQueryService } from '../../common/services/access-query.service';
+import { ResourceValidator } from '../../common/resource-validator';
+import { UnifiedActor } from '../../common/types/actor.types';
+
+/** Overview token cap (~4000). When exceeded, docs are truncated and `truncated: true` is set. */
+const OVERVIEW_TOKEN_CAP = 4000;
+
+/**
+ * Overview 条目成本 = 地图行自身（title+path+summary）的 CJK 感知 token 估算，
+ * 不是文档全文的 tokenEstimate——否则单篇大文档（如 39k token 的 api-definition.md）
+ * 就会顶爆 4000 上限，导致真实数据下地图为空（生产首跑暴露）。公式与 markdown-chunker 一致。
+ */
+function overviewEntryTokens(doc: Doc): number {
+  const text = `${doc.title ?? ''}${doc.path ?? ''}${doc.summary ?? ''}`;
+  const cjk = (text.match(/[一-鿿豈-﫿]/g) || []).length;
+  return cjk + Math.ceil((text.length - cjk) / 4);
+}
+
+/**
+ * 逗号分隔 query 参数 → 去空白去空串数组；空串/全空 → undefined（视为未传）。
+ * 语义：`?excludeType=memory,guide` → ['memory','guide']；`?excludeType=` → 未传（回退空间默认）。
+ */
+function splitCsv(value?: string): string[] | undefined {
+  if (!value) return undefined;
+  const parts = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
+}
+
+/**
+ * overview 过滤条件（per-call 解析 + 空间默认合并后的最终生效值）
+ */
+interface ResolvedOverviewFilters {
+  /** docType 白名单（type=，无空间默认版本） */
+  types?: string[];
+  /** docType 黑名单（excludeType= 优先，否则空间默认 excludeTypes） */
+  excludeTypes?: string[];
+  /** category slug 白名单（category=，无空间默认版本） */
+  categories?: string[];
+  /** category slug 黑名单（excludeCategory= 优先，否则空间默认 excludeCategories） */
+  excludeCategories?: string[];
+  /** tag 过滤（tag=） */
+  tag?: string;
+  /** 路径前缀（pathPrefix=） */
+  pathPrefix?: string;
+  /** token 上限（maxTokens= 或缺省 4000） */
+  maxTokens: number;
+  /** 回显：实际生效的过滤条件（appliedFilters，未生效维度不出现） */
+  appliedFilters: DocSpaceOverviewAppliedFilters;
+}
+
+/**
+ * 合并 per-call 查询参数与空间级默认过滤（settings.overviewFilter）。
+ *
+ * 优先级（plan WS2 定稿语义）：
+ * 1. per-call 显式传参（非空）按维度覆盖空间默认 —— 传了 type 或 excludeType 任一，
+ *    空间默认 excludeTypes 即不生效（显式 type=memory 应能取回被默认排除的文档）；category 维度同理
+ * 2. applySpaceDefaults=false（逃生门）→ 完全忽略空间默认
+ * 3. 其余缺省 → 全量（无过滤）
+ */
+function resolveOverviewFilters(
+  space: DocSpace,
+  query?: DocOverviewQueryDto,
+): ResolvedOverviewFilters {
+  // settings 为 jsonb，运行时可能缺失键；旧数据无 overviewFilter
+  const spaceDefault = (space.settings ?? {})['overviewFilter'] as
+    | DocSpaceOverviewFilter
+    | undefined;
+  // 脏数据防御（评审 B4）：jsonb 手工改库可能把数组存成字符串（"memory"），
+  // 字符串同样有 .includes() 会静默产生错误语义——非数组一律视为无默认过滤
+  const spaceDefaultExcludeTypes = Array.isArray(spaceDefault?.excludeTypes)
+    ? spaceDefault.excludeTypes
+    : undefined;
+  const spaceDefaultExcludeCategories = Array.isArray(spaceDefault?.excludeCategories)
+    ? spaceDefault.excludeCategories
+    : undefined;
+  const useSpaceDefaults = query?.applySpaceDefaults !== false;
+
+  const perCall = {
+    types: splitCsv(query?.type),
+    excludeTypes: splitCsv(query?.excludeType),
+    categories: splitCsv(query?.category),
+    excludeCategories: splitCsv(query?.excludeCategory),
+    tag: query?.tag?.trim() ? query.tag.trim() : undefined,
+    pathPrefix: query?.pathPrefix?.trim() ? query.pathPrefix.trim() : undefined,
+  };
+
+  // exclude 维度：per-call 非空优先，否则空间默认（逃生门关闭时）；
+  // 且 per-call 传了同维度的 include（type/category）同样抑制空间默认 exclude——
+  // 否则「空间默认排除 memory，显式 type=memory 取回」会被默认黑名单再次剔除（plan WS2 验证场景）
+  const typeDimOverridden = perCall.types !== undefined || perCall.excludeTypes !== undefined;
+  const excludeTypes =
+    perCall.excludeTypes ??
+    (useSpaceDefaults && !typeDimOverridden ? spaceDefaultExcludeTypes : undefined);
+  const categoryDimOverridden =
+    perCall.categories !== undefined || perCall.excludeCategories !== undefined;
+  const excludeCategories =
+    perCall.excludeCategories ??
+    (useSpaceDefaults && !categoryDimOverridden ? spaceDefaultExcludeCategories : undefined);
+
+  const maxTokens = query?.maxTokens ?? OVERVIEW_TOKEN_CAP;
+
+  // appliedFilters 回显：只回显实际生效的维度；maxTokens 仅显式传参时回显（缺省 4000 不冗余）
+  const appliedFilters: DocSpaceOverviewAppliedFilters = {};
+  if (perCall.types) appliedFilters.types = perCall.types;
+  if (excludeTypes) appliedFilters.excludeTypes = excludeTypes;
+  if (perCall.categories) appliedFilters.categories = perCall.categories;
+  if (excludeCategories) appliedFilters.excludeCategories = excludeCategories;
+  if (perCall.tag) appliedFilters.tag = perCall.tag;
+  if (perCall.pathPrefix) appliedFilters.pathPrefix = perCall.pathPrefix;
+  if (query?.maxTokens !== undefined) appliedFilters.maxTokens = query.maxTokens;
+
+  return {
+    types: perCall.types,
+    excludeTypes,
+    categories: perCall.categories,
+    excludeCategories,
+    tag: perCall.tag,
+    pathPrefix: perCall.pathPrefix,
+    maxTokens,
+    appliedFilters,
+  };
+}
+
+/**
+ * Generate a URL-friendly slug from a name.
+ * Lowercase, replace non-alphanumeric with hyphens, collapse multiples.
+ * 非拉丁名称（如纯中文）slugify 后为空串 —— 兜底随机后缀，保证 slug 可用且唯一（由调用方唯一性循环再校验）。
+ */
+function slugify(name: string): string {
+  const base = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 128);
+  if (base) return base;
+  return `s-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+@Injectable()
+export class DocSpaceService {
+  constructor(
+    @InjectRepository(DocSpace)
+    private spaceRepo: Repository<DocSpace>,
+    @InjectRepository(DocSpaceMember)
+    private memberRepo: Repository<DocSpaceMember>,
+    @InjectRepository(DocCategory)
+    private categoryRepo: Repository<DocCategory>,
+    @InjectRepository(Doc)
+    private docRepo: Repository<Doc>,
+    @InjectRepository(DocSection)
+    private sectionRepo: Repository<DocSection>,
+    @InjectRepository(TaskDocLink)
+    private taskDocLinkRepo: Repository<TaskDocLink>,
+    @InjectRepository(Agent)
+    private agentRepo: Repository<Agent>,
+    @InjectRepository(User)
+    private userRepo: Repository<User>,
+    @InjectRepository(Actor)
+    private actorRepo: Repository<Actor>,
+    @InjectRepository(Board)
+    private boardRepo: Repository<Board>,
+    @InjectRepository(Topic)
+    private topicRepo: Repository<Topic>,
+    private readonly accessQuery: AccessQueryService,
+    private readonly resourceValidator: ResourceValidator,
+    private readonly eventService: EventService,
+  ) {}
+
+  // ─── Actor helpers ──────────────────────────────────────────
+
+  /**
+   * Batch resolve actor types from the actors table.
+   */
+  private async resolveActorTypes(actorIds: string[]): Promise<Map<string, ActorType>> {
+    const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+    if (uniqueIds.length === 0) return new Map();
+    const actors = await this.actorRepo.find({ where: { id: In(uniqueIds) } });
+    return new Map(actors.map((a) => [a.id, a.type]));
+  }
+
+  /**
+   * Batch resolve actor public profiles (type, name, avatar).
+   */
+  private async resolveActorProfiles(
+    actorIds: string[],
+  ): Promise<
+    Map<
+      string,
+      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
+    >
+  > {
+    const typeMap = await this.resolveActorTypes(actorIds);
+    const humanIds = actorIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+    const agentIds = actorIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+
+    const [humans, agents] = await Promise.all([
+      humanIds.length > 0
+        ? this.userRepo.find({ where: { id: In(humanIds) }, relations: { actor: true } })
+        : Promise.resolve([] as User[]),
+      agentIds.length > 0
+        ? this.agentRepo.find({ where: { id: In(agentIds) }, relations: { actor: true } })
+        : Promise.resolve([] as Agent[]),
+    ]);
+
+    const humanMap = new Map(humans.map((u) => [u.id, u]));
+    const agentMap = new Map(agents.map((a) => [a.id, a]));
+
+    const result = new Map<
+      string,
+      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
+    >();
+    for (const id of actorIds) {
+      const type = typeMap.get(id);
+      if (type === ActorType.HUMAN) {
+        const user = humanMap.get(id);
+        result.set(id, {
+          type,
+          name: user?.displayName || user?.username || 'Unknown User',
+          avatarUrl: user?.avatarUrl ?? null,
+          description: null,
+        });
+      } else if (type === ActorType.AGENT) {
+        const agent = agentMap.get(id);
+        result.set(id, {
+          type,
+          name: agent?.name || 'Unknown Agent',
+          avatarUrl: agent?.avatarUrl ?? null,
+          description: agent?.description ?? null,
+        });
+      }
+    }
+    return result;
+  }
+
+  // ─── Slug generation ────────────────────────────────────────
+
+  /**
+   * Generate a unique slug within the space (excluding soft-deleted).
+   * If the base slug collides, appends a suffix (-2, -3, ...).
+   */
+  private async generateUniqueSlug(baseSlug: string, excludeSpaceId?: string): Promise<string> {
+    let slug = baseSlug;
+    let suffix = 2;
+
+    while (true) {
+      const qb = this.spaceRepo
+        .createQueryBuilder('ds')
+        .where('ds.slug = :slug', { slug })
+        .andWhere('ds.deleted_at IS NULL');
+      if (excludeSpaceId) {
+        qb.andWhere('ds.id != :excludeSpaceId', { excludeSpaceId });
+      }
+      const existing = await qb.getOne();
+      if (!existing) return slug;
+
+      slug = `${baseSlug}-${suffix}`;
+      if (slug.length > 128) {
+        slug = baseSlug.slice(0, 128 - String(suffix).length - 1) + `-${suffix}`;
+      }
+      suffix++;
+    }
+  }
+
+  /**
+   * Generate a unique slug within a space's categories.
+   */
+  private async generateUniqueCategorySlug(
+    spaceId: string,
+    baseSlug: string,
+    excludeId?: string,
+  ): Promise<string> {
+    let slug = baseSlug;
+    let suffix = 2;
+
+    while (true) {
+      const qb = this.categoryRepo
+        .createQueryBuilder('dc')
+        .where('dc.space_id = :spaceId', { spaceId })
+        .andWhere('dc.slug = :slug', { slug })
+        .andWhere('dc.deleted_at IS NULL');
+      if (excludeId) {
+        qb.andWhere('dc.id != :excludeId', { excludeId });
+      }
+      const existing = await qb.getOne();
+      if (!existing) return slug;
+
+      slug = `${baseSlug}-${suffix}`;
+      if (slug.length > 128) {
+        slug = baseSlug.slice(0, 128 - String(suffix).length - 1) + `-${suffix}`;
+      }
+      suffix++;
+    }
+  }
+
+  // ─── Validation helpers ─────────────────────────────────────
+
+  /** Validate topicId/boardId mutual exclusivity (both → 400). */
+  private validateBinding(dto: { topicId?: string; boardId?: string }): void {
+    if (dto.topicId && dto.boardId) {
+      throw new ConflictException({
+        message: 'topicId and boardId are mutually exclusive — provide at most one',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+  }
+
+  /** Look up board by id, throw if not found. */
+  private async ensureBoardExists(boardId: string): Promise<Board> {
+    const board = await this.boardRepo.findOne({ where: { id: boardId } });
+    if (!board) {
+      throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
+    }
+    return board;
+  }
+
+  /** Look up topic by id, throw if not found. */
+  private async ensureTopicExists(topicId: string): Promise<void> {
+    const topic = await this.topicRepo.findOne({ where: { id: topicId } });
+    if (!topic) {
+      throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
+    }
+  }
+
+  // ─── Enrich helpers ─────────────────────────────────────────
+
+  /** Aggregate members with actor public info. */
+  private async enrichMembers(spaceId: string): Promise<DocSpaceMemberDto[]> {
+    const members = await this.memberRepo.find({
+      where: { spaceId },
+      order: { createdAt: 'ASC' },
+    });
+    if (members.length === 0) return [];
+
+    const memberActorIds = members.map((m) => m.actorId);
+    const profileMap = await this.resolveActorProfiles(memberActorIds);
+
+    return members.map((m) => {
+      const profile = profileMap.get(m.actorId);
+      return {
+        actorId: m.actorId,
+        actorName: profile?.name || 'Unknown',
+        actorType: (profile?.type === ActorType.HUMAN ? 'human' : 'agent') as 'human' | 'agent',
+        role: m.role,
+        invitedBy: m.invitedBy,
+        createdAt: m.createdAt,
+      };
+    });
+  }
+
+  /** Aggregate categories for a space. */
+  private async enrichCategories(spaceId: string): Promise<DocCategoryDto[]> {
+    const categories = await this.categoryRepo.find({
+      where: { spaceId, deletedAt: IsNull() },
+      order: { sortOrder: 'ASC', createdAt: 'ASC' },
+    });
+    return categories.map((c) => ({
+      id: c.id,
+      spaceId: c.spaceId,
+      name: c.name,
+      slug: c.slug,
+      description: c.description,
+      sortOrder: c.sortOrder,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
+    }));
+  }
+
+  /** Count non-deleted docs in a space. */
+  private async countDocs(spaceId: string): Promise<number> {
+    const result = await this.docRepo
+      .createQueryBuilder('doc')
+      .select('COUNT(*)', 'count')
+      .where('doc.space_id = :spaceId', { spaceId })
+      .andWhere('doc.deleted_at IS NULL')
+      .getRawOne();
+    return parseInt(result?.count ?? '0', 10);
+  }
+
+  /**
+   * Count distinct tasks linked to non-deleted docs in this space (via task_doc_links).
+   * 单 count 查询（join docs 过滤软删），不加 join 载荷；供 detail 响应 linkedTaskCount。
+   */
+  private async countLinkedTasks(spaceId: string): Promise<number> {
+    const result = await this.taskDocLinkRepo
+      .createQueryBuilder('tdl')
+      .select('COUNT(DISTINCT tdl.task_id)', 'count')
+      .innerJoin('docs', 'doc', 'doc.id = tdl.doc_id')
+      .where('doc.space_id = :spaceId', { spaceId })
+      .andWhere('doc.deleted_at IS NULL')
+      .getRawOne<{ count: string }>();
+    return parseInt(result?.count ?? '0', 10);
+  }
+
+  // ─── CRUD: DocSpace ─────────────────────────────────────────
+
+  /** Raw find by ID (no permission check). */
+  async findById(id: string): Promise<DocSpace> {
+    const space = await this.spaceRepo.findOne({ where: { id } });
+    if (!space) {
+      throw new NotFoundException({
+        message: 'DocSpace not found',
+        code: ErrorCode.DOC_SPACE_NOT_FOUND,
+      });
+    }
+    return space;
+  }
+
+  /** Enrich a single space into DocSpaceDetail. */
+  async enrich(space: DocSpace): Promise<DocSpaceDetail> {
+    const [members, categories, docCount, linkedTaskCount] = await Promise.all([
+      this.enrichMembers(space.id),
+      this.enrichCategories(space.id),
+      this.countDocs(space.id),
+      this.countLinkedTasks(space.id),
+    ]);
+
+    const { description, ...rest } = space;
+
+    return {
+      ...rest,
+      description,
+      descriptionSnippet: description?.slice(0, 200) ?? null,
+      visibility: (space.settings?.visibility || Visibility.OPEN) as Visibility,
+      topicId: space.topicId,
+      boardId: space.boardId,
+      creatorId: space.creatorId,
+      docCount,
+      linkedTaskCount,
+      members,
+      categories,
+      createdAt: space.createdAt,
+      updatedAt: space.updatedAt,
+    };
+  }
+
+  /**
+   * List spaces with pagination + whitelist filtering.
+   */
+  async findAll(
+    query: { page?: number; pageSize?: number; boardId?: string; topicId?: string } = {},
+    actor?: UnifiedActor,
+  ): Promise<PaginatedResponse<DocSpaceSummary>> {
+    const { page = 1, pageSize = 20, boardId, topicId } = query;
+
+    const accessibleIds = await this.accessQuery.getAccessibleDocSpaceIds(actor);
+    // Non-admin with empty whitelist → return empty page
+    if (accessibleIds !== null && accessibleIds.length === 0) {
+      return {
+        items: [],
+        total: 0,
+        page: +page,
+        pageSize: +pageSize,
+        totalPages: 0,
+        hasNext: false,
+        hasPrev: false,
+      };
+    }
+
+    const qb = this.spaceRepo.createQueryBuilder('ds').where('ds.deleted_at IS NULL');
+
+    if (accessibleIds) {
+      qb.andWhere('ds.id IN (:...accessibleIds)', { accessibleIds });
+    }
+    if (boardId) {
+      qb.andWhere('ds.board_id = :boardId', { boardId });
+    }
+    if (topicId) {
+      qb.andWhere('ds.topic_id = :topicId', { topicId });
+    }
+
+    const [items, total] = await qb
+      .skip((page - 1) * pageSize)
+      .take(pageSize)
+      .orderBy('ds.createdAt', 'DESC')
+      .getManyAndCount();
+
+    const enrichedItems: DocSpaceSummary[] = items.map((s) => ({
+      id: s.id,
+      name: s.name,
+      slug: s.slug,
+      descriptionSnippet: s.description?.slice(0, 200) ?? null,
+      topicId: s.topicId,
+      boardId: s.boardId,
+      visibility: (s.settings?.visibility || Visibility.OPEN) as Visibility,
+      creatorId: s.creatorId,
+      docCount: s.docCount,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+    }));
+
+    const totalPages = Math.ceil(total / pageSize);
+    return {
+      items: enrichedItems,
+      total,
+      page: +page,
+      pageSize: +pageSize,
+      totalPages,
+      hasNext: +page < totalPages,
+      hasPrev: +page > 1,
+    };
+  }
+
+  /** Create a new DocSpace. */
+  async create(
+    actor: UnifiedActor,
+    dto: {
+      name: string;
+      slug?: string;
+      description?: string;
+      topicId?: string;
+      boardId?: string;
+      visibility?: Visibility;
+      invitedAgentIds?: string[];
+    },
+  ): Promise<DocSpace> {
+    this.validateBinding(dto);
+
+    if (dto.topicId) {
+      await this.ensureTopicExists(dto.topicId);
+    }
+    if (dto.boardId) {
+      await this.ensureBoardExists(dto.boardId);
+    }
+
+    // Validate invited agents exist
+    const invitedAgentIds = dto.invitedAgentIds || [];
+    if (invitedAgentIds.length > 0) {
+      await this.resourceValidator.existsMany(
+        this.agentRepo,
+        invitedAgentIds,
+        ErrorCode.AGENT_NOT_FOUND,
+      );
+    }
+
+    const baseSlug = dto.slug || slugify(dto.name);
+    const slug = await this.generateUniqueSlug(baseSlug);
+
+    const space = this.spaceRepo.create({
+      name: dto.name,
+      slug,
+      description: dto.description ?? null,
+      topicId: dto.topicId ?? null,
+      boardId: dto.boardId ?? null,
+      creatorId: actor.id,
+      settings: { visibility: dto.visibility ?? Visibility.OPEN },
+      // docCount 由 trigger 单一事实源维护，应用层禁写（缺省 0 走 DB default）
+    });
+    const saved = await this.spaceRepo.save(space);
+
+    // Create initial members
+    if (invitedAgentIds.length > 0) {
+      const memberEntities = [...new Set(invitedAgentIds)].map((agentId) =>
+        this.memberRepo.create({
+          spaceId: saved.id,
+          actorId: agentId,
+          role: 'member',
+          invitedBy: actor.id,
+        }),
+      );
+      await this.memberRepo.save(memberEntities);
+    }
+
+    return saved;
+  }
+
+  /** Update a DocSpace. */
+  async update(
+    id: string,
+    dto: {
+      name?: string;
+      description?: string | null;
+      visibility?: Visibility;
+      topicId?: string | null;
+      boardId?: string | null;
+      overviewFilter?: DocSpaceOverviewFilter | null;
+    },
+  ): Promise<DocSpace> {
+    const space = await this.findById(id);
+
+    if (dto.topicId !== undefined || dto.boardId !== undefined) {
+      this.validateBinding({
+        topicId: dto.topicId ?? undefined,
+        boardId: dto.boardId ?? undefined,
+      });
+      if (dto.topicId) {
+        await this.ensureTopicExists(dto.topicId);
+        space.topicId = dto.topicId;
+        // clear the other binding
+        space.boardId = null;
+      } else if (dto.boardId) {
+        await this.ensureBoardExists(dto.boardId);
+        space.boardId = dto.boardId;
+        space.topicId = null;
+      } else {
+        // 显式 null：解除对应侧绑定（未绑定侧传 null 为无操作；
+        // 任务↔文档链接按 docId 关联，与 space 绑定无关，解绑不级联）
+        if (dto.topicId === null) space.topicId = null;
+        if (dto.boardId === null) space.boardId = null;
+      }
+    }
+
+    if (dto.name !== undefined) space.name = dto.name;
+    // 「字段出现即采用」语义：显式 null = 清空（写 null），未传（undefined）才保留旧值。
+    // 不用真值判断（`?? existing`），否则 null 会被误判为"未提供"而保留旧值。
+    if (dto.description !== undefined) space.description = dto.description;
+    if (dto.visibility !== undefined) {
+      space.settings = { ...space.settings, visibility: dto.visibility };
+    }
+    // 空间级 overview 默认过滤（v1.38）：显式 null = 清除该键；未传保留旧值
+    if (dto.overviewFilter !== undefined) {
+      const settings = { ...space.settings };
+      if (dto.overviewFilter === null) {
+        delete settings.overviewFilter;
+      } else {
+        settings.overviewFilter = dto.overviewFilter;
+      }
+      space.settings = settings;
+    }
+
+    return this.spaceRepo.save(space);
+  }
+
+  /**
+   * Delete a DocSpace (cascade soft delete).
+   * Soft-deletes all docs + the space in one transaction, then emits a
+   * doc_deleted event per cascaded doc (plan §4.2: 删除处发射，Agent 经 events/poll 感知).
+   *
+   * NOTE: doc_sections have NO deleted_at column (hard-delete-only table).
+   * Orphan sections of soft-deleted docs are unreachable — every read path
+   * (search / overview / findOne / getContent / getSection / TaskDetail join)
+   * filters `docs.deleted_at IS NULL` — so sections are intentionally left as-is.
+   * （历史教训：曾在此对 doc_sections 做软删 UPDATE，列不存在导致删除含文档的空间必然 500，
+   *  单测 mock 掉事务从未暴露——真 DB 验证是硬门槛。）
+   */
+  async remove(
+    id: string,
+    actor?: UnifiedActor,
+  ): Promise<{ deleted: boolean; docCount: number; linkedTaskCount: number }> {
+    const space = await this.findById(id);
+
+    // Count non-deleted docs (path/title kept for event payloads)
+    const docResult = await this.docRepo
+      .createQueryBuilder('doc')
+      .select(['doc.id AS id', 'doc.path AS path', 'doc.title AS title'])
+      .where('doc.space_id = :spaceId', { spaceId: id })
+      .andWhere('doc.deleted_at IS NULL')
+      .getRawMany<{ id: string; path: string; title: string }>();
+    const docCount = docResult.length;
+    const docIds = docResult.map((d) => d.id);
+
+    // Count linked tasks (join task_doc_links)
+    let linkedTaskCount = 0;
+    if (docIds.length > 0) {
+      const linkResult = await this.taskDocLinkRepo
+        .createQueryBuilder('tdl')
+        .select('COUNT(DISTINCT tdl.task_id)', 'count')
+        .where('tdl.doc_id IN (:...docIds)', { docIds })
+        .getRawOne<{ count: string }>();
+      linkedTaskCount = parseInt(linkResult?.count ?? '0', 10);
+    }
+
+    // In a transaction: soft-delete all docs in the space, then soft-delete the space itself.
+    await this.spaceRepo.manager.transaction(async (manager) => {
+      // Soft-delete docs in space
+      if (docIds.length > 0) {
+        await manager
+          .createQueryBuilder()
+          .update('Doc')
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .set({ deletedAt: new Date() } as any)
+          .where('id IN (:...docIds)', { docIds })
+          .execute();
+      }
+
+      // Soft-delete the space itself
+      await manager
+        .createQueryBuilder()
+        .update('DocSpace')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .set({ deletedAt: new Date() } as any)
+        .where('id = :id', { id })
+        .execute();
+    });
+
+    // Emit doc_deleted per cascaded doc (after commit; payload mirrors DocService.remove)
+    for (const d of docResult) {
+      await this.eventService.create({
+        eventType: EventType.DOC_DELETED,
+        resourceType: 'doc',
+        resourceId: d.id,
+        actorId: actor?.id ?? undefined,
+        topicId: space.topicId ?? undefined,
+        boardId: space.boardId ?? undefined,
+        payload: { spaceId: id, docId: d.id, path: d.path, title: d.title },
+      });
+    }
+
+    return { deleted: true, docCount, linkedTaskCount };
+  }
+
+  // ─── Members ────────────────────────────────────────────────
+
+  /** Invite an agent as member. Idempotent: 409 if already exists. */
+  async inviteAgent(spaceId: string, agentId: string): Promise<DocSpace> {
+    const space = await this.findById(spaceId);
+
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const existing = await this.memberRepo.findOne({
+      where: { spaceId, actorId: agentId },
+    });
+    if (existing) {
+      throw new ConflictException({
+        message: 'Agent already has access to this space',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
+    const member = this.memberRepo.create({
+      spaceId,
+      actorId: agentId,
+      role: 'member',
+      invitedBy: space.creatorId,
+    });
+    await this.memberRepo.save(member);
+
+    return space;
+  }
+
+  /** Uninvite an agent (remove member row). */
+  async uninviteAgent(spaceId: string, agentId: string): Promise<DocSpace> {
+    const space = await this.findById(spaceId);
+
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const existing = await this.memberRepo.findOne({
+      where: { spaceId, actorId: agentId },
+    });
+    if (!existing) {
+      throw new ConflictException({
+        message: 'Agent is not a member',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+    if (existing.role === 'editor') {
+      throw new ConflictException({
+        message: 'Use removeEditor first',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
+    await this.memberRepo.delete({ spaceId, actorId: agentId });
+
+    return space;
+  }
+
+  /** Promote member to editor. */
+  async addEditor(spaceId: string, agentId: string): Promise<DocSpace> {
+    const space = await this.findById(spaceId);
+
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const existing = await this.memberRepo.findOne({
+      where: { spaceId, actorId: agentId },
+    });
+
+    if (existing) {
+      if (existing.role === 'editor') {
+        throw new ConflictException({
+          message: 'Agent is already an editor',
+          code: ErrorCode.RESOURCE_CONFLICT,
+        });
+      }
+      // member → editor upgrade
+      existing.role = 'editor';
+      await this.memberRepo.save(existing);
+    } else {
+      // Create editor row directly (upsert semantics: new editor)
+      const member = this.memberRepo.create({
+        spaceId,
+        actorId: agentId,
+        role: 'editor',
+        invitedBy: space.creatorId,
+      });
+      await this.memberRepo.save(member);
+    }
+
+    return space;
+  }
+
+  /** Demote editor to member. Editor row is changed to member (not deleted — prevents dangling members). */
+  async removeEditor(spaceId: string, agentId: string): Promise<DocSpace> {
+    const space = await this.findById(spaceId);
+
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const existing = await this.memberRepo.findOne({
+      where: { spaceId, actorId: agentId, role: 'editor' },
+    });
+    if (!existing) {
+      throw new ConflictException({
+        message: 'Agent is not an editor',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
+    // Demote: editor → member (never delete the row — that would remove access)
+    existing.role = 'member';
+    await this.memberRepo.save(existing);
+
+    return space;
+  }
+
+  // ─── Categories ─────────────────────────────────────────────
+
+  /** Find a category by ID, throw if not found or soft-deleted. */
+  async findCategoryById(id: string): Promise<DocCategory> {
+    const category = await this.categoryRepo.findOne({ where: { id } });
+    if (!category) {
+      throw new NotFoundException({
+        message: 'Category not found',
+        code: ErrorCode.DOC_CATEGORY_NOT_FOUND,
+      });
+    }
+    return category;
+  }
+
+  /** Create a category in a space. Slug must be unique within the space. */
+  async createCategory(
+    spaceId: string,
+    dto: { name: string; slug?: string; description?: string; sortOrder?: number },
+  ): Promise<DocCategory> {
+    const space = await this.findById(spaceId);
+
+    const baseSlug = dto.slug || slugify(dto.name);
+    const slug = await this.generateUniqueCategorySlug(spaceId, baseSlug);
+
+    const category = this.categoryRepo.create({
+      spaceId: space.id,
+      name: dto.name,
+      slug,
+      description: dto.description ?? null,
+      sortOrder: dto.sortOrder ?? 0,
+    });
+    return this.categoryRepo.save(category);
+  }
+
+  /** Update a category. */
+  async updateCategory(
+    id: string,
+    dto: { name?: string; slug?: string; description?: string; sortOrder?: number },
+  ): Promise<DocCategory> {
+    const category = await this.findCategoryById(id);
+
+    if (dto.name !== undefined) category.name = dto.name;
+    if (dto.description !== undefined) category.description = dto.description;
+    if (dto.sortOrder !== undefined) category.sortOrder = dto.sortOrder;
+    if (dto.slug !== undefined && dto.slug !== category.slug) {
+      const newSlug = await this.generateUniqueCategorySlug(
+        category.spaceId,
+        dto.slug,
+        category.id,
+      );
+      category.slug = newSlug;
+    }
+
+    return this.categoryRepo.save(category);
+  }
+
+  /**
+   * Delete a category.
+   * Does NOT delete docs — sets their categoryId to null (uncategorized) in the same transaction.
+   */
+  async removeCategory(id: string): Promise<void> {
+    await this.findCategoryById(id);
+
+    await this.categoryRepo.manager.transaction(async (manager) => {
+      // Set doc.categoryId to null for docs in this category
+      await manager
+        .createQueryBuilder()
+        .update('Doc')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .set({ categoryId: null } as any)
+        .where('category_id = :categoryId', { categoryId: id })
+        .andWhere('deleted_at IS NULL')
+        .execute();
+
+      // Soft-delete the category
+      await manager
+        .createQueryBuilder()
+        .update('DocCategory')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .set({ deletedAt: new Date() } as any)
+        .where('id = :id', { id })
+        .execute();
+    });
+  }
+
+  // ─── Overview ───────────────────────────────────────────────
+
+  /**
+   * Generate a compact overview map of the space.
+   * Categories sorted by sortOrder → each contains docs sorted by path.
+   * Uncategorized docs also included. Token cap ~4000 with truncation.
+   *
+   * v1.38 起支持可配置过滤：per-call 查询参数（type/excludeType/category/excludeCategory/
+   * tag/pathPrefix/maxTokens/applySpaceDefaults）+ 空间级默认过滤（settings.overviewFilter），
+   * 合并语义见 resolveOverviewFilters；响应回显实际生效的 appliedFilters。
+   */
+  async getOverview(spaceId: string, query?: DocOverviewQueryDto): Promise<DocSpaceOverview> {
+    const space = await this.findById(spaceId);
+
+    const filters = resolveOverviewFilters(space, query);
+    const { types, excludeTypes, categories, excludeCategories, tag, pathPrefix } = filters;
+    const maxTokens = filters.maxTokens;
+
+    // Load non-deleted categories sorted by sortOrder
+    // Note: deletedAt has select:false, so we use a raw query or QB
+    const allCategories = await this.categoryRepo
+      .createQueryBuilder('dc')
+      .where('dc.space_id = :spaceId', { spaceId })
+      .andWhere('dc.deleted_at IS NULL')
+      .orderBy('dc.sort_order', 'ASC')
+      .addOrderBy('dc.created_at', 'ASC')
+      .getMany();
+
+    // Load all non-deleted docs in the space
+    // 过滤在内存完成：overview 本就全量拉取单空间文档（量级有限），且 category slug
+    // 白名单需要已加载的分类做 slug→id 预解析；避免把过滤逻辑散进 SQL 降低可读性。
+    const docs = await this.docRepo
+      .createQueryBuilder('d')
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .orderBy('d.path', 'ASC')
+      .getMany();
+
+    // category slug → id 预解析（仅白/黑名单生效时使用）
+    const slugToId = new Map(allCategories.map((c) => [c.slug, c.id]));
+    // include 白名单：doc.categoryId 必须命中；exclude 黑名单：命中即剔除。
+    // 语义（plan WS2）：include 与 exclude 同现 = 先 include 后 exclude（交集）
+    const whiteCategoryIds = categories
+      ? new Set(categories.map((slug) => slugToId.get(slug)).filter((id) => id !== undefined))
+      : undefined;
+    const blackCategoryIds = excludeCategories
+      ? new Set(
+          excludeCategories.map((slug) => slugToId.get(slug)).filter((id) => id !== undefined),
+        )
+      : undefined;
+
+    const filteredDocs = docs.filter((doc) => {
+      if (types && (!doc.docType || !types.includes(doc.docType))) return false;
+      if (excludeTypes && doc.docType && excludeTypes.includes(doc.docType)) return false;
+      if (whiteCategoryIds && (!doc.categoryId || !whiteCategoryIds.has(doc.categoryId))) {
+        return false;
+      }
+      if (blackCategoryIds && doc.categoryId && blackCategoryIds.has(doc.categoryId)) {
+        return false;
+      }
+      if (tag && !(doc.tags ?? []).includes(tag)) return false;
+      if (pathPrefix && !doc.path.startsWith(pathPrefix)) return false;
+      return true;
+    });
+
+    const docMap = new Map<string | null, Doc[]>();
+    for (const doc of filteredDocs) {
+      const key = doc.categoryId ?? null;
+      if (!docMap.has(key)) docMap.set(key, []);
+      docMap.get(key)!.push(doc);
+    }
+
+    let totalTokenEstimate = 0;
+    let truncated = false;
+
+    const categoryOverviews: DocCategoryOverview[] = [];
+
+    // 分类输出：白名单命中分类保留（未命中整体省略）；黑名单命中分类整体隐藏（含其文档）。
+    // 两维度对称——include 保留命中分类，exclude 剔除命中分类
+    for (const cat of allCategories) {
+      if (whiteCategoryIds && !whiteCategoryIds.has(cat.id)) continue;
+      if (blackCategoryIds && blackCategoryIds.has(cat.id)) continue;
+      const catDocs = docMap.get(cat.id) || [];
+      const docItems: DocSummary[] = [];
+      for (const doc of catDocs) {
+        if (totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
+          truncated = true;
+          break;
+        }
+        totalTokenEstimate += overviewEntryTokens(doc);
+        docItems.push({
+          id: doc.id,
+          spaceId: doc.spaceId,
+          categoryId: doc.categoryId,
+          path: doc.path,
+          title: doc.title,
+          summary: doc.summary,
+          docType: doc.docType,
+          tags: doc.tags,
+          source: doc.source,
+          sectionCount: doc.sectionCount,
+          tokenEstimate: doc.tokenEstimate,
+          createdBy: doc.createdBy,
+          createdAt: doc.createdAt,
+          updatedAt: doc.updatedAt,
+        });
+      }
+      if (truncated) break;
+
+      categoryOverviews.push({
+        id: cat.id,
+        spaceId: cat.spaceId,
+        name: cat.name,
+        slug: cat.slug,
+        description: cat.description,
+        sortOrder: cat.sortOrder,
+        createdAt: cat.createdAt,
+        updatedAt: cat.updatedAt,
+        docs: docItems,
+      });
+    }
+
+    // Uncategorized docs（传 category 白名单时省略该段——未分类文档不属于任何被选分类）
+    const uncategorized: DocSummary[] = [];
+    if (!categories) {
+      const uncategorizedDocs = docMap.get(null) || [];
+      for (const doc of uncategorizedDocs) {
+        if (totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
+          truncated = true;
+          break;
+        }
+        totalTokenEstimate += overviewEntryTokens(doc);
+        uncategorized.push({
+          id: doc.id,
+          spaceId: doc.spaceId,
+          categoryId: doc.categoryId,
+          path: doc.path,
+          title: doc.title,
+          summary: doc.summary,
+          docType: doc.docType,
+          tags: doc.tags,
+          source: doc.source,
+          sectionCount: doc.sectionCount,
+          tokenEstimate: doc.tokenEstimate,
+          createdBy: doc.createdBy,
+          createdAt: doc.createdAt,
+          updatedAt: doc.updatedAt,
+        });
+      }
+    }
+
+    return {
+      spaceId: space.id,
+      spaceName: space.name,
+      categories: categoryOverviews,
+      uncategorized,
+      totalTokenEstimate,
+      truncated,
+      ...(Object.keys(filters.appliedFilters).length > 0
+        ? { appliedFilters: filters.appliedFilters }
+        : {}),
+    };
+  }
+}

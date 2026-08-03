@@ -1,0 +1,336 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * ============================================================================
+ * 「Mission Control」深空暗色设计令牌 — 全站唯一主题（dark-only）
+ * ============================================================================
+ * 约定（详见 docs/ui-design-system.md，视觉唯一真相源）：
+ * - 站点已收敛为单套暗色主题：layout.tsx 服务端硬编码 <html class="dark">，
+ *   因此令牌只定义在 :root 一份（.dark 不再另写，防双份漂移）；
+ *   html 上的 .dark class 保留是为了让 `dark:` 变体（如 skills 页 dark:prose-invert）生效。
+ * - 变量值必须是「空格分隔 HSL 通道」格式（如 187 92% 55%），
+ *   供 tailwind.config.ts 的 hsl(var(--x) / <alpha-value>) 映射消费。
+ */
+@layer base {
+  :root {
+    /* 底色：深空蓝黑（约 #060a14），全站最暗层 */
+    --background: 222 47% 5%;
+    /* 正文前景：96% 亮度，深底上保 WCAG AA 对比度 */
+    --foreground: 210 40% 96%;
+
+    /* 层级面：card/popover 比背景亮 2-3%，营造玻璃纵深 */
+    --card: 222 44% 8%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 44% 8%;
+    --popover-foreground: 210 40% 96%;
+
+    /* 主光色：青（cyan 系）—— 选中/focus/CTA 的主发光色 */
+    --primary: 187 92% 55%;
+    /* 亮青按钮上用深色文字保证对比度 */
+    --primary-foreground: 222 47% 10%;
+    /* 辅助光色：紫（violet 系）—— 渐变描边/次发光色，映射为 violet-glow */
+    --violet: 258 90% 72%;
+
+    /* 次表面：hover 底色等，带紫色调呼应辅助光色 */
+    --secondary: 224 30% 15%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 224 30% 15%;
+    /* 次要文字 ≥60% 亮度，深底可读性底线 */
+    --muted-foreground: 215 20% 62%;
+    --accent: 224 28% 18%;
+    --accent-foreground: 210 40% 96%;
+
+    /* 语义色：保留语义，亮度上调适配暗底 */
+    --destructive: 0 84% 65%;
+    --destructive-foreground: 210 40% 98%;
+
+    /* 边框/输入框描边：低亮度冷灰蓝，细腻不抢戏 */
+    --border: 222 25% 16%;
+    --input: 222 25% 20%;
+    /* focus 环：主光色青 */
+    --ring: 187 92% 55%;
+
+    /* 圆角基准加大（0.75rem）：深色玻璃质感配大圆角更柔和 */
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  /**
+   * 全局网格纹理：固定定位、~3% 透明度的细网格线，模拟控制台/星图底纹。
+   * z-index: -1 置于根背景之上、所有内容之下——因此布局壳/页面容器
+   * 不得再刷不透明 bg-background（body 已负责底色），否则纹理会被盖住。
+   */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background-image:
+      linear-gradient(hsl(210 40% 96% / 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(210 40% 96% / 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+}
+
+@layer utilities {
+  /**
+   * .glass — 玻璃拟态：半透底 + backdrop-blur + 半透边框 + inset 内高光。
+   * 【红线】仅用于壳层元素（sidebar/navbar/dialog/sheet/统计卡/登录卡）；
+   * 滚动列表内的重复元素（消息气泡、任务卡、表格行）禁用，避免滚动掉帧。
+   */
+  .glass {
+    background-color: hsl(var(--card) / 0.6);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid hsl(var(--border) / 0.6);
+    /* 顶部内高光：模拟玻璃受光边 */
+    box-shadow: inset 0 1px 0 hsl(0 0% 100% / 0.06);
+  }
+
+  /**
+   * .glass-vivid — 展示位加强玻璃（登录卡专属，比 .glass 更「透光」）。
+   * 透光四件套：
+   *   ① 底更薄（card/0.38）——背后 AmbientGlow 光斑/网格光束能透进来；
+   *   ② blur 20px + saturate(1.5)——磨砂感更强，且透进来的青/紫光更鲜活；
+   *   ③ 表面 135° 受光渐变——模拟光源斜射玻璃的表面亮度差；
+   *   ④ 边缘折射——顶边亮线 + 左青/右紫色散边 + 底边暗线 + 外投影。
+   * 【红线】仅单卡展示位（登录卡）；壳层导航/滚动元素禁用
+   * （blur 20px 合成层开销更大，且强透光在工作区会干扰阅读）。
+   * 【实验记录】动态反光曾试两版均被否（radial 光晕团 / 线性光泽带），
+   * 保持纯静态；勿再轻易加移动反光层。
+   */
+  .glass-vivid {
+    position: relative;
+    background:
+      linear-gradient(135deg, hsl(0 0% 100% / 0.07), hsl(0 0% 100% / 0.02) 40%, transparent 70%),
+      hsl(var(--card) / 0.38);
+    backdrop-filter: blur(20px) saturate(1.5);
+    -webkit-backdrop-filter: blur(20px) saturate(1.5);
+    border: 1px solid hsl(0 0% 100% / 0.12);
+    box-shadow:
+      inset 0 1px 0 hsl(0 0% 100% / 0.28),
+      inset 1px 0 0 hsl(var(--primary) / 0.1),
+      inset -1px 0 0 hsl(var(--violet) / 0.1),
+      inset 0 -1px 0 hsl(0 0% 0% / 0.3),
+      0 8px 32px hsl(0 0% 0% / 0.35);
+  }
+
+  /**
+   * .glass-flat — 半透实色底（无 blur）的玻璃平替。
+   * 用于滚动区域内大量重复的元素（列表卡、气泡、行），视觉上与 .glass 同族
+   * 但无合成层开销。
+   */
+  .glass-flat {
+    background-color: hsl(var(--card) / 0.6);
+    border: 1px solid hsl(var(--border) / 0.6);
+  }
+
+  /**
+   * .glow-border — 青→紫渐变描边（双层背景法：padding-box 填底色、border-box 填渐变）。
+   * 仅用于焦点/选中/CTA。注意它会接管 background，请勿与 bg-* 背景类叠加。
+   */
+  .glow-border {
+    border: 1px solid transparent;
+    background:
+      linear-gradient(hsl(var(--card) / 0.7), hsl(var(--card) / 0.7)) padding-box,
+      linear-gradient(135deg, hsl(var(--primary) / 0.7), hsl(var(--violet) / 0.7)) border-box;
+  }
+
+  /**
+   * .nav-item-active — 侧边栏当前导航项：渐变描边 + 青光微底 + 微发光。
+   * padding-box 用 primary/10 底色而非 card 底，让选中态透出主光色。
+   */
+  .nav-item-active {
+    border: 1px solid transparent;
+    background:
+      linear-gradient(hsl(var(--primary) / 0.12), hsl(var(--primary) / 0.12)) padding-box,
+      linear-gradient(135deg, hsl(var(--primary) / 0.6), hsl(var(--violet) / 0.5)) border-box;
+    box-shadow: 0 0 16px hsl(var(--primary) / 0.18);
+  }
+
+  /* 文字发光：标题/logo 点缀用，正文禁用（影响可读性） */
+  .text-glow-cyan {
+    text-shadow:
+      0 0 12px hsl(var(--primary) / 0.55),
+      0 0 36px hsl(var(--primary) / 0.25);
+  }
+
+  /* 品牌 Logo 裸用（无托盒）时的贴合发光：drop-shadow 跟随 SVG 形状，box-shadow 只会贴方盒 */
+  .logo-glow {
+    filter:
+      drop-shadow(0 0 8px hsl(var(--primary) / 0.5))
+      drop-shadow(0 0 20px hsl(var(--primary) / 0.22));
+  }
+
+  /* 品牌文字故障色差（常态）：青光发光打底 + 很淡的红/青色散重影 */
+  .glitch-soft {
+    text-shadow:
+      0 0 12px hsl(var(--primary) / 0.55),
+      0 0 36px hsl(var(--primary) / 0.25),
+      -1px 0 hsl(350 90% 60% / 0.22),
+      1px 0 hsl(var(--primary) / 0.3);
+  }
+
+  /* 乱码突发期间：发光保留，色散加重（不做位移抖动，纯字符变化） */
+  .glitching {
+    text-shadow:
+      0 0 12px hsl(var(--primary) / 0.55),
+      0 0 36px hsl(var(--primary) / 0.25),
+      -2px 0 hsl(350 90% 60% / 0.55),
+      2px 0 hsl(var(--primary) / 0.6);
+  }
+  .text-glow-violet {
+    text-shadow:
+      0 0 12px hsl(var(--violet) / 0.55),
+      0 0 36px hsl(var(--violet) / 0.25);
+  }
+
+  /**
+   * 滚动区域渐变遮罩 — 在内容溢出时于顶部/底部添加透明渐变，
+   * 视觉提示用户"此处可滚动，还有更多内容"。
+   */
+  .scroll-fade {
+    mask-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      black 12px,
+      black calc(100% - 12px),
+      transparent 100%
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent 0%,
+      black 12px,
+      black calc(100% - 12px),
+      transparent 100%
+    );
+  }
+}
+
+/* 全局自定义滚动条 — 细、圆角、冷灰蓝半透明，适配深空暗底 */
+/* 放在 @layer 外面确保构建产物保留 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(222 25% 30% / 0.6);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(222 25% 40% / 0.7);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(222 25% 30% / 0.6) transparent;
+}
+
+/* ==========================================================================
+ * v1.33.0-dev 氛围动效扩展（focus-glow / 网格光线流动）
+ * ========================================================================== */
+
+/**
+ * .focus-glow — 焦点激活发光（展厅级表单容器：登录/注册卡）。
+ * 容器内任意输入 focus 时，边缘点亮青色光晕并呼吸脉动；无 focus 时保持现状。
+ * 光晕走 ::after 伪元素只做 opacity 呼吸，不触发 layout（动效红线，见 §5）。
+ */
+.focus-glow {
+  position: relative;
+}
+.focus-glow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  box-shadow:
+    0 0 24px hsl(var(--primary) / 0.35),
+    0 0 64px hsl(var(--primary) / 0.15),
+    inset 0 0 0 1px hsl(var(--primary) / 0.55),
+    inset 0 0 24px hsl(var(--primary) / 0.08);
+}
+.focus-glow:focus-within::after {
+  opacity: 1;
+  animation: focus-breathing 3.6s ease-in-out infinite;
+}
+@keyframes focus-breathing {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* 品牌文字故障抖动 keyframes 已随抖动效果移除（用户反馈过于抢眼，保留纯乱码变化） */
+
+/**
+ * 网格光线流动 — 全局网格底纹（body::before，40px 网格）上的光斑沿网格线横/纵流动。
+ * linear 循环且两端都在屏外，无跳变；只动 transform / opacity。
+ * top/left 须取 40 的倍数以对齐网格线；duration/delay 内联错开模拟随机分布。
+ */
+.grid-beam {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(1px);
+}
+.grid-beam-x {
+  width: 180px;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, hsl(var(--primary) / 0.5), transparent);
+  box-shadow: 0 0 12px hsl(var(--primary) / 0.35);
+  animation: grid-beam-x 14s linear infinite;
+}
+.grid-beam-y {
+  width: 2px;
+  height: 180px;
+  background: linear-gradient(180deg, transparent, hsl(var(--primary) / 0.5), transparent);
+  box-shadow: 0 0 12px hsl(var(--primary) / 0.35);
+  animation: grid-beam-y 18s linear infinite;
+}
+@keyframes grid-beam-x {
+  from {
+    transform: translate3d(-25vw, 0, 0);
+  }
+  to {
+    transform: translate3d(125vw, 0, 0);
+  }
+}
+@keyframes grid-beam-y {
+  from {
+    transform: translate3d(0, -25vh, 0);
+  }
+  to {
+    transform: translate3d(0, 125vh, 0);
+  }
+}
+
+/* prefers-reduced-motion：氛围动效整体关闭（focus-glow 保留静态点亮态） */
+@media (prefers-reduced-motion: reduce) {
+  .focus-glow:focus-within::after {
+    animation: none;
+  }
+  .grid-beam-x,
+  .grid-beam-y {
+    animation: none;
+    opacity: 0;
+  }
+}

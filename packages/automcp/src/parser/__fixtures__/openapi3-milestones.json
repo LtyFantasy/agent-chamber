@@ -1,0 +1,47 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Milestone API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/tasks/milestones": {
+      "get": {
+        "operationId": "task_controller_find_milestones",
+        "summary": "List milestones",
+        "responses": { "200": { "description": "OK" } }
+      },
+      "post": {
+        "operationId": "task_controller_create_milestone",
+        "summary": "Create milestone",
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/tasks/milestones/{id}": {
+      "get": {
+        "operationId": "task_controller_find_milestone",
+        "summary": "Get milestone",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "patch": {
+        "operationId": "task_controller_update_milestone",
+        "summary": "Update milestone",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "task_controller_remove_milestone",
+        "summary": "Delete milestone",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  }
+}

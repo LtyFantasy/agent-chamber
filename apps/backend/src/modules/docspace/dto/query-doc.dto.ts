@@ -1,0 +1,62 @@
+import { IsOptional, IsString, IsInt, Min, Max } from 'class-validator';
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+
+/**
+ * 查询文档列表 DTO
+ *
+ * GET /doc-spaces/:id/docs?category=&tag=&type=&q=&path=&page=&pageSize=
+ *
+ * path= 精确匹配，与模糊 q= 互斥，同传 → 400。
+ */
+export class QueryDocDto {
+  @ApiPropertyOptional({ description: 'Filter by category slug' })
+  @IsOptional()
+  @IsString()
+  category?: string;
+
+  @ApiPropertyOptional({ description: 'Filter by tag' })
+  @IsOptional()
+  @IsString()
+  tag?: string;
+
+  @ApiPropertyOptional({ description: 'Filter by document type' })
+  @IsOptional()
+  @IsString()
+  type?: string;
+
+  @ApiPropertyOptional({
+    description: 'Full-text search keyword (title + path ILIKE). Mutually exclusive with path=.',
+  })
+  @IsOptional()
+  @IsString()
+  q?: string;
+
+  @ApiPropertyOptional({
+    description: 'Exact path match. Mutually exclusive with q=.',
+  })
+  @IsOptional()
+  @IsString()
+  path?: string;
+
+  @ApiPropertyOptional({ description: 'Page number', minimum: 1, default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @ApiPropertyOptional({
+    description: 'Items per page (max 100)',
+    minimum: 1,
+    maximum: 100,
+    default: 20,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  // 分页硬上限 100，对齐全仓惯例（docs/spec.md 分页约定）；超限 → 400 而非透传 DB 触发 500
+  @Max(100)
+  pageSize?: number = 20;
+}

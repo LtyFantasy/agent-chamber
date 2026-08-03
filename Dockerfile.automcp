@@ -1,0 +1,35 @@
+# automcp MCP Server 镜像：从 backend Swagger 动态生成 MCP tools，暴露 /mcp 入口
+# 与 Dockerfile.backend 同构：builder 阶段编译，运行时阶段保留 monorepo 目录结构
+FROM node:22-alpine AS builder
+WORKDIR /app
+ENV CI=true
+RUN corepack enable && corepack prepare pnpm@latest --activate
+COPY pnpm-workspace.yaml package.json ./
+COPY pnpm-lock.yaml ./
+COPY packages/automcp/package.json ./packages/automcp/
+# platform-mcp 依赖 automcp（workspace:*），两个包一起装
+COPY packages/platform-mcp/package.json ./packages/platform-mcp/
+# lockfile 已随仓导出，严格 --frozen-lockfile：回退只会掩盖 lockfile 漂移
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm --filter @agent-chamber/automcp build
+RUN pnpm --filter @agent-chamber/platform-mcp build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+# 保留 monorepo 目录结构，使 workspace symlink 能解析到根 node_modules/.pnpm
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages ./packages
+# MCP tool 白名单 profile 来自 backend config（运行期只读）
+COPY --from=builder /app/apps/backend/config ./apps/backend/config
+EXPOSE 8745
+# spec/base-url 指向 compose 内的 backend 服务名；启动时 backend 未就绪会失败，
+# 依赖 compose restart: unless-stopped 自动重试直至成功
+CMD ["node", "packages/automcp/dist/cli.js", "serve", \
+  "--spec", "http://backend:8743/api/docs-json", \
+  "--base-url", "http://backend:8743/api/v1", \
+  "--port", "8745", \
+  "--base-path", "/mcp", \
+  "--profile-path", "apps/backend/config/mcp-profiles/agent.json", \
+  "--custom-tools", "packages/platform-mcp/dist/index.js"]

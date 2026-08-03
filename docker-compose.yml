@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: chamber-postgres
+    restart: unless-stopped
+    environment:
+      # 插值自 .env 的 DB_* 键（无 .env 时默认值 = 原硬编码值，行为等价），
+      # 使 .env 的 DB_PASSWORD 单一事实来源注释名实相符
+      POSTGRES_USER: ${DB_USERNAME:-chamber}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-chamber_password}
+      POSTGRES_DB: ${DB_DATABASE:-agent_chamber}
+    ports:
+      - "8744:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chamber -d agent_chamber"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: chamber-backend
+    # migration 失败等启动即 crash 时最多重启 5 次后停止（on-failure:5），
+    # 避免 DB 配置错误导致的无休止 crash 循环刷日志
+    restart: on-failure:5
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres
+      DB_PORT: 5432
+      # DB_* 插值自 .env（默认值与原硬编码值一致，无 .env 时行为不变）
+      DB_USERNAME: ${DB_USERNAME:-chamber}
+      DB_PASSWORD: ${DB_PASSWORD:-chamber_password}
+      DB_NAME: ${DB_DATABASE:-agent_chamber}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-in-production-refresh}
+    ports:
+      - "8743:8743"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        # Next.js 的 NEXT_PUBLIC_* 在构建期内联，runtime environment 不生效；
+        # 非本机部署时必须改这里并重建（--build）
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8743/api/v1}
+    container_name: chamber-web
+    restart: unless-stopped
+    ports:
+      - "8742:8742"
+    depends_on:
+      - backend
+
+  # MCP 入口（agent 直连）：从 backend Swagger 动态生成 80+ tools（当前实测 82）
+  # backend 未就绪时启动会失败，由 restart 策略自动重试
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.automcp
+    container_name: chamber-mcp
+    restart: unless-stopped
+    ports:
+      - "8745:8745"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

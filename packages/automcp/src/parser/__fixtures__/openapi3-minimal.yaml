@@ -1,0 +1,41 @@
+openapi: "3.0.0"
+info:
+  title: Minimal YAML API
+  version: "1.0.0"
+paths:
+  /items:
+    get:
+      operationId: listItems
+      summary: List items
+      tags:
+        - items
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+          description: Page number
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 100
+          description: Items per page
+      responses:
+        "200":
+          description: List of items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string

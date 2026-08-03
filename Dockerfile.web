@@ -1,0 +1,28 @@
+FROM node:22-alpine AS builder
+WORKDIR /app
+ENV CI=true
+RUN corepack enable && corepack prepare pnpm@latest --activate
+COPY pnpm-workspace.yaml package.json ./
+COPY pnpm-lock.yaml ./
+COPY apps/web/package.json ./apps/web/
+COPY packages/shared/package.json ./packages/shared/
+# lockfile 已随仓导出，严格 --frozen-lockfile：回退只会掩盖 lockfile 漂移
+RUN pnpm install --frozen-lockfile
+COPY . .
+# NEXT_PUBLIC_* 构建期内联：compose 通过 build.args 传入（默认 http://localhost:8743）
+ARG NEXT_PUBLIC_API_URL=http://localhost:8743/api/v1
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+RUN pnpm --filter @agent-chamber/web build
+
+FROM node:22-alpine
+WORKDIR /app/apps/web
+ENV NODE_ENV=production
+# 根 node_modules 提供完整的 .pnpm store；apps/web/node_modules 中的 symlink 通过 ../../../node_modules/.pnpm 解析
+COPY --from=builder /app/node_modules /app/node_modules
+COPY --from=builder /app/apps/web/.next ./.next
+COPY --from=builder /app/apps/web/node_modules ./node_modules
+COPY --from=builder /app/apps/web/package.json ./
+COPY --from=builder /app/apps/web/next.config.js ./
+COPY --from=builder /app/apps/web/public ./public
+EXPOSE 8742
+CMD ["node", "node_modules/next/dist/bin/next", "start", "-p", "8742"]

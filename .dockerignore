@@ -1,0 +1,38 @@
+# =============================================================================
+# .dockerignore — Docker 构建上下文排除清单
+#
+# 背景：Dockerfile.backend / Dockerfile.web / Dockerfile.automcp 均含 `COPY . .`，
+#       构建上下文为本目录（本仓库根）。不排除会把 .env（真实密钥）
+#       与宿主 node_modules 打进镜像层，既有安全风险又让镜像膨胀、缓存失效。
+# =============================================================================
+
+# 安全：.env 含真实密钥，绝不进镜像（.env.example 是模板，显式放行）
+.env
+.env.*
+!.env.example
+
+# 依赖与构建产物：镜像内会重新 pnpm install / build，宿主产物不带入
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+coverage
+.turbo
+**/.turbo
+*.tsbuildinfo
+.eslintcache
+
+# 版本控制与本地工具元数据
+.git
+.gitnexus
+
+# 运行时噪音与部署备份
+logs
+*.log
+*.pid
+backups
+
+# 工程文档：运维/架构文档不进镜像
+docs
