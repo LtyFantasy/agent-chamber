@@ -7,7 +7,10 @@
  *   - 补充: plan §4.5 (检索规格), plan §1.5 (检索双路纯 PostgreSQL),
  *     plan §4-C3 (意图融合检索：路由/任务链接 boost 重排 + boosts 透出)
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [踩坑索引]
+ *   - bug 9082464c：ts_headline options 串 `'...,StartSel=,StopSel='` 无空格无引号 →
+ *     `,StopSel=` 字面量残渣污染 snippet；空值必须写成 `StartSel="", StopSel=""`（详见
+ *     buildTsHeadlineSnippet 注释）
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验)
  *
@@ -405,6 +408,13 @@ export class DocSearchService {
   /**
    * Build ts_headline snippet for a specific section.
    * Falls back to trgm snippet if ts_headline returns empty.
+   *
+   * ts_headline options 语法铁律（PG 实测，bug 9082464c 教训）：
+   * - options 串按**空白**拆分选项（不是按逗号）——`'StartSel=,StopSel='` 会被整体吞为
+   *   StartSel 的值，`,StopSel=` 字面量混进 snippet（StopSel 落回默认 `</b>`）；
+   * - 空值必须双引号包裹 `StartSel=""`——裸空值（即便空格分隔）报 invalid parameter list format；
+   * - plainto_tsquery 显式传 'simple'，与 search() 双路打分 ts_rank 的 regconfig 一致，
+   *   否则 default_text_search_config 漂移会导致高亮位置与打分 token 不对齐。
    */
   private async buildTsHeadlineSnippet(
     docId: string,
@@ -414,7 +424,7 @@ export class DocSearchService {
     const row = await this.sectionRepo.manager
       .createQueryBuilder()
       .select(
-        "ts_headline('simple', s.content, plainto_tsquery(:q), 'MaxWords=50,MaxFragments=2,StartSel=,StopSel=')",
+        "ts_headline('simple', s.content, plainto_tsquery('simple', :q), 'MaxWords=50, MaxFragments=2, StartSel=\"\", StopSel=\"\"')",
         'headline',
       )
       .from('doc_sections', 's')

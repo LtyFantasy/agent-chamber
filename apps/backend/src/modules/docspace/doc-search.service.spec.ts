@@ -206,6 +206,30 @@ describe('DocSearchService', () => {
     expect(hits[0].snippet).toBe('This is the <b>full</b> section content.');
   });
 
+  // ─── Test 2b: ts_headline options 串语法（bug 9082464c 回归）─────
+  it('builds ts_headline with double-quoted empty sels and explicit simple regconfig', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0.15, score: 0.15 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+
+    const mockHeadlineQb = createMockQueryBuilder({
+      getRawOne: jest.fn().mockResolvedValue({ headline: 'clean snippet' }),
+    });
+    (mockSectionRepo.manager.createQueryBuilder as jest.Mock)
+      .mockReturnValueOnce(mockOuterQb)
+      .mockReturnValueOnce(mockHeadlineQb);
+
+    await service.search(['space-1'], { q: 'test' });
+
+    // PG 实测（bug 9082464c）：options 串按空白拆分而非逗号——`'StartSel=,StopSel='`
+    // 会被吞为 StartSel 的值（`,StopSel=` 残渣）；空值必须双引号包裹。
+    const headlineSql = (mockHeadlineQb.select as jest.Mock).mock.calls[0][0] as string;
+    expect(headlineSql).toContain('StartSel="", StopSel=""');
+    // regconfig 必须与 search() 双路打分 ts_rank 的 'simple' 一致（否则高亮位置漂移）
+    expect(headlineSql).toContain("plainto_tsquery('simple', :q)");
+  });
+
   // ─── Test 3: Mixed scoring sorts by composite score DESC ─────
   it('should sort results by composite score in descending order', async () => {
     const rawRows = [

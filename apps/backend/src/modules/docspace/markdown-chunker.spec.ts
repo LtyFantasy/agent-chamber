@@ -283,5 +283,91 @@ describe('markdown-chunker', () => {
       expect(tokenEst).toBeGreaterThanOrEqual(cjkChars * 0.8);
       expect(tokenEst).toBeLessThanOrEqual(cjkChars * 1.2);
     });
+
+    // ─── 围栏代码块（bug f2549375 回归）──────────────────────────
+
+    describe('fenced code blocks', () => {
+      it('ignores ATX-like lines inside ``` fenced code blocks', () => {
+        const content = [
+          '# Real',
+          'real content',
+          '',
+          '```bash',
+          '# 只搜索消息',
+          'curl -s https://example.com # 查看全部任务',
+          '```',
+          '',
+          '## Child',
+          'child content',
+        ].join('\n');
+
+        const result = chunkMarkdown(content, 'Doc');
+        expect(result).toHaveLength(2);
+        expect(result[0].headingPath).toBe('Real');
+        expect(result[1].headingPath).toBe('Real § Child');
+        // 围栏内的注释行完整保留在正文，不参与标题识别
+        expect(result[0].content).toContain('# 只搜索消息');
+        expect(result[0].content).toContain('```bash');
+      });
+
+      it('ignores ATX-like lines inside ~~~ fenced code blocks', () => {
+        const content = [
+          '# Real',
+          'real content',
+          '~~~',
+          '# Not A Heading',
+          '~~~',
+          '## Child',
+          'child content',
+        ].join('\n');
+
+        const result = chunkMarkdown(content, 'Doc');
+        expect(result).toHaveLength(2);
+        expect(result[0].headingPath).toBe('Real');
+        expect(result[1].headingPath).toBe('Real § Child');
+      });
+
+      it('closes fence only on same marker char with length >= opening', () => {
+        const content = [
+          '# A',
+          'a',
+          '```',
+          '~~~', // 异种围栏标记 → 仍是 ``` 围栏内的代码内容
+          '# Not A Heading',
+          '````', // 同字符且更长 → 合法闭合
+          '## B',
+          'b',
+        ].join('\n');
+
+        const result = chunkMarkdown(content, 'Doc');
+        expect(result).toHaveLength(2);
+        expect(result[0].headingPath).toBe('A');
+        expect(result[1].headingPath).toBe('A § B');
+      });
+
+      it('treats everything after an unclosed fence as code (no headings)', () => {
+        const content = ['# A', 'a', '```', '# Not A Heading', '## Also Not'].join('\n');
+
+        const result = chunkMarkdown(content, 'Doc');
+        expect(result).toHaveLength(1);
+        expect(result[0].headingPath).toBe('A');
+      });
+
+      it('indented fence (≤3 spaces) still opens a code block', () => {
+        const content = [
+          '# Real',
+          'real content',
+          '  ```bash',
+          '# Not A Heading',
+          '  ```',
+          '## Child',
+          'child content',
+        ].join('\n');
+
+        const result = chunkMarkdown(content, 'Doc');
+        expect(result).toHaveLength(2);
+        expect(result[1].headingPath).toBe('Real § Child');
+      });
+    });
   });
 });

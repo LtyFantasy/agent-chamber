@@ -6,7 +6,9 @@
  *   - 主文档: plan §4.4 (chunking 规格)
  *   - 补充: docs/architecture.md §3.2 (DocSpace 模块)
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [踩坑索引]
+ *   - bug f2549375：围栏代码块内的 `# 注释`（curl/bash 示例）曾被识别为 ATX 标题，
+ *     导致 section 切错 + headingPath 顶层误植；标题扫描必须先走围栏状态机（见 step 1）
  *
  * [铁律关联] #11(注释) #17(测试契约)
  *
@@ -25,6 +27,7 @@
  *
  * 规格严格按 plan §4.4：
  * - 按 ATX 标题 (#{1,6}) 切段；文首无标题内容 → level 0 段，headingPath=文档 title
+ * - 围栏代码块（``` / ~~~）内的行不识别为标题（防代码注释污染标题栈）
  * - headingPath=祖先标题链 "父 § 子" 拼接（截断 512）
  * - 单 section >4000 字符按段落二次切分
  * - CJK 感知 tokenEstimate：cjkCharCount + ceil(nonCjkLength / 4)
@@ -36,6 +39,9 @@ const CJK_RE = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\u3040-\u309F\u30A0-\u30
 
 /** ATX 标题：行首 #{1,6} + 空格 + 标题文本 */
 const HEADING_RE = /^(#{1,6})\s+(.+)$/;
+
+/** 代码围栏行：行首（可缩进）≥3 个反引号或波浪号（可带 info string，如 ```bash） */
+const FENCE_RE = /^\s*(`{3,}|~{3,})/;
 
 /** frontmatter 分隔符正则：行首 ---（可含空格） */
 const FRONTMATTER_DELIM = /^---\s*$/;
@@ -132,7 +138,12 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
     }
   }
 
-  // ── 1. 第一遍扫描：识别标题位置 ──────────────────────────
+  // ── 1. 第一遍扫描：识别标题位置（围栏代码块内的行除外）────────────
+  // 围栏状态机：开围栏后的所有行（含 `# 注释`、异种围栏标记）都是代码内容，
+  // 不得识别为 ATX 标题——否则 curl/bash 示例里的 `# xxx` 注释会切错 section
+  // 并污染标题祖先栈（api-definition.md headingPath 顶层误植「只搜索消息」教训，
+  // bug f2549375）。闭合规则（CommonMark）：同字符且长度 ≥ 开围栏；未闭合围栏
+  // 到 EOF 为止全部视为代码内容。
   interface HeadingInfo {
     lineIndex: number;
     level: number;
@@ -140,7 +151,19 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
   }
 
   const headings: HeadingInfo[] = [];
+  let openFence: string | null = null;
   for (let i = startLine; i < lines.length; i++) {
+    const fence = FENCE_RE.exec(lines[i]);
+    if (openFence !== null) {
+      if (fence && fence[1][0] === openFence[0] && fence[1].length >= openFence.length) {
+        openFence = null;
+      }
+      continue;
+    }
+    if (fence) {
+      openFence = fence[1];
+      continue;
+    }
     const m = HEADING_RE.exec(lines[i]);
     if (m) {
       headings.push({
