@@ -118,6 +118,16 @@ export interface DocSummary {
   tags?: string[];
   /** 文档来源 */
   source?: string;
+  /**
+   * last-verified 源码提交 sha（v1.42 B6）：内容在此 sha 验证一致（sync 适配器上报）；
+   * 仅 ingest 文档（source=git:*）携带；NULL/缺省 = 无验证记录（native 或旧数据）。
+   */
+  sourceSha?: string | null;
+  /**
+   * 断链计数（v1.42 B6，仅 overview 装配）：从 link_health jsonb broken 数组取 length。
+   * 无 linkHealth（NULL = 尚未检查）时省略该键——与"已检查且 0 断链"区分。
+   */
+  brokenLinkCount?: number;
   /** Section 数量 */
   sectionCount?: number;
   /** Token 估算总量 */
@@ -147,6 +157,58 @@ export interface LinkHealth {
   broken: string[];
   /** 检查时间戳 ISO 8601 */
   checkedAt: string;
+}
+
+/**
+ * 路由健康巡检 issue 单项（doc_routes.health，v1.42 批次 C1/C2）
+ *
+ * - 'heading'（C1）：headingPath 悬空（primary/secondary 锚点）；
+ * - 'codeEntry'（C2）：仓库 manifest 级联校验未命中（codeEntry 不在 repoManifest.files）。
+ */
+export interface RouteHealthIssue {
+  /** issue 类别：'heading' = 定位锚点悬空；'codeEntry' = 代码入口失配 */
+  kind: 'heading' | 'codeEntry';
+  /** 命中位置：'primary' | 'secondary' = 主/次文档 headingPath；'codeEntry' = 代码入口 */
+  target: 'primary' | 'secondary' | 'codeEntry';
+  /** 未解析的原始引用值（headingPath 原文或 codeEntry 原文） */
+  value: string;
+}
+
+/**
+ * 路由健康巡检结果（doc_routes.health jsonb，v1.42 批次 C1/C2）
+ *
+ * 写入时机：route-health.service.recheckSpace（upsert 内容变更 / remove / 手动 recheck 端点
+ * 三触发点异步重检）。
+ * 语义：空 issues = 健康；NULL = 尚未检查（对齐 LinkHealth「无数据 ≠ 零断链」）。
+ *
+ * codeEntryStatus（C2，codeEntry 非空时出现）：'ok' = 精确命中或目录前缀命中 repoManifest.files；
+ * 'broken' = 有 manifest 且不命中（issues 同时含 kind:'codeEntry'）；'unchecked' = 空间无
+ * repoManifest（不算 broken——「从未上报清单」≠「代码入口失配」）。codeEntry 为空时省略该键。
+ */
+export interface RouteHealth {
+  /** issue 列表，空数组 = 健康 */
+  issues: RouteHealthIssue[];
+  /** codeEntry 级联校验状态（C2；仅 codeEntry 非空时携带，详见类型注释） */
+  codeEntryStatus?: 'ok' | 'broken' | 'unchecked';
+  /** 检查时间戳 ISO 8601 */
+  checkedAt: string;
+}
+
+/**
+ * 仓库文件清单（doc_spaces.settings.repoManifest jsonb，v1.42 批次 C2）
+ *
+ * 写入时机：scripts/sync-docs.mjs 每次同步末尾 PUT /doc-spaces/:id/repo-manifest
+ * （git ls-files 全量清单 + HEAD sha，原子 jsonb_set 覆写——对齐 board metrics 先例）。
+ * 消费方：route-health.service.recheckSpace 对每条路由 codeEntry 做存在性级联校验。
+ * reportedAt 由服务端生成（不信客户端时钟）。
+ */
+export interface RepoManifest {
+  /** 上报时的 git HEAD commit sha（≤64；清单所对应的仓库版本） */
+  sha: string;
+  /** git ls-files 全量相对路径清单（仓库内路径，禁绝对路径与 `..` 段；≤20000 条、每条 ≤512） */
+  files: string[];
+  /** 服务端写入时刻 ISO 8601（非客户端上报值） */
+  reportedAt: string;
 }
 
 export interface DocDetail extends DocSummary {
@@ -240,6 +302,21 @@ export interface DocSearchHit {
   contentTruncated?: boolean;
   /** 相关性分数 */
   score: number;
+  /**
+   * 命中加权的可解释性透出（v1.42 批次 C3 意图融合检索）
+   *
+   * 三路融合：SQL SCORE_FLOOR 过滤之后，命中 doc 叠加「策展路由命中」（route）与
+   * 「任务链接数」（taskLinks）两路固定倍率加权重排——只重排、不引入新结果。
+   * - route: 'primary' = 该 doc 是命中路由的 primaryDoc（×1.5）；'secondary' = ×1.2。
+   *   同一 doc 被多条路由命中取最大倍率，不叠加连乘。
+   * - taskLinks: task_doc_links 中该 doc 的关联任务数（原始 COUNT，未封顶；
+   *   乘数按 min(count,5)×0.05 封顶 ×1.25）。
+   * 无任何 boost 的命中省略本键（后端不产出空 boosts 对象）。
+   */
+  boosts?: {
+    route?: 'primary' | 'secondary';
+    taskLinks?: number;
+  };
 }
 
 // ─── Overview ────────────────────────────────────────────
@@ -263,8 +340,48 @@ export interface DocSpaceOverviewAppliedFilters {
   tag?: string;
   /** 生效的路径前缀（pathPrefix=，如 "memory/"） */
   pathPrefix?: string;
-  /** 实际使用的 token 上限（仅显式传参时回显；缺省 4000 不回显） */
+  /** 实际使用的 token 上限（仅显式传参时回显；缺省 20000 不回显） */
   maxTokens?: number;
+}
+
+/**
+ * 意图路由（doc_routes，v1.42 批次 B5）
+ *
+ * INDEX.md 功能-文档映射表的结构化形态：intent（"我要…"）→ primaryDoc+headingPath（先看）→
+ * secondaryDoc（再看）→ codeEntry（代码入口）。category = 路由分组。
+ */
+export interface DocRoute {
+  /** 路由 ID */
+  id: string;
+  /** 所属空间 ID */
+  spaceId: string;
+  /** 用户意图描述（"我要…"） */
+  intent: string;
+  /** 路由分组（可空） */
+  category?: string | null;
+  /** 主文档 ID（路由第一步跳转） */
+  primaryDocId: string;
+  /** 主文档定位锚点（doc_sections.heading_path 精确匹配；null = 文档级） */
+  primaryHeadingPath?: string | null;
+  /** 次文档 ID（可空） */
+  secondaryDocId?: string | null;
+  /** 次文档定位锚点（可空） */
+  secondaryHeadingPath?: string | null;
+  /** 代码入口（仓库内相对路径；null = 无） */
+  codeEntry?: string | null;
+  /**
+   * 路由健康巡检结果（v1.42 批次 C1，异步重检写入）：
+   * 空 issues = 健康；NULL = 尚未检查。C1 只产出 kind:'heading' 的 issue。
+   */
+  health?: RouteHealth | null;
+  /** 排序权重（同空间内 ASC 升序） */
+  sortOrder: number;
+  /** 创建者 Actor ID */
+  createdBy: string;
+  /** 创建时间 */
+  createdAt?: string | Date;
+  /** 更新时间 */
+  updatedAt?: string | Date;
 }
 
 /**
@@ -276,13 +393,36 @@ export interface DocSpaceOverview {
   spaceId: string;
   /** 空间名称 */
   spaceName: string;
+  /** 空间图例（v1.41）：description 全文内嵌，markdown；includeDescription=false 或 description 为空时缺省 */
+  spaceDescription?: string | null;
+  /** 空间图例 token 估算（v1.41）：单列记账，不参与 maxTokens 文档条目预算竞争 */
+  legendTokenEstimate?: number;
+  /**
+   * 意图路由列表（v1.42 B5）：全量返回（按 sortOrder+createdAt ASC），与图例同待遇——
+   * 不占 maxTokens 文档条目预算；includeRoutes=false 时缺省
+   */
+  routes?: DocRoute[];
+  /** 意图路由 token 估算（v1.42 B5）：estimateTokens 对序列化 routes 单列记账，计入 totalTokenEstimate */
+  routesTokenEstimate?: number;
   /** 分类树 */
   categories: DocCategoryOverview[];
   /** 未分类文档 */
   uncategorized: DocSummary[];
-  /** 总 token 估算 */
+  /**
+   * 空间断链合计（v1.42 B6）：过滤后可见文档的 brokenLinkCount 求和。
+   * 0 也返回（有已检查文档时）；全部文档均未检查（无 linkHealth）时省略。
+   */
+  totalBrokenLinks?: number;
+  /**
+   * 空间 broken 路由合计（v1.42 批次 C1）：routes 段内 health 非 NULL 的路由中
+   * issues.length>0 的计数和。0 也返回（有已检查路由时）；全部路由均未检查
+   * （health NULL）时省略——"空间路由全健康"与"从未检查过路由"语义不同。
+   * includeRoutes=false 时同步省略。
+   */
+  totalBrokenRoutes?: number;
+  /** 总 token 估算（图例 + 文档条目 + 意图路由合计，仅信息回显） */
   totalTokenEstimate?: number;
-  /** 是否因 token 上限截断 */
+  /** 是否因 token 上限截断（仅文档条目截断，图例/意图路由始终全量） */
   truncated?: boolean;
   /** 实际生效的过滤条件回显（未传任何过滤且无空间默认时缺省） */
   appliedFilters?: DocSpaceOverviewAppliedFilters;

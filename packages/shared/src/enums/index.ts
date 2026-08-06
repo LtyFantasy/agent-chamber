@@ -56,11 +56,28 @@ export enum TaskDependencyType {
   DUPLICATES = 'duplicates',
 }
 
+/**
+ * 里程碑状态（v1.42 起扩展为 Release 载体，普通里程碑与 Release 里程碑共存一枚举）
+ * - 普通生命周期：planned → active → completed / cancelled（version 为空时使用）
+ * - Release 生命周期：dev → ready → deployed → verified（version 非空时使用，流转矩阵见
+ *   docs/spec.md §3.2 MilestoneStatus；dev/ready 可直落 cancelled，deployed 只能经
+ *   POST /tasks/milestones/:id/deployed 写入，verified 为终态）
+ * - 两类生命周期由 MilestoneService 流转矩阵隔离：version 非空禁落普通态，
+ *   version 为空禁落 Release 四态（cancelled 为共享终态）
+ */
 export enum MilestoneStatus {
   PLANNED = 'planned',
   ACTIVE = 'active',
   COMPLETED = 'completed',
   CANCELLED = 'cancelled',
+  /** Release 生命周期初始态（create 带 version 时的缺省状态） */
+  DEV = 'dev',
+  /** 可发布候选（等待部署） */
+  READY = 'ready',
+  /** 已部署（只能经 deployed 端点写入，PATCH 一律 400） */
+  DEPLOYED = 'deployed',
+  /** 已验收（终态，前置 status=deployed） */
+  VERIFIED = 'verified',
 }
 
 export enum Priority {
@@ -189,6 +206,12 @@ export enum ErrorCode {
   // Milestone (7000-7099)
   MILESTONE_NOT_FOUND = 7000,
   MILESTONE_NAME_EXISTS = 7001,
+  /** 400 — 状态流转非法（含 version 与状态类别不匹配、前置态不满足） */
+  MILESTONE_INVALID_TRANSITION = 7002,
+  /** 400 — deployed 只能经 POST /tasks/milestones/:id/deployed 写入，PATCH 一律拒绝 */
+  MILESTONE_DEPLOY_VIA_ENDPOINT = 7003,
+  /** 409 — 同 board 内 version 重复（部分唯一索引 uq_milestones_board_version 23505） */
+  MILESTONE_VERSION_CONFLICT = 7004,
 
   // Agent (5000-5099)
   AGENT_NOT_FOUND = 5000,
@@ -213,4 +236,12 @@ export enum ErrorCode {
   /** 409 — 只读来源或 source 冲突 */
   DOC_SOURCE_MISMATCH = 10003,
   DOC_LINK_NOT_FOUND = 10004,
+  /** 400 — doc_routes 写时校验：primary/secondary doc 不存在、已软删或不属于该空间 */
+  DOC_ROUTE_DOC_NOT_FOUND = 10005,
+  /** 400 — doc_routes 写时校验：headingPath 非空但未精确命中该 doc 的 doc_sections.heading_path */
+  DOC_ROUTE_HEADING_UNRESOLVED = 10006,
+  /** 400 — doc_routes 写时校验：codeEntry 超长、绝对路径或含 `..` 段 */
+  DOC_ROUTE_INVALID_CODE_ENTRY = 10007,
+  /** 404 — doc_routes 目标路由不存在 */
+  DOC_ROUTE_NOT_FOUND = 10008,
 }

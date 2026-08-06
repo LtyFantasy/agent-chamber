@@ -6,8 +6,8 @@ import { DocOverviewQueryDto } from './doc-overview.dto';
 /**
  * DocOverviewQueryDto 校验测试（v1.38 overview 可配置过滤）
  *
- * 覆盖：全字段 optional、maxTokens 边界（500–16000）、
- * applySpaceDefaults 字符串 'false'→false transform、非法值拒绝。
+ * 覆盖：全字段 optional、maxTokens 边界（500–50000，v1.41 放宽）、
+ * applySpaceDefaults/includeDescription 字符串 transform、非法值拒绝。
  */
 describe('DocOverviewQueryDto', () => {
   it('accepts an empty query (all fields optional)', async () => {
@@ -26,21 +26,23 @@ describe('DocOverviewQueryDto', () => {
       pathPrefix: 'docs/',
       maxTokens: '6000',
       applySpaceDefaults: 'false',
+      includeDescription: 'false',
     });
     const errors = await validate(dto);
     expect(errors).toHaveLength(0);
     expect(dto.maxTokens).toBe(6000);
     expect(dto.applySpaceDefaults).toBe(false);
+    expect(dto.includeDescription).toBe(false);
   });
 
-  describe('maxTokens 边界（500–16000）', () => {
+  describe('maxTokens 边界（500–50000，v1.41 放宽）', () => {
     it('accepts 500 (lower bound)', async () => {
       const dto = plainToInstance(DocOverviewQueryDto, { maxTokens: '500' });
       expect(await validate(dto)).toHaveLength(0);
     });
 
-    it('accepts 16000 (upper bound)', async () => {
-      const dto = plainToInstance(DocOverviewQueryDto, { maxTokens: '16000' });
+    it('accepts 50000 (upper bound)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { maxTokens: '50000' });
       expect(await validate(dto)).toHaveLength(0);
     });
 
@@ -50,8 +52,8 @@ describe('DocOverviewQueryDto', () => {
       expect(errors.some((e) => e.property === 'maxTokens' && e.constraints?.min)).toBe(true);
     });
 
-    it('rejects 16001 (above upper bound)', async () => {
-      const dto = plainToInstance(DocOverviewQueryDto, { maxTokens: '16001' });
+    it('rejects 50001 (above upper bound)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { maxTokens: '50001' });
       const errors = await validate(dto);
       expect(errors.some((e) => e.property === 'maxTokens' && e.constraints?.max)).toBe(true);
     });
@@ -146,6 +148,68 @@ describe('DocOverviewQueryDto', () => {
         const dto = plainToInstance(DocOverviewQueryDto, { applySpaceDefaults: value });
         const errors = await validate(dto);
         expect(errors.some((e) => e.property === 'applySpaceDefaults')).toBe(true);
+      },
+    );
+  });
+
+  describe('includeDescription transform（v1.41，对齐 applySpaceDefaults 惯例）', () => {
+    it("parses 'false' as false (省略图例)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { includeDescription: 'false' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.includeDescription).toBe(false);
+    });
+
+    it("parses 'true' as true", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { includeDescription: 'true' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.includeDescription).toBe(true);
+    });
+
+    it('omitted → undefined (service 视为 true 默认内嵌图例)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, {});
+      expect(dto.includeDescription).toBeUndefined();
+    });
+
+    // 同 applySpaceDefaults：格式错误直接 400，不静默当作 false
+    it.each(['1', '0', 'yes', 'TRUE', 'False', '', 'on'])(
+      "rejects '%s' (→ 400，格式错误不透传)",
+      async (value) => {
+        const dto = plainToInstance(DocOverviewQueryDto, { includeDescription: value });
+        const errors = await validate(dto);
+        expect(errors.some((e) => e.property === 'includeDescription')).toBe(true);
+      },
+    );
+  });
+
+  describe('includeRoutes transform（v1.42 B5，对齐 includeDescription 惯例）', () => {
+    it("parses 'false' as false (省略 routes)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { includeRoutes: 'false' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.includeRoutes).toBe(false);
+    });
+
+    it("parses 'true' as true", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { includeRoutes: 'true' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.includeRoutes).toBe(true);
+    });
+
+    it('omitted → undefined (service 视为 true 默认内嵌 routes)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, {});
+      expect(dto.includeRoutes).toBeUndefined();
+    });
+
+    // 同 includeDescription：格式错误直接 400，不静默当作 false
+    it.each(['1', '0', 'yes', 'TRUE', 'False', '', 'on'])(
+      "rejects '%s' (→ 400，格式错误不透传)",
+      async (value) => {
+        const dto = plainToInstance(DocOverviewQueryDto, { includeRoutes: value });
+        const errors = await validate(dto);
+        expect(errors.some((e) => e.property === 'includeRoutes')).toBe(true);
       },
     );
   });

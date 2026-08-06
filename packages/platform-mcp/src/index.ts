@@ -33,6 +33,7 @@ import { resolveAgentTool } from './tools/resolve-agent';
 import { batchGetTasksTool } from './tools/batch-get-tasks';
 import { markTopicReadTool } from './tools/mark-topic-read';
 import { getDocsOverviewTool } from './tools/get-docs-overview';
+import { getBoardDigestTool } from './tools/get-board-digest';
 import { searchDocsTool } from './tools/search-docs';
 import { readDocTool } from './tools/read-doc';
 import { upsertDocTool } from './tools/upsert-doc';
@@ -40,7 +41,7 @@ import { deleteDocTool } from './tools/delete-doc';
 import { importDocsTool } from './tools/import-docs';
 
 /**
- * 15 个业务语义化高层 MCP tools
+ * 16 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号）：
@@ -48,7 +49,7 @@ import { importDocsTool } from './tools/import-docs';
  * ④ create_topic_with_board → ⑤ report_task_result →
  * ⑥ create_task → ⑦ resolve_agent → ⑧ batch_get_tasks →
  * ⑨ mark_topic_read → ⑩ get_docs_overview → ⑪ search_docs →
- * ⑫ read_doc → ⑬ upsert_doc → ⑭ delete_doc → ⑮ import_docs
+ * ⑫ read_doc → ⑬ upsert_doc → ⑭ delete_doc → ⑮ import_docs → ⑯ get_board_digest
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -66,4 +67,5 @@ export const customTools: CustomTool[] = [
   upsertDocTool,
   deleteDocTool,
   importDocsTool,
+  getBoardDigestTool,
 ];

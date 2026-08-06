@@ -30,9 +30,10 @@ export class CreateDocSpaceDto implements CreateDocSpaceInput {
 
   @IsOptional()
   @IsString()
-  @MaxLength(5000)
+  // 空间图例（v1.41）：description 承载长 markdown 图例（INDEX），cap 放宽到 20000
+  @MaxLength(20000)
   @ApiPropertyOptional({
-    description: 'Space description',
+    description: 'Space description (markdown space legend since v1.41)',
     example: 'Documentation for the project',
   })
   description?: string;

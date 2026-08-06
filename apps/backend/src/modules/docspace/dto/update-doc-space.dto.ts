@@ -91,9 +91,11 @@ export class UpdateDocSpaceDto implements UpdateDocSpaceInput {
   @IsOptional()
   @IsString()
   @MinLength(1)
-  @MaxLength(5000)
+  // 空间图例（v1.41）：description 承载长 markdown 图例（INDEX），cap 放宽到 20000
+  @MaxLength(20000)
   @ApiPropertyOptional({
-    description: 'Space description; explicit null clears it (empty string is rejected)',
+    description:
+      'Space description (markdown space legend since v1.41); explicit null clears it (empty string is rejected)',
     example: 'Updated description',
     nullable: true,
   })

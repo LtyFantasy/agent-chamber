@@ -41,6 +41,7 @@ import {
   Get,
   Post,
   Patch,
+  Put,
   Delete,
   Body,
   Param,
@@ -69,6 +70,8 @@ import {
   ReorderTasksDto,
   FindListTasksQueryDto,
   QueryBoardDto,
+  BoardDigestQueryDto,
+  UpdateBoardMetricsDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ErrorCode, UserRole } from '@agent-chamber/shared';
@@ -126,6 +129,61 @@ export class BoardController {
   }
 
   @UseGuards(JwtOrApiKeyGuard)
+  @Get(':id/digest')
+  @ApiOperation({
+    summary: 'Get board digest',
+    description:
+      'Real-time assembled project overview (v1.41): task/milestone/docspace status digest, ' +
+      'never stored. Replaces the manual PROJECT.md snapshot for session initialization. ' +
+      'Includes the board description (legend) in full by default (pass includeDescription=false to omit). ' +
+      'docs section permission semantics (contract-level decision): board readability implies ' +
+      'readability of its bound DocSpace metadata — spaceName/spaceDescriptionSnippet/doc ' +
+      'path+title+updatedAt, never document bodies; no DocSpace membership check is performed.',
+  })
+  @ApiParam({ name: 'id', description: 'Board ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'openLimit',
+    required: false,
+    description: 'Max nextUp items (default 10; 0 = empty)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'doneLimit',
+    required: false,
+    description: 'Max recentDone items (default 5; 0 = empty)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'riskLimit',
+    required: false,
+    description: 'Max risks items (default 10; 0 = empty)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'docsLimit',
+    required: false,
+    description: 'Max docs.recentlyUpdated items (default 5; 0 = empty)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'includeDescription',
+    required: false,
+    description: "Include the board description (legend). Default true; pass 'false' to set description to null.",
+    type: Boolean,
+  })
+  @ApiResponse({ status: 200, description: 'Board digest returned successfully' })
+  async getDigest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: BoardDigestQueryDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    // 权限复用 findOne 读路径：findById + ensureCan read（board 可读蕴含 docs 段元数据可读）
+    const board = await this.boardService.findById(id);
+    await this.permService.ensureCan(board, actor, 'read');
+    return this.boardService.getDigest(id, query);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
   @Get(':id/lists')
   @ApiOperation({
     summary: 'Get board lists',
@@ -137,6 +195,29 @@ export class BoardController {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'read');
     return this.boardService.findLists(id);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Put(':id/metrics')
+  @ApiOperation({
+    summary: 'Update board metrics',
+    description:
+      'Store machine facts (test baselines, MCP tool counts, etc.) into ' +
+      'board.settings.metrics (v1.42). Atomic jsonb_set merge — only the metrics key ' +
+      'is touched; visibility and other settings keys are preserved. ' +
+      'The only writer is scripts/report-metrics.mjs; digest exposes the same object ' +
+      'as the metrics section.',
+  })
+  @ApiParam({ name: 'id', description: 'Board ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Board metrics updated successfully' })
+  async updateMetrics(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateBoardMetricsDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const board = await this.boardService.findById(id);
+    await this.permService.ensureCan(board, actor, 'write');
+    return this.boardService.updateMetrics(id, dto.metrics);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

@@ -106,6 +106,8 @@ export interface BatchCreateTasksInput {
 
 /**
  * 创建里程碑请求输入
+ * - version 非空 = Release 里程碑：status 缺省 dev，显式仅可 dev/ready
+ * - version 为空 = 普通里程碑：status 任意普通态，行为零变更
  */
 export interface CreateMilestoneInput {
   /** 里程碑名称 */
@@ -114,18 +116,41 @@ export interface CreateMilestoneInput {
   description?: string;
   /** 关联看板 ID（必填，禁止孤立里程碑） */
   boardId: string;
-  /** 状态 */
+  /** 状态（version 非空时缺省 dev；显式仅可 dev/ready，其余 400） */
   status?: MilestoneStatus;
   /** 开始日期（ISO 8601） */
   startDate?: string;
   /** 目标日期（ISO 8601） */
   targetDate?: string;
+  /**
+   * Release 版本号（形如 v1.42.0 / 1.42.0 / 1.42.0-rc.1）。
+   * 同 board 内唯一（部分唯一索引，version IS NOT NULL）；唯一性冲突返回 409。
+   */
+  version?: string;
+  /** Release 变更说明/发布说明（Markdown；详情接口全量返回，列表接口投影为 bodySnippet） */
+  body?: string;
 }
 
 /**
  * 更新里程碑请求输入
  */
 export type UpdateMilestoneInput = Partial<CreateMilestoneInput>;
+
+/**
+ * 部署里程碑请求输入（POST /tasks/milestones/:id/deployed）
+ * 全可选——热修重部署幂等：只覆盖 payload 中显式提供的字段，deployMeta 合并写入。
+ * deployMeta/deployedAt/verifiedAt 本身不可经本类型写入（whitelist 拦截，部署事实只能由端点产生）。
+ */
+export interface MarkMilestoneDeployedInput {
+  /** 部署锚点（如 health ok / web ok / migration 防呆结果），对象透传 */
+  anchors?: Record<string, unknown>;
+  /** 部署前备份文件名 */
+  backup?: string;
+  /** 本次执行的 migration 名称清单 */
+  migrations?: string[];
+  /** 部署时间（ISO 8601），缺省 = 服务器当前时间 */
+  deployedAt?: string;
+}
 
 /**
  * 任务列表查询输入

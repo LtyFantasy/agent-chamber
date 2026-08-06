@@ -31,6 +31,7 @@ import { DocCategory } from '../../database/entities/doc-category.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
+import { DocRoute } from '../../database/entities/doc-route.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
@@ -48,25 +49,57 @@ import type {
   DocCategoryOverview,
   DocSpaceOverviewFilter,
   DocSpaceOverviewAppliedFilters,
+  DocRoute as DocRouteDto,
+  RepoManifest,
   PaginatedResponse,
 } from '@agent-chamber/shared';
 import { DocOverviewQueryDto } from './dto';
+import { toDocRouteDto } from './doc-route.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 
-/** Overview token cap (~4000). When exceeded, docs are truncated and `truncated: true` is set. */
-const OVERVIEW_TOKEN_CAP = 4000;
+/** Overview token cap (~20000, v1.41 图例化升格). When exceeded, docs are truncated and `truncated: true` is set. */
+const OVERVIEW_TOKEN_CAP = 20000;
 
 /**
- * Overview 条目成本 = 地图行自身（title+path+summary）的 CJK 感知 token 估算，
- * 不是文档全文的 tokenEstimate——否则单篇大文档（如 39k token 的 api-definition.md）
- * 就会顶爆 4000 上限，导致真实数据下地图为空（生产首跑暴露）。公式与 markdown-chunker 一致。
+ * CJK 感知 token 估算（与 markdown-chunker 公式一致）：CJK 字符逐字计 1 token，
+ * 其余字符按 4 字符 1 token 折算。用于：
+ * - overview 地图行（title+path+summary）条目成本——不是文档全文 tokenEstimate，
+ *   否则单篇大文档（如 39k token 的 api-definition.md）就会顶爆上限，导致真实数据下
+ *   地图为空（生产首跑暴露）。
+ * - 空间图例（spaceDescription）的 legendTokenEstimate 单列记账（v1.41）。
  */
-function overviewEntryTokens(doc: Doc): number {
-  const text = `${doc.title ?? ''}${doc.path ?? ''}${doc.summary ?? ''}`;
+function estimateTokens(text: string): number {
   const cjk = (text.match(/[一-鿿豈-﫿]/g) || []).length;
   return cjk + Math.ceil((text.length - cjk) / 4);
+}
+
+/** Overview 条目成本 = 地图行自身（title+path+summary）的 CJK 感知 token 估算 */
+function overviewEntryTokens(doc: Doc): number {
+  return estimateTokens(`${doc.title ?? ''}${doc.path ?? ''}${doc.summary ?? ''}`);
+}
+
+/**
+ * 从 link_health jsonb 取 broken 数组长度（v1.42 B6 overview 断链汇总用）。
+ * 无 linkHealth（NULL = 尚未检查）或 broken 非数组（脏数据防御，对齐 B4 jsonb 防御惯例）
+ * → undefined（省略该键）。语义区分：0 = 已检查且无断链（合法结果），
+ * undefined = 未检查（缺省）——两者在消费端含义不同，不可混同。
+ */
+function brokenCountOf(doc: Doc): number | undefined {
+  const broken = (doc.linkHealth as { broken?: unknown } | null)?.broken;
+  return Array.isArray(broken) ? broken.length : undefined;
+}
+
+/**
+ * 从路由 health jsonb 取 broken 计数（0/1，批次 C1 overview brokenRoutes 汇总用）。
+ * 无 health（NULL = 尚未检查）或 issues 非数组（脏数据防御，对齐 B4 jsonb 防御惯例）
+ * → undefined（省略该键）。语义区分：1 = 该路由有 issue（issues.length>0），
+ * 0 = 已检查且健康，undefined = 未检查——与 brokenCountOf 的「无数据 ≠ 零问题」同款。
+ */
+function brokenRouteCountOf(route: DocRoute): number | undefined {
+  const issues = (route.health as { issues?: unknown } | null)?.issues;
+  return Array.isArray(issues) ? (issues.length > 0 ? 1 : 0) : undefined;
 }
 
 /**
@@ -98,7 +131,7 @@ interface ResolvedOverviewFilters {
   tag?: string;
   /** 路径前缀（pathPrefix=） */
   pathPrefix?: string;
-  /** token 上限（maxTokens= 或缺省 4000） */
+  /** token 上限（maxTokens= 或缺省 20000） */
   maxTokens: number;
   /** 回显：实际生效的过滤条件（appliedFilters，未生效维度不出现） */
   appliedFilters: DocSpaceOverviewAppliedFilters;
@@ -155,7 +188,7 @@ function resolveOverviewFilters(
 
   const maxTokens = query?.maxTokens ?? OVERVIEW_TOKEN_CAP;
 
-  // appliedFilters 回显：只回显实际生效的维度；maxTokens 仅显式传参时回显（缺省 4000 不冗余）
+  // appliedFilters 回显：只回显实际生效的维度；maxTokens 仅显式传参时回显（缺省 20000 不冗余）
   const appliedFilters: DocSpaceOverviewAppliedFilters = {};
   if (perCall.types) appliedFilters.types = perCall.types;
   if (excludeTypes) appliedFilters.excludeTypes = excludeTypes;
@@ -207,6 +240,8 @@ export class DocSpaceService {
     private sectionRepo: Repository<DocSection>,
     @InjectRepository(TaskDocLink)
     private taskDocLinkRepo: Repository<TaskDocLink>,
+    @InjectRepository(DocRoute)
+    private routeRepo: Repository<DocRoute>,
     @InjectRepository(Agent)
     private agentRepo: Repository<Agent>,
     @InjectRepository(User)
@@ -677,6 +712,45 @@ export class DocSpaceService {
   }
 
   /**
+   * 写入仓库文件清单（v1.42 批次 C2，唯一写口 = scripts/sync-docs.mjs 部署上报）。
+   *
+   * 原子单条 SQL：`jsonb_set(settings, '{repoManifest}', $1::jsonb)` 只动 repoManifest 键，
+   * visibility/overviewFilter 等既有键不受影响（禁 read-modify-write——并发下整对象覆盖会丢键，
+   * 对齐 board.service.updateMetrics 原子先例，plan §3 C2 硬语义）。
+   * reportedAt 由服务端 now 生成（不信客户端时钟）；manifest 永不经 DTO 之外的路径写入。
+   *
+   * @param spaceId - 空间 ID（Controller 层已 findById 判空 + write 权限检查）
+   * @param manifest - { sha, files }（路径格式已在 DTO 层校验，铁律 #21）
+   * @returns 写后 settings.repoManifest（RETURNING 单条 SQL，无第二次查询；无则 null）
+   */
+  async updateRepoManifest(
+    spaceId: string,
+    manifest: { sha: string; files: string[] },
+  ): Promise<{ repoManifest: RepoManifest | null }> {
+    // 存储形状：客户端上报 + 服务端写入时刻（reportedAt 防客户端伪造时间戳）
+    const stored: RepoManifest = {
+      sha: manifest.sha,
+      files: manifest.files,
+      reportedAt: new Date().toISOString(),
+    };
+    // 原生 query：TypeORM 实体级 update 无法表达 jsonb_set 片段，且会整体覆盖 settings。
+    // AND deleted_at IS NULL：软删空间不得接受写入（Controller findById 已过滤，此处 TOCTOU 兜底）
+    const rows: Array<{ settings?: Record<string, any> | null }> = await this.spaceRepo.query(
+      `UPDATE doc_spaces SET settings = jsonb_set(settings, '{repoManifest}', $1::jsonb) WHERE id = $2 AND deleted_at IS NULL RETURNING settings`,
+      [JSON.stringify(stored), spaceId],
+    );
+    // 防御：Controller 已判空，此处兜底 TOCTOU 窗口（铁律 #22）
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new NotFoundException({
+        message: 'DocSpace not found',
+        code: ErrorCode.DOC_SPACE_NOT_FOUND,
+      });
+    }
+    const repoManifest = (rows[0].settings?.repoManifest as RepoManifest | undefined) ?? null;
+    return { repoManifest };
+  }
+
+  /**
    * Delete a DocSpace (cascade soft delete).
    * Soft-deletes all docs + the space in one transaction, then emits a
    * doc_deleted event per cascaded doc (plan §4.2: 删除处发射，Agent 经 events/poll 感知).
@@ -957,11 +1031,20 @@ export class DocSpaceService {
   /**
    * Generate a compact overview map of the space.
    * Categories sorted by sortOrder → each contains docs sorted by path.
-   * Uncategorized docs also included. Token cap ~4000 with truncation.
+   * Uncategorized docs also included. Token cap ~20000 with truncation.
    *
    * v1.38 起支持可配置过滤：per-call 查询参数（type/excludeType/category/excludeCategory/
    * tag/pathPrefix/maxTokens/applySpaceDefaults）+ 空间级默认过滤（settings.overviewFilter），
    * 合并语义见 resolveOverviewFilters；响应回显实际生效的 appliedFilters。
+   *
+   * v1.41 图例化：includeDescription 缺省 true 时内嵌 space.description 全文
+   * （markdown 空间图例，始终全量不截断）；legendTokenEstimate 单列图例 token，
+   * 不参与 maxTokens 文档条目预算竞争；totalTokenEstimate = 图例 + 文档条目合计（仅信息回显）。
+   *
+   * v1.42 B5 意图路由内嵌：includeRoutes 缺省 true 时返回空间全量 doc_routes（按
+   * sortOrder+createdAt ASC），与图例同待遇——不占 maxTokens 文档条目预算；
+   * routesTokenEstimate 用 estimateTokens 对序列化 routes 单列记账并计入 totalTokenEstimate；
+   * truncated 语义不变（只管文档条目）。显式 includeRoutes=false 时省略 routes/routesTokenEstimate。
    */
   async getOverview(spaceId: string, query?: DocOverviewQueryDto): Promise<DocSpaceOverview> {
     const space = await this.findById(spaceId);
@@ -969,6 +1052,10 @@ export class DocSpaceService {
     const filters = resolveOverviewFilters(space, query);
     const { types, excludeTypes, categories, excludeCategories, tag, pathPrefix } = filters;
     const maxTokens = filters.maxTokens;
+    // 缺省内嵌图例（v1.41）：显式 false 才省略（对齐 applySpaceDefaults 的"缺省 true"语义）
+    const includeDescription = query?.includeDescription !== false;
+    // 缺省内嵌意图路由（v1.42 B5）：显式 false 才省略（与 includeDescription 同惯例）
+    const includeRoutes = query?.includeRoutes !== false;
 
     // Load non-deleted categories sorted by sortOrder
     // Note: deletedAt has select:false, so we use a raw query or QB
@@ -1024,6 +1111,8 @@ export class DocSpaceService {
       docMap.get(key)!.push(doc);
     }
 
+    // 文档条目预算累计（v1.41 语义明确）：只装文档条目，图例 token 不参与 maxTokens 竞争；
+    // 最终回显的 totalTokenEstimate = 文档合计 + legendTokenEstimate（见返回处）
     let totalTokenEstimate = 0;
     let truncated = false;
 
@@ -1052,6 +1141,8 @@ export class DocSpaceService {
           docType: doc.docType,
           tags: doc.tags,
           source: doc.source,
+          sourceSha: doc.sourceSha,
+          brokenLinkCount: brokenCountOf(doc),
           sectionCount: doc.sectionCount,
           tokenEstimate: doc.tokenEstimate,
           createdBy: doc.createdBy,
@@ -1094,6 +1185,8 @@ export class DocSpaceService {
           docType: doc.docType,
           tags: doc.tags,
           source: doc.source,
+          sourceSha: doc.sourceSha,
+          brokenLinkCount: brokenCountOf(doc),
           sectionCount: doc.sectionCount,
           tokenEstimate: doc.tokenEstimate,
           createdBy: doc.createdBy,
@@ -1103,12 +1196,69 @@ export class DocSpaceService {
       }
     }
 
+    // 断链汇总（v1.42 B6）：过滤后可见文档的 broken 计数合计——与 brokenLinkCount 同一
+    // 视图口径（被过滤掉的文档不计入）。0 也返回（有已检查文档时）；全部文档均未检查
+    // （无 linkHealth）则省略——"空间没有断链"与"空间从未检查过断链"语义不同。
+    let totalBrokenLinks = 0;
+    let hasCheckedDocs = false;
+    for (const doc of filteredDocs) {
+      const n = brokenCountOf(doc);
+      if (n !== undefined) {
+        totalBrokenLinks += n;
+        hasCheckedDocs = true;
+      }
+    }
+
+    // 图例（v1.41）：includeDescription 且 description 非空 → 内嵌全文（始终全量，不截断）；
+    // legendTokenEstimate 用 estimateTokens 单列记账，不参与上方文档条目预算竞争。
+    const legendTokenEstimate =
+      includeDescription && space.description ? estimateTokens(space.description) : undefined;
+
+    // 意图路由（v1.42 B5）：includeRoutes 缺省 true → 空间全量返回（同一 find，与图例同待遇，
+    // 不占 maxTokens 文档条目预算）；routesTokenEstimate 对序列化 routes 单列记账并计入 totalTokenEstimate。
+    let routes: DocRouteDto[] | undefined;
+    let routesTokenEstimate: number | undefined;
+    // 路由健康汇总（v1.42 批次 C1）：与 totalBrokenLinks 同款装配模式——有任一路由已检
+    // （health 非 NULL 且 issues 为数组）时返回"broken 路由数"（issues.length>0 的计数和，
+    // 0 也返回），全部未检则省略。includeRoutes=false 时同步省略（无 routes 可统计）。
+    let totalBrokenRoutes: number | undefined;
+    if (includeRoutes) {
+      const routeRows = await this.routeRepo.find({
+        where: { spaceId },
+        order: { sortOrder: 'ASC', createdAt: 'ASC' },
+      });
+      routes = routeRows.map(toDocRouteDto);
+      // 序列化 routes 的 token 估算（CJK 感知同款公式）；空集合成本为 0——
+      // 保持 v1.41 既有契约"空 overview totalTokenEstimate=0"不变（'[]' 的 1 token 属实现噪声）。
+      routesTokenEstimate = routes.length > 0 ? estimateTokens(JSON.stringify(routes)) : 0;
+
+      let sum = 0;
+      let hasCheckedRoutes = false;
+      for (const route of routeRows) {
+        const n = brokenRouteCountOf(route);
+        if (n !== undefined) {
+          sum += n;
+          hasCheckedRoutes = true;
+        }
+      }
+      if (hasCheckedRoutes) totalBrokenRoutes = sum;
+    }
+
     return {
       spaceId: space.id,
       spaceName: space.name,
+      ...(legendTokenEstimate !== undefined
+        ? { spaceDescription: space.description, legendTokenEstimate }
+        : {}),
+      ...(routes !== undefined ? { routes, routesTokenEstimate } : {}),
+      ...(totalBrokenRoutes !== undefined ? { totalBrokenRoutes } : {}),
       categories: categoryOverviews,
       uncategorized,
-      totalTokenEstimate,
+      ...(hasCheckedDocs ? { totalBrokenLinks } : {}),
+      totalTokenEstimate:
+        (legendTokenEstimate !== undefined ? legendTokenEstimate : 0) +
+        (routesTokenEstimate !== undefined ? routesTokenEstimate : 0) +
+        totalTokenEstimate,
       truncated,
       ...(Object.keys(filters.appliedFilters).length > 0
         ? { appliedFilters: filters.appliedFilters }

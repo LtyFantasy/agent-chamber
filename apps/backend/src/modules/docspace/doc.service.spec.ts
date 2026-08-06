@@ -14,6 +14,7 @@ import {
 } from '@agent-chamber/shared';
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { EventService } from '../event/event.service';
+import { RouteHealthService } from './route-health.service';
 
 describe('DocService', () => {
   let service: DocService;
@@ -24,7 +25,11 @@ describe('DocService', () => {
   let docSpaceRepo: jest.Mocked<Repository<DocSpace>>;
   let boardRepo: jest.Mocked<Repository<Board>>;
   let eventService: { create: jest.Mock };
+  let routeHealthService: { recheckSpace: jest.Mock };
   let mockTransaction: jest.Mock;
+
+  /** 冲刷 setImmediate 队列：让 upsert/remove 里 fire-and-forget 的异步任务先于本回调执行 */
+  const flushImmediates = () => new Promise<void>((resolve) => setImmediate(resolve));
 
   function makeDoc(overrides: Partial<Doc> = {}): Doc {
     return {
@@ -38,6 +43,7 @@ describe('DocService', () => {
       tags: [],
       source: 'native',
       contentHash: 'abc123',
+      sourceSha: null,
       sectionCount: 1,
       tokenEstimate: 100,
       linkHealth: null,
@@ -164,6 +170,10 @@ describe('DocService', () => {
       create: jest.fn().mockResolvedValue({}),
     };
 
+    routeHealthService = {
+      recheckSpace: jest.fn().mockResolvedValue({ rechecked: 0, broken: 0 }),
+    };
+
     service = new DocService(
       docRepo,
       sectionRepo,
@@ -172,6 +182,7 @@ describe('DocService', () => {
       docSpaceRepo,
       boardRepo,
       eventService as unknown as EventService,
+      routeHealthService as unknown as RouteHealthService,
     );
   });
 
@@ -237,6 +248,139 @@ describe('DocService', () => {
       expect(result.unchanged).toBe(true);
       expect(result.id).toBe('doc-1');
       expect(result.created).toBeUndefined();
+    });
+
+    // ─── sourceSha（v1.42 B6，last-verified 语义） ─────────────
+
+    it('create: persists sourceSha when payload carries it', async () => {
+      const qb = createMockQueryBuilder([], 0);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      // 自定义事务：暴露 manager repo 的 create spy 以断言落库字段
+      const createSpy = jest.fn((x: unknown) => x);
+      const managerRepo = {
+        save: jest.fn((x: unknown) => Promise.resolve(x)),
+        create: createSpy,
+        createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+      };
+      mockTransaction.mockImplementation((fn: any) => fn({ getRepository: () => managerRepo }));
+
+      await service.upsert('space-1', { ...dto, sourceSha: 'sha-abc123' });
+
+      expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceSha: 'sha-abc123' }));
+    });
+
+    it('create: sourceSha stays null when payload omits it (native docs)', async () => {
+      const qb = createMockQueryBuilder([], 0);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const createSpy = jest.fn((x: unknown) => x);
+      const managerRepo = {
+        save: jest.fn((x: unknown) => Promise.resolve(x)),
+        create: createSpy,
+        createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+      };
+      mockTransaction.mockImplementation((fn: any) => fn({ getRepository: () => managerRepo }));
+
+      await service.upsert('space-1', dto);
+
+      expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceSha: null }));
+    });
+
+    it('unchanged content + no payload sourceSha → pure early return, zero writes', async () => {
+      const testContent = '# Hello\n\nSome content.';
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update(testContent).digest('hex');
+      // linkHealth 非 null：跳过 backfill 分支，隔离 sourceSha 逻辑
+      const existingDoc = makeDoc({
+        contentHash: hash,
+        sourceSha: 'old-sha',
+        linkHealth: { total: 0, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+      });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/test.md',
+        content: testContent,
+      });
+      expect(result.unchanged).toBe(true);
+      // 完全照旧早退：不触发任何 update
+      expect(qb.update).not.toHaveBeenCalled();
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
+    it('unchanged content + same sourceSha → no refresh write', async () => {
+      const testContent = '# Hello\n\nSome content.';
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update(testContent).digest('hex');
+      const existingDoc = makeDoc({
+        contentHash: hash,
+        sourceSha: 'same-sha',
+        linkHealth: { total: 0, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+      });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/test.md',
+        content: testContent,
+        sourceSha: 'same-sha',
+      });
+      expect(result.unchanged).toBe(true);
+      expect(qb.update).not.toHaveBeenCalled();
+    });
+
+    it('unchanged content + different sourceSha → refreshes source_sha column only, still unchanged:true', async () => {
+      const testContent = '# Hello\n\nSome content.';
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update(testContent).digest('hex');
+      const existingDoc = makeDoc({
+        contentHash: hash,
+        sourceSha: 'old-sha',
+        linkHealth: { total: 0, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+      });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/test.md',
+        content: testContent,
+        sourceSha: 'new-sha',
+      });
+      expect(result.unchanged).toBe(true);
+      // last-verified 语义：仅刷新 source_sha 列（不碰 sections/contentHash/其他元数据），
+      // 响应仍 unchanged:true（sync 即验证，unchanged 文档也推进验证点）
+      expect(qb.update).toHaveBeenCalledWith('Doc');
+      expect((qb as any).set).toHaveBeenCalledWith({ sourceSha: 'new-sha' });
+      expect((qb as any).execute).toHaveBeenCalled();
+    });
+
+    it('content change + payload sourceSha → new sha persisted; without → old sha kept', async () => {
+      const existingDoc = makeDoc({ contentHash: 'oldhash', sourceSha: 'old-sha' });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      // 事务真实执行：捕获 manager repo 的 save 以断言实体字段
+      const saveSpy = jest.fn((x: unknown) => Promise.resolve(x));
+      const managerRepo = {
+        save: saveSpy,
+        create: jest.fn((x: unknown) => x),
+        createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+      };
+      mockTransaction.mockImplementation((fn: any) => fn({ getRepository: () => managerRepo }));
+
+      await service.upsert('space-1', { ...dto, sourceSha: 'new-sha' });
+      expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceSha: 'new-sha' }));
+
+      // 第二次：独立 doc 实例（避免首轮事务对同一引用的原地变更污染断言）
+      const existingDoc2 = makeDoc({ contentHash: 'oldhash', sourceSha: 'old-sha' });
+      const qb2 = createMockQueryBuilder([existingDoc2], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb2);
+      saveSpy.mockClear();
+      await service.upsert('space-1', dto);
+      // native 编辑不带 sha → 保留旧验证 sha（旧 sha 显 stale 正是消费端新鲜度比较的用途）
+      expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceSha: 'old-sha' }));
     });
 
     it('updates document on content change', async () => {
@@ -453,6 +597,55 @@ describe('DocService', () => {
       // No event emitted because contentHash matches
       expect(eventService.create).not.toHaveBeenCalled();
     });
+
+    // ─── 批次 C1：route health 异步重检触发（plan §7-C1）──────────────
+
+    it('内容变更（create）→ 事务提交后 setImmediate 触发 recheckSpace（该空间）', async () => {
+      const qb = createMockQueryBuilder([], 0);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      mockTransaction.mockResolvedValue(
+        makeDoc({ id: 'doc-new', sectionCount: 2, tokenEstimate: 42 }),
+      );
+
+      await service.upsert('space-1', dto);
+      await flushImmediates();
+
+      expect(routeHealthService.recheckSpace).toHaveBeenCalledWith('space-1');
+    });
+
+    it('内容变更（update）→ 事务提交后触发 recheckSpace', async () => {
+      const existingDoc = makeDoc({ contentHash: 'oldhash' });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      mockTransaction.mockResolvedValue(
+        makeDoc({ sectionCount: 3, tokenEstimate: 150, contentHash: 'newhash' }),
+      );
+
+      await service.upsert('space-1', dto);
+      await flushImmediates();
+
+      expect(routeHealthService.recheckSpace).toHaveBeenCalledWith('space-1');
+    });
+
+    it('unchanged 早退分支 → 不触发 recheckSpace（sections 未重建，重检无意义）', async () => {
+      const testContent = '# Hello\n\nSome content.';
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update(testContent).digest('hex');
+      const existingDoc = makeDoc({ contentHash: hash });
+      const qb = createMockQueryBuilder([existingDoc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/test.md',
+        content: testContent,
+      });
+
+      expect(result.unchanged).toBe(true);
+      await flushImmediates();
+      expect(routeHealthService.recheckSpace).not.toHaveBeenCalled();
+    });
   });
 
   // ─── batchUpsert ──────────────────────────────────────────────
@@ -653,6 +846,18 @@ describe('DocService', () => {
       expect((result as any).content).toBeUndefined();
       // outline 分支零额外开销：仅一次 section 查询
       expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('exposes sourceSha in detail (via toSummary, DocDetail extends DocSummary)', async () => {
+      const doc = makeDoc({ tokenEstimate: 5000, sourceSha: 'sha-last-verified' });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sectionQb = createMockQueryBuilder([], 0);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.sourceSha).toBe('sha-last-verified');
     });
 
     it('small doc (tokenEstimate ≤ threshold) → mode:full + content with dedup semantics', async () => {
@@ -1029,6 +1234,17 @@ describe('DocService', () => {
         }),
       );
       expect(auditRepo.save).toHaveBeenCalled();
+    });
+
+    it('批次 C1：删文后同一 setImmediate 触发 recheckSpace（路由锚点悬空重检）', async () => {
+      const doc = makeDoc({ source: 'native', spaceId: 'space-1' });
+      const qb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      await service.remove('doc-1');
+      await flushImmediates();
+
+      expect(routeHealthService.recheckSpace).toHaveBeenCalledWith('space-1');
     });
   });
 

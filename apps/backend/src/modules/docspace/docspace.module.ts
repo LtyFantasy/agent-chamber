@@ -23,6 +23,10 @@ import { Event } from '../../database/entities/event.entity';
 import { BoardModule } from '../board/board.module';
 import { EventModule } from '../event/event.module';
 import { DocSearchService } from './doc-search.service';
+import { DocRouteService } from './doc-route.service';
+import { DocRouteController } from './doc-route.controller';
+import { RouteHealthService } from './route-health.service';
+import { DocRoute } from '../../database/entities/doc-route.entity';
 
 @Module({
   imports: [
@@ -33,6 +37,7 @@ import { DocSearchService } from './doc-search.service';
       Doc,
       DocSection,
       TaskDocLink,
+      DocRoute,
       Agent,
       User,
       ApiKey,
@@ -45,8 +50,8 @@ import { DocSearchService } from './doc-search.service';
     BoardModule,
     EventModule,
   ],
-  providers: [DocSpaceService, DocService, DocSearchService],
-  controllers: [DocSpaceController, DocController, DocCategoryController],
-  exports: [DocSpaceService, DocService, DocSearchService],
+  providers: [DocSpaceService, DocService, DocSearchService, DocRouteService, RouteHealthService],
+  controllers: [DocSpaceController, DocController, DocCategoryController, DocRouteController],
+  exports: [DocSpaceService, DocService, DocSearchService, RouteHealthService],
 })
 export class DocSpaceModule {}

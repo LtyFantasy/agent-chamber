@@ -4,7 +4,8 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
- *   - 补充: plan §4.5 (检索规格), plan §1.5 (检索双路纯 PostgreSQL)
+ *   - 补充: plan §4.5 (检索规格), plan §1.5 (检索双路纯 PostgreSQL),
+ *     plan §4-C3 (意图融合检索：路由/任务链接 boost 重排 + boosts 透出)
  *
  * [踩坑索引] (无历史踩坑，新建文件)
  *
@@ -21,6 +22,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { Doc } from '../../database/entities/doc.entity';
+import { DocRoute } from '../../database/entities/doc-route.entity';
+import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import type { DocSearchHit } from '@agent-chamber/shared';
 
 /**
@@ -40,6 +43,34 @@ const RANK_WEIGHTS = {
   /** pg_trgm similarity(headingPath) 权重 — 标题结构匹配 */
   TRGM_HEADING: 0.8,
 } as const;
+
+/**
+ * 三路融合检索加权常量（plan §4-C3 意图融合检索）
+ *
+ * 语义：SQL SCORE_FLOOR 过滤**之后**，对命中 doc 叠加「策展路由命中」与「任务链接数」
+ * 两路乘数加权重排——只重排、不引入新结果（plan §4 明文边界）。
+ *
+ * rationale：
+ * - ROUTE_PRIMARY_BOOST 1.5 > ROUTE_SECONDARY_BOOST 1.2：路由的「先看」文档比「再看」
+ *   文档更贴近用户意图，加权更高；同一 doc 被多条路由命中时**取最大倍率不叠加连乘**
+ *   （避免策展重复导致分数虚高）；
+ * - 阈值语义（≥ 判定）：intent 相似度 ≥0.15 或 category 相似度 ≥0.3 即视为路由命中。
+ *   intent 是自由文本（"我要…"），trgm 相似度普遍偏低，故阈值低于 category
+ *   （短 slug 词如 "architecture"，命中通常更强）；
+ * - TASK_LINK_STEP 0.05 × min(count, TASK_LINK_CAP=5)：被 ≥1 个任务引用的文档带
+ *   「被使用」信号加分，封顶 ×1.25 防止高频引用文档（如 README/INDEX 常客）垄断排序；
+ * - 所有常量集中一处，后续调参只需改这里。
+ */
+const ROUTE_PRIMARY_BOOST = 1.5;
+const ROUTE_SECONDARY_BOOST = 1.2;
+/** 路由 intent 相似度阈值（≥ 命中） */
+const ROUTE_INTENT_FLOOR = 0.15;
+/** 路由 category 相似度阈值（≥ 命中） */
+const ROUTE_CATEGORY_FLOOR = 0.3;
+/** 任务链接阶梯步长：每个任务 +5% 权重 */
+const TASK_LINK_STEP = 0.05;
+/** 任务链接计数封顶（超出不再累加，乘数上限 ×1.25） */
+const TASK_LINK_CAP = 5;
 
 /**
  * 合成分数下限阈值
@@ -75,6 +106,21 @@ interface SearchRow {
   trgm_heading_score: number;
 }
 
+/** doc_routes 相似度查询行（raw row：PG 数值列经驱动返回 string） */
+interface RouteSimilarityRow {
+  id: string;
+  primary_doc_id: string;
+  secondary_doc_id: string | null;
+  intent_similarity: string;
+  category_similarity: string;
+}
+
+/** 单 doc 的路由加权结果：乘数 + 用于 boosts 透出的角色标签 */
+interface RouteBoost {
+  multiplier: number;
+  label: 'primary' | 'secondary';
+}
+
 @Injectable()
 export class DocSearchService {
   constructor(
@@ -82,15 +128,22 @@ export class DocSearchService {
     private readonly sectionRepo: Repository<DocSection>,
     @InjectRepository(Doc)
     private readonly docRepo: Repository<Doc>,
+    @InjectRepository(DocRoute)
+    private readonly routeRepo: Repository<DocRoute>,
+    @InjectRepository(TaskDocLink)
+    private readonly taskLinkRepo: Repository<TaskDocLink>,
   ) {}
 
   /**
-   * Search documents within accessible spaces using dual scoring.
+   * Search documents within accessible spaces using dual scoring + intent fusion.
    *
    * Scoring:
    *   composite = ts_rank(search_vector, query) × TS_RANK(1.0)
    *             + similarity(content, query) × TRGM_CONTENT(0.6)
    *             + similarity(heading_path, query) × TRGM_HEADING(0.8)
+   *   → SQL SCORE_FLOOR 过滤后，命中 doc 再叠加两路乘数（plan §4-C3 三路融合）：
+   *     ① 策展路由命中：命中路由的 primaryDoc ×1.5 / secondaryDoc ×1.2（取最大不叠加）
+   *     ② 任务链接数：×(1 + min(count, 5) × 0.05)，封顶 ×1.25
    *
    * Filtering:
    *   - Only spaces in accessibleSpaceIds
@@ -99,12 +152,15 @@ export class DocSearchService {
    *
    * Score floor: composite > SCORE_FLOOR (0.08) —
    *   filters zero-relevance noise that pg_trgm would otherwise pass through.
+   *   ⚠️ 边界（plan §4 明文）：boost 在 floor 之后执行——只重排、不引入新结果；
+   *   query 与 doc 内容零重叠但仅与路由 intent 重叠的 doc 不会召回，留待未来版本。
    *
    * Snippet:
    *   - ts_headline when ts_rank > 0
    *   - Fallback: matched substring ±150 chars, ≤300 chars total
    *
-   * Sorting: score DESC, position ASC (stable within same doc).
+   * Sorting: score DESC, position ASC（boost 后 Node 侧重排，对齐既有 SQL ORDER BY 语义）。
+   * 可解释性：命中携带 boosts（route/taskLinks）透出加权来源；无 boost 省略该键。
    *
    * @param accessibleSpaceIds - Whitelist from AccessQueryService (null = admin, all spaces)
    * @param query - Search parameters (q, type, tag, category, limit)
@@ -184,6 +240,21 @@ export class DocSearchService {
       .limit(effectiveLimit)
       .getRawMany<SearchRow & { score: number }>();
 
+    // ── 三路融合 boost（plan §4-C3）────────────────────────────────
+    // 边界（plan §4 明文）：boost 在 SQL SCORE_FLOOR 过滤之后执行——只重排、不引入新结果
+    // （query 与 doc 内容零重叠但仅与路由 intent 重叠的 doc 不会被召回，留待未来版本）。
+    // 无命中直接短路，跳过两路 boost 查询。
+    if (rows.length === 0) {
+      return [];
+    }
+
+    // ① 策展路由命中：命中路由的 primaryDocId ×1.5 / secondaryDocId ×1.2
+    const routeBoosts = await this.computeRouteBoosts(accessibleSpaceIds, q);
+    // ② 任务链接加权：×(1 + min(count, 5) × 0.05)，封顶 ×1.25（docId 去重防重复计数）
+    const taskLinkCounts = await this.countTaskLinksByDoc([
+      ...new Set(rows.map((row) => row.doc_id)),
+    ]);
+
     // Build hits
     const hits: DocSearchHit[] = [];
     for (const row of rows) {
@@ -192,7 +263,7 @@ export class DocSearchService {
         ? await this.buildTsHeadlineSnippet(row.doc_id, row.section_position, q)
         : this.buildTrgmSnippet(row.section_content, q);
 
-      hits.push({
+      const hit: DocSearchHit = {
         docId: row.doc_id,
         docPath: row.doc_path,
         docTitle: row.doc_title,
@@ -201,10 +272,134 @@ export class DocSearchService {
         snippet: snippet.text,
         contentTruncated: snippet.truncated,
         score: Number(row.score),
-      });
+      };
+
+      // ③ 应用两路乘数并透出 boosts（可解释性：调用方知道结果为何排前）
+      // 无任何 boost 的命中分数不变、boosts 键省略（taskLinks=0 视为无 boost——GROUP BY
+      // 实际不会产出 0 行，此处为防御性语义）。
+      const route = routeBoosts.get(row.doc_id);
+      const taskLinks = taskLinkCounts.get(row.doc_id);
+      const hasRoute = route !== undefined;
+      const hasTaskLinks = taskLinks !== undefined && taskLinks > 0;
+      if (hasRoute || hasTaskLinks) {
+        if (hasRoute) {
+          hit.score *= route.multiplier;
+        }
+        if (hasTaskLinks) {
+          hit.score *= 1 + Math.min(taskLinks, TASK_LINK_CAP) * TASK_LINK_STEP;
+        }
+        hit.boosts = {};
+        if (hasRoute) {
+          hit.boosts.route = route.label;
+        }
+        if (hasTaskLinks) {
+          hit.boosts.taskLinks = taskLinks;
+        }
+      }
+
+      hits.push(hit);
     }
 
+    // ④ 重排：boost 后按 score DESC、position ASC 重新排序（对齐既有 ORDER BY 语义；
+    //    无 boost 时分数不变，JS sort 稳定 + position 平局兜底，顺序与 SQL 结果一致）
+    hits.sort((a, b) => b.score - a.score || a.position - b.position);
+
     return hits;
+  }
+
+  /**
+   * 策展路由命中加权（plan §4-C3 三路融合之一）
+   *
+   * 一次 SQL 拉取查询空间全部路由及 PG `similarity()` 预计算分数——与正文检索同款函数，
+   * 保证语义一致（单空间 ≤16 条规模，无索引压力），Node 侧按阈值过滤：
+   * intent ≥ ROUTE_INTENT_FLOOR（0.15）或 category ≥ ROUTE_CATEGORY_FLOOR（0.3）即视为命中。
+   * 命中路由的 primaryDocId → ×ROUTE_PRIMARY_BOOST（1.5）、secondaryDocId → ×ROUTE_SECONDARY_BOOST
+   * （1.2）；同一 doc 同时被多条路由命中时取最大倍率（不叠加连乘，见 applyRouteBoost）。
+   *
+   * @param accessibleSpaceIds - 可访问空间白名单（null = admin，全量空间不过滤）
+   * @param q - 检索词（与正文检索同参数，保证 similarity 打分一致）
+   * @returns docId → { multiplier, label } 映射；未命中任何路由的 doc 不在映射中
+   */
+  private async computeRouteBoosts(
+    accessibleSpaceIds: string[] | null,
+    q: string,
+  ): Promise<Map<string, RouteBoost>> {
+    const boosts = new Map<string, RouteBoost>();
+
+    const qb = this.routeRepo
+      .createQueryBuilder('r')
+      .select('r.id', 'id')
+      .addSelect('r.primaryDocId', 'primary_doc_id')
+      .addSelect('r.secondaryDocId', 'secondary_doc_id')
+      .addSelect('similarity(r.intent, :q)', 'intent_similarity')
+      .addSelect("similarity(COALESCE(r.category, ''), :q)", 'category_similarity')
+      .setParameter('q', q);
+    if (accessibleSpaceIds !== null) {
+      qb.where('r.spaceId IN (:...spaceIds)', { spaceIds: accessibleSpaceIds });
+    }
+    const rows = await qb.getRawMany<RouteSimilarityRow>();
+
+    for (const row of rows) {
+      // 阈值过滤（≥ 判定，0.15/0.3 为边界值）：intent/category 任一达标即路由命中
+      const intentSim = Number(row.intent_similarity);
+      const categorySim = Number(row.category_similarity);
+      if (intentSim < ROUTE_INTENT_FLOOR && categorySim < ROUTE_CATEGORY_FLOOR) {
+        continue;
+      }
+      this.applyRouteBoost(boosts, row.primary_doc_id, ROUTE_PRIMARY_BOOST, 'primary');
+      if (row.secondary_doc_id) {
+        this.applyRouteBoost(boosts, row.secondary_doc_id, ROUTE_SECONDARY_BOOST, 'secondary');
+      }
+    }
+
+    return boosts;
+  }
+
+  /**
+   * 写入/覆盖单 doc 的路由加权（取最大倍率语义）
+   *
+   * 同一 doc 可能同时是路由 A 的 primary 与路由 B 的 secondary：若直接连乘，
+   * 策展重复会虚高分数（1.5×1.2=1.8），故仅当新倍率更高时覆盖——plan §4-C3 明文。
+   * label 与倍率一一对应（primary 1.5 > secondary 1.2，存谁 label 就是谁）。
+   */
+  private applyRouteBoost(
+    boosts: Map<string, RouteBoost>,
+    docId: string,
+    multiplier: number,
+    label: 'primary' | 'secondary',
+  ): void {
+    const current = boosts.get(docId);
+    if (!current || multiplier > current.multiplier) {
+      boosts.set(docId, { multiplier, label });
+    }
+  }
+
+  /**
+   * 任务链接加权（plan §4-C3 三路融合之二）
+   *
+   * 一把聚合查询：对 hits 涉及的 docId 集合按 doc 分组 COUNT(DISTINCT task_id)
+   * （task_doc_links 裸 uuid 无 FK，按 docId 直接计数即可——docspace.service.countLinkedTasks
+   * 同款先例）。乘数 = ×(1 + min(count, TASK_LINK_CAP) × TASK_LINK_STEP)，封顶 ×1.25。
+   *
+   * @param docIds - hits 涉及的 docId 集合（已去重，≤20 条）
+   * @returns docId → 实际关联任务数（原始 COUNT 未封顶；无链接的 doc 不在映射中）
+   */
+  private async countTaskLinksByDoc(docIds: string[]): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    if (docIds.length === 0) {
+      return counts;
+    }
+    const rows = await this.taskLinkRepo
+      .createQueryBuilder('tdl')
+      .select('tdl.docId', 'doc_id')
+      .addSelect('COUNT(DISTINCT tdl.taskId)', 'c')
+      .where('tdl.docId IN (:...docIds)', { docIds })
+      .groupBy('tdl.docId')
+      .getRawMany<{ doc_id: string; c: string }>();
+    for (const row of rows) {
+      counts.set(row.doc_id, Number(row.c));
+    }
+    return counts;
   }
 
   /**

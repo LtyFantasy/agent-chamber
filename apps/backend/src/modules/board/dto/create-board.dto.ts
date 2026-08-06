@@ -22,7 +22,8 @@ export class CreateBoardDto implements CreateBoardInput {
 
   @IsOptional()
   @IsString()
-  @MaxLength(5000)
+  // v1.41 项目图例：description 升格为 board 图例（长 markdown，随 digest 全量送达），cap 20000
+  @MaxLength(20000)
   @ApiPropertyOptional({ description: 'Description', example: 'A description' })
   description?: string;
 

@@ -80,6 +80,16 @@ export class Doc {
   @Column({ type: 'varchar', length: 64, nullable: true, name: 'content_hash' })
   contentHash: string | null;
 
+  /**
+   * last-verified 语义的源码提交 sha（如 git rev-parse HEAD 40 hex）
+   * 含义 = "内容在此 sha 验证一致"，由 sync 适配器每次同步时上报；
+   * unchanged 文档也刷新该列（同步即验证），内容实际变更不受影响。
+   * 新鲜度判断留给消费端：doc.sourceSha vs 空间 maxSha 比较。
+   * 普通 btree 索引（空间内按 sha 扫比较）。
+   */
+  @Column({ type: 'varchar', length: 64, nullable: true, name: 'source_sha' })
+  sourceSha: string | null;
+
   /** section 数量，chunking 后回填 */
   @Column({ type: 'int', default: 0, name: 'section_count' })
   sectionCount: number;

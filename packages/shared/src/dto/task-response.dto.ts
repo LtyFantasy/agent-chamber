@@ -172,7 +172,9 @@ export interface Activity {
 }
 
 /**
- * 里程碑
+ * 里程碑（v1.42 起可承载 Release 信息）
+ * 列表投影（findAll）：body → bodySnippet(300 字符)，不返回 deployMeta；
+ * 详情（findOne / deployed 端点响应）：body 与 deployMeta 全量返回。
  */
 export interface Milestone {
   /** 里程碑 ID */
@@ -191,6 +193,18 @@ export interface Milestone {
   targetDate?: string | Date | null;
   /** 创建者 Actor ID（human/agent 通用；历史数据为 null） */
   creatorId?: string | null;
+  /** Release 版本号（null = 普通里程碑） */
+  version?: string | null;
+  /** Release 变更说明全量（仅详情返回） */
+  body?: string | null;
+  /** Release 变更说明摘要（仅列表投影：body 前 300 字符） */
+  bodySnippet?: string | null;
+  /** 部署元数据（anchors/backup/migrations，仅详情返回；写入只经 deployed 端点合并） */
+  deployMeta?: Record<string, unknown> | null;
+  /** 最近一次部署时间（deployed 端点写入） */
+  deployedAt?: string | Date | null;
+  /** 验收时间（PATCH status=verified 时写入） */
+  verifiedAt?: string | Date | null;
   /** 统计信息 */
   stats?: {
     total: number;

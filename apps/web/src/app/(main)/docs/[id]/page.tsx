@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslations } from 'next-intl';
@@ -148,6 +148,10 @@ export default function DocSpaceDetailPage() {
   /** 待滚动定位的标题路径（搜索命中直达 section 用） */
   const pendingHeadingRef = useRef<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  /** 空间图例（description）展开态（v1.41）：markdown 渲染，超长（>max-h-64）折叠 + 展开/收起 */
+  const [legendExpanded, setLegendExpanded] = useState(false);
+  const [legendOverflowing, setLegendOverflowing] = useState(false);
+  const legendRef = useRef<HTMLDivElement>(null);
 
   // ── 查询 ────────────────────────────────────────
   const { data: space, isLoading: spaceLoading } = useQuery({
@@ -155,6 +159,13 @@ export default function DocSpaceDetailPage() {
     queryFn: () => Api.docs.getSpace(spaceId),
     enabled: !!spaceId,
   });
+
+  // 图例内容变化后测量是否超长（max-h-64 = 256px）；overflow-hidden 下 scrollHeight 仍返回内容全高
+  useLayoutEffect(() => {
+    const el = legendRef.current;
+    if (!el) return;
+    setLegendOverflowing(el.scrollHeight > 256);
+  }, [space?.description]);
 
   /** 空间设置的绑定选项（仅在对话框打开时拉取） */
   const { data: bindingBoards } = useQuery({
@@ -761,8 +772,29 @@ export default function DocSpaceDetailPage() {
           )}
         </div>
       </div>
+      {/* 空间图例（v1.41）：markdown 渲染（复用中栏 MARKDOWN_CLASSES 文档版），超长折叠 + 展开/收起 */}
       {space.description && (
-        <p className="-mt-2 text-sm text-muted-foreground">{space.description}</p>
+        <div className="-mt-2">
+          <div
+            ref={legendRef}
+            className={`text-sm text-muted-foreground ${MARKDOWN_CLASSES} ${
+              legendExpanded ? '' : 'max-h-64 overflow-hidden'
+            }`}
+          >
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {space.description}
+            </ReactMarkdown>
+          </div>
+          {legendOverflowing && (
+            <button
+              type="button"
+              onClick={() => setLegendExpanded((v) => !v)}
+              className="mt-1 text-xs text-primary hover:underline"
+            >
+              {legendExpanded ? t('detail.legendCollapse') : t('detail.legendExpand')}
+            </button>
+          )}
+        </div>
       )}
 
       {/* 三栏主体 */}

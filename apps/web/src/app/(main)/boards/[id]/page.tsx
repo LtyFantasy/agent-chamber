@@ -1,13 +1,16 @@
 'use client';
 
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import { Priority, TaskStatus } from '@agent-chamber/shared';
 import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Api } from '@/lib/api';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
+import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -668,6 +671,9 @@ function MilestoneManageDialog({
     status: 'planned',
     startDate: '',
     targetDate: '',
+    // Release 字段（v1.42 B6）：version 创建时可填、编辑只读（release 身份标识，避免唯一索引冲突 UX 复杂化）；body 任何时候可编辑
+    version: '',
+    body: '',
   });
 
   const { data: milestonesData } = useQuery({
@@ -676,12 +682,36 @@ function MilestoneManageDialog({
     enabled: !!boardId,
   });
 
+  // 正在编辑的里程碑对象（deployed 状态：select 禁用占位 + 提交保态用）
+  const editingMilestone = (milestonesData?.items ?? []).find((m: Milestone) => m.id === editingId);
+
+  /**
+   * 后端状态机（B1）：version 非空 → 禁普通态（planned/active/completed）；version 空 → 禁 release 态。
+   * 创建态填了 version 后自动把不在 release 组的 status 切到 dev（后端 create 缺省 dev 同语义）；
+   * 编辑态 version 只读不会变，状态由后端约束，前端不干预。
+   */
+  useEffect(() => {
+    if (editingId) return;
+    const releaseStatuses = ['dev', 'ready', 'verified', 'cancelled'];
+    if (form.version.trim() && !releaseStatuses.includes(form.status)) {
+      setForm((f) => ({ ...f, status: 'dev' }));
+    }
+  }, [form.version, form.status, editingId]);
+
   const createMutation = useMutation({
     mutationFn: (data: Parameters<typeof Api.tasks.createMilestone>[0]) =>
       Api.tasks.createMilestone(data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['milestones', 'list', boardId] });
-      setForm({ name: '', description: '', status: 'planned', startDate: '', targetDate: '' });
+      setForm({
+        name: '',
+        description: '',
+        status: 'planned',
+        startDate: '',
+        targetDate: '',
+        version: '',
+        body: '',
+      });
     },
   });
 
@@ -696,7 +726,15 @@ function MilestoneManageDialog({
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['milestones', 'list', boardId] });
       setEditingId(null);
-      setForm({ name: '', description: '', status: 'planned', startDate: '', targetDate: '' });
+      setForm({
+        name: '',
+        description: '',
+        status: 'planned',
+        startDate: '',
+        targetDate: '',
+        version: '',
+        body: '',
+      });
     },
   });
 
@@ -713,9 +751,14 @@ function MilestoneManageDialog({
       name: form.name,
       description: form.description || undefined,
       boardId,
-      status: form.status,
+      // deployed 只能经 POST /tasks/milestones/:id/deployed 端点写入（PATCH status=deployed 后端 400）；
+      // 编辑 deployed 里程碑时保持原状态（不传 status，PATCH 保留原值）
+      status: editingMilestone?.status === 'deployed' ? undefined : form.status,
       startDate: form.startDate || undefined,
       targetDate: form.targetDate || undefined,
+      // version 仅创建时可填（编辑只读展示，不允许改挂/改 version——部分唯一索引冲突 UX 复杂化）
+      ...(!editingId && form.version.trim() ? { version: form.version.trim() } : {}),
+      ...(form.body.trim() ? { body: form.body.trim() } : {}),
     };
     if (editingId) {
       updateMutation.mutate({ id: editingId, data: payload });
@@ -732,6 +775,10 @@ function MilestoneManageDialog({
       status: m.status || 'planned',
       startDate: m.startDate ? String(m.startDate).slice(0, 10) : '',
       targetDate: m.targetDate ? String(m.targetDate).slice(0, 10) : '',
+      version: m.version ?? '',
+      // body 不回填：列表投影只返回 bodySnippet（300 字符截断），回填会覆盖截断原正文；
+      // 提交时 body 留空 = 不传（PATCH 保留原值），安全
+      body: '',
     });
   };
 
@@ -740,6 +787,10 @@ function MilestoneManageDialog({
     active: 'boards.milestone.status.active',
     completed: 'boards.milestone.status.completed',
     cancelled: 'boards.milestone.status.cancelled',
+    dev: 'boards.milestone.status.dev',
+    ready: 'boards.milestone.status.ready',
+    deployed: 'boards.milestone.status.deployed',
+    verified: 'boards.milestone.status.verified',
   };
 
   // 里程碑状态徽章：新色板暗色适配（半透明语义色底 + 亮阶文字）
@@ -748,6 +799,10 @@ function MilestoneManageDialog({
     active: 'bg-blue-500/15 text-blue-300',
     completed: 'bg-emerald-500/15 text-emerald-300',
     cancelled: 'bg-muted/40 text-muted-foreground line-through',
+    dev: 'bg-amber-500/15 text-amber-300',
+    ready: 'bg-cyan-500/15 text-cyan-300',
+    deployed: 'bg-violet-500/15 text-violet-300',
+    verified: 'bg-emerald-500/15 text-emerald-300',
   };
 
   return (
@@ -775,10 +830,30 @@ function MilestoneManageDialog({
               value={form.status}
               onChange={(e) => setForm({ ...form, status: e.target.value })}
             >
-              <option value="planned">{t('milestone.status.planned')}</option>
-              <option value="active">{t('milestone.status.active')}</option>
-              <option value="completed">{t('milestone.status.completed')}</option>
-              <option value="cancelled">{t('milestone.status.cancelled')}</option>
+              {form.version.trim() !== '' ? (
+                /* Release 里程碑（version 非空）：release 状态组——deployed 不出现在选项（端点专属，
+                   PATCH 会被后端 400 MILESTONE_DEPLOY_VIA_ENDPOINT）；当前 status=deployed 时以 disabled
+                   占位展示（不可选，编辑保存时保态不传 status） */
+                <>
+                  <option value="dev">{t('milestone.status.dev')}</option>
+                  <option value="ready">{t('milestone.status.ready')}</option>
+                  <option value="verified">{t('milestone.status.verified')}</option>
+                  <option value="cancelled">{t('milestone.status.cancelled')}</option>
+                  {editingMilestone?.status === 'deployed' && (
+                    <option value="deployed" disabled>
+                      {t('milestone.status.deployed')}
+                    </option>
+                  )}
+                </>
+              ) : (
+                /* 普通里程碑（version 空）：普通四态，行为零变更 */
+                <>
+                  <option value="planned">{t('milestone.status.planned')}</option>
+                  <option value="active">{t('milestone.status.active')}</option>
+                  <option value="completed">{t('milestone.status.completed')}</option>
+                  <option value="cancelled">{t('milestone.status.cancelled')}</option>
+                </>
+              )}
             </select>
             <Input
               type="date"
@@ -795,6 +870,20 @@ function MilestoneManageDialog({
               className="flex-1"
             />
           </div>
+          <Input
+            placeholder={t('milestone.versionPlaceholder')}
+            value={form.version}
+            disabled={!!editingId}
+            title={editingId ? t('milestone.versionReadonlyHint') : undefined}
+            onChange={(e) => setForm({ ...form, version: e.target.value })}
+          />
+          <textarea
+            placeholder={t('milestone.bodyPlaceholder')}
+            value={form.body}
+            onChange={(e) => setForm({ ...form, body: e.target.value })}
+            rows={3}
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground"
+          />
           <div className="flex gap-2">
             <Button
               variant="outline"
@@ -808,6 +897,8 @@ function MilestoneManageDialog({
                   status: 'planned',
                   startDate: '',
                   targetDate: '',
+                  version: '',
+                  body: '',
                 });
               }}
             >
@@ -842,6 +933,15 @@ function MilestoneManageDialog({
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium truncate">{m.name}</span>
+                  {m.version && (
+                    <Badge
+                      variant="outline"
+                      className="shrink-0 text-xs font-mono text-primary border-primary/40 bg-primary/10"
+                      title={m.version}
+                    >
+                      v{m.version.replace(/^v/i, '')}
+                    </Badge>
+                  )}
                   <Badge variant="secondary" className={`text-xs ${statusColors[m.status] || ''}`}>
                     {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
                     {tGlobal((milestoneStatusLabelKeys[m.status] || m.status) as any)}
@@ -932,6 +1032,18 @@ export default function BoardDetailPage() {
     queryFn: () => Api.boards.getById(id),
     enabled: !!id,
   });
+
+  /** 看板 description 折叠（v1.42 B6）：markdown 渲染（复用 MARKDOWN_CLASSES），超长（>max-h-64）折叠 + 展开/收起 */
+  const [descExpanded, setDescExpanded] = useState(false);
+  const [descOverflowing, setDescOverflowing] = useState(false);
+  const descRef = useRef<HTMLDivElement>(null);
+
+  // 描述内容变化后测量是否超长（max-h-64 = 256px）；overflow-hidden 下 scrollHeight 仍返回内容全高
+  useLayoutEffect(() => {
+    const el = descRef.current;
+    if (!el) return;
+    setDescOverflowing(el.scrollHeight > 256);
+  }, [board?.description]);
 
   /** 绑定本看板的文档空间（头部 Docs 徽章用） */
   const { data: boardSpacesData } = useQuery({
@@ -1401,7 +1513,23 @@ export default function BoardDetailPage() {
               )}
             </h1>
             {board.description && (
-              <p className="text-sm text-muted-foreground truncate">{board.description}</p>
+              <div
+                ref={descRef}
+                className={`text-sm text-muted-foreground ${MARKDOWN_CLASSES} ${
+                  descExpanded ? '' : 'max-h-64 overflow-hidden'
+                }`}
+              >
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{board.description}</ReactMarkdown>
+              </div>
+            )}
+            {descOverflowing && (
+              <button
+                type="button"
+                onClick={() => setDescExpanded((v) => !v)}
+                className="mt-1 text-xs text-primary hover:underline"
+              >
+                {descExpanded ? t('descriptionCollapse') : t('descriptionExpand')}
+              </button>
             )}
           </div>
         </div>

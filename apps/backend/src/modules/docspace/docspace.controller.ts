@@ -25,6 +25,7 @@ import {
   Get,
   Post,
   Patch,
+  Put,
   Delete,
   Body,
   Param,
@@ -50,6 +51,7 @@ import {
   AddDocSpaceEditorDto,
   RemoveDocSpaceEditorDto,
   DocOverviewQueryDto,
+  RepoManifestDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { DocSpace } from '../../database/entities/doc-space.entity';
@@ -187,6 +189,30 @@ export class DocSpaceController {
     }
 
     return this.docSpaceService.update(id, dto);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Put(':id/repo-manifest')
+  @ApiOperation({
+    summary: 'Report repository file manifest',
+    description:
+      'Store the git ls-files manifest (HEAD sha + full relative path list) into ' +
+      'doc_spaces.settings.repoManifest (v1.42 batch C2). Atomic jsonb_set merge — only the ' +
+      'repoManifest key is touched; visibility and other settings keys are preserved. ' +
+      'The only writer is scripts/sync-docs.mjs; route-health recheck consumes the manifest ' +
+      'to cascade-check codeEntry existence. reportedAt is generated server-side.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Repo manifest stored successfully' })
+  @ApiResponse({ status: 400, description: 'Validation failed (files limit / absolute path / `..` segment)' })
+  async updateRepoManifest(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: RepoManifestDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(id);
+    await this.permService.ensureCan(space, actor, 'write');
+    return this.docSpaceService.updateRepoManifest(id, dto);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -345,8 +371,10 @@ export class DocSpaceController {
     summary: 'Get DocSpace overview',
     description:
       'Return a compact overview map: categories (sorted by sortOrder) → docs[{path,title,summary,docType,tags,tokenEstimate}] ' +
-      '+ uncategorized docs. Total token estimate is capped at ~4000 (overridable via maxTokens, 500–16000); ' +
+      '+ uncategorized docs. Total token estimate is capped at ~20000 (overridable via maxTokens, 500–50000); ' +
       'if exceeded, truncation sets `truncated:true`. ' +
+      'The response includes spaceDescription (space legend) in full by default; legend tokens are reported ' +
+      'separately as legendTokenEstimate and do not consume the maxTokens budget (pass includeDescription=false to omit). ' +
       'Configurable filters (v1.38): type/excludeType/category/excludeCategory (comma-separated, include+exclude = ' +
       'include-then-exclude intersection), tag, pathPrefix, applySpaceDefaults=false ignores space-level default ' +
       'filters (settings.overviewFilter). Response echoes the effective filters as `appliedFilters`.',

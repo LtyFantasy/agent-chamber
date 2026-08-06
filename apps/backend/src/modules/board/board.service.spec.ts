@@ -9,7 +9,9 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { BoardMember } from '../../database/entities/board-member.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
-import { Visibility, ErrorCode, ActorType, UserRole, TaskStatus, BoardMemberRole, EventType } from '@agent-chamber/shared';
+import { Doc } from '../../database/entities/doc.entity';
+import { Milestone } from '../../database/entities/milestone.entity';
+import { Visibility, ErrorCode, ActorType, UserRole, TaskStatus, BoardMemberRole, EventType, Priority } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { NotFoundException, ConflictException } from '@nestjs/common';
 import { SelectQueryBuilder } from 'typeorm';
@@ -33,6 +35,8 @@ describe('BoardService', () => {
   let taskService: jest.Mocked<TaskService>;
   let eventService: { create: jest.Mock };
   let docSpaceRepo: jest.Mocked<Repository<DocSpace>>;
+  let docRepo: jest.Mocked<Repository<Doc>>;
+  let milestoneRepo: jest.Mocked<Repository<Milestone>>;
 
   beforeEach(() => {
     accessQuery = {
@@ -44,6 +48,8 @@ describe('BoardService', () => {
       findAndCount: jest.fn(),
       save: jest.fn((b: unknown) => Promise.resolve(b)),
       softDelete: jest.fn(),
+      // v1.42 metrics：原生原子 SQL（jsonb_set 合并），Repository.query 直通
+      query: jest.fn(),
       createQueryBuilder: jest.fn(() => ({
         leftJoinAndSelect: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
@@ -61,6 +67,7 @@ describe('BoardService', () => {
     } as unknown as jest.Mocked<Repository<BoardList>>;
     taskRepo = {
       update: jest.fn(),
+      find: jest.fn().mockResolvedValue([]),
       createQueryBuilder: jest.fn(() => ({
         select: jest.fn().mockReturnThis(),
         addSelect: jest.fn().mockReturnThis(),
@@ -69,8 +76,12 @@ describe('BoardService', () => {
         andWhere: jest.fn().mockReturnThis(),
         setParameter: jest.fn().mockReturnThis(),
         groupBy: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
         getRawMany: jest.fn().mockResolvedValue([]),
         getRawOne: jest.fn().mockResolvedValue({ total: '0', completed: '0' }),
+        getMany: jest.fn().mockResolvedValue([]),
       })),
     } as unknown as jest.Mocked<Repository<Task>>;
     topicRepo = {
@@ -127,7 +138,20 @@ describe('BoardService', () => {
           })),
         })),
       })),
+      findOne: jest.fn(),
     } as unknown as jest.Mocked<Repository<DocSpace>>;
+    docRepo = {
+      createQueryBuilder: jest.fn(() => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([]),
+      })),
+    } as unknown as jest.Mocked<Repository<Doc>>;
+    milestoneRepo = {
+      find: jest.fn().mockResolvedValue([]),
+    } as unknown as jest.Mocked<Repository<Milestone>>;
 
     service = new BoardService(
       boardRepo,
@@ -143,6 +167,8 @@ describe('BoardService', () => {
       taskService,
       eventService as unknown as EventService,
       docSpaceRepo,
+      docRepo,
+      milestoneRepo,
     );
   });
 
@@ -944,6 +970,530 @@ describe('BoardService', () => {
       expect(setMock).toHaveBeenCalledWith({ boardId: null });
       expect(whereMock).toHaveBeenCalledWith('board_id = :boardId', { boardId: 'board-1' });
       expect(executeMock).toHaveBeenCalled();
+    });
+  });
+
+  describe('getDigest', () => {
+    // v1.41 项目总揽装配：board 详情口径 taskCount + lists/nextUp/risks/recentDone/milestones/docs
+    const makeList = (overrides: Partial<any> = {}) => ({
+      id: 'list-1',
+      boardId: 'board-1',
+      name: 'To Do',
+      position: 1,
+      color: null,
+      mappedStatus: 'todo',
+      createdAt: new Date('2024-01-01'),
+      updatedAt: new Date('2024-01-01'),
+      deletedAt: null,
+      ...overrides,
+    });
+    const makeTaskRow = (overrides: Partial<any> = {}) => ({
+      id: 'task-1',
+      title: 'Task 1',
+      status: TaskStatus.TODO,
+      priority: Priority.P1,
+      listId: 'list-1',
+      assigneeId: 'agent-1',
+      labels: null,
+      milestoneId: null,
+      createdAt: new Date('2024-01-01'),
+      updatedAt: new Date('2024-01-01'),
+      completedAt: null,
+      ...overrides,
+    });
+    // v1.42 Release 里程碑构造器（version 非空 = release；deployedAt/verifiedAt 可空）
+    const makeMilestone = (overrides: Partial<any> = {}) => ({
+      id: 'rel-1',
+      name: 'Release 1.0',
+      status: 'dev',
+      version: '1.0.0',
+      deployedAt: null,
+      verifiedAt: null,
+      createdAt: new Date('2024-01-01'),
+      startDate: null,
+      targetDate: null,
+      ...overrides,
+    });
+
+    // 通用装配 mock：taskRepo.find 按查询形状分发；createQueryBuilder 各方法各就各位
+    const setupDigestMocks = (opts: {
+      openTasks?: any[];
+      doneRows?: any[];
+      milestoneTasks?: any[];
+      riskRows?: any[];
+      listCounts?: any[];
+      total?: string;
+      completed?: string;
+      milestones?: any[];
+      space?: any;
+      docs?: any[];
+    }) => {
+      boardRepo.findOne.mockResolvedValue(
+        makeBoard({ id: 'board-1', description: '## 项目图例\n\n由 PM 维护。' }),
+      );
+      listRepo.find.mockResolvedValue([makeList()] as unknown as BoardList[]);
+      taskRepo.createQueryBuilder.mockImplementation(() => ({
+        select: jest.fn().mockReturnThis(),
+        addSelect: jest.fn().mockReturnThis(),
+        innerJoin: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        setParameter: jest.fn().mockReturnThis(),
+        groupBy: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getRawMany: jest.fn().mockResolvedValue(opts.listCounts ?? []),
+        getRawOne: jest
+          .fn()
+          .mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
+        getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
+      }) as any);
+      taskRepo.find.mockImplementation(((query: any) => {
+        if (query?.where?.milestoneId !== undefined) {
+          return Promise.resolve(opts.milestoneTasks ?? []);
+        }
+        if (query?.where?.status === TaskStatus.DONE) {
+          return Promise.resolve(opts.doneRows ?? []);
+        }
+        return Promise.resolve(opts.openTasks ?? []);
+      }) as any);
+      milestoneRepo.find.mockResolvedValue(opts.milestones ?? []);
+      docSpaceRepo.findOne.mockResolvedValue(opts.space ?? null);
+      docRepo.createQueryBuilder.mockImplementation(() => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(opts.docs ?? []),
+      }) as any);
+      // assignee 解析：agent-1 → Kimi
+      actorRepo.find.mockResolvedValue([{ id: 'agent-1', type: ActorType.AGENT } as Actor]);
+      agentRepo.find.mockResolvedValue([
+        { id: 'agent-1', name: 'Kimi', avatarUrl: null, status: 'active', description: null } as any,
+      ]);
+      userRepo.find.mockResolvedValue([]);
+    };
+
+    it('assembles all sections from live state (happy path)', async () => {
+      setupDigestMocks({
+        openTasks: [
+          makeTaskRow({ id: 't1', title: 'Fix auth', priority: Priority.P0, labels: ['bug'] }),
+          makeTaskRow({ id: 't2', title: 'Refactor', priority: Priority.P2 }),
+        ],
+        riskRows: [makeTaskRow({ id: 't1', title: 'Fix auth', priority: Priority.P0, labels: ['bug'] })],
+        doneRows: [
+          makeTaskRow({ id: 't9', title: 'Ship digest', status: TaskStatus.DONE, completedAt: new Date('2024-01-05') }),
+          makeTaskRow({ id: 't8', title: 'Ship overview', status: TaskStatus.DONE, completedAt: new Date('2024-01-04') }),
+        ],
+        milestoneTasks: [
+          makeTaskRow({ id: 't3', milestoneId: 'm1', status: TaskStatus.DONE }),
+          makeTaskRow({ id: 't4', milestoneId: 'm1', status: TaskStatus.IN_PROGRESS }),
+          makeTaskRow({ id: 't5', milestoneId: 'm1', status: TaskStatus.BACKLOG }),
+        ],
+        milestones: [{ id: 'm1', name: 'v1.41', status: 'active', startDate: new Date('2024-01-01'), targetDate: new Date('2024-02-01') }],
+        listCounts: [{ listId: 'list-1', count: '3' }],
+        total: '8',
+        completed: '2',
+        space: {
+          id: 'sp-1',
+          name: 'Project Docs',
+          description: '空间图例'.repeat(100),
+        },
+        docs: [
+          { id: 'd2', path: 'docs/b.md', title: 'B', updatedAt: new Date('2024-01-02') },
+          { id: 'd1', path: 'docs/a.md', title: 'A', updatedAt: new Date('2024-01-01') },
+        ],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.boardId).toBe('board-1');
+      expect(result.boardName).toBe('Test Board');
+      expect(result.description).toBe('## 项目图例\n\n由 PM 维护。');
+      expect(result.visibility).toBe(Visibility.OPEN);
+      // taskCount 口径 = board 详情（countTasksByBoard 返回值直通）
+      expect(result.taskCount).toBe(8);
+      expect(result.completedTaskCount).toBe(2);
+      expect(result.lists).toEqual([{ id: 'list-1', name: 'To Do', mappedStatus: 'todo', taskCount: 3 }]);
+      // priorityDistribution：open 任务内存聚合（含 0 值形状稳定；t1=P0、t2=P2）
+      expect(result.priorityDistribution.open).toEqual({ p0: 1, p1: 0, p2: 1, p3: 0 });
+      // nextUp：open 任务 priority 序 + assigneeName 解析
+      expect(result.nextUp).toEqual([
+        { id: 't1', title: 'Fix auth', priority: Priority.P0, status: TaskStatus.TODO, assigneeName: 'Kimi' },
+        { id: 't2', title: 'Refactor', priority: Priority.P2, status: TaskStatus.TODO, assigneeName: 'Kimi' },
+      ]);
+      // risks：labels bug 命中；assigneeName 解析
+      expect(result.risks).toEqual([
+        { id: 't1', title: 'Fix auth', priority: Priority.P0, status: TaskStatus.TODO, labels: ['bug'], assigneeName: 'Kimi' },
+      ]);
+      expect(result.recentDone).toHaveLength(2);
+      expect(result.recentDone[0].completedAt).toEqual(new Date('2024-01-05'));
+      // milestones：stats 口径对齐 milestone.service（done 含 archived）
+      expect(result.milestones).toEqual([
+        {
+          id: 'm1',
+          name: 'v1.41',
+          status: 'active',
+          startDate: expect.any(Date),
+          targetDate: expect.any(Date),
+          stats: { total: 3, done: 1, inProgress: 1, open: 1 },
+        },
+      ]);
+      // docs：空间元数据 + 最近更新文档
+      expect(result.docs).toEqual({
+        spaceId: 'sp-1',
+        spaceName: 'Project Docs',
+        spaceDescriptionSnippet: expect.any(String),
+        recentlyUpdated: [
+          { path: 'docs/b.md', title: 'B', updatedAt: expect.any(Date) },
+          { path: 'docs/a.md', title: 'A', updatedAt: expect.any(Date) },
+        ],
+      });
+      expect(result.truncated).toBe(false);
+    });
+
+    it('queries open tasks with priority order and done tasks with completedAt desc', async () => {
+      setupDigestMocks({
+        openTasks: [makeTaskRow()],
+        doneRows: [makeTaskRow({ status: TaskStatus.DONE, completedAt: new Date('2024-01-05') })],
+        total: '1',
+        completed: '1',
+      });
+
+      await service.getDigest('board-1');
+
+      // open 查询：priority ASC（p0 在前）→ p1 → p2 → p3
+      expect(taskRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: expect.objectContaining({
+              _value: expect.any(Array),
+            }),
+          }),
+          order: { priority: 'ASC', createdAt: 'ASC' },
+        }),
+      );
+      // done 查询：completedAt DESC + take(doneLimit+1) 探针
+      expect(taskRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: TaskStatus.DONE }),
+          order: { completedAt: 'DESC', createdAt: 'DESC' },
+          take: 6,
+        }),
+      );
+      // done 查询：completedAt 非空过滤（Not(IsNull()) FindOperator）——PG DESC 默认 NULLS FIRST，
+      // 存量 NULL 行会顶到 recentDone 最前（2026-08-05 产品锚点验收暴露，铁律 #17 契约化）
+      const doneCall = (taskRepo.find as jest.Mock).mock.calls.find(
+        (c) => c[0]?.where?.status === TaskStatus.DONE,
+      );
+      expect(doneCall[0].where.completedAt).toMatchObject({ _type: 'not' });
+    });
+
+    it('filters risks via PG && overlap and excludes done/archived', async () => {
+      setupDigestMocks({ riskRows: [] });
+      await service.getDigest('board-1');
+
+      // 捕获 risks 查询链的 andWhere 调用，断言 SQL 语义
+      const qb = (taskRepo.createQueryBuilder as jest.Mock).mock.results[2].value;
+      const andWheres: any[] = [];
+      for (const call of qb.andWhere.mock.calls) andWheres.push(call);
+      expect(andWheres.some((c) => c[0].includes("labels && ARRAY['bug','debt']"))).toBe(true);
+      expect(andWheres.some((c) => c[0].includes('status NOT IN'))).toBe(true);
+    });
+
+    it('returns empty lists when limits are 0 without querying those sections', async () => {
+      setupDigestMocks({
+        openTasks: [makeTaskRow()],
+        doneRows: [makeTaskRow({ status: TaskStatus.DONE, completedAt: new Date('2024-01-05') })],
+        riskRows: [makeTaskRow({ labels: ['bug'] })],
+        total: '1',
+        completed: '1',
+        space: { id: 'sp-1', name: 'Docs', description: 'd' },
+        docs: [{ id: 'd1', path: 'docs/a.md', title: 'A', updatedAt: new Date('2024-01-01') }],
+      });
+
+      const result = await service.getDigest('board-1', {
+        openLimit: 0,
+        doneLimit: 0,
+        riskLimit: 0,
+        docsLimit: 0,
+      });
+
+      expect(result.nextUp).toEqual([]);
+      expect(result.recentDone).toEqual([]);
+      expect(result.risks).toEqual([]);
+      expect(result.docs).toEqual({
+        spaceId: 'sp-1',
+        spaceName: 'Docs',
+        spaceDescriptionSnippet: 'd',
+        recentlyUpdated: [],
+      });
+      expect(result.truncated).toBe(false);
+      // 0 limit 不查询对应段（taskRepo.find 仅 open + milestone stats 两次；docRepo 不查）
+      const findCalls = (taskRepo.find as jest.Mock).mock.calls;
+      expect(findCalls.some((c) => c[0]?.where?.status === TaskStatus.DONE)).toBe(false);
+      expect(docRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('marks truncated when nextUp exceeds openLimit', async () => {
+      const openTasks = Array.from({ length: 11 }, (_, i) =>
+        makeTaskRow({ id: `t${i}`, title: `Task ${i}`, priority: Priority.P2 }),
+      );
+      setupDigestMocks({ openTasks });
+
+      const result = await service.getDigest('board-1', { openLimit: 10 });
+
+      expect(result.nextUp).toHaveLength(10);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('returns null description when board has no description', async () => {
+      setupDigestMocks({});
+      boardRepo.findOne.mockResolvedValue(
+        makeBoard({ id: 'board-1', description: null }),
+      );
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.description).toBeNull();
+    });
+
+    it('returns null description when includeDescription=false (legend omitted)', async () => {
+      setupDigestMocks({});
+
+      const result = await service.getDigest('board-1', { includeDescription: false });
+
+      expect(result.description).toBeNull();
+    });
+
+    it('returns docs: null when board has no bound DocSpace', async () => {
+      setupDigestMocks({ space: null });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.docs).toBeNull();
+      expect(result.truncated).toBe(false);
+    });
+
+    // ── v1.42 versions 版本区：三区口径 + 截断 + 零新查询（内存装配） ──
+    it('versions: 无 release（version 全空）→ production/development null + history [] + total 0', async () => {
+      setupDigestMocks({
+        milestones: [{ id: 'm1', name: 'v1.41', status: 'active', createdAt: new Date('2024-01-01') }],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.versions).toEqual({ production: null, development: null, history: [], total: 0 });
+      expect(result.truncated).toBe(false);
+    });
+
+    it('versions: 仅 dev release → development 命中、production null、history 含该行', async () => {
+      setupDigestMocks({
+        milestones: [
+          makeMilestone({ id: 'r1', name: 'v1.42', version: '1.42.0', status: 'dev', createdAt: new Date('2024-02-01') }),
+        ],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.versions.production).toBeNull();
+      expect(result.versions.development).toMatchObject({ id: 'r1', version: '1.42.0', status: 'dev' });
+      expect(result.versions.history).toHaveLength(1);
+      expect(result.versions.history[0].version).toBe('1.42.0');
+      expect(result.versions.total).toBe(1);
+    });
+
+    it('versions: 仅 deployed release → production 命中、development null', async () => {
+      setupDigestMocks({
+        milestones: [
+          makeMilestone({
+            id: 'r1', name: 'v1.40', version: '1.40.0', status: 'deployed',
+            deployedAt: new Date('2024-01-01'), createdAt: new Date('2024-01-01'),
+          }),
+        ],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.versions.production).toMatchObject({ id: 'r1', version: '1.40.0', status: 'deployed' });
+      expect(result.versions.development).toBeNull();
+      expect(result.versions.total).toBe(1);
+    });
+
+    it('versions: 混合排序 deployedAt DESC NULLS LAST + createdAt DESC（未部署 release 沉底）', async () => {
+      setupDigestMocks({
+        milestones: [
+          makeMilestone({ id: 'r1', version: '1.0.0', status: 'deployed', deployedAt: new Date('2024-03-01'), createdAt: new Date('2024-01-01') }),
+          makeMilestone({ id: 'r2', version: '1.1.0', status: 'ready', deployedAt: null, createdAt: new Date('2024-02-01') }),
+          makeMilestone({ id: 'r3', version: '1.0.1', status: 'verified', deployedAt: new Date('2024-02-01'), createdAt: new Date('2024-01-15') }),
+          makeMilestone({ id: 'r4', version: '1.2.0', status: 'dev', deployedAt: null, createdAt: new Date('2024-03-01') }),
+        ],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      // production = deployed/verified 中 deployedAt 最新（r1）；verified 也是 production 候选（r3）
+      expect(result.versions.production?.id).toBe('r1');
+      // development = dev/ready 中 createdAt 最新（r4 > r2）
+      expect(result.versions.development?.id).toBe('r4');
+      // history：有 deployedAt 的按 DESC 在前（r1→r3），NULL deployedAt 沉底按 createdAt DESC（r4→r2）
+      expect(result.versions.history.map((h) => h.id)).toEqual(['r1', 'r3', 'r4', 'r2']);
+      expect(result.versions.total).toBe(4);
+    });
+
+    it('versions: versionLimit 截断 → history 截断 + total 全量 + truncated=true', async () => {
+      const releases = Array.from({ length: 7 }, (_, i) =>
+        makeMilestone({
+          id: `rel-${i}`,
+          version: `1.${i}.0`,
+          status: 'deployed',
+          deployedAt: new Date(`2024-01-${String(i + 1).padStart(2, '0')}`),
+          createdAt: new Date(`2024-01-${String(i + 1).padStart(2, '0')}`),
+        }),
+      );
+      setupDigestMocks({ milestones: releases });
+
+      const result = await service.getDigest('board-1', { versionLimit: 2 });
+
+      expect(result.versions.history).toHaveLength(2);
+      // deployedAt 最新（rel-6 = 1.6.0）排最前；production 同口径
+      expect(result.versions.history[0].version).toBe('1.6.0');
+      expect(result.versions.production?.version).toBe('1.6.0');
+      expect(result.versions.total).toBe(7);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('versions: versionLimit=0 → history 空数组但不截断（对齐 limit=0 显式空段惯例）', async () => {
+      setupDigestMocks({
+        milestones: [
+          makeMilestone({ id: 'r1', version: '1.0.0', status: 'deployed', deployedAt: new Date('2024-01-01') }),
+        ],
+      });
+
+      const result = await service.getDigest('board-1', { versionLimit: 0 });
+
+      expect(result.versions.history).toEqual([]);
+      expect(result.versions.total).toBe(1);
+      expect(result.truncated).toBe(false);
+    });
+
+    it('versions/milestones: release 里程碑投影 version/deployedAt/verifiedAt 且不含 body/deployMeta', async () => {
+      setupDigestMocks({
+        milestones: [
+          makeMilestone({
+            id: 'm1', name: 'v1.42', version: '1.42.0', status: 'verified',
+            deployedAt: new Date('2024-01-01'), verifiedAt: new Date('2024-01-02'),
+            body: 'should-not-leak', deployMeta: { anchors: ['health-ok'] },
+            createdAt: new Date('2024-01-01'),
+          }),
+        ],
+      });
+
+      const result = await service.getDigest('board-1');
+
+      const m = result.milestones[0];
+      expect(m.version).toBe('1.42.0');
+      expect(m.deployedAt).toEqual(new Date('2024-01-01'));
+      expect(m.verifiedAt).toEqual(new Date('2024-01-02'));
+      expect('body' in m).toBe(false);
+      expect('deployMeta' in m).toBe(false);
+      const v = result.versions.production;
+      expect(v?.version).toBe('1.42.0');
+      expect(v?.deployedAt).toEqual(new Date('2024-01-01'));
+      expect('body' in (v as any)).toBe(false);
+      expect('deployMeta' in (v as any)).toBe(false);
+    });
+
+    // ── v1.42 metrics：settings.metrics 透传不加工（report-metrics.mjs 上报的机器事实） ──
+    it('metrics: settings 无 metrics → null', async () => {
+      setupDigestMocks({});
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.metrics).toBeNull();
+    });
+
+    it('metrics: settings.metrics 存在 → 透传原样（含任意嵌套结构）', async () => {
+      setupDigestMocks({});
+      boardRepo.findOne.mockResolvedValue(
+        makeBoard({
+          id: 'board-1',
+          description: null,
+          settings: {
+            visibility: Visibility.OPEN,
+            metrics: {
+              testBaseline: { backend: { suites: 75, tests: 1214 }, e2e: { suites: 6, tests: 75 } },
+              mcpTools: { worker: 44, full: 146 },
+              updatedAt: '2026-08-05T00:00:00.000Z',
+            },
+          },
+        }),
+      );
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.metrics).toEqual({
+        testBaseline: { backend: { suites: 75, tests: 1214 }, e2e: { suites: 6, tests: 75 } },
+        mcpTools: { worker: 44, full: 146 },
+        updatedAt: '2026-08-05T00:00:00.000Z',
+      });
+    });
+
+    it('throws 404 when board does not exist', async () => {
+      boardRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getDigest('board-404')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('updateMetrics (v1.42: PUT /boards/:id/metrics 原子 jsonb_set)', () => {
+    // 返回的 settings 预置既有键（visibility/archived_lists_visible）——jsonb_set 语义下
+    // 这些键由 SQL 保证不被覆盖；service 只透传 RETURNING 的 settings.metrics
+    const storedSettings = {
+      visibility: 'private',
+      archived_lists_visible: true,
+      metrics: { testBaseline: { backend: { suites: 76, tests: 1229 } } },
+    };
+
+    it('executes single atomic jsonb_set SQL and returns settings.metrics', async () => {
+      boardRepo.query.mockResolvedValue([{ settings: storedSettings }]);
+
+      const metrics = { testBaseline: { backend: { suites: 76, tests: 1229 } } };
+      const result = await service.updateMetrics('board-1', metrics);
+
+      expect(result).toEqual({ metrics: metrics });
+      // 单条原子 SQL：jsonb_set 只动 metrics 键（$1::jsonb），id 定位（$2），RETURNING 免重查
+      expect(boardRepo.query).toHaveBeenCalledTimes(1);
+      const [sql, params] = boardRepo.query.mock.calls[0];
+      expect(sql).toContain(`jsonb_set(settings, '{metrics}', $1::jsonb)`);
+      expect(sql).toContain('WHERE id = $2');
+      expect(sql).toContain('RETURNING settings');
+      expect(params).toEqual([JSON.stringify(metrics), 'board-1']);
+    });
+
+    it('overwrites metrics key while preserving pre-existing settings keys (merge semantics)', async () => {
+      boardRepo.query.mockResolvedValue([
+        { settings: { ...storedSettings, metrics: { newBaseline: { suites: 1 } } } },
+      ]);
+
+      const result = await service.updateMetrics('board-1', { newBaseline: { suites: 1 } });
+
+      // 断言 RETURNING 的 settings 完整包含既有键 + 新 metrics（jsonb_set 的合并结果）
+      expect(result.metrics).toEqual({ newBaseline: { suites: 1 } });
+      const [sql] = boardRepo.query.mock.calls[0];
+      // 只动 metrics 键：SQL 不含 visibility/archived_lists_visible 的整对象覆盖
+      expect(sql).not.toContain('archived_lists_visible');
+      expect(sql).not.toContain('visibility');
+    });
+
+    it('throws BOARD_NOT_FOUND when no row affected (TOCTOU 兜底, 铁律 #22)', async () => {
+      boardRepo.query.mockResolvedValue([]);
+
+      await expect(service.updateMetrics('board-gone', {})).rejects.toMatchObject({
+        message: 'Board not found',
+        response: expect.objectContaining({ code: ErrorCode.BOARD_NOT_FOUND }),
+      });
     });
   });
 });

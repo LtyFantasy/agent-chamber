@@ -6,6 +6,7 @@ import { DocCategory } from '../../database/entities/doc-category.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
+import { DocRoute } from '../../database/entities/doc-route.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
@@ -31,6 +32,7 @@ describe('DocSpaceService', () => {
   let docRepo: jest.Mocked<Repository<Doc>>;
   let sectionRepo: jest.Mocked<Repository<DocSection>>;
   let taskDocLinkRepo: jest.Mocked<Repository<TaskDocLink>>;
+  let routeRepo: jest.Mocked<Repository<DocRoute>>;
   let agentRepo: jest.Mocked<Repository<Agent>>;
   let userRepo: jest.Mocked<Repository<User>>;
   let actorRepo: jest.Mocked<Repository<Actor>>;
@@ -107,6 +109,8 @@ describe('DocSpaceService', () => {
       save: jest.fn((x: unknown) => Promise.resolve(x)),
       create: jest.fn((x: unknown) => x),
       createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+      // v1.42 批次 C2：updateRepoManifest 走原生 jsonb_set SQL（board updateMetrics 同款）
+      query: jest.fn(),
       manager: {
         transaction: jest.fn((fn: any) => fn({
           createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
@@ -179,6 +183,11 @@ describe('DocSpaceService', () => {
       getAccessibleDocSpaceIds: jest.fn().mockResolvedValue(null),
     } as unknown as jest.Mocked<AccessQueryService>;
 
+    routeRepo = {
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn(),
+    } as unknown as jest.Mocked<Repository<DocRoute>>;
+
     resourceValidator = {
       exists: jest.fn().mockResolvedValue({ id: 'agent-1' } as Agent),
       existsMany: jest.fn().mockResolvedValue([]),
@@ -193,6 +202,7 @@ describe('DocSpaceService', () => {
       docRepo,
       sectionRepo,
       taskDocLinkRepo,
+      routeRepo,
       agentRepo,
       userRepo,
       actorRepo,
@@ -220,6 +230,80 @@ describe('DocSpaceService', () => {
       await expect(service.findById('space-1')).rejects.toMatchObject({
         response: { code: ErrorCode.DOC_SPACE_NOT_FOUND },
       });
+    });
+  });
+
+  // ─── updateRepoManifest（v1.42 批次 C2）────────────────────
+
+  describe('updateRepoManifest', () => {
+    const sha = 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d';
+    const files = ['apps/backend/src/app.module.ts', 'docs/architecture.md'];
+
+    it('原子 jsonb_set：单条 UPDATE 只动 repoManifest 键，params=[序列化清单, spaceId]', async () => {
+      const storedManifest = {
+        sha,
+        files,
+        reportedAt: '2026-08-06T00:00:00.000Z',
+      };
+      spaceRepo.query.mockResolvedValue([
+        { settings: { visibility: Visibility.OPEN, repoManifest: storedManifest } },
+      ]);
+
+      const result = await service.updateRepoManifest('space-1', { sha, files });
+
+      expect(spaceRepo.query).toHaveBeenCalledTimes(1);
+      const [sql, params] = spaceRepo.query.mock.calls[0] as [string, [string, string]];
+      expect(sql).toContain("jsonb_set(settings, '{repoManifest}', $1::jsonb)");
+      expect(sql).toContain('deleted_at IS NULL');
+      expect(params[1]).toBe('space-1');
+      // 序列化载荷 = { sha, files, reportedAt }：reportedAt 服务端生成（ISO），非客户端传入
+      const payload = JSON.parse(params[0]) as {
+        sha: string;
+        files: string[];
+        reportedAt: string;
+      };
+      expect(payload.sha).toBe(sha);
+      expect(payload.files).toEqual(files);
+      expect(payload.reportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      // 返回写后 settings.repoManifest（RETURNING 读回，无第二次查询）
+      expect(result.repoManifest).toEqual(storedManifest);
+    });
+
+    it('reportedAt 由服务端 now 生成（合法 ISO 时间戳），请求载荷不含该键', async () => {
+      spaceRepo.query.mockResolvedValue([{ settings: { repoManifest: null } }]);
+
+      await service.updateRepoManifest('space-1', { sha, files });
+
+      const [, params] = spaceRepo.query.mock.calls[0] as [string, [string, string]];
+      const payload = JSON.parse(params[0]) as { reportedAt: string };
+      expect(payload.reportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      expect(new Date(payload.reportedAt).toISOString()).toBe(payload.reportedAt);
+    });
+
+    it('空间不存在（0 行 RETURNING）→ 404 DOC_SPACE_NOT_FOUND（TOCTOU 兜底，铁律 #22）', async () => {
+      spaceRepo.query.mockResolvedValue([]);
+
+      await expect(service.updateRepoManifest('space-1', { sha, files })).rejects.toMatchObject({
+        response: { code: ErrorCode.DOC_SPACE_NOT_FOUND },
+      });
+    });
+
+    it('settings 既有键不受影响——SQL 形状即语义：单条 UPDATE + jsonb_set 片段（非 read-modify-write）', async () => {
+      spaceRepo.query.mockResolvedValue([
+        {
+          settings: {
+            visibility: Visibility.PRIVATE,
+            overviewFilter: { excludeTypes: ['memory'] },
+            repoManifest: { sha, files, reportedAt: '2026-08-06T00:00:00.000Z' },
+          },
+        },
+      ]);
+
+      await service.updateRepoManifest('space-1', { sha, files });
+
+      const sql = spaceRepo.query.mock.calls[0][0] as string;
+      expect(sql).toMatch(/^UPDATE doc_spaces SET settings = jsonb_set\(/);
+      expect(spaceRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -673,6 +757,7 @@ describe('DocSpaceService', () => {
         tags: [],
         source: 'native',
         contentHash: null,
+        sourceSha: null,
         sectionCount: 1,
         tokenEstimate: 39000,
         linkHealth: null,
@@ -693,6 +778,112 @@ describe('DocSpaceService', () => {
       expect(result.totalTokenEstimate).toBeLessThan(100);
     });
 
+    // ─── v1.42 B6 linkHealth 汇总 + sourceSha 透出 ─────────────
+
+    it('surfaces brokenLinkCount per doc + totalBrokenLinks (sum over visible docs) + sourceSha', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+
+      // 三态：2 断链 / 0 断链（已检查）/ NULL 未检查
+      const docs = [
+        makeOverviewDoc({
+          id: 'doc-broken',
+          path: 'a.md',
+          sourceSha: 'sha-1',
+          linkHealth: {
+            total: 3,
+            broken: ['/docs/x', '/docs/y'],
+            checkedAt: '2026-08-05T00:00:00Z',
+          },
+        }),
+        makeOverviewDoc({
+          id: 'doc-clean',
+          path: 'b.md',
+          linkHealth: { total: 1, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+        }),
+        makeOverviewDoc({ id: 'doc-unchecked', path: 'c.md', linkHealth: null }),
+      ] as Doc[];
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(docs);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1');
+      const byPath = Object.fromEntries(result.uncategorized.map((d) => [d.path, d]));
+      expect(byPath['a.md'].brokenLinkCount).toBe(2);
+      expect(byPath['b.md'].brokenLinkCount).toBe(0); // 已检查且 0 断链：0 而非缺省
+      expect(byPath['c.md'].brokenLinkCount).toBeUndefined(); // 未检查（NULL）：省略
+      expect(result.totalBrokenLinks).toBe(2);
+      expect(byPath['a.md'].sourceSha).toBe('sha-1');
+      // 实体字段直拷：无验证记录 = null（与 brokenLinkCount 的"未检查省略"语义不同）
+      expect(byPath['b.md'].sourceSha).toBeNull();
+    });
+
+    it('totalBrokenLinks: omitted when no doc checked; 0 returned when checked docs have no broken links', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+
+      // 全部文档 linkHealth = NULL（未检查）→ 省略 totalBrokenLinks（与"检查过且 0 断链"区分）
+      const unchecked = [makeOverviewDoc({ id: 'd1', path: 'a.md' })] as Doc[];
+      const uncheckedQb = createMockQueryBuilder([], 0);
+      uncheckedQb.getMany = jest.fn().mockResolvedValue(unchecked);
+      docRepo.createQueryBuilder.mockReturnValue(uncheckedQb);
+      const r1 = await service.getOverview('space-1');
+      expect(r1.totalBrokenLinks).toBeUndefined();
+
+      // 有已检查文档且全 0 断链 → totalBrokenLinks = 0 返回
+      const clean = [
+        makeOverviewDoc({
+          id: 'd1',
+          path: 'a.md',
+          linkHealth: { total: 1, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+        }),
+      ] as Doc[];
+      const cleanQb = createMockQueryBuilder([], 0);
+      cleanQb.getMany = jest.fn().mockResolvedValue(clean);
+      docRepo.createQueryBuilder.mockReturnValue(cleanQb);
+      const r2 = await service.getOverview('space-1');
+      expect(r2.totalBrokenLinks).toBe(0);
+    });
+
+    it('totalBrokenLinks counts only visible (post-filter) docs', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+
+      // memory 文档（将被 excludeType 过滤）带断链；可见 guide 文档 0 断链
+      const docs = [
+        makeOverviewDoc({
+          id: 'doc-memory',
+          path: 'memory/m.md',
+          docType: 'memory',
+          linkHealth: { total: 2, broken: ['/docs/x'], checkedAt: '2026-08-05T00:00:00Z' },
+        }),
+        makeOverviewDoc({
+          id: 'doc-guide',
+          path: 'docs/g.md',
+          docType: 'guide',
+          linkHealth: { total: 1, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+        }),
+      ] as Doc[];
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(docs);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1', { excludeType: 'memory' });
+      // 过滤掉 memory 文档后：可见文档 0 断链 → totalBrokenLinks = 0（1 被过滤不计入）
+      expect(result.uncategorized.map((d) => d.path)).toEqual(['docs/g.md']);
+      expect(result.totalBrokenLinks).toBe(0);
+    });
+
     it('sets truncated when map row footprint cap exceeded', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
@@ -701,8 +892,8 @@ describe('DocSpaceService', () => {
       catQb.getMany = jest.fn().mockResolvedValue([]);
       categoryRepo.createQueryBuilder.mockReturnValue(catQb);
 
-      // 单条 summary 500 字符（CJK≈500 token），9 条即超 4000 上限
-      const docs = Array.from({ length: 10 }, (_, i) => ({
+      // 单条 summary 500 字符（CJK≈500 token），50 条即超 20000 上限（v1.41 图例化后默认 cap 放宽）
+      const docs = Array.from({ length: 50 }, (_, i) => ({
         id: `doc-${i}`,
         spaceId: 'space-1',
         categoryId: null,
@@ -713,6 +904,7 @@ describe('DocSpaceService', () => {
         tags: [],
         source: 'native',
         contentHash: null,
+        sourceSha: null,
         sectionCount: 1,
         tokenEstimate: 600,
         linkHealth: null,
@@ -729,7 +921,7 @@ describe('DocSpaceService', () => {
       const result = await service.getOverview('space-1');
       expect(result.truncated).toBe(true);
       expect(result.uncategorized.length).toBeGreaterThan(0);
-      expect(result.uncategorized.length).toBeLessThan(10);
+      expect(result.uncategorized.length).toBeLessThan(50);
     });
 
     // ─── v1.38 可配置过滤 ─────────────────────────────────
@@ -747,6 +939,7 @@ describe('DocSpaceService', () => {
         tags: [],
         source: 'native',
         contentHash: null,
+        sourceSha: null,
         sectionCount: 1,
         tokenEstimate: 100,
         linkHealth: null,
@@ -1043,6 +1236,368 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1');
       expect(result.appliedFilters).toBeUndefined();
+    });
+
+    // ─── v1.41 空间图例（description 内嵌 + legendTokenEstimate 单列） ────
+
+    it('默认内嵌 spaceDescription 图例全文（legendTokenEstimate 单列，totalTokenEstimate 合计）', async () => {
+      const space = makeSpace({ description: '## 空间图例\n\n由 PM 维护的 INDEX。' });
+      mockOverview([], [], space);
+
+      const result = await service.getOverview('space-1');
+      expect(result.spaceDescription).toBe('## 空间图例\n\n由 PM 维护的 INDEX。');
+      expect(result.legendTokenEstimate).toBeDefined();
+      expect(result.legendTokenEstimate).toBeGreaterThan(0);
+      // 空文档时 totalTokenEstimate = 图例 token（仅信息回显）
+      expect(result.totalTokenEstimate).toBe(result.legendTokenEstimate);
+    });
+
+    it('includeDescription=false → 省略 spaceDescription/legendTokenEstimate', async () => {
+      const space = makeSpace({ description: '## 图例' });
+      mockOverview([], [], space);
+
+      const result = await service.getOverview('space-1', { includeDescription: false });
+      expect(result.spaceDescription).toBeUndefined();
+      expect(result.legendTokenEstimate).toBeUndefined();
+      expect(result.totalTokenEstimate).toBe(0);
+    });
+
+    it('description 为空 → 不携带图例字段（向后兼容）', async () => {
+      mockOverview([], [], makeSpace({ description: null }));
+
+      const result = await service.getOverview('space-1');
+      expect(result.spaceDescription).toBeUndefined();
+      expect(result.legendTokenEstimate).toBeUndefined();
+    });
+
+    it('图例 token 不占 maxTokens 预算（万级图例 + 小预算，文档仍全量不截断）', async () => {
+      // 10000 CJK 图例（≈10000 token）远超大预算上限 2000：图例仍全量内嵌，文档条目不受影响
+      const space = makeSpace({ description: '摘'.repeat(10000) });
+      const docs = [makeOverviewDoc({ id: 'd1' })];
+      mockOverview([], docs, space);
+
+      const result = await service.getOverview('space-1', { maxTokens: 2000 });
+      expect(result.truncated).toBe(false);
+      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(result.spaceDescription).toBe('摘'.repeat(10000));
+      expect(result.legendTokenEstimate).toBe(10000);
+      // totalTokenEstimate = 图例 + 文档条目合计（仅信息回显，可超 maxTokens）
+      expect(result.totalTokenEstimate).toBeGreaterThan(10000);
+    });
+
+    it('文档截断时图例仍全量返回（truncated 语义不变，仅文档条目截断）', async () => {
+      const space = makeSpace({ description: '## 图例' });
+      const docs = Array.from({ length: 3 }, (_, i) =>
+        makeOverviewDoc({ id: `d${i}`, summary: '摘'.repeat(500) }),
+      );
+      mockOverview([], docs, space);
+
+      const result = await service.getOverview('space-1', { maxTokens: 1000 });
+      expect(result.truncated).toBe(true);
+      expect(result.spaceDescription).toBe('## 图例');
+      expect(result.legendTokenEstimate).toBeDefined();
+      // 截断后文档数仍少于全部（预算只装文档条目）
+      expect(result.uncategorized.length).toBeLessThan(3);
+    });
+
+    // ─── v1.42 B5 意图路由内嵌（routes 全量返回 + routesTokenEstimate 单列） ────
+
+    it('默认内嵌 routes 全量（routesTokenEstimate 单列计入 totalTokenEstimate，不占文档预算）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r1',
+          spaceId: 'space-1',
+          intent: '我要了解系统架构',
+          category: 'architecture',
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: '## 3. 架构总览',
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: 'apps/backend/src/app.module.ts',
+          sortOrder: 1,
+          createdBy: 'user-1',
+          createdAt: new Date('2024-01-01'),
+          updatedAt: new Date('2024-01-01'),
+        },
+        {
+          id: 'r2',
+          spaceId: 'space-1',
+          intent: '我要了解数据库设计',
+          category: 'architecture',
+          primaryDocId: 'doc-2',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date('2024-01-02'),
+          updatedAt: new Date('2024-01-02'),
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.routes).toHaveLength(2);
+      // 响应 DTO 投影：保留完整字段（含 intent/category/headingPath/codeEntry）
+      expect(result.routes![0]).toMatchObject({
+        id: 'r1',
+        intent: '我要了解系统架构',
+        category: 'architecture',
+        primaryHeadingPath: '## 3. 架构总览',
+        codeEntry: 'apps/backend/src/app.module.ts',
+      });
+      // routesTokenEstimate 单列（序列化 routes 的 CJK 感知估算），计入 totalTokenEstimate
+      expect(result.routesTokenEstimate).toBeGreaterThan(0);
+      // makeSpace 默认 description='A test space' → totalTokenEstimate = 图例 + routes 合计
+      expect(result.totalTokenEstimate).toBe(
+        result.legendTokenEstimate! + result.routesTokenEstimate!,
+      );
+      // 空文档时 truncated 仍为 false（routes 不参与文档条目预算竞争）
+      expect(result.truncated).toBe(false);
+    });
+
+    it('includeRoutes=false → 省略 routes/routesTokenEstimate（省 token 逃生门）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1', { includeRoutes: false });
+      expect(result.routes).toBeUndefined();
+      expect(result.routesTokenEstimate).toBeUndefined();
+      // includeRoutes=false 时不查 routes（省一次查询）
+      expect(routeRepo.find).not.toHaveBeenCalled();
+      // makeSpace 默认 description='A test space' → totalTokenEstimate 仅含图例
+      expect(result.totalTokenEstimate).toBe(result.legendTokenEstimate!);
+    });
+
+    it('routes 不占 maxTokens 预算（大路由集合 + 小预算，文档仍全量不截断）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([makeOverviewDoc({ id: 'd1' })]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      // 50 条 CJK 意图路由（序列化估算 ≈ 数千 token）远超预算 500：仍全量返回不截断
+      const routeRows = Array.from({ length: 50 }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `我要了解第 ${i} 号功能的实现细节`,
+        category: 'reference',
+        primaryDocId: 'doc-1',
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1', { maxTokens: 500 });
+      expect(result.routes).toHaveLength(50);
+      expect(result.truncated).toBe(false);
+      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      // totalTokenEstimate = 文档条目 + routes（仅信息回显，可超 maxTokens）
+      expect(result.totalTokenEstimate).toBeGreaterThan(500);
+    });
+
+    // ─── v1.42 批次 C1 路由健康透出（health 原样透传 + totalBrokenRoutes 省略键语义） ────
+
+    it('routes 段每条 health 原样透传（NULL=未检与已检值均透传）；broken 路由计入 totalBrokenRoutes', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r1',
+          spaceId: 'space-1',
+          intent: '我要了解系统架构',
+          category: null,
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: {
+            issues: [{ kind: 'heading', target: 'primary', value: '## 悬空的节' }],
+            checkedAt: '2026-08-06T00:00:00.000Z',
+          },
+        },
+        {
+          id: 'r2',
+          spaceId: 'space-1',
+          intent: '我要了解数据库设计',
+          category: null,
+          primaryDocId: 'doc-2',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 1,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: { issues: [], checkedAt: '2026-08-06T00:00:00.000Z' },
+        },
+        {
+          id: 'r3',
+          spaceId: 'space-1',
+          intent: '未检路由',
+          category: null,
+          primaryDocId: 'doc-3',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 2,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: null, // 未检（NULL）——不参与汇总也不省略别的路由的结果
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      // health 原样透传：已检值完整保留、NULL 透传为 null（区别于 brokenLinkCount 的省略语义）
+      expect(result.routes![0].health).toEqual({
+        issues: [{ kind: 'heading', target: 'primary', value: '## 悬空的节' }],
+        checkedAt: '2026-08-06T00:00:00.000Z',
+      });
+      expect(result.routes![1].health).toEqual({ issues: [], checkedAt: '2026-08-06T00:00:00.000Z' });
+      expect(result.routes![2].health).toBeNull();
+      // 有已检路由（r1/r2）→ totalBrokenRoutes 返回；只数 issues.length>0 的路由（r1），未检 r3 不计
+      expect(result.totalBrokenRoutes).toBe(1);
+    });
+
+    it('totalBrokenRoutes：全部路由未检（health NULL）→ 省略该键（"全健康"≠"从未检查"）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r1',
+          spaceId: 'space-1',
+          intent: '未检 1',
+          category: null,
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: null,
+        },
+        {
+          id: 'r2',
+          spaceId: 'space-1',
+          intent: '未检 2',
+          category: null,
+          primaryDocId: 'doc-2',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 1,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: null,
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.totalBrokenRoutes).toBeUndefined();
+    });
+
+    it('totalBrokenRoutes：有已检路由且全健康 → 0 返回（合法结果，区别于省略）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r1',
+          spaceId: 'space-1',
+          intent: '健康路由',
+          category: null,
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: { issues: [], checkedAt: '2026-08-06T00:00:00.000Z' },
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.totalBrokenRoutes).toBe(0);
+    });
+
+    it('includeRoutes=false → totalBrokenRoutes 同步省略（无 routes 可统计）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1', { includeRoutes: false });
+      expect(result.routes).toBeUndefined();
+      expect(result.totalBrokenRoutes).toBeUndefined();
+      expect(routeRepo.find).not.toHaveBeenCalled();
     });
   });
 

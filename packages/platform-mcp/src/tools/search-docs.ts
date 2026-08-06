@@ -4,7 +4,8 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: plan §5 W5 (search_docs 契约)
- *   - 补充: plan §4.5 (双路检索 + snippet), plan §1.1-13 (position 定位)
+ *   - 补充: plan §4.5 (双路检索 + snippet), plan §1.1-13 (position 定位),
+ *     plan §4-C3 (意图融合检索：boosts 可解释性透出)
  *
  * [踩坑索引] -
  *
@@ -86,16 +87,20 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
  * search_docs — 文档语义搜索
  *
  * 解析 spaceName → 调用双路检索 → 投影 hits 为紧凑摘要。
- * 返回 top-k hits：{docId, docPath, docTitle, headingPath, position, snippet, score}。
+ * 返回 top-k hits：{docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}。
+ * boosts 为三路融合加权来源（plan §4-C3）：route = 策展路由命中（primary ×1.5 / secondary ×1.2）、
+ * taskLinks = 关联任务数（×1+min(c,5)×0.05 封顶 ×1.25）；无 boost 的命中省略该键。
  * docId + position 保留供 read_doc 接续定位。
  */
 export const searchDocsTool: CustomTool = {
   tool: {
     name: 'search_docs',
     description:
-      'Search documents in a DocSpace using dual-scoring (ts_rank + pg_trgm). ' +
+      'Search documents in a DocSpace using dual-scoring (ts_rank + pg_trgm) ' +
+      'plus intent fusion boosts (curated routes ×1.5/×1.2 and task-link count ×1..×1.25). ' +
       'Resolves spaceName via three-layer match. ' +
-      'Returns top-k hits projected to {docId, docPath, docTitle, headingPath, position, snippet, score}. ' +
+      'Returns top-k hits projected to {docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}. ' +
+      'boosts: {route: "primary"|"secondary", taskLinks} explains why a hit ranked high. ' +
       'docId + position are preserved for read_doc follow-up.',
     inputSchema: {
       type: 'object',

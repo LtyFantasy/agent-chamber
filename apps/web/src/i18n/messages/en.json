@@ -450,9 +450,18 @@
         "planned": "Planned",
         "active": "Active",
         "completed": "Completed",
-        "cancelled": "Cancelled"
-      }
+        "cancelled": "Cancelled",
+        "dev": "In development",
+        "ready": "Ready to deploy",
+        "deployed": "Deployed",
+        "verified": "Verified"
+      },
+      "versionPlaceholder": "Version (optional, e.g. 1.42.0) — becomes a release milestone",
+      "versionReadonlyHint": "Version is fixed once created (release identity)",
+      "bodyPlaceholder": "Release notes (optional; leave empty to keep current on edit)"
     },
+    "descriptionExpand": "Expand description",
+    "descriptionCollapse": "Collapse description",
     "filter": {
       "activeTasks": "Active tasks",
       "allStatuses": "All statuses",
@@ -540,7 +549,9 @@
       "searchHits": "Search results",
       "filterByTag": "Filter by tag \"{tag}\"",
       "contentLoadError": "Failed to load document content",
-      "contentLoadErrorDesc": "Check your connection and try again"
+      "contentLoadErrorDesc": "Check your connection and try again",
+      "legendExpand": "Expand legend",
+      "legendCollapse": "Collapse legend"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",

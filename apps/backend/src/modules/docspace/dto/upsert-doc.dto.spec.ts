@@ -49,4 +49,20 @@ describe('UpsertDocDto', () => {
     const errors = await validate(dto);
     expect(errors.some((e) => e.property === 'tags' && e.constraints?.maxLength)).toBe(true);
   });
+
+  it('accepts a valid sourceSha (last-verified git sha)', async () => {
+    const dto = makeValidDto();
+    dto.sourceSha = 'a'.repeat(40); // git rev-parse HEAD 40 hex
+
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects sourceSha exceeding 64 chars (must be 400, not PG 22001 → 500)', async () => {
+    const dto = makeValidDto();
+    dto.sourceSha = 'a'.repeat(65);
+
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'sourceSha' && e.constraints?.maxLength)).toBe(true);
+  });
 });

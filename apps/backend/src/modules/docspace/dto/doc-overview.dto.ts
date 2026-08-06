@@ -48,6 +48,8 @@ const CSV_FILTER_MAX_LENGTH = 512;
  * - 传 category 白名单时 uncategorized 段省略；excludeCategory 时保留
  * - per-call 显式传参逐字段覆盖空间级默认过滤（settings.overviewFilter）
  * - applySpaceDefaults=false 为逃生门：完全忽略空间级默认过滤（本次要全量）
+ * - includeDescription（v1.41）：缺省 true（内嵌空间图例全文）；显式 false 省略 spaceDescription/legendTokenEstimate
+ * - includeRoutes（v1.42 B5）：缺省 true（内嵌全量意图路由）；显式 false 省略 routes/routesTokenEstimate
  */
 export class DocOverviewQueryDto {
   @IsOptional()
@@ -114,14 +116,60 @@ export class DocOverviewQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(500)
-  @Max(16000)
+  @Max(50000)
   @ApiPropertyOptional({
-    description: 'Override the ~4000 default token cap (range 500–16000).',
+    description:
+      'Override the ~20000 default token cap (range 500–50000). Applies to doc entries only; ' +
+      'the space legend (spaceDescription) is always returned in full and does not consume this budget.',
     minimum: 500,
-    maximum: 16000,
-    example: 6000,
+    maximum: 50000,
+    example: 20000,
   })
   maxTokens?: number;
+
+  /**
+   * 是否内嵌空间图例（spaceDescription 全文，v1.41）：query 参数均为字符串，
+   * 故用 @Transform 严格解析（对齐 applySpaceDefaults 的惯例，评审 B2）：
+   * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：缺省视为 true（默认内嵌图例）；显式 false 时响应省略 spaceDescription/legendTokenEstimate。
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Include the space description (legend) in the response. Default true; ' +
+      "pass 'false' to omit spaceDescription/legendTokenEstimate.",
+    example: 'true',
+  })
+  includeDescription?: boolean;
+
+  /**
+   * 是否内嵌意图路由（routes，v1.42 批次 B5）：query 参数均为字符串，
+   * 用 @Transform 严格解析（对齐 includeDescription 的惯例）：
+   * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：缺省视为 true（默认内嵌全量 routes）；显式 false 时响应省略 routes/routesTokenEstimate。
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Include the intent routes (doc_routes) in the response. Default true; ' +
+      "pass 'false' to omit routes/routesTokenEstimate.",
+    example: 'true',
+  })
+  includeRoutes?: boolean;
 
   /**
    * 逃生门：query 参数均为字符串，class-validator 的 @IsBoolean 无法直接校验字符串，

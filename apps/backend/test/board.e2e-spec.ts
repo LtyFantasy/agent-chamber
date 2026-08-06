@@ -309,4 +309,162 @@ describe('BoardController (e2e)', () => {
         expect(res.body.data).toHaveProperty('name', 'Renamed By Owner');
       });
   });
+
+  // ==================== v1.41 Board Digest（GET /boards/:id/digest） ====================
+
+  const makeDigestMocks = (opts: {
+    openTasks?: any[];
+    doneRows?: any[];
+    milestoneTasks?: any[];
+    riskRows?: any[];
+    total?: string;
+    completed?: string;
+    space?: any;
+    docs?: any[];
+  }) => {
+    mockRepos.Board.findOne.mockResolvedValue(
+      makeBoard([makeList()]) // findById 返回含 lists；digest 用 listRepo 重查列
+    );
+    mockRepos.BoardList.find.mockResolvedValue([makeList()]);
+    // taskRepo.createQueryBuilder 被 3 次复用：列计数(getRawMany) / countTasksByBoard(getRawOne) / risks(getMany)
+    mockRepos.Task.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      innerJoin: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      groupBy: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([{ listId, count: '3' }]),
+      getRawOne: jest.fn().mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
+      getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
+    });
+    // taskRepo.find 按查询形状分发：milestone stats / done / open
+    mockRepos.Task.find.mockImplementation((query: any) => {
+      if (query?.where?.milestoneId !== undefined) {
+        return Promise.resolve(opts.milestoneTasks ?? []);
+      }
+      if (query?.where?.status === TaskStatus.DONE) {
+        return Promise.resolve(opts.doneRows ?? []);
+      }
+      return Promise.resolve(opts.openTasks ?? []);
+    });
+    mockRepos.Milestone.find.mockResolvedValue([]);
+    mockRepos.DocSpace.findOne.mockResolvedValue(opts.space ?? null);
+    mockRepos.Doc.createQueryBuilder.mockReturnValue({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue(opts.docs ?? []),
+    });
+    // assignee 解析（无 assignee 时不需要 profiles）
+    mockRepos.Actor.find.mockResolvedValue([]);
+    mockRepos.User.find.mockResolvedValue([]);
+    mockRepos.Agent.find.mockResolvedValue([]);
+  };
+
+  it('GET /boards/:id/digest returns assembled project overview (v1.41)', async () => {
+    makeDigestMocks({
+      openTasks: [
+        makeTask({ id: 't1', title: 'Fix auth', status: TaskStatus.TODO, priority: 'p0', labels: ['bug'] }),
+        makeTask({ id: 't2', title: 'Refactor', status: TaskStatus.IN_PROGRESS, priority: 'p2' }),
+      ],
+      riskRows: [
+        makeTask({ id: 't1', title: 'Fix auth', status: TaskStatus.TODO, priority: 'p0', labels: ['bug'] }),
+      ],
+      doneRows: [
+        makeTask({ id: 't9', title: 'Ship digest', status: TaskStatus.DONE, completedAt: new Date('2024-01-05') }),
+      ],
+      total: '5',
+      completed: '1',
+      space: {
+        id: '00000000-0000-0000-0000-0000000000aa',
+        name: 'Project Docs',
+        description: '空间图例',
+      },
+      docs: [
+        { id: 'd1', path: 'docs/a.md', title: 'A', updatedAt: new Date('2024-01-02') },
+      ],
+    });
+
+    return request(app.getHttpServer())
+      .get(`/boards/${boardId}/digest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        const data = res.body.data;
+        expect(data.boardId).toBe(boardId);
+        expect(data.boardName).toBe('Test Board');
+        // taskCount 口径 = board 详情（countTasksByBoard 返回值直通）
+        expect(data.taskCount).toBe(5);
+        expect(data.completedTaskCount).toBe(1);
+        expect(data.lists).toEqual([{ id: listId, name: 'To Do', mappedStatus: 'todo', taskCount: 3 }]);
+        // priorityDistribution：open 任务内存聚合
+        expect(data.priorityDistribution.open).toEqual({ p0: 1, p1: 0, p2: 1, p3: 0 });
+        expect(data.nextUp).toHaveLength(2);
+        // risks：labels bug 命中，剔除 done/archived
+        expect(data.risks).toHaveLength(1);
+        expect(data.risks[0]).toHaveProperty('labels', ['bug']);
+        expect(data.recentDone).toHaveLength(1);
+        expect(data.recentDone[0]).toHaveProperty('completedAt');
+        // docs：绑定空间元数据 + 最近更新文档
+        expect(data.docs).toMatchObject({
+          spaceName: 'Project Docs',
+          recentlyUpdated: [{ path: 'docs/a.md', title: 'A' }],
+        });
+        expect(data.truncated).toBe(false);
+      });
+  });
+
+  it('GET /boards/:id/digest?includeDescription=false omits legend', async () => {
+    makeDigestMocks({ openTasks: [], doneRows: [], total: '0', completed: '0' });
+
+    return request(app.getHttpServer())
+      .get(`/boards/${boardId}/digest?includeDescription=false`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.description).toBeNull();
+        expect(res.body.data.docs).toBeNull(); // 无绑定空间
+      });
+  });
+
+  it('GET /boards/:id/digest - 404 when board does not exist', async () => {
+    mockRepos.Board.findOne.mockResolvedValue(null);
+
+    return request(app.getHttpServer())
+      .get(`/boards/${boardId}/digest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.BOARD_NOT_FOUND);
+      });
+  });
+
+  it('GET /boards/:id/digest - non-member gets 404 for private board (read permission reuse)', async () => {
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+    mockRepos.Board.findOne.mockResolvedValue(makeAgentPrivateBoard());
+
+    return request(app.getHttpServer())
+      .get(`/boards/${boardId}/digest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.BOARD_NOT_FOUND);
+      });
+  });
+
+  it('GET /boards/:id/digest?openLimit=abc - 400（DTO 校验失败）', async () => {
+    return request(app.getHttpServer())
+      .get(`/boards/${boardId}/digest?openLimit=abc`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(400)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.BAD_REQUEST);
+      });
+  });
 });

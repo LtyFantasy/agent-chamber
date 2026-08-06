@@ -256,7 +256,7 @@ describe('get_docs_overview', () => {
     expect(() => JSON.parse(text)).not.toThrow();
   });
 
-  it('过滤参数透传：type/excludeType/category/tag/maxTokens/applySpaceDefaults 原样传给 REST', async () => {
+  it('过滤参数透传：type/excludeType/category/tag/maxTokens/applySpaceDefaults/includeDescription 原样传给 REST', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -274,6 +274,7 @@ describe('get_docs_overview', () => {
         pathPrefix: 'docs/',
         maxTokens: 6000,
         applySpaceDefaults: false,
+        includeDescription: false,
       },
       ctx(),
     );
@@ -290,7 +291,24 @@ describe('get_docs_overview', () => {
       pathPrefix: 'docs/',
       maxTokens: 6000,
       applySpaceDefaults: false,
+      includeDescription: false,
     });
+  });
+
+  it('includeDescription=true 原样透传（缺省语义交给后端，显式传参不吞掉）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler(
+      { spaceName: 'My Docs', includeDescription: true },
+      ctx(),
+    );
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ includeDescription: true });
   });
 
   it('未传过滤参数 → 空 params（不携带多余键）', async () => {

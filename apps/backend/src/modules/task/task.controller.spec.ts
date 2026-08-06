@@ -44,6 +44,7 @@ describe('TaskController', () => {
     create: jest.fn(),
     update: jest.fn(),
     remove: jest.fn(),
+    markDeployed: jest.fn(),
   };
 
   const mockPermService = {
@@ -117,6 +118,17 @@ describe('TaskController', () => {
 
       expect(await controller.create(dto, mockActor)).toBe(result);
       expect(service.create).toHaveBeenCalledWith(dto, mockActor.id, mockActor.type);
+    });
+  });
+
+  describe('deployMilestone', () => {
+    it('should call milestoneService.markDeployed with id, dto and actor', async () => {
+      const dto = { anchors: { health: 'ok' }, backup: 'b.sql' };
+      const result = { id: 'ms-1', status: 'deployed' };
+      mockMilestoneService.markDeployed.mockResolvedValue(result);
+
+      expect(await controller.deployMilestone('ms-1', dto, mockAgentActor)).toBe(result);
+      expect(mockMilestoneService.markDeployed).toHaveBeenCalledWith('ms-1', dto, mockAgentActor);
     });
   });
 

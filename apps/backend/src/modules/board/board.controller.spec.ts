@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { BoardController } from './board.controller';
 import { BoardService } from './board.service';
 import { PermissionService } from '../../common/services/permission.service';
@@ -34,6 +35,8 @@ describe('BoardController', () => {
     uninviteAgent: jest.fn(),
     addEditor: jest.fn(),
     removeEditor: jest.fn(),
+    getDigest: jest.fn(),
+    updateMetrics: jest.fn(),
   };
 
   const mockPermService = {
@@ -535,6 +538,94 @@ describe('BoardController', () => {
         name: 'Updated',
         description: 'Desc',
       });
+    });
+  });
+
+  describe('getDigest', () => {
+    it('should ensure read permission (findOne 读路径) then assemble digest', async () => {
+      const board = { id: 'board-1', name: 'Board' };
+      const digest = { boardId: 'board-1', boardName: 'Board', truncated: false };
+      service.findById.mockResolvedValue(board);
+      service.getDigest.mockResolvedValue(digest);
+
+      const query = { openLimit: 5, doneLimit: 3 };
+      expect(await controller.getDigest('board-1', query, mockActor)).toBe(digest);
+      expect(service.findById).toHaveBeenCalledWith('board-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'read');
+      expect(service.getDigest).toHaveBeenCalledWith('board-1', query);
+    });
+
+    it('should propagate 403 when read permission denied (ForbiddenException)', async () => {
+      const board = { id: 'board-1', name: 'Board' };
+      service.findById.mockResolvedValue(board);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({
+          message: 'Access denied',
+          code: ErrorCode.PERMISSION_DENIED,
+        }),
+      );
+
+      await expect(controller.getDigest('board-1', {}, mockActor)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(service.getDigest).not.toHaveBeenCalled();
+    });
+
+    it('should propagate 404 when board does not exist (NotFoundException)', async () => {
+      service.findById.mockRejectedValue(
+        new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND }),
+      );
+
+      await expect(controller.getDigest('board-404', {}, mockActor)).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(permService.ensureCan).not.toHaveBeenCalled();
+      expect(service.getDigest).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateMetrics (PUT /boards/:id/metrics, v1.42)', () => {
+    it('should ensure write permission then store metrics via service', async () => {
+      // 恢复 ensureCan 默认实现：前序 403 测试的 mockRejectedValue 会跨测试残留
+      permService.ensureCan.mockResolvedValue(undefined);
+      const board = { id: 'board-1', name: 'Board' };
+      const stored = { metrics: { testBaseline: { backend: { suites: 76, tests: 1229 } } } };
+      service.findById.mockResolvedValue(board);
+      service.updateMetrics.mockResolvedValue(stored);
+
+      const dto = { metrics: { testBaseline: { backend: { suites: 76, tests: 1229 } } } };
+      expect(await controller.updateMetrics('board-1', dto, mockActor)).toBe(stored);
+      expect(service.findById).toHaveBeenCalledWith('board-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
+      expect(service.updateMetrics).toHaveBeenCalledWith('board-1', dto.metrics);
+    });
+
+    it('should propagate 403 when write permission denied (ForbiddenException)', async () => {
+      const board = { id: 'board-1', name: 'Board' };
+      service.findById.mockResolvedValue(board);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({
+          message: 'Access denied',
+          code: ErrorCode.PERMISSION_DENIED,
+        }),
+      );
+
+      await expect(
+        controller.updateMetrics('board-1', { metrics: {} }, mockActor),
+      ).rejects.toThrow(ForbiddenException);
+      expect(service.updateMetrics).not.toHaveBeenCalled();
+    });
+
+    it('should propagate 404 when board does not exist (NotFoundException)', async () => {
+      service.findById.mockRejectedValue(
+        new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND }),
+      );
+
+      await expect(
+        controller.updateMetrics('board-404', { metrics: {} }, mockActor),
+      ).rejects.toThrow(NotFoundException);
+      expect(permService.ensureCan).not.toHaveBeenCalled();
+      expect(service.updateMetrics).not.toHaveBeenCalled();
     });
   });
 });

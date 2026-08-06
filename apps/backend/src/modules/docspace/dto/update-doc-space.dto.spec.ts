@@ -51,6 +51,20 @@ describe('UpdateDocSpaceDto', () => {
       expect(errors).toHaveLength(0);
       expect(dto.description).toBeUndefined();
     });
+
+    it('accepts boundary 20000 chars (图例化 cap，v1.41)', async () => {
+      const dto = plainToInstance(UpdateDocSpaceDto, { description: 'a'.repeat(20000) });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+    });
+
+    it('rejects 20001 chars (→ 400，超出图例 cap)', async () => {
+      const dto = plainToInstance(UpdateDocSpaceDto, { description: 'a'.repeat(20001) });
+      const errors = await validate(dto);
+      expect(
+        errors.some((e) => e.property === 'description' && e.constraints?.maxLength),
+      ).toBe(true);
+    });
   });
 
   describe('overviewFilter (v1.38)', () => {

@@ -13,10 +13,18 @@ describe('UpdateBoardDto', () => {
 
   it('should reject description exceeding max length', async () => {
     const dto = new UpdateBoardDto();
-    dto.description = 'a'.repeat(5001);
+    dto.description = 'a'.repeat(20001);
 
     const errors = await validate(dto);
     expect(errors.some((e) => e.property === 'description' && e.constraints?.maxLength)).toBe(true);
+  });
+
+  it('should accept description at max length (v1.41 board legend cap 20000)', async () => {
+    const dto = new UpdateBoardDto();
+    dto.description = 'a'.repeat(20000);
+
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'description')).toBe(false);
   });
 
   it('should reject invalid invitedAgentIds', async () => {

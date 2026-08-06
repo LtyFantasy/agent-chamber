@@ -323,6 +323,45 @@ describe('DocSpaceController (e2e)', () => {
       });
   });
 
+  // ─── Test 2b: PUT upsert sourceSha last-verified 刷新（v1.42 B6） ───
+
+  it('PUT /doc-spaces/:id/docs — unchanged content + different sourceSha → refreshes source_sha, response unchanged:true', async () => {
+    const space = makeSpace();
+    // 真实 hash：服务端 computeHash 计算内容哈希，相等才走 unchanged 分支
+    const crypto = require('crypto');
+    const testContent = '# 你好世界\n\n这是一段中文测试内容。';
+    const hash = crypto.createHash('sha256').update(testContent).digest('hex');
+    const existingDoc = makeDoc({
+      source: 'git:agent-chamber',
+      contentHash: hash,
+      sourceSha: 'old-sha',
+      linkHealth: { total: 0, broken: [], checkedAt: '2026-08-05T00:00:00Z' },
+    });
+
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // 既有文档命中 → unchanged 分支：仅刷新 source_sha（update mock 断言）
+    const docFindQb = genericQb({ getOne: jest.fn().mockResolvedValue(existingDoc) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docFindQb);
+
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/docs`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({
+        path: 'test.md',
+        content: testContent,
+        source: 'git:agent-chamber',
+        sourceSha: 'new-sha',
+      })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.unchanged).toBe(true);
+        expect(docFindQb.update).toHaveBeenCalledWith('Doc');
+        expect(docFindQb.set).toHaveBeenCalledWith({ sourceSha: 'new-sha' });
+      });
+  });
+
   // ─── Test 3: GET /doc-spaces/:id/docs?category=tutorial ───────
 
   it('GET /doc-spaces/:id/docs — lists documents with category filter', async () => {
@@ -748,6 +787,386 @@ describe('DocSpaceController (e2e)', () => {
           ...res.body.data.uncategorized,
         ];
         expect(allDocs.map((d: any) => d.docType).sort()).toEqual(['guide', 'reference']);
+      });
+  });
+
+  // ==================== v1.41 空间图例（description 内嵌） ====================
+
+  it('GET /doc-spaces/:id/overview - 默认内嵌 spaceDescription 图例全文 + legendTokenEstimate 单列', async () => {
+    const space = makeSpace({ description: '## 空间图例\n\n由 PM 维护的 INDEX。' });
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const catQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.DocCategory.createQueryBuilder.mockReturnValue(catQb);
+    const docQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/overview`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.spaceDescription).toBe('## 空间图例\n\n由 PM 维护的 INDEX。');
+        expect(res.body.data.legendTokenEstimate).toBeGreaterThan(0);
+        // 空文档时 totalTokenEstimate = 图例 token（仅信息回显）
+        expect(res.body.data.totalTokenEstimate).toBe(res.body.data.legendTokenEstimate);
+        expect(res.body.data.truncated).toBe(false);
+      });
+  });
+
+  it('GET /doc-spaces/:id/overview?includeDescription=false - 省略图例字段（v1.41）', async () => {
+    const space = makeSpace({ description: '## 图例' });
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const catQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.DocCategory.createQueryBuilder.mockReturnValue(catQb);
+    const docQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/overview?includeDescription=false`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.spaceDescription).toBeUndefined();
+        expect(res.body.data.legendTokenEstimate).toBeUndefined();
+        expect(res.body.data.totalTokenEstimate).toBe(0);
+      });
+  });
+
+  // ==================== v1.42 B5 意图路由（doc_routes CRUD + overview 内嵌） ====================
+
+  it('GET /doc-spaces/:id/routes — 排序返回全量意图路由', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const routeRows = [
+      {
+        id: '00000000-0000-4000-8000-000000000610',
+        spaceId,
+        intent: '我要了解系统架构',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: '你好世界',
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: 'apps/backend/src/app.module.ts',
+        sortOrder: 1,
+        createdBy: actorId,
+        createdAt: new Date('2024-01-01'),
+        updatedAt: new Date('2024-01-01'),
+      },
+      {
+        id: '00000000-0000-4000-8000-000000000611',
+        spaceId,
+        intent: '我要了解数据库设计',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: 0,
+        createdBy: actorId,
+        createdAt: new Date('2024-01-02'),
+        updatedAt: new Date('2024-01-02'),
+      },
+    ];
+    mockRepos.DocRoute.find.mockResolvedValue(routeRows);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/routes`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        // 排序契约在 find 参数（sortOrder ASC + createdAt ASC，mock 原样透传不排序）
+        expect(mockRepos.DocRoute.find).toHaveBeenCalledWith({
+          where: { spaceId },
+          order: { sortOrder: 'ASC', createdAt: 'ASC' },
+        });
+        expect(res.body.data).toHaveLength(2);
+        expect(res.body.data[0].intent).toBe('我要了解系统架构');
+        expect(res.body.data[1].intent).toBe('我要了解数据库设计');
+      });
+  });
+
+  it('POST /doc-spaces/:id/routes — 创建成功（写时校验通过，createdBy=actor.id）', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // primary doc 存在且属于该空间
+    mockRepos.Doc.findOne.mockResolvedValue(makeDoc());
+    // headingPath 精确命中（sectionExistsByHeadingPath → sectionRepo QB getOne）
+    const sectionQb = genericQb({ getOne: jest.fn().mockResolvedValue(makeSection()) });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    mockRepos.DocRoute.create.mockImplementation((x: any) => x);
+    mockRepos.DocRoute.save.mockImplementation(async (x: any) => ({
+      ...x,
+      id: '00000000-0000-4000-8000-000000000612',
+    }));
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/routes`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({
+        intent: '我要了解系统架构',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: '你好世界',
+        codeEntry: 'apps/backend/src/app.module.ts',
+        sortOrder: 2,
+      })
+      .expect(201)
+      .expect((res: any) => {
+        expect(res.body.data.primaryDocId).toBe(docId);
+        expect(res.body.data.primaryHeadingPath).toBe('你好世界');
+        expect(res.body.data.createdBy).toBe(actorId);
+      });
+  });
+
+  it('POST /doc-spaces/:id/routes/recheck — 全量重检落库 health，返回 {rechecked, broken}', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // 两条路由：r1 带 primaryHeadingPath（存在）、r2 文档级跳转（无锚点）
+    const routeRows = [
+      {
+        id: '00000000-0000-4000-8000-000000000610',
+        spaceId,
+        intent: '我要了解系统架构',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: '你好世界',
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: 'apps/backend/src/app.module.ts',
+        sortOrder: 1,
+        createdBy: actorId,
+        createdAt: new Date('2024-01-01'),
+        updatedAt: new Date('2024-01-01'),
+        health: null,
+      },
+      {
+        id: '00000000-0000-4000-8000-000000000611',
+        spaceId,
+        intent: '我要了解数据库设计',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: 0,
+        createdBy: actorId,
+        createdAt: new Date('2024-01-02'),
+        updatedAt: new Date('2024-01-02'),
+        health: null,
+      },
+    ];
+    mockRepos.DocRoute.find.mockResolvedValue(routeRows);
+    // headingPath 精确命中（sectionExistsByHeadingPath → sectionRepo QB getOne）
+    const sectionQb = genericQb({ getOne: jest.fn().mockResolvedValue(makeSection()) });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/routes/recheck`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data).toEqual({ rechecked: 2, broken: 0 });
+        // 全量批量落库：每条路由 health 已装配（issues 空 = 健康；checkedAt ISO 时间戳）
+        const saved = mockRepos.DocRoute.save.mock.calls[0][0] as any[];
+        expect(saved).toHaveLength(2);
+        expect(saved[0].health.issues).toEqual([]);
+        expect(saved[1].health.issues).toEqual([]);
+        expect(saved[0].health.checkedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+        // 重检走 section 精确命中（复用 DocService.sectionExistsByHeadingPath）
+        expect(sectionQb.getOne).toHaveBeenCalled();
+      });
+  });
+
+  it('PUT /doc-spaces/:id/repo-manifest — 200：原子 jsonb_set 落库，reportedAt 服务端生成', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const manifest = {
+      sha: 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d',
+      files: ['apps/backend/src/app.module.ts', 'docs/architecture.md'],
+      reportedAt: '2026-08-06T00:00:00.000Z',
+    };
+    mockRepos.DocSpace.query.mockResolvedValue([
+      { settings: { ...space.settings, repoManifest: manifest } },
+    ]);
+
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/repo-manifest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ sha: manifest.sha, files: manifest.files })
+      .expect(200)
+      .expect((res: any) => {
+        // 响应 = 写后 settings.repoManifest（RETURNING 读回）；reportedAt 服务端 ISO 时间戳
+        expect(res.body.data.repoManifest.sha).toBe(manifest.sha);
+        expect(res.body.data.repoManifest.files).toEqual(manifest.files);
+        expect(res.body.data.repoManifest.reportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+        // 原子 jsonb_set：单条 UPDATE 只动 repoManifest 键（对齐 board metrics 先例）
+        const [sql, params] = mockRepos.DocSpace.query.mock.calls[0] as [string, [string, string]];
+        expect(sql).toContain("jsonb_set(settings, '{repoManifest}', $1::jsonb)");
+        expect(params[1]).toBe(spaceId);
+        // 请求不含 reportedAt（服务端生成，不信客户端）
+        const payload = JSON.parse(params[0]) as { reportedAt: string };
+        expect(payload.reportedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      });
+  });
+
+  it('PUT /doc-spaces/:id/repo-manifest — 400：files 超 20000 条（DTO arrayMaxSize）', async () => {
+    // 用最短文件名（'a'×20001）控制 body < 100kb（E2E app 默认 body 限制；生产 main.ts 为 5mb），
+    // 使请求能到达 ValidationPipe 触发 arrayMaxSize 400。真实 20001 长名边界由 DTO 单测覆盖。
+    const files = Array.from({ length: 20001 }, () => 'a');
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/repo-manifest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ sha: 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d', files })
+      .expect(400);
+  });
+
+  it('PUT /doc-spaces/:id/repo-manifest — 400：绝对路径文件（自定义约束）', async () => {
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/repo-manifest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ sha: 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d', files: ['/etc/passwd'] })
+      .expect(400);
+  });
+
+  it('PUT /doc-spaces/:id/repo-manifest — 400：`..` 段文件（自定义约束）', async () => {
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/repo-manifest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ sha: 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d', files: ['apps/../secret'] })
+      .expect(400);
+  });
+
+  it('PUT /doc-spaces/:id/repo-manifest — 400：sha 超 64 字符（DTO maxLength）', async () => {
+    return request(app.getHttpServer())
+      .put(`/doc-spaces/${spaceId}/repo-manifest`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ sha: 'a'.repeat(65), files: ['apps/backend/src/app.module.ts'] })
+      .expect(400);
+  });
+
+  it('POST /doc-spaces/:id/routes — 写时校验 400：headingPath 不可解析', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // primary doc 存在
+    mockRepos.Doc.findOne.mockResolvedValue(makeDoc());
+    // headingPath 精确命中失败（section exists 查询返回 null）
+    const sectionQb = genericQb({ getOne: jest.fn().mockResolvedValue(null) });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/routes`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({
+        intent: '我要了解系统架构',
+        primaryDocId: docId,
+        primaryHeadingPath: '## 不存在的节',
+      })
+      .expect(400)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.DOC_ROUTE_HEADING_UNRESOLVED);
+      });
+  });
+
+  it('POST /doc-spaces/:id/routes — 写时校验 400：doc 不属于该空间', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // doc 存在但属于其他空间（空间归属不符）
+    mockRepos.Doc.findOne.mockResolvedValue(makeDoc({ spaceId: '00000000-0000-4000-8000-000000000999' }));
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/routes`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ intent: '我要了解系统架构', primaryDocId: docId })
+      .expect(400)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.DOC_ROUTE_DOC_NOT_FOUND);
+      });
+  });
+
+  it('GET /doc-spaces/:id/overview — 默认内嵌 routes 全量 + routesTokenEstimate 单列', async () => {
+    const space = makeSpace({ description: '## 空间图例' });
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const catQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.DocCategory.createQueryBuilder.mockReturnValue(catQb);
+    const docQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    const routeRows = [
+      {
+        id: '00000000-0000-4000-8000-000000000613',
+        spaceId,
+        intent: '我要了解系统架构',
+        category: 'architecture',
+        primaryDocId: docId,
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: 0,
+        createdBy: actorId,
+        createdAt: new Date('2024-01-01'),
+        updatedAt: new Date('2024-01-01'),
+      },
+    ];
+    mockRepos.DocRoute.find.mockResolvedValue(routeRows);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/overview`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        // 默认内嵌 routes（全量，不占 maxTokens 预算）
+        expect(res.body.data.routes).toHaveLength(1);
+        expect(res.body.data.routes[0].intent).toBe('我要了解系统架构');
+        // routesTokenEstimate 单列 + 计入 totalTokenEstimate（图例 + routes 合计）
+        expect(res.body.data.routesTokenEstimate).toBeGreaterThan(0);
+        expect(res.body.data.totalTokenEstimate).toBe(
+          res.body.data.legendTokenEstimate + res.body.data.routesTokenEstimate,
+        );
+        expect(res.body.data.truncated).toBe(false);
+      });
+  });
+
+  it('GET /doc-spaces/:id/overview?includeRoutes=false — 省略 routes/routesTokenEstimate', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const catQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.DocCategory.createQueryBuilder.mockReturnValue(catQb);
+    const docQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/overview?includeRoutes=false`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.routes).toBeUndefined();
+        expect(res.body.data.routesTokenEstimate).toBeUndefined();
+        expect(mockRepos.DocRoute.find).not.toHaveBeenCalled();
       });
   });
 });

@@ -184,6 +184,8 @@ const DOC_HIT_KEPT_FIELDS = [
   'position',
   'snippet',
   'score',
+  // v1.42 批次 C3：可解释性透出——路由/任务链接加权来源（后端仅在存在 boost 时产出该键，原样透传）
+  'boosts',
 ] as const;
 
 /**

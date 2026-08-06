@@ -11,3 +11,5 @@ export { RemoveBoardListDto } from './remove-board-list.dto';
 export { ReorderTasksDto } from './reorder-tasks.dto';
 export { FindListTasksQueryDto } from './find-list-tasks.dto';
 export { QueryBoardDto } from './query-board.dto';
+export { BoardDigestQueryDto } from './query-board-digest.dto';
+export { UpdateBoardMetricsDto } from './update-board-metrics.dto';

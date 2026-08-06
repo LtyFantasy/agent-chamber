@@ -71,6 +71,8 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
         orWhere: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
         addOrderBy: jest.fn().mockReturnThis(),
+        groupBy: jest.fn().mockReturnThis(),
+        addGroupBy: jest.fn().mockReturnThis(),
         skip: jest.fn().mockReturnThis(),
         take: jest.fn().mockReturnThis(),
         limit: jest.fn().mockReturnThis(),

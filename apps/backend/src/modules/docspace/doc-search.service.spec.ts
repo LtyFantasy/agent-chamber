@@ -4,6 +4,8 @@ import { Repository } from 'typeorm';
 import { DocSearchService } from './doc-search.service';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { Doc } from '../../database/entities/doc.entity';
+import { DocRoute } from '../../database/entities/doc-route.entity';
+import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 
 // ─── Mock helpers ──────────────────────────────────────────────
 
@@ -20,6 +22,7 @@ function createMockQueryBuilder(overrides: Record<string, jest.Mock> = {}) {
     setParameter: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
     addOrderBy: jest.fn().mockReturnThis(),
+    groupBy: jest.fn().mockReturnThis(),
     limit: jest.fn().mockReturnThis(),
     getRawMany: jest.fn().mockResolvedValue([]),
     getRawOne: jest.fn().mockResolvedValue(null),
@@ -64,10 +67,29 @@ const SCORE_FLOOR = 0.08;
 const SNIPPET_MAX_CHARS = 300;
 const DEFAULT_LIMIT = 5;
 
+/** Build a doc_routes similarity raw row (PG numeric columns come back as string) */
+function makeRouteRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'route-1',
+    primary_doc_id: 'doc-1',
+    secondary_doc_id: null,
+    intent_similarity: '0.5',
+    category_similarity: '0',
+    ...overrides,
+  };
+}
+
+/** Build a task_doc_links COUNT raw row */
+function makeTaskLinkRow(docId: string, count: number) {
+  return { doc_id: docId, c: String(count) };
+}
+
 describe('DocSearchService', () => {
   let service: DocSearchService;
   let mockSectionRepo: jest.Mocked<Repository<DocSection>>;
   let mockDocRepo: jest.Mocked<Repository<Doc>>;
+  let mockRouteRepo: jest.Mocked<Repository<DocRoute>>;
+  let mockTaskLinkRepo: jest.Mocked<Repository<TaskDocLink>>;
 
   // The subquery mock — captured by the outer QB's `from` factory
   let mockSubQb: ReturnType<typeof createMockQueryBuilder>;
@@ -75,6 +97,9 @@ describe('DocSearchService', () => {
   let mockOuterQb: ReturnType<typeof createMockQueryBuilder>;
   // The typed QB returned by sectionRepo.createQueryBuilder('s')
   let mockTypedQb: ReturnType<typeof createMockQueryBuilder>;
+  // The QBs returned by routeRepo / taskLinkRepo.createQueryBuilder (三路融合 boost 查询)
+  let mockRouteQb: ReturnType<typeof createMockQueryBuilder>;
+  let mockTaskLinkQb: ReturnType<typeof createMockQueryBuilder>;
 
   beforeEach(async () => {
     // ── Subquery mock ──
@@ -91,6 +116,10 @@ describe('DocSearchService', () => {
     // ── Typed query builder (sectionRepo.createQueryBuilder('s')) ──
     mockTypedQb = createMockQueryBuilder();
 
+    // ── 三路融合 boost 查询 builders（routeRepo / taskLinkRepo）──
+    mockRouteQb = createMockQueryBuilder();
+    mockTaskLinkQb = createMockQueryBuilder();
+
     // ── Create repos ──
     const sectionRepoPair = createMockRepo<DocSection>();
     mockSectionRepo = sectionRepoPair;
@@ -102,11 +131,21 @@ describe('DocSearchService', () => {
     const docRepoPair = createMockRepo<Doc>();
     mockDocRepo = docRepoPair;
 
+    const routeRepoPair = createMockRepo<DocRoute>();
+    mockRouteRepo = routeRepoPair;
+    (mockRouteRepo.createQueryBuilder as jest.Mock).mockReturnValue(mockRouteQb);
+
+    const taskLinkRepoPair = createMockRepo<TaskDocLink>();
+    mockTaskLinkRepo = taskLinkRepoPair;
+    (mockTaskLinkRepo.createQueryBuilder as jest.Mock).mockReturnValue(mockTaskLinkQb);
+
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         DocSearchService,
         { provide: getRepositoryToken(DocSection), useValue: mockSectionRepo },
         { provide: getRepositoryToken(Doc), useValue: mockDocRepo },
+        { provide: getRepositoryToken(DocRoute), useValue: mockRouteRepo },
+        { provide: getRepositoryToken(TaskDocLink), useValue: mockTaskLinkRepo },
       ],
     }).compile();
 
@@ -174,8 +213,9 @@ describe('DocSearchService', () => {
       makeRawRow({ doc_id: 'doc-c', score: 0.15, ts_rank_score: 0.15, trgm_content_score: 0 }),
       makeRawRow({ doc_id: 'doc-b', score: 1.2, ts_rank_score: 1.0, trgm_content_score: 0.2 / 0.6 }),
     ];
-    // getRawMany already returns them in DB order; service does NOT re-sort
-    // (ORDER BY is in SQL). We just verify getRawMany was called.
+    // getRawMany already returns them in DB order (ORDER BY is in SQL). Since neither
+    // route nor task-link boosts apply in this test, the post-boost re-sort is a no-op —
+    // order is preserved (JS sort is stable + position tiebreak). We just verify getRawMany was called.
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
     const mockHeadlineQb = createMockQueryBuilder({
@@ -375,5 +415,241 @@ describe('DocSearchService', () => {
     // manager.createQueryBuilder should NOT have been called a second time
     // (it was called once for the outer query, zero times for ts_headline)
     expect(mockSectionRepo.manager.createQueryBuilder).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── 三路融合 boost（plan §4-C3）───────────────────────────────
+
+  it('should boost primaryDocId hits by ×1.5 and expose boosts.route=primary', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // doc-1 是命中路由（intent 0.5 ≥ 0.15）的 primaryDoc
+    mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
+
+    const hits = await service.search(['space-1'], { q: '架构' });
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
+    expect(hits[0].boosts).toEqual({ route: 'primary' });
+    // 路由查询限定在可访问空间内
+    expect(mockRouteQb.where).toHaveBeenCalledWith('r.spaceId IN (:...spaceIds)', {
+      spaceIds: ['space-1'],
+    });
+  });
+
+  it('should boost secondaryDocId hits by ×1.2 and expose boosts.route=secondary', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // doc-1 是命中路由（intent 0.4 ≥ 0.15）的 secondaryDoc
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ primary_doc_id: 'doc-other', secondary_doc_id: 'doc-1', intent_similarity: '0.4' }),
+    ]);
+
+    const hits = await service.search(['space-1'], { q: '再看' });
+
+    expect(hits[0].score).toBeCloseTo(0.2 * 1.2, 6);
+    expect(hits[0].boosts).toEqual({ route: 'secondary' });
+  });
+
+  it('route threshold: intent 0.14 misses (no boost), 0.15 hits (×1.5, ≥ semantics)', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+
+    // 0.14 < ROUTE_INTENT_FLOOR(0.15) → 不命中
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ intent_similarity: '0.14', category_similarity: '0' }),
+    ]);
+    let hits = await service.search(['space-1'], { q: '边界' });
+    expect(hits[0].score).toBeCloseTo(0.2, 6);
+    expect(hits[0].boosts).toBeUndefined();
+
+    // 0.15 = ROUTE_INTENT_FLOOR → 命中（≥ 判定，边界值必须命中）
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ intent_similarity: '0.15', category_similarity: '0' }),
+    ]);
+    hits = await service.search(['space-1'], { q: '边界' });
+    expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
+    expect(hits[0].boosts).toEqual({ route: 'primary' });
+  });
+
+  it('route threshold: category 0.29 misses, 0.3 hits (intent can be zero)', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+
+    // 0.29 < ROUTE_CATEGORY_FLOOR(0.3) 且 intent=0 → 不命中
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ intent_similarity: '0', category_similarity: '0.29' }),
+    ]);
+    let hits = await service.search(['space-1'], { q: '分类' });
+    expect(hits[0].boosts).toBeUndefined();
+
+    // 0.3 = ROUTE_CATEGORY_FLOOR → 命中（category 单独达标即命中）
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ intent_similarity: '0', category_similarity: '0.3' }),
+    ]);
+    hits = await service.search(['space-1'], { q: '分类' });
+    expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
+    expect(hits[0].boosts).toEqual({ route: 'primary' });
+  });
+
+  it('multiple routes hitting the same doc take the max multiplier (no stacking)', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-1', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-2', ts_rank_score: 0, trgm_content_score: 0.3 / 0.6, score: 0.3 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // doc-1：route A 的 primary（×1.5）+ route B 的 secondary（×1.2）→ 取 1.5，绝不叠加 1.8
+    // doc-2：route A 的 secondary（×1.2）
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ id: 'r1', primary_doc_id: 'doc-1', secondary_doc_id: 'doc-2', intent_similarity: '0.5' }),
+      makeRouteRow({ id: 'r2', primary_doc_id: 'doc-3', secondary_doc_id: 'doc-1', intent_similarity: '0.4' }),
+    ]);
+
+    const hits = await service.search(['space-1'], { q: '架构' });
+
+    const doc1 = hits.find((h) => h.docId === 'doc-1')!;
+    const doc2 = hits.find((h) => h.docId === 'doc-2')!;
+    expect(doc1.score).toBeCloseTo(0.2 * 1.5, 6);
+    expect(doc1.boosts).toEqual({ route: 'primary' });
+    expect(doc2.score).toBeCloseTo(0.3 * 1.2, 6);
+    expect(doc2.boosts).toEqual({ route: 'secondary' });
+  });
+
+  it('task-link multiplier follows min(count,5)×0.05 ladder with cap at ×1.25', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-3', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-5', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-8', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-0', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // c=3 → ×1.15；c=5 → ×1.25；c=8 → ×1.25（封顶）；doc-0 无链接 → 无 boost
+    mockTaskLinkQb.getRawMany.mockResolvedValue([
+      makeTaskLinkRow('doc-3', 3),
+      makeTaskLinkRow('doc-5', 5),
+      makeTaskLinkRow('doc-8', 8),
+    ]);
+
+    const hits = await service.search(['space-1'], { q: '任务' });
+
+    const byId = (id: string) => hits.find((h) => h.docId === id)!;
+    expect(byId('doc-3').score).toBeCloseTo(0.2 * 1.15, 6);
+    expect(byId('doc-3').boosts).toEqual({ taskLinks: 3 });
+    expect(byId('doc-5').score).toBeCloseTo(0.2 * 1.25, 6);
+    expect(byId('doc-5').boosts).toEqual({ taskLinks: 5 });
+    expect(byId('doc-8').score).toBeCloseTo(0.2 * 1.25, 6); // 封顶
+    expect(byId('doc-8').boosts).toEqual({ taskLinks: 8 }); // 透出实际 count（未封顶）
+    expect(byId('doc-0').score).toBeCloseTo(0.2, 6);
+    expect(byId('doc-0').boosts).toBeUndefined();
+    // 聚合查询按 docId 集合一把 COUNT（去重后传入）
+    expect(mockTaskLinkQb.where).toHaveBeenCalledWith('tdl.docId IN (:...docIds)', {
+      docIds: ['doc-3', 'doc-5', 'doc-8', 'doc-0'],
+    });
+    expect(mockTaskLinkQb.groupBy).toHaveBeenCalledWith('tdl.docId');
+  });
+
+  it('boost only re-ranks: hit set after boost equals hit set from SQL (floor already applied)', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-keep', ts_rank_score: 0, trgm_content_score: 0.15, score: 0.09 }),
+      makeRawRow({ doc_id: 'doc-top', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // doc-keep 是命中路由 primary（0.09×1.5=0.135）——boost 只重排，不得增加/移除命中
+    mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow({ primary_doc_id: 'doc-keep' })]);
+
+    const hits = await service.search(['space-1'], { q: 'noise' });
+
+    expect(hits).toHaveLength(2);
+    expect(hits.map((h) => h.docId).sort()).toEqual(['doc-keep', 'doc-top']);
+    // doc-top(0.2) 仍居首（boost 后 doc-keep 0.135 未反超）
+    expect(hits[0].docId).toBe('doc-top');
+  });
+
+  it('omits boosts key when no route or task-link boost applies', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2, score: 0.12 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // 路由与任务链接均无命中（默认空结果）
+
+    const hits = await service.search(['space-1'], { q: 'plain' });
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).not.toHaveProperty('boosts');
+    expect(hits[0].score).toBeCloseTo(0.12, 6);
+  });
+
+  it('exposes both route and taskLinks keys when both boosts apply', async () => {
+    const rawRows = [
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
+    mockTaskLinkQb.getRawMany.mockResolvedValue([makeTaskLinkRow('doc-1', 2)]);
+
+    const hits = await service.search(['space-1'], { q: '架构' });
+
+    expect(hits[0].score).toBeCloseTo(0.2 * 1.5 * 1.1, 6); // 1.5 × (1 + 2×0.05)
+    expect(hits[0].boosts).toEqual({ route: 'primary', taskLinks: 2 });
+  });
+
+  it('re-sorts ties by position ASC after boost (same final score)', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-a', section_position: 1, ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-b', section_position: 0, ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // 无 boost，同分 → position ASC（SQL 结果序 doc-a 在前，重排后 doc-b 在前）
+
+    const hits = await service.search(['space-1'], { q: 'tie' });
+
+    expect(hits.map((h) => h.docId)).toEqual(['doc-b', 'doc-a']);
+  });
+
+  it('re-ranks hits by boosted score DESC (boosted doc overtakes higher base score)', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-plain', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({ doc_id: 'doc-boost', ts_rank_score: 0, trgm_content_score: 0.17 / 0.6, score: 0.17 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // doc-boost 是命中路由 primary：0.17 × 1.5 = 0.255 > 0.2 → 反超 doc-plain
+    mockRouteQb.getRawMany.mockResolvedValue([
+      makeRouteRow({ primary_doc_id: 'doc-boost', intent_similarity: '0.5' }),
+    ]);
+
+    const hits = await service.search(['space-1'], { q: '架构' });
+
+    expect(hits.map((h) => h.docId)).toEqual(['doc-boost', 'doc-plain']);
+    expect(hits[0].score).toBeCloseTo(0.255, 5);
+  });
+
+  it('does not filter routes by space when accessibleSpaceIds is null (admin)', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ]);
+    mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
+
+    const hits = await service.search(null, { q: '架构' });
+
+    expect(mockRouteQb.where).not.toHaveBeenCalled();
+    expect(hits[0].score).toBeCloseTo(0.3, 6);
+    expect(hits[0].boosts).toEqual({ route: 'primary' });
+  });
+
+  it('skips route/task-link boost queries when no hits pass the floor', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    const hits = await service.search(['space-1'], { q: 'nothing' });
+
+    expect(hits).toEqual([]);
+    expect(mockRouteRepo.createQueryBuilder).not.toHaveBeenCalled();
+    expect(mockTaskLinkRepo.createQueryBuilder).not.toHaveBeenCalled();
   });
 });

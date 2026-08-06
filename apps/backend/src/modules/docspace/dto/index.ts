@@ -14,3 +14,6 @@ export { DocSearchDto } from './doc-search.dto';
 export { AddDocLinkDto } from './doc-link.dto';
 export { BatchUpsertDocsDto } from './batch-upsert-docs.dto';
 export { DocDetailQueryDto } from './doc-detail-query.dto';
+export { CreateDocRouteDto } from './create-doc-route.dto';
+export { UpdateDocRouteDto } from './update-doc-route.dto';
+export { RepoManifestDto, RepoManifestFileConstraint } from './repo-manifest.dto';

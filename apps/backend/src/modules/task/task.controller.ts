@@ -54,6 +54,7 @@ import {
   AddTaskDependencyDto,
   CreateMilestoneDto,
   UpdateMilestoneDto,
+  MarkMilestoneDeployedDto,
   QueryTaskDto,
   QueryMilestoneDto,
   BatchCreateTasksDto,
@@ -256,6 +257,30 @@ export class TaskController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     return this.milestoneService.update(id, dto, actor);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('milestones/:id/deployed')
+  @ApiOperation({
+    summary: 'Mark milestone as deployed',
+    description:
+      'Deploy a release milestone. Body is fully optional: { anchors?, backup?, migrations?, deployedAt? }.' +
+      'Idempotent: re-deployment merges deployMeta and refreshes deployedAt (hotfix redeploys are the norm).' +
+      'Requires write access to the board. Returns the milestone detail (same as GET /tasks/milestones/:id).' +
+      'Deployed status can ONLY be set via this endpoint (PATCH status=deployed is rejected).',
+  })
+  @ApiParam({ name: 'id', description: 'Milestone ID (UUID)', type: String })
+  @ApiResponse({ status: 201, description: 'Milestone marked as deployed' })
+  @ApiResponse({ status: 400, description: 'Invalid transition (not dev/ready/deployed)' })
+  @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
+  @ApiResponse({ status: 403, description: 'Forbidden (no write access to board)' })
+  @ApiResponse({ status: 404, description: 'Milestone not found' })
+  async deployMilestone(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: MarkMilestoneDeployedDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    return this.milestoneService.markDeployed(id, dto, actor);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

@@ -39,7 +39,7 @@
  */
 import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, IsNull } from 'typeorm';
+import { Repository, In, IsNull, Not } from 'typeorm';
 import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
 import { Agent } from '../../database/entities/agent.entity';
@@ -51,12 +51,22 @@ import {
   ErrorCode,
   ActorType,
   TaskStatus,
+  MilestoneStatus,
   BoardMemberRole,
   EventType,
+  Priority,
 } from '@agent-chamber/shared';
 import type {
   BoardDetail,
   BoardListSummary,
+  BoardDigest,
+  BoardDigestList,
+  BoardDigestMilestone,
+  BoardDigestVersionRef,
+  BoardDigestRisk,
+  BoardDigestOpenTask,
+  BoardDigestDoneTask,
+  BoardDigestDocs,
   PaginatedResponse,
   TaskSummary,
 } from '@agent-chamber/shared';
@@ -68,6 +78,8 @@ import { Task } from '../../database/entities/task.entity';
 import { TaskService } from '../task/task.service';
 import { EventService } from '../event/event.service';
 import { DocSpace } from '../../database/entities/doc-space.entity';
+import { Doc } from '../../database/entities/doc.entity';
+import { Milestone } from '../../database/entities/milestone.entity';
 import { QueryTaskDto } from '../task/dto';
 import {
   CreateBoardDto,
@@ -77,6 +89,7 @@ import {
   UpdateBoardListDto,
   ReorderTasksDto,
   FindListTasksQueryDto,
+  BoardDigestQueryDto,
 } from './dto';
 
 @Injectable()
@@ -104,6 +117,12 @@ export class BoardService {
     private readonly eventService: EventService,
     @InjectRepository(DocSpace)
     private docSpaceRepo: Repository<DocSpace>,
+    // v1.41 digest：绑定空间内最近更新文档（updatedAt desc top N）
+    @InjectRepository(Doc)
+    private docRepo: Repository<Doc>,
+    // v1.41 digest：里程碑元数据 + 批量 stats（无模块循环依赖——实体注册仅依赖表）
+    @InjectRepository(Milestone)
+    private milestoneRepo: Repository<Milestone>,
   ) {}
 
   /**
@@ -473,6 +492,401 @@ export class BoardService {
   async findOne(id: string): Promise<BoardDetail> {
     const board = await this.findById(id);
     return this.enrich(board);
+  }
+
+  /**
+   * Board Digest（v1.41）：实时装配项目总揽视图，永不存储。
+   *
+   * 设计原则（plan §2）：机器能从事态算出的绝不人填；必须人写的（项目图例）
+   * 写在 board.description。装配数据源：tasks（直查，避免 board↔task 模块循环依赖）、
+   * milestones、绑定 DocSpace。
+   *
+   * 各段语义（与 docs/api-definition.md §7 digest 端点契约同步）：
+   * - taskCount/completedTaskCount 口径 = GET /boards/:id 详情（countTasksByBoard）：
+   *   未删除列 + 未删除任务（含 archived）；与 topic digest 口径（不排除已删除列）
+   *   存在已知差异，本视图以 board 详情口径为准（plan §4 A2-4，不修 trigger）
+   * - nextUp：open 任务（backlog/todo/in_progress/blocked/review）priority 序，openLimit 截断
+   * - risks：labels 与 ['bug','debt'] 数组重叠（PG && 运算符，OR 语义；task.service 的
+   *   @> 是 AND 语义不适用）∧ status 非 done/archived，priority 序，riskLimit 截断
+   * - recentDone：status=done 且 completedAt 非空，completedAt desc，doneLimit 截断
+   * - milestones：v1.42 起 Release 化——version 非空 = Release 里程碑，投影
+   *   version/deployedAt/verifiedAt（不返回 body/deployMeta）；stats 口径对齐
+   *   milestone.service（done 含 archived；open = backlog/todo/review/blocked，
+   *   不含 in_progress）
+   * - versions：Release 版本三区（production/development/history），全部内存装配，
+   *   复用 milestones 段已加载的全量集合 + stats 批量结果，零新查询；history 按
+   *   deployedAt DESC NULLS LAST + createdAt DESC 排序后 slice(versionLimit)；
+   *   versionsTruncated = total > history.length，并入 truncated 语义
+   *   （versionLimit=0 对齐既有惯例：显式要求空段不参与截断判定）
+   * - metrics：board.settings.metrics 透传（report-metrics.mjs 上报的测试基线/MCP
+   *   工具数等机器事实），无则 null
+   * - docs：按 boardId 找绑定空间（无则 docs: null）+ 该空间未删除文档 updatedAt desc；
+   *   **权限语义（契约层决定）**：board 可读即蕴含空间元数据可读（不含正文）
+   * - truncated：任一列表段"实际存在但被 limit 截断"为 true；limit=0（调用方显式
+   *   要求空段）不参与截断判定；v1.42 起 versions.history 截断并入
+   *
+   * @param boardId - 看板 ID（Controller 层已做权限检查 + findById 判空）
+   * @param query   - 各段 limit 与 includeDescription（缺省值在此应用）
+   * @returns 实时装配的 BoardDigest
+   */
+  async getDigest(boardId: string, query?: BoardDigestQueryDto): Promise<BoardDigest> {
+    const board = await this.findById(boardId);
+
+    // 缺省值应用：DTO 只做格式校验（铁律 #21），业务缺省在 service 层
+    const openLimit = query?.openLimit ?? 10;
+    const doneLimit = query?.doneLimit ?? 5;
+    const riskLimit = query?.riskLimit ?? 10;
+    const docsLimit = query?.docsLimit ?? 5;
+    const versionLimit = query?.versionLimit ?? 5;
+    // includeDescription 缺省 true（对齐 getOverview 惯例）；显式 false 时 description 置 null
+    const includeDescription = query?.includeDescription !== false;
+
+    // ── 列元数据 + 列 taskCount（口径对齐 findLists：未删除任务计数，含 archived） ──
+    const lists = await this.listRepo.find({
+      where: { boardId, deletedAt: IsNull() },
+      order: { position: 'ASC', createdAt: 'ASC' },
+    });
+    const listIds = lists.map((l) => l.id);
+
+    const listTaskCounts =
+      listIds.length > 0
+        ? await this.taskRepo
+            .createQueryBuilder('task')
+            .select('task.list_id', 'listId')
+            .addSelect('COUNT(*)', 'count')
+            .where('task.list_id IN (:...listIds)', { listIds })
+            .andWhere('task.deleted_at IS NULL')
+            .groupBy('task.list_id')
+            .getRawMany()
+        : [];
+    const listCountMap = new Map(listTaskCounts.map((c) => [c.listId, parseInt(c.count, 10)]));
+    const digestLists: BoardDigestList[] = lists.map((l) => ({
+      id: l.id,
+      name: l.name,
+      mappedStatus: l.mappedStatus ?? null,
+      taskCount: listCountMap.get(l.id) ?? 0,
+    }));
+
+    // ── taskCount / completedTaskCount：复用 enrich 口径（board 详情为准） ──
+    const { total: taskCount, completed: completedTaskCount } =
+      listIds.length > 0
+        ? await this.countTasksByBoard(boardId)
+        : { total: 0, completed: 0 };
+
+    // ── open 任务全量（priorityDistribution 需全量；nextUp 是它的前缀切片） ──
+    // Priority 枚举序 p0→p1→p2→p3，ORDER BY priority ASC = p0（最高优先级）在前
+    const openTasks =
+      listIds.length > 0
+        ? await this.taskRepo.find({
+            where: {
+              listId: In(listIds),
+              status: In([
+                TaskStatus.BACKLOG,
+                TaskStatus.TODO,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.BLOCKED,
+                TaskStatus.REVIEW,
+              ]),
+            },
+            order: { priority: 'ASC', createdAt: 'ASC' },
+          })
+        : [];
+
+    // priorityDistribution：open 任务按 priority 内存聚合（含 0 值，形状稳定）
+    const priorityDistribution: Record<Priority, number> = {
+      [Priority.P0]: 0,
+      [Priority.P1]: 0,
+      [Priority.P2]: 0,
+      [Priority.P3]: 0,
+    };
+    for (const t of openTasks) {
+      priorityDistribution[t.priority] = (priorityDistribution[t.priority] ?? 0) + 1;
+    }
+
+    // nextUp：open 任务 priority 序前缀（已全量加载，slice 而非 take）
+    const nextUpAll: DigestTaskRow[] = openTasks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      priority: t.priority,
+      status: t.status,
+      assigneeId: t.assigneeId,
+    }));
+    const nextUp = nextUpAll.slice(0, openLimit);
+    const nextUpTruncated = openLimit > 0 && nextUpAll.length > openLimit;
+
+    // ── risks：labels 数组重叠（&& = 任一命中）∧ status 非 done/archived，priority 序 ──
+    // 独立 SQL 查询（对齐 plan 指定的 PG && 运算符；内存过滤会与 open 集合强耦合，语义不清）
+    let riskAll: DigestRiskRow[] = [];
+    if (riskLimit > 0 && listIds.length > 0) {
+      const riskRows = await this.taskRepo
+        .createQueryBuilder('task')
+        .where('task.list_id IN (:...listIds)', { listIds })
+        .andWhere('task.deleted_at IS NULL')
+        .andWhere("task.labels && ARRAY['bug','debt']")
+        .andWhere('task.status NOT IN (:...excluded)', {
+          excluded: [TaskStatus.DONE, TaskStatus.ARCHIVED],
+        })
+        .orderBy('task.priority', 'ASC')
+        .addOrderBy('task.created_at', 'ASC')
+        .take(riskLimit + 1) // +1 探针：超出 limit 即 truncated（避免全量加载风险任务）
+        .getMany();
+      riskAll = riskRows.map((t) => ({
+        id: t.id,
+        title: t.title,
+        priority: t.priority,
+        status: t.status,
+        labels: t.labels,
+        assigneeId: t.assigneeId,
+      }));
+    }
+    const risks = riskAll.slice(0, riskLimit);
+    const risksTruncated = riskLimit > 0 && riskAll.length > riskLimit;
+
+    // ── recentDone：status=done 且 completedAt 非空（不变量 #18），completedAt desc ──
+    // archived 任务已移出视野，不计入"最近完成"（口径注释见 api-definition §7）
+    // completedAt NULL 过滤（2026-08-05 产品锚点验收暴露）：PG ORDER BY DESC 默认 NULLS FIRST，
+    // 存量 NULL 行（不变量建立前的历史数据）会顶到最前，把真实最近完成挤出 top N。
+    let recentDoneAll: DigestDoneRow[] = [];
+    if (doneLimit > 0 && listIds.length > 0) {
+      const doneRows = await this.taskRepo.find({
+        where: { listId: In(listIds), status: TaskStatus.DONE, completedAt: Not(IsNull()) },
+        order: { completedAt: 'DESC', createdAt: 'DESC' },
+        take: doneLimit + 1, // +1 探针：超出 limit 即 truncated
+      });
+      recentDoneAll = doneRows.map((t) => ({
+        id: t.id,
+        title: t.title,
+        completedAt: t.completedAt ?? t.updatedAt,
+        assigneeId: t.assigneeId,
+      }));
+    }
+    const recentDone = recentDoneAll.slice(0, doneLimit);
+    const recentDoneTruncated = doneLimit > 0 && recentDoneAll.length > doneLimit;
+
+    // ── milestones：元数据 + 批量 stats（避免 N+1） ──
+    // v1.42 Release 化：投影 version/deployedAt/verifiedAt（不返回 body/deployMeta）
+    const milestones = await this.milestoneRepo.find({
+      where: { boardId },
+      order: { createdAt: 'ASC' },
+    });
+    const milestoneStats = await this.getMilestoneStatsBatch(milestones.map((m) => m.id));
+    const digestMilestones: BoardDigestMilestone[] = milestones.map((m) => ({
+      id: m.id,
+      name: m.name,
+      status: m.status,
+      startDate: m.startDate,
+      targetDate: m.targetDate,
+      // ?? undefined：普通里程碑序列化不出现该键（保持 JSON 干净）
+      version: m.version ?? undefined,
+      deployedAt: m.deployedAt ?? undefined,
+      verifiedAt: m.verifiedAt ?? undefined,
+      stats: milestoneStats.get(m.id) ?? { total: 0, done: 0, inProgress: 0, open: 0 },
+    }));
+
+    // ── versions：Release 版本三区（全部内存装配，复用上面已加载的 milestone 全量
+    //    集合 + stats 批量结果，零新查询；2026-08-05 教训：DESC 排序先想 NULL 处理） ──
+    const releaseMilestones = milestones.filter((m) => m.version);
+    const toVersionRef = (m: Milestone): BoardDigestVersionRef => ({
+      id: m.id,
+      version: m.version as string, // filter(m => m.version) 保证非空
+      name: m.name,
+      status: m.status,
+      deployedAt: m.deployedAt ?? undefined,
+      verifiedAt: m.verifiedAt ?? undefined,
+      stats: milestoneStats.get(m.id) ?? { total: 0, done: 0, inProgress: 0, open: 0 },
+    });
+    /**
+     * Release 排序比较器：deployedAt DESC 且 NULL 排最后（对齐 PG NULLS LAST），
+     * 并列（含双 null）取 createdAt DESC。部署事实列可能为 NULL（未部署过的
+     * dev/ready release），DESC 排序必须显式处理，否则 NULL 顶到最前（e85938b 教训）。
+     */
+    const compareReleaseDesc = (a: Milestone, b: Milestone): number => {
+      if (a.deployedAt && b.deployedAt) {
+        const diff = b.deployedAt.getTime() - a.deployedAt.getTime();
+        if (diff !== 0) return diff;
+      } else if (a.deployedAt || b.deployedAt) {
+        return a.deployedAt ? -1 : 1;
+      }
+      return b.createdAt.getTime() - a.createdAt.getTime();
+    };
+
+    // production：deployed/verified 中 deployedAt 最新（并列 createdAt 最新）
+    const production =
+      releaseMilestones
+        .filter(
+          (m) => m.status === MilestoneStatus.DEPLOYED || m.status === MilestoneStatus.VERIFIED,
+        )
+        .sort(compareReleaseDesc)[0] ?? null;
+    // development：dev/ready 中 createdAt 最新（未部署，无 deployedAt 可比）
+    const development =
+      releaseMilestones
+        .filter((m) => m.status === MilestoneStatus.DEV || m.status === MilestoneStatus.READY)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0] ?? null;
+    // history：version 非空全体，deployedAt DESC NULLS LAST + createdAt DESC，slice(versionLimit)
+    const versionsHistory = releaseMilestones
+      .slice()
+      .sort(compareReleaseDesc)
+      .slice(0, versionLimit)
+      .map(toVersionRef);
+    const versionsTotal = releaseMilestones.length;
+    // 截断判定对齐既有语义：limit=0（显式要求空段）不参与截断判定
+    const versionsTruncated = versionLimit > 0 && versionsTotal > versionsHistory.length;
+
+    // ── docs：board 绑定空间元数据 + 最近更新文档（updatedAt desc） ──
+    // 权限语义（契约层决定，评审已拍板）：board 可读蕴含空间元数据可读，不做 DocSpace 成员校验
+    let docs: BoardDigestDocs | null = null;
+    let docsTruncated = false;
+    const space = await this.docSpaceRepo.findOne({ where: { boardId } });
+    if (space) {
+      const recentDocs =
+        docsLimit > 0
+          ? await this.docRepo
+              .createQueryBuilder('d')
+              .where('d.space_id = :spaceId', { spaceId: space.id })
+              .andWhere('d.deleted_at IS NULL') // 显式排除软删文档（对齐 overview 口径）
+              .orderBy('d.updated_at', 'DESC')
+              .take(docsLimit + 1) // +1 探针：超出 limit 即 truncated
+              .getMany()
+          : [];
+      docsTruncated = docsLimit > 0 && recentDocs.length > docsLimit;
+      docs = {
+        spaceId: space.id,
+        spaceName: space.name,
+        // snippet 口径对齐 boards 列表页 descriptionSnippet（≤200 字符）
+        spaceDescriptionSnippet: space.description?.slice(0, 200) ?? null,
+        recentlyUpdated: recentDocs.slice(0, docsLimit).map((d) => ({
+          path: d.path,
+          title: d.title,
+          updatedAt: d.updatedAt,
+        })),
+      };
+    }
+
+    // ── assigneeName 批量解析（risks/nextUp/recentDone 一次补齐，避免 N+1） ──
+    const allAssignees = [
+      ...riskAll.map((r) => r.assigneeId),
+      ...nextUpAll.map((t) => t.assigneeId),
+      ...recentDoneAll.map((t) => t.assigneeId),
+    ].filter((id): id is string => Boolean(id));
+    const profileMap = await this.resolveActorProfiles([...new Set(allAssignees)]);
+    const nameOf = (id: string | null | undefined): string | null =>
+      id ? (profileMap.get(id)?.name ?? null) : null;
+
+    // metrics：settings.metrics 透传不加工（report-metrics.mjs 上报的机器事实；无则 null）
+    const metrics = (board.settings?.metrics as Record<string, unknown> | undefined) ?? null;
+
+    const truncated =
+      risksTruncated || nextUpTruncated || recentDoneTruncated || docsTruncated || versionsTruncated;
+
+    // 最终投影：剔除内部 assigneeId，统一填充 assigneeName
+    const projectRisk = (r: DigestRiskRow): BoardDigestRisk => {
+      const { assigneeId, ...rest } = r;
+      return { ...rest, assigneeName: nameOf(assigneeId) };
+    };
+    const projectOpen = (t: DigestTaskRow): BoardDigestOpenTask => {
+      const { assigneeId, ...rest } = t;
+      return { ...rest, assigneeName: nameOf(assigneeId) };
+    };
+    const projectDone = (t: DigestDoneRow): BoardDigestDoneTask => {
+      const { assigneeId, ...rest } = t;
+      return { ...rest, assigneeName: nameOf(assigneeId) };
+    };
+
+    return {
+      boardId: board.id,
+      boardName: board.name,
+      description: includeDescription ? board.description : null,
+      visibility: board.settings?.visibility ?? Visibility.OPEN,
+      taskCount,
+      completedTaskCount,
+      lists: digestLists,
+      milestones: digestMilestones,
+      versions: {
+        production: production ? toVersionRef(production) : null,
+        development: development ? toVersionRef(development) : null,
+        history: versionsHistory,
+        total: versionsTotal,
+      },
+      metrics,
+      priorityDistribution: { open: priorityDistribution },
+      risks: risks.map(projectRisk),
+      nextUp: nextUp.map(projectOpen),
+      recentDone: recentDone.map(projectDone),
+      docs,
+      truncated,
+    };
+  }
+
+  /**
+   * 写入 board 测试基线等机器事实（v1.42，metrics 唯一写口 = report-metrics.mjs）。
+   *
+   * 原子单条 SQL：`jsonb_set(settings, '{metrics}', $1::jsonb)` 只动 metrics 键，
+   * visibility/archived_lists_visible 等既有键不受影响（禁 read-modify-write——并发下
+   * 整对象覆盖会丢键，plan §4 B3-1 硬语义）。metrics 永不经 DTO 之外的路径写入。
+   *
+   * @param boardId - 看板 ID（Controller 层已做 findById 判空 + write 权限检查）
+   * @param metrics - 机器事实对象（整对象覆盖写入 settings.metrics）
+   * @returns 写后 settings.metrics（RETURNING 单条 SQL，无第二次查询；无则 null）
+   */
+  async updateMetrics(
+    boardId: string,
+    metrics: Record<string, unknown>,
+  ): Promise<{ metrics: Record<string, unknown> | null }> {
+    // 原生 query：TypeORM 实体级 update 无法表达 jsonb_set 片段，且会整体覆盖 settings
+    const rows: Array<{ settings?: Record<string, any> | null }> = await this.boardRepo.query(
+      `UPDATE boards SET settings = jsonb_set(settings, '{metrics}', $1::jsonb) WHERE id = $2 RETURNING settings`,
+      [JSON.stringify(metrics), boardId],
+    );
+    // 防御：Controller 已判空，此处兜底 TOCTOU 窗口（铁律 #22）
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
+    }
+    const stored = (rows[0].settings?.metrics as Record<string, unknown> | undefined) ?? null;
+    return { metrics: stored };
+  }
+
+  /**
+   * 批量聚合 milestone 的 stats（避免 N+1，v1.41 digest 用）
+   *
+   * 口径对齐 milestone.service.getStatsBatch（保持一致，测试即文档）：
+   * - done 含 archived（历史完成任务）
+   * - inProgress 仅 in_progress
+   * - open = backlog/todo/review/blocked（不含 in_progress/done/archived）
+   *
+   * @param milestoneIds - 里程碑 ID 列表（空数组返回空 Map）
+   * @returns milestoneId → { total, done, inProgress, open }
+   */
+  private async getMilestoneStatsBatch(
+    milestoneIds: string[],
+  ): Promise<Map<string, { total: number; done: number; inProgress: number; open: number }>> {
+    const map = new Map<
+      string,
+      { total: number; done: number; inProgress: number; open: number }
+    >();
+    if (milestoneIds.length === 0) return map;
+    for (const id of milestoneIds) map.set(id, { total: 0, done: 0, inProgress: 0, open: 0 });
+
+    const tasks = await this.taskRepo.find({
+      where: { milestoneId: In(milestoneIds) },
+      select: ['milestoneId', 'status'],
+    });
+    for (const task of tasks) {
+      if (!task.milestoneId) continue;
+      const stats = map.get(task.milestoneId);
+      if (!stats) continue;
+      stats.total += 1;
+      if (task.status === TaskStatus.DONE || task.status === TaskStatus.ARCHIVED) stats.done += 1;
+      if (task.status === TaskStatus.IN_PROGRESS) stats.inProgress += 1;
+      if (
+        task.status === TaskStatus.BACKLOG ||
+        task.status === TaskStatus.TODO ||
+        task.status === TaskStatus.REVIEW ||
+        task.status === TaskStatus.BLOCKED
+      ) {
+        stats.open += 1;
+      }
+    }
+    return map;
   }
 
   async create(creatorId: string, creatorType: string, dto: CreateBoardDto) {
@@ -932,4 +1346,28 @@ export class BoardService {
     const tasks = await this.taskRepo.find({ where: { listId }, order: { position: 'ASC' } });
     return tasks.map((task) => ({ ...task }));
   }
+}
+
+// ─── digest 内部中间态类型（v1.41） ──────────────────────────────────────────
+
+/** nextUp/risks 行的内部中间态：带 assigneeId，最终统一解析 assigneeName 后投影为共享类型 */
+interface DigestTaskRow {
+  id: string;
+  title: string;
+  priority: Priority;
+  status: TaskStatus;
+  assigneeId: string | null;
+}
+
+/** risks 行：DigestTaskRow + labels（PG && 过滤命中 bug/debt 之一） */
+interface DigestRiskRow extends DigestTaskRow {
+  labels: string[] | null;
+}
+
+/** recentDone 行：内部中间态（completedAt 由 service 兜底填充） */
+interface DigestDoneRow {
+  id: string;
+  title: string;
+  completedAt: string | Date;
+  assigneeId: string | null;
 }

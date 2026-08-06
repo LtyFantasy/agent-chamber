@@ -13,6 +13,8 @@ import { ApiKey } from '../../database/entities/api-key.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
+import { Doc } from '../../database/entities/doc.entity';
+import { Milestone } from '../../database/entities/milestone.entity';
 import { TaskModule } from '../task/task.module';
 import { EventModule } from '../event/event.module';
 
@@ -30,6 +32,10 @@ import { EventModule } from '../event/event.module';
       Agent,
       Actor,
       DocSpace,
+      // v1.41 digest：BoardDigest docs 段按 boardId 找空间 + 该空间文档 updatedAt desc
+      Doc,
+      // v1.41 digest：milestones 段需查里程碑元数据 + 批量 stats（与 Doc 同款，无模块循环依赖）
+      Milestone,
     ]),
     TaskModule,
     EventModule,

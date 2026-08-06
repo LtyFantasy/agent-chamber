@@ -72,6 +72,44 @@ describe('search_docs', () => {
     expect(hit.internalField).toBeUndefined();
   });
 
+  it('boosts 白名单透传（有则原样透传，无则不产出键）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce([
+      {
+        docId: 'd1',
+        docPath: 'docs/a.md',
+        docTitle: 'A',
+        headingPath: null,
+        position: 0,
+        snippet: 's',
+        score: 0.3,
+        boosts: { route: 'primary', taskLinks: 4 },
+      },
+      {
+        docId: 'd2',
+        docPath: 'docs/b.md',
+        docTitle: 'B',
+        headingPath: null,
+        position: 0,
+        snippet: 's',
+        score: 0.2,
+      },
+    ]);
+
+    const result = await searchDocsTool.handler(
+      { spaceName: 'My Docs', q: 'test' },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.hits[0].boosts).toEqual({ route: 'primary', taskLinks: 4 });
+    // 无 boost 的命中不产出 boosts 键
+    expect(body.hits[1].boosts).toBeUndefined();
+  });
+
   it('contentTruncated 透传', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({

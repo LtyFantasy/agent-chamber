@@ -22,6 +22,8 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  forwardRef,
+  Inject,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -46,6 +48,7 @@ import type {
 } from '@agent-chamber/shared';
 import { chunkMarkdown } from './markdown-chunker';
 import { computeLinkHealth } from './link-health';
+import { RouteHealthService } from './route-health.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AuditLog } from '../../database/entities/audit-log.entity';
 import { EventService } from '../event/event.service';
@@ -92,6 +95,11 @@ export class DocService {
     @InjectRepository(Board)
     private readonly boardRepo: Repository<Board>,
     private readonly eventService: EventService,
+    // 循环依赖说明（批次 C1）：本服务触发点注入 RouteHealthService（upsert/remove 内
+    // setImmediate 重检），RouteHealthService 又注入本服务复用 sectionExistsByHeadingPath →
+    // 互相依赖，双向 forwardRef 是 NestJS 标准解法（plan §2 授权）。
+    @Inject(forwardRef(() => RouteHealthService))
+    private readonly routeHealthService: RouteHealthService,
   ) {}
 
   // ─── Helpers ─────────────────────────────────────────────────
@@ -187,6 +195,7 @@ export class DocService {
       docType: doc.docType,
       tags: doc.tags,
       source: doc.source,
+      sourceSha: doc.sourceSha,
       sectionCount: doc.sectionCount,
       tokenEstimate: doc.tokenEstimate,
       createdBy: doc.createdBy,
@@ -235,6 +244,7 @@ export class DocService {
       category?: string;
       tags?: string[];
       source?: string;
+      sourceSha?: string;
     },
     actor?: UnifiedActor,
   ): Promise<UpsertDocResult> {
@@ -277,6 +287,21 @@ export class DocService {
             .createQueryBuilder()
             .update('Doc')
             .set({ linkHealth: backfill as unknown as Record<string, unknown> })
+            .where('id = :id', { id: existing.id })
+            .execute();
+        }
+
+        // sourceSha 刷新（v1.42 B6，last-verified 语义关键）：contentHash 相同（内容未变）
+        // 但 payload 携带的 sha 与现存不同 → 仅更新 source_sha 列，不碰 sections/contentHash/
+        // 其他元数据，响应仍 unchanged:true。理由：sourceSha 语义 = "内容在此 sha 验证一致"，
+        // 每次 sync 都是一次验证（sync 时统一取 git rev-parse HEAD），unchanged 文档也必须
+        // 刷新验证点，否则旧 sha 会误显 stale。payload 不带 sourceSha（如 native 编辑）→
+        // 完全照旧早退，不产生任何写操作。
+        if (dto.sourceSha !== undefined && existing.sourceSha !== dto.sourceSha) {
+          await this.docRepo
+            .createQueryBuilder()
+            .update('Doc')
+            .set({ sourceSha: dto.sourceSha })
             .where('id = :id', { id: existing.id })
             .execute();
         }
@@ -345,6 +370,9 @@ export class DocService {
           existing.tags = dto.tags ?? existing.tags;
           existing.categoryId = categoryId ?? existing.categoryId;
           existing.contentHash = computedHash;
+          // 内容变更时刷新 last-verified sha（sync 携带则覆盖；native 编辑不带 sha 保留旧值——
+          // 旧 sha 将显 stale，正是消费端 doc.sourceSha vs 空间 maxSha 新鲜度比较的用途）
+          existing.sourceSha = dto.sourceSha ?? existing.sourceSha;
           existing.sectionCount = chunks.length;
           existing.tokenEstimate = totalTokens;
           existing.linkHealth = linkHealth as unknown as Record<string, unknown>;
@@ -361,6 +389,7 @@ export class DocService {
             tags: dto.tags ?? [],
             source,
             contentHash: computedHash,
+            sourceSha: dto.sourceSha ?? null,
             sectionCount: chunks.length,
             tokenEstimate: totalTokens,
             linkHealth: linkHealth as unknown as Record<string, unknown>,
@@ -428,6 +457,21 @@ export class DocService {
           payload: { spaceId, docId: result.id, path: result.path, title: autoTitle },
         });
       }
+
+      // Async fire-and-forget（批次 C1）：内容变更分支事务提交后异步重检该空间 doc_routes
+      // health。内容变更会重建 sections → 既有路由 headingPath 可能悬空，重检刷新 health。
+      // unchanged 早退分支不触发（sections 未重建，重检结果不会变化）；23505 幂等 catch
+      // 分支也不触发（本请求未写入内容）。
+      // 安全模式：Promise.resolve().then(...).catch(...) 保证 setImmediate 回调内永不抛出
+      // 未捕获异常（同步 throw 与异步 reject 均被 catch 吞掉）——fire-and-forget 语义
+      // = 失败仅记日志不透出（recalcSpaceLinkHealth 同款先例语义的强化版）。
+      setImmediate(() => {
+        void Promise.resolve()
+          .then(() => this.routeHealthService.recheckSpace(spaceId))
+          .catch((err: unknown) => {
+            this.logger.error(`route health recheck failed for space ${spaceId}`, err);
+          });
+      });
 
       return {
         id: result.id,
@@ -729,6 +773,26 @@ export class DocService {
   }
 
   /**
+   * headingPath 精确命中 exists 查询（v1.42 B5 doc_routes 写时校验复用）。
+   *
+   * 与 getSection 的 headingPath 分支同款 where（doc_id + heading_path 精确匹配）：
+   * 抽成 exists 版供 Service 层"写时校验"使用——校验路由引用的 heading 在写入当下可解析。
+   * 已知边界：doc 后续编辑/重排导致 headingPath 悬空属批次 C 异步校验范围，写时校验只管当下。
+   *
+   * @param docId 目标文档 ID（须未软删，由调用方保证存在性）
+   * @param headingPath 待校验的 heading 路径（精确匹配，不做模糊/前缀匹配）
+   * @returns true = 存在至少一个 section 的 heading_path 精确命中
+   */
+  async sectionExistsByHeadingPath(docId: string, headingPath: string): Promise<boolean> {
+    const section = await this.sectionRepo
+      .createQueryBuilder('s')
+      .where('s.doc_id = :docId', { docId })
+      .andWhere('s.heading_path = :headingPath', { headingPath })
+      .getOne();
+    return !!section;
+  }
+
+  /**
    * Get a single section by position OR headingPath.
    *
    * - position (from URL param) takes priority if both provided
@@ -844,6 +908,14 @@ export class DocService {
       this.recalcSpaceLinkHealth(spaceId).catch((err: unknown) => {
         this.logger.error(`recalcSpaceLinkHealth failed for space ${spaceId}`, err);
       });
+      // 批次 C1：路由引用的 doc 被删 → 该路由指向的锚点大概率悬空，同批次异步重检
+      // doc_routes health（与 link_health 重算同一 fire-and-forget 时机，不引入额外调度；
+      // Promise.resolve().then(...).catch(...) 安全模式见 upsert 触发点注释）
+      void Promise.resolve()
+        .then(() => this.routeHealthService.recheckSpace(spaceId))
+        .catch((err: unknown) => {
+          this.logger.error(`route health recheck failed for space ${spaceId}`, err);
+        });
     });
 
     return { deleted: true, path: doc.path };

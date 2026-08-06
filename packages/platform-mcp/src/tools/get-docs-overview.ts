@@ -104,6 +104,8 @@ export const getDocsOverviewTool: CustomTool = {
       '0 or >1 candidates returns isError:true + structured candidate info — never silently picks one. ' +
       'Returns categories → docs[{path,title,summary,docType,tags,tokenEstimate}] + uncategorized docs. ' +
       'Truncated flag is passed through when token cap is exceeded. ' +
+      'Response includes spaceDescription (space legend) in full by default; legend tokens are reported ' +
+      'separately as legendTokenEstimate and do not consume the maxTokens budget (pass includeDescription=false to omit). ' +
       'Default is the full map; filtering (v1.38): excludeType=memory filters diary-type noise out, ' +
       'type=guide,reference shows only curated docs, applySpaceDefaults=false ignores space-level default filters. ' +
       'The response echoes effective filters as appliedFilters.',
@@ -144,7 +146,15 @@ export const getDocsOverviewTool: CustomTool = {
         },
         maxTokens: {
           type: 'number',
-          description: 'Optional: override the ~4000 default token cap (range 500–16000).',
+          description:
+            'Optional: override the ~20000 default token cap (range 500–50000). ' +
+            'Applies to doc entries only; the space legend (spaceDescription) is always returned in full.',
+        },
+        includeDescription: {
+          type: 'boolean',
+          description:
+            'Optional: include the space description (legend) in the response. Default true; ' +
+            'pass false to omit spaceDescription/legendTokenEstimate.',
         },
         applySpaceDefaults: {
           type: 'boolean',
@@ -229,6 +239,7 @@ export const getDocsOverviewTool: CustomTool = {
       'pathPrefix',
       'maxTokens',
       'applySpaceDefaults',
+      'includeDescription',
     ] as const;
     const params: Record<string, unknown> = {};
     for (const key of filterKeys) {

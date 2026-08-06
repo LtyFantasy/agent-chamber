@@ -25,3 +25,4 @@ export { DocCategory } from './doc-category.entity';
 export { Doc } from './doc.entity';
 export { DocSection } from './doc-section.entity';
 export { TaskDocLink } from './task-doc-link.entity';
+export { DocRoute } from './doc-route.entity';

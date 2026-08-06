@@ -450,9 +450,18 @@
         "planned": "计划中",
         "active": "进行中",
         "completed": "已完成",
-        "cancelled": "已取消"
-      }
+        "cancelled": "已取消",
+        "dev": "开发中",
+        "ready": "待部署",
+        "deployed": "已部署",
+        "verified": "已验证"
+      },
+      "versionPlaceholder": "版本号（可选，如 1.42.0）——创建 release 里程碑",
+      "versionReadonlyHint": "版本创建后不可修改（release 身份标识）",
+      "bodyPlaceholder": "发布说明（可选；编辑时留空保持不变）"
     },
+    "descriptionExpand": "展开描述",
+    "descriptionCollapse": "收起描述",
     "filter": {
       "activeTasks": "活跃任务",
       "allStatuses": "全部状态",
@@ -540,7 +549,9 @@
       "searchHits": "搜索结果",
       "filterByTag": "按标签「{tag}」筛选",
       "contentLoadError": "文档内容加载失败",
-      "contentLoadErrorDesc": "请检查网络后重试"
+      "contentLoadErrorDesc": "请检查网络后重试",
+      "legendExpand": "展开图例",
+      "legendCollapse": "收起图例"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",

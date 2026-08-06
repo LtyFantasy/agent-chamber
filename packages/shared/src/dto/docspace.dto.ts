@@ -89,6 +89,37 @@ export interface UpdateDocCategoryInput {
 }
 
 /**
+ * 创建 doc_route 输入（v1.42 批次 B5：INDEX.md 意图路由结构化）
+ *
+ * 语义：intent（"我要…"）→ primaryDoc+headingPath（先看）→ secondaryDoc（再看）→ codeEntry（代码入口）。
+ * 写时校验（Service 层，铁律 #21/#22）：doc 必须存在且属于该空间、headingPath 非空时须精确命中
+ * doc_sections.heading_path、codeEntry 禁绝对路径与 `..` 段。
+ */
+export interface CreateDocRouteInput {
+  /** 用户意图描述（"我要…"），如 "我要了解系统架构" */
+  intent: string;
+  /** 路由分组（可空），如 "architecture"、"troubleshooting" */
+  category?: string;
+  /** 主文档 ID（必填，路由的第一步跳转） */
+  primaryDocId: string;
+  /** 主文档定位锚点（doc_sections.heading_path 精确匹配，可空 = 文档级） */
+  primaryHeadingPath?: string;
+  /** 次文档 ID（可空，看完主文档后需要再看时跳转） */
+  secondaryDocId?: string;
+  /** 次文档定位锚点（可空） */
+  secondaryHeadingPath?: string;
+  /** 代码入口（仓库内相对路径，如 `apps/backend/src/modules/docspace/doc.service.ts`；禁绝对路径与 `..`） */
+  codeEntry?: string;
+  /** 排序权重（同空间内 ASC 升序展示，缺省 0） */
+  sortOrder?: number;
+}
+
+/**
+ * 更新 doc_route 输入（Partial 语义；PATCH 改 primary/secondary doc 或 headingPath 时重新走写时校验）
+ */
+export type UpdateDocRouteInput = Partial<CreateDocRouteInput>;
+
+/**
  * Upsert 文档输入（PUT by space+path）
  */
 export interface UpsertDocInput {

@@ -57,6 +57,38 @@ export class Milestone {
   @Column({ type: 'uuid', nullable: true, name: 'creator_id' })
   creatorId: string | null;
 
+  /**
+   * Release 版本号（varchar 50）。null = 普通里程碑（status 限普通四态）；
+   * 非空 = Release 里程碑（status 走 dev→ready→deployed→verified 生命周期）。
+   * 同 board 内唯一：部分唯一索引 uq_milestones_board_version (board_id, version)
+   * WHERE version IS NOT NULL，冲突 23505 → 409 MILESTONE_VERSION_CONFLICT。
+   */
+  @Column({ type: 'varchar', length: 50, nullable: true })
+  version: string | null;
+
+  /**
+   * Release 变更说明（Markdown 全文；text 不受 200 上限约束，DTO @MaxLength(20000)）。
+   * 列表接口投影为 bodySnippet(300)，详情接口全量返回。
+   */
+  @Column({ type: 'text', nullable: true })
+  body: string | null;
+
+  /**
+   * 部署元数据（jsonb：anchors/backup/migrations 等一次性机器写入）。
+   * 只经 POST /tasks/milestones/:id/deployed 合并写入（热修重部署幂等覆盖），
+   * 不可经 create/update DTO 写入（whitelist 拦截）。列表接口不返回该字段。
+   */
+  @Column({ type: 'jsonb', nullable: true, name: 'deploy_meta' })
+  deployMeta: Record<string, unknown> | null;
+
+  /** 最近一次部署时间（deployed 端点写入：payload.deployedAt 优先，缺省 now） */
+  @Column({ type: 'timestamptz', nullable: true, name: 'deployed_at' })
+  deployedAt: Date | null;
+
+  /** 验收时间（PATCH status=verified 时由 Service 写入，不变量：verified ⇔ verifiedAt 非空） */
+  @Column({ type: 'timestamptz', nullable: true, name: 'verified_at' })
+  verifiedAt: Date | null;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 

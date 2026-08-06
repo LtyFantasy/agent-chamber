@@ -70,4 +70,17 @@ export class UpsertDocDto {
   @IsString()
   @MaxLength(128)
   source?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'last-verified 源码提交 sha（ingest 适配器上报，如 git rev-parse HEAD 40 hex）。' +
+      '语义 = "内容在此 sha 验证一致"；contentHash 相同但 sha 不同时仅刷新该列，' +
+      '响应仍 unchanged。native 写入不需要此字段。',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  // docs.source_sha 列为 varchar(64)，超长必须在 DTO 层 400，禁止透传 PG 22001 → 500（铁律 21）
+  @MaxLength(64)
+  sourceSha?: string;
 }

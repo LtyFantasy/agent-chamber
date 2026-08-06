@@ -33,6 +33,8 @@ describe('DocSpaceController', () => {
     updateCategory: jest.fn(),
     removeCategory: jest.fn(),
     getOverview: jest.fn(),
+    // v1.42 批次 C2：repo-manifest 上报
+    updateRepoManifest: jest.fn(),
   };
 
   const mockPermService = {
@@ -113,6 +115,55 @@ describe('DocSpaceController', () => {
       await controller.create(mockActor, dto);
       expect(boardService.findById).toHaveBeenCalledWith('board-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'read');
+    });
+  });
+
+  // ─── updateRepoManifest（v1.42 批次 C2）────────────────────
+
+  describe('updateRepoManifest', () => {
+    const dto = {
+      sha: 'e75475d3c9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d',
+      files: ['apps/backend/src/app.module.ts'],
+    };
+
+    it('要求 space write 权限（ensureCan write），通过后透传 dto 到 service', async () => {
+      const space = { id: 'space-1', creatorId: 'user-1' };
+      const result = {
+        repoManifest: { ...dto, reportedAt: '2026-08-06T00:00:00.000Z' },
+      };
+      service.findById.mockResolvedValue(space);
+      service.updateRepoManifest.mockResolvedValue(result);
+
+      const response = await controller.updateRepoManifest('space-1', dto, mockActor);
+
+      expect(service.findById).toHaveBeenCalledWith('space-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
+      expect(service.updateRepoManifest).toHaveBeenCalledWith('space-1', dto);
+      expect(response).toBe(result);
+    });
+
+    it('无 write 权限 → 403，service 不调用（权限门在 Controller，铁律 #21）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(controller.updateRepoManifest('space-1', dto, nonAdminActor)).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+      );
+      expect(service.updateRepoManifest).not.toHaveBeenCalled();
+    });
+
+    it('空间不存在 → findById 404 透传（不落库）', async () => {
+      service.findById.mockRejectedValue(
+        new ForbiddenException({ message: 'Not found', code: ErrorCode.DOC_SPACE_NOT_FOUND }),
+      );
+
+      await expect(controller.updateRepoManifest('space-1', dto, mockActor)).rejects.toThrow(
+        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.DOC_SPACE_NOT_FOUND }) }),
+      );
+      expect(permService.ensureCan).not.toHaveBeenCalled();
     });
   });
 

@@ -6,6 +6,7 @@ export * from './add-comment.dto';
 export * from './add-task-dependency.dto';
 export * from './create-milestone.dto';
 export * from './update-milestone.dto';
+export * from './mark-milestone-deployed.dto';
 export * from './query-task.dto';
 export * from './query-milestone.dto';
 export * from './batch-create-tasks.dto';

@@ -209,11 +209,12 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 | 空间 | `POST/GET /doc-spaces`、`GET/PATCH/DELETE /doc-spaces/:id`、`GET /doc-spaces/:id/overview` |
 | 成员（creator-only） | `POST /doc-spaces/:id/{invite-agent,uninvite-agent,add-editor,remove-editor}` |
 | 分类 | `POST /doc-spaces/:id/categories`、`PATCH/DELETE /doc-categories/:id` |
+| 意图路由（v1.43 起） | `GET/POST /doc-spaces/:id/routes`、`PATCH/DELETE /doc-routes/:id`、`POST /doc-spaces/:id/routes/recheck`（手动重检 health，space write）、`PUT /doc-spaces/:id/repo-manifest`（仓库清单上报，space write） |
 | 文档读 | `GET /doc-spaces/:id/docs`、`GET /doc-spaces/:id/search`、`GET /docs/:id`、`GET /docs/:id/content`（web 专用）、`GET /docs/:id/sections/:position?` |
 | 文档写 | `PUT /doc-spaces/:id/docs`、`PUT /doc-spaces/:id/docs/batch`（1–50 篇批量）、`DELETE /docs/:id` |
 | 任务关联 | `POST/DELETE /tasks/:id/doc-links[/:docId]` |
 
-**错误码（10000 段）**：`DOC_SPACE_NOT_FOUND`(10000) / `DOC_NOT_FOUND`(10001) / `DOC_CATEGORY_NOT_FOUND`(10002) / `DOC_SOURCE_MISMATCH`(10003, 409) / `DOC_LINK_NOT_FOUND`(10004)。
+**错误码（10000 段）**：`DOC_SPACE_NOT_FOUND`(10000) / `DOC_NOT_FOUND`(10001) / `DOC_CATEGORY_NOT_FOUND`(10002) / `DOC_SOURCE_MISMATCH`(10003, 409) / `DOC_LINK_NOT_FOUND`(10004) / `DOC_ROUTE_DOC_NOT_FOUND`(10005, 400) / `DOC_ROUTE_HEADING_UNRESOLVED`(10006, 400) / `DOC_ROUTE_INVALID_CODE_ENTRY`(10007, 400) / `DOC_ROUTE_NOT_FOUND`(10008, 404)。
 
 ---
 
