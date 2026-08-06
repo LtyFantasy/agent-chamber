@@ -6,6 +6,8 @@ export interface Agent {
   id: string;
   /** Agent 名称 */
   name: string;
+  /** 头像短链/URL（SVG 头像为 /api/v1/avatars/:actorId.svg） */
+  avatarUrl?: string | null;
   /** 描述摘要片段：≤200 字符截断，无描述时 null，仅列表视图返回 */
   descriptionSnippet?: string | null;
   /** Agent 状态 */

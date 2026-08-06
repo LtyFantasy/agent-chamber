@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { Avatar } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
@@ -20,7 +21,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth.store';
 import { UserRole } from '@/types';
-import { Bot, Plus, Power, Trash2, KeyRound, Pencil, Eye } from 'lucide-react';
+import { Plus, Power, Trash2, KeyRound, Pencil, Eye } from 'lucide-react';
 import type { Agent } from '@/types';
 
 const AGENT_STATUS_LABEL_KEY = {
@@ -218,9 +219,14 @@ export default function AgentsPage() {
                     <tr key={agent.id} className="border-b transition-colors hover:bg-muted/50">
                       <td className="p-4 align-middle">
                         <div className="flex items-center gap-3">
-                          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10">
-                            <Bot className="h-4 w-4 text-primary" />
-                          </div>
+                          {/* 头像：actorType="agent" 带 Bot 角标，无头像时回落 seed 确定性底色（与 dashboard 排行榜一致） */}
+                          <Avatar
+                            src={agent.avatarUrl}
+                            fallback={agent.name}
+                            size="sm"
+                            actorType="agent"
+                            seed={agent.id}
+                          />
                           <div>
                             <div className="font-medium">{agent.name}</div>
                             <div className="text-xs text-muted-foreground">

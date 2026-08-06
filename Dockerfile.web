@@ -12,6 +12,9 @@ COPY . .
 # NEXT_PUBLIC_* 构建期内联：compose 通过 build.args 传入（默认 http://localhost:8743）
 ARG NEXT_PUBLIC_API_URL=http://localhost:8743/api/v1
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# 必须先构建 @agent-chamber/shared（web 依赖 workspace:*，其入口是编译产物 dist/；
+# 干净克隆下 dist 不存在，直接 build web 会报 Module not found）——顺序同 Dockerfile.backend
+RUN pnpm --filter @agent-chamber/shared build
 RUN pnpm --filter @agent-chamber/web build
 
 FROM node:22-alpine

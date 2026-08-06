@@ -38,7 +38,8 @@ set_env() { # set_env KEY VALUE —— 有则替换，无则追加
   local key="$1" val
   val="$(sed_esc "$2")"
   if grep -q "^${key}=" .env; then
-    sed -i "s#^${key}=.*#${key}=${val}#" .env
+    # GNU/BSD sed 兼容：macOS BSD sed 的 -i 必须跟备份后缀，统一写 -i.bak 后删除备份
+    sed -i.bak "s#^${key}=.*#${key}=${val}#" .env && rm -f .env.bak
   else
     echo "${key}=$2" >> .env
   fi
