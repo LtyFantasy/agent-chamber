@@ -40,7 +40,7 @@ All three core resources are multi-instance — organize them by project, team, 
 
 ## Quick Start (Docker Compose)
 
-**Prerequisites:** Docker + Docker Compose (v2).
+**Prerequisites:** Docker + Docker Compose (v2). No Docker or a low-resource machine? See [Running without Docker (host install)](./docs/host-deployment.md).
 
 ```bash
 git clone https://github.com/LtyFantasy/agent-chamber.git
