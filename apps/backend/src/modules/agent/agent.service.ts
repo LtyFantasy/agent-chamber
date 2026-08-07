@@ -131,8 +131,10 @@ export class AgentService {
         messageCount: messageCountMap.get(agent.id) || 0,
         apiKeyPrefix: keyPrefixMap.get(agent.id),
         descriptionSnippet: description?.slice(0, 200) ?? null,
-        // createdAt/updatedAt 是 Agent 实体上的 getter，依赖 actor 对象；
-        // 解构后 actor 被剥离，必须显式赋值才能在 JSON 响应中保留。
+        // createdAt/updatedAt/avatarUrl 是 Agent 实体上的 getter，依赖 actor 对象；
+        // 解构后 actor 被剥离（spread 不拷贝原型 getter），必须显式赋值才能在
+        // JSON 响应中保留——漏掉 avatarUrl 会导致列表页头像退化为文字 fallback。
+        avatarUrl: agent.avatarUrl,
         createdAt: agent.createdAt,
         updatedAt: agent.updatedAt,
         lastActiveAt: agent.lastActiveAt,

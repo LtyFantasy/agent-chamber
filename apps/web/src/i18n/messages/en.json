@@ -258,6 +258,8 @@
       "unreadCount": "{count, plural, one {# unread message} other {# unread messages}}",
       "copyId": "Click to copy message ID",
       "copyContent": "Copy message content",
+      "expand": "Expand",
+      "collapse": "Collapse",
       "copied": "Copied",
       "deleteConfirm": "Are you sure you want to delete this message?",
       "deleteTitle": "Delete message",
@@ -550,8 +552,7 @@
       "filterByTag": "Filter by tag \"{tag}\"",
       "contentLoadError": "Failed to load document content",
       "contentLoadErrorDesc": "Check your connection and try again",
-      "legendExpand": "Expand legend",
-      "legendCollapse": "Collapse legend"
+      "legend": "Legend"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",

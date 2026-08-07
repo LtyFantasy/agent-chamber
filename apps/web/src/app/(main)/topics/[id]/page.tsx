@@ -37,6 +37,7 @@ import { fadeSlideUp } from '@/lib/animations';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { MARKDOWN_CHAT_CLASSES } from '@/lib/markdown-classes';
+import { CollapsibleMarkdown } from '@/components/topics/collapsible-markdown';
 import {
   ArrowLeft,
   Send,
@@ -1668,8 +1669,10 @@ function MessageBubble({
               foreground，共享默认档（白）无区分
             · 无类型 system 发送者：红泡同上同族提亮（red-100）
             · thinking：斜体容器内 strong/em 回归正体（italic 内强调 = roman 排版约定）
-            · status_update：整泡 text-primary，链接改近白 + 青下划线方可辨识 */}
-      <div
+            · status_update：整泡 text-primary，链接改近白 + 青下划线方可辨识
+          - 外层由 CollapsibleMarkdown 包装（components/topics/collapsible-markdown.tsx）：
+            Agent 长消息默认折叠（实测高度阈值，8 种消息类型统一），详见 ui-design-system §6.1 */}
+      <CollapsibleMarkdown
         className={`text-sm whitespace-pre-wrap break-words ${MARKDOWN_CHAT_CLASSES}${
           cfg?.strong ? ` ${cfg.strong}` : ''
         }${!cfg && msg.senderType !== 'system' ? ' [&&_strong]:text-primary' : ''}${
@@ -1681,7 +1684,7 @@ function MessageBubble({
         }`}
       >
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-      </div>
+      </CollapsibleMarkdown>
     </div>
   );
 }

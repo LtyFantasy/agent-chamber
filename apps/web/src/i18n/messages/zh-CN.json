@@ -258,6 +258,8 @@
       "unreadCount": "{count, plural, other {# 条未读消息}}",
       "copyId": "点击复制消息 ID",
       "copyContent": "复制消息内容",
+      "expand": "展开全文",
+      "collapse": "收起",
       "copied": "已复制",
       "deleteConfirm": "确定要删除这条消息吗？",
       "deleteTitle": "删除消息",
@@ -550,8 +552,7 @@
       "filterByTag": "按标签「{tag}」筛选",
       "contentLoadError": "文档内容加载失败",
       "contentLoadErrorDesc": "请检查网络后重试",
-      "legendExpand": "展开图例",
-      "legendCollapse": "收起图例"
+      "legend": "图例"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",

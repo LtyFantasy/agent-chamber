@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslations } from 'next-intl';
@@ -11,6 +11,7 @@ import Link from 'next/link';
 import {
   AlertTriangle,
   ArrowLeft,
+  BookOpen,
   Check,
   CheckCircle,
   Copy,
@@ -148,10 +149,8 @@ export default function DocSpaceDetailPage() {
   /** 待滚动定位的标题路径（搜索命中直达 section 用） */
   const pendingHeadingRef = useRef<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  /** 空间图例（description）展开态（v1.41）：markdown 渲染，超长（>max-h-64）折叠 + 展开/收起 */
-  const [legendExpanded, setLegendExpanded] = useState(false);
-  const [legendOverflowing, setLegendOverflowing] = useState(false);
-  const legendRef = useRef<HTMLDivElement>(null);
+  /** 空间图例对话框开关（v1.43.1-dev）：图例改为头部按钮触发只读弹窗，不再内联占用首屏三栏区 */
+  const [legendOpen, setLegendOpen] = useState(false);
 
   // ── 查询 ────────────────────────────────────────
   const { data: space, isLoading: spaceLoading } = useQuery({
@@ -159,13 +158,6 @@ export default function DocSpaceDetailPage() {
     queryFn: () => Api.docs.getSpace(spaceId),
     enabled: !!spaceId,
   });
-
-  // 图例内容变化后测量是否超长（max-h-64 = 256px）；overflow-hidden 下 scrollHeight 仍返回内容全高
-  useLayoutEffect(() => {
-    const el = legendRef.current;
-    if (!el) return;
-    setLegendOverflowing(el.scrollHeight > 256);
-  }, [space?.description]);
 
   /** 空间设置的绑定选项（仅在对话框打开时拉取） */
   const { data: bindingBoards } = useQuery({
@@ -713,6 +705,13 @@ export default function DocSpaceDetailPage() {
               {t('doc.outline')}
             </Button>
           )}
+          {/* 空间图例入口（v1.43.1-dev）：仅在有图例内容时显示，点击打开只读弹窗 */}
+          {space.description && (
+            <Button variant="outline" size="sm" onClick={() => setLegendOpen(true)}>
+              <BookOpen className="mr-1 h-4 w-4" />
+              {t('detail.legend')}
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={() => setMembersSheetOpen(true)}>
             <Users className="mr-1 h-4 w-4" />
             {t('members.title')}
@@ -772,31 +771,6 @@ export default function DocSpaceDetailPage() {
           )}
         </div>
       </div>
-      {/* 空间图例（v1.41）：markdown 渲染（复用中栏 MARKDOWN_CLASSES 文档版），超长折叠 + 展开/收起 */}
-      {space.description && (
-        <div className="-mt-2">
-          <div
-            ref={legendRef}
-            className={`text-sm text-muted-foreground ${MARKDOWN_CLASSES} ${
-              legendExpanded ? '' : 'max-h-64 overflow-hidden'
-            }`}
-          >
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {space.description}
-            </ReactMarkdown>
-          </div>
-          {legendOverflowing && (
-            <button
-              type="button"
-              onClick={() => setLegendExpanded((v) => !v)}
-              className="mt-1 text-xs text-primary hover:underline"
-            >
-              {legendExpanded ? t('detail.legendCollapse') : t('detail.legendExpand')}
-            </button>
-          )}
-        </div>
-      )}
-
       {/* 三栏主体 */}
       <div className="flex gap-4" style={{ height: 'calc(100vh - 13rem)' }}>
         {/* 左栏：搜索 + 过滤 + 分类树/搜索命中 */}
@@ -1174,6 +1148,19 @@ export default function DocSpaceDetailPage() {
       </Sheet>
 
       {/* 分类管理 Dialog（canManage：增/改名/删） */}
+      {/* 空间图例只读弹窗（v1.43.1-dev）：markdown 渲染查看；编辑入口在空间设置 */}
+      <Dialog open={legendOpen} onOpenChange={setLegendOpen}>
+        <DialogHeader>
+          <DialogTitle>{t('detail.legend')}</DialogTitle>
+          <DialogDescription>{space.name}</DialogDescription>
+        </DialogHeader>
+        <div className={`py-4 text-sm text-muted-foreground ${MARKDOWN_CLASSES}`}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            {space.description ?? ''}
+          </ReactMarkdown>
+        </div>
+      </Dialog>
+
       <Dialog open={categoriesOpen} onOpenChange={setCategoriesOpen}>
         <DialogHeader>
           <DialogTitle>{t('categories.title')}</DialogTitle>
