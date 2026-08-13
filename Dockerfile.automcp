@@ -9,9 +9,14 @@ COPY pnpm-lock.yaml ./
 COPY packages/automcp/package.json ./packages/automcp/
 # platform-mcp 依赖 automcp（workspace:*），两个包一起装
 COPY packages/platform-mcp/package.json ./packages/platform-mcp/
+# platform-mcp 还依赖 shared（workspace:*，read-doc.ts 等直接 import）——缺装缺编译则
+# platform-mcp tsc TS2307 必炸（v1.51.1 从零冒烟第四层 bug，2026-08-13）
+COPY packages/shared/package.json ./packages/shared/
 # lockfile 已随仓导出，严格 --frozen-lockfile：回退只会掩盖 lockfile 漂移
 RUN pnpm install --frozen-lockfile
 COPY . .
+# 必须先编译 shared，platform-mcp 运行时通过 workspace symlink 依赖其 dist
+RUN pnpm --filter @agent-chamber/shared build
 RUN pnpm --filter @agent-chamber/automcp build
 RUN pnpm --filter @agent-chamber/platform-mcp build
 
