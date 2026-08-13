@@ -10,6 +10,11 @@ COPY packages/shared/package.json ./packages/shared/
 # 缺装缺编译则 backend tsc 产物 require 被改写成直指 .ts 源码的相对路径，容器启动必挂
 # （2026-08-08 圆桌首发事故的 docker 版复现，v1.51.2 从零冒烟第五层 bug）
 COPY packages/roundtable-protocol/package.json ./packages/roundtable-protocol/
+# 原生模块编译工具链：bcrypt 的 node-pre-gyp 预编译包托管在 github releases，
+# 国内拉取偶发 socket hang up 时会 --fallback-to-build 走源码编译，alpine 无
+# python3/make/g++ 则 gyp configure 必炸（v1.51.3 冒烟 mcp 镜像同坑实证，
+# 2026-08-13）。仅 builder 阶段需要，不进运行时镜像
+RUN apk add --no-cache python3 make g++
 # lockfile 已随仓导出，严格 --frozen-lockfile：回退只会掩盖 lockfile 漂移
 RUN pnpm install --frozen-lockfile
 COPY . .
