@@ -42,9 +42,7 @@ describe('get_my_briefing', () => {
     await getMyBriefingTool.handler({}, ctx());
 
     // task 查询应带 pageSize=20
-    const tasksCall = request.mock.calls.find(
-      ([, path, opts]: any[]) => path === '/tasks',
-    );
+    const tasksCall = request.mock.calls.find(([, path, opts]: any[]) => path === '/tasks');
     expect(tasksCall[2].params.pageSize).toBe(20);
 
     // activity 查询应带 limit=10
@@ -63,14 +61,10 @@ describe('get_my_briefing', () => {
 
     await getMyBriefingTool.handler({ taskLimit: 5, activityLimit: 3 }, ctx());
 
-    const tasksCall = request.mock.calls.find(
-      ([, path]: any[]) => path === '/tasks',
-    );
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
     expect(tasksCall[2].params.pageSize).toBe(5);
 
-    const actCall = request.mock.calls.find(
-      ([, path]: any[]) => path === '/agents/me/activities',
-    );
+    const actCall = request.mock.calls.find(([, path]: any[]) => path === '/agents/me/activities');
     expect(actCall[2].params.limit).toBe(3);
   });
 
@@ -106,16 +100,16 @@ describe('get_my_briefing', () => {
 
     await getMyBriefingTool.handler({}, ctx());
 
-    const tasksCall = request.mock.calls.find(
-      ([, path]: any[]) => path === '/tasks',
-    );
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
     expect(tasksCall[2].params.assigneeId).toBe('agent-uuid');
     expect(tasksCall[2].params.status).toBe('backlog,todo,in_progress,blocked');
   });
 
   it('get_me 步骤失败 → isError + failedStep=get_me', async () => {
     const request = mockRequest();
-    request.mockRejectedValueOnce(new PlatformApiError({ status: 401, code: 1009, message: 'Invalid API Key' }));
+    request.mockRejectedValueOnce(
+      new PlatformApiError({ status: 401, code: 1009, message: 'Invalid API Key' }),
+    );
 
     const result = await getMyBriefingTool.handler({}, ctx());
 

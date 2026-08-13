@@ -6,7 +6,17 @@
  *
  * 字段语义出处：docs/roundtable-design.md §5（roundtable_seats 表）/ §3（SeatConfig）。
  */
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { PERMISSION_MODES, SEAT_VENDORS } from '@agent-chamber/roundtable-protocol';
 

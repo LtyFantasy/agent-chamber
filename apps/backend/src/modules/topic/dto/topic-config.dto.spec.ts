@@ -9,9 +9,7 @@ describe('TopicConfigDto', () => {
     dto.invitedAgentIds = ['not-a-uuid'];
 
     const errors = await validate(dto);
-    expect(errors.some((e) => e.property === 'invitedAgentIds' && e.constraints?.isUuid)).toBe(
-      true,
-    );
+    expect(errors.some((e) => e.property === 'invitedAgentIds' && e.constraints?.isUuid)).toBe(true);
   });
 
   // ── kind / wakePolicy 校验矩阵（设计 §5/§6 冻结枚举，铁律 #20 契约即设计） ──

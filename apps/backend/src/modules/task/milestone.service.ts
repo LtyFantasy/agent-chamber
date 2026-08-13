@@ -41,7 +41,12 @@
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
 import { Milestone } from '../../database/entities/milestone.entity';
@@ -140,13 +145,9 @@ export class MilestoneService {
           message: 'Deployed status can only be set via POST /tasks/milestones/:id/deployed',
           code: ErrorCode.MILESTONE_DEPLOY_VIA_ENDPOINT,
         });
-      } else if (
-        status !== MilestoneStatus.DEV &&
-        status !== MilestoneStatus.READY
-      ) {
+      } else if (status !== MilestoneStatus.DEV && status !== MilestoneStatus.READY) {
         throw new BadRequestException({
-          message:
-            'Release milestone (version set) can only start as dev or ready (default dev)',
+          message: 'Release milestone (version set) can only start as dev or ready (default dev)',
           code: ErrorCode.MILESTONE_INVALID_TRANSITION,
         });
       }
@@ -213,7 +214,10 @@ export class MilestoneService {
         : new Map<string, { total: number; done: number; inProgress: number; open: number }>();
 
     const itemsWithStats = items.map((m) => {
-      const item = { ...m, stats: statsMap.get(m.id) ?? { total: 0, done: 0, inProgress: 0, open: 0 } } as MilestoneDto;
+      const item = {
+        ...m,
+        stats: statsMap.get(m.id) ?? { total: 0, done: 0, inProgress: 0, open: 0 },
+      } as MilestoneDto;
       // 列表投影（响应体积规范）：body → bodySnippet(300)，deployMeta 不在列表返回
       item.bodySnippet = item.body != null ? item.body.slice(0, 300) : null;
       delete item.body;
@@ -348,7 +352,9 @@ export class MilestoneService {
 
     // ---- Release 状态机（只约束 release/version 相关流转；普通 milestone 既有行为零变更）----
     const attachingVersion =
-      dto.version !== undefined && dto.version !== null && dto.version !== '' &&
+      dto.version !== undefined &&
+      dto.version !== null &&
+      dto.version !== '' &&
       milestone.version == null;
 
     if (attachingVersion) {

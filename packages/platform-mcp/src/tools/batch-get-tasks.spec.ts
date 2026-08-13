@@ -73,10 +73,10 @@ describe('batch_get_tasks', () => {
     const request = mockRequest();
     // 故意让第二个先 resolve
     let resolveSecond: (v: unknown) => void;
-    const p2 = new Promise((r) => { resolveSecond = r; });
-    request
-      .mockResolvedValueOnce(Promise.resolve({ id: 't1' }))
-      .mockResolvedValueOnce(p2);
+    const p2 = new Promise((r) => {
+      resolveSecond = r;
+    });
+    request.mockResolvedValueOnce(Promise.resolve({ id: 't1' })).mockResolvedValueOnce(p2);
 
     const resultPromise = batchGetTasksTool.handler(
       { ids: ['550e8400-e29b-41d4-a716-446655440001', '550e8400-e29b-41d4-a716-446655440002'] },
@@ -95,9 +95,7 @@ describe('batch_get_tasks', () => {
 
   it('非法 UUID → 本地短路，不发 HTTP', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 't2' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 't2' });
 
     const result = await batchGetTasksTool.handler(
       {

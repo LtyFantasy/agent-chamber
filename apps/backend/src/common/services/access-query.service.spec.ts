@@ -160,11 +160,7 @@ describe('AccessQueryService', () => {
       const result = await service.getAccessibleTopicIds(actor);
 
       expect(result).toEqual(
-        expect.arrayContaining([
-          'topic-open',
-          'topic-creator',
-          'topic-accessible',
-        ]),
+        expect.arrayContaining(['topic-open', 'topic-creator', 'topic-accessible']),
       );
       expect(result).toHaveLength(3);
       expect(mockTopicRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
@@ -197,7 +193,11 @@ describe('AccessQueryService', () => {
       expect(result).toEqual(expect.arrayContaining(['topic-open', 'topic-agent-created']));
       expect(result).toHaveLength(2);
       // creator 查询按 IN (本人 + owned agent ids) 过滤
-      expect(topicQb.setParameter).toHaveBeenCalledWith('creatorIds', ['user-1', 'agent-1', 'agent-2']);
+      expect(topicQb.setParameter).toHaveBeenCalledWith('creatorIds', [
+        'user-1',
+        'agent-1',
+        'agent-2',
+      ]);
       expect(mockOwnerProxy.getOwnedAgentIds).toHaveBeenCalledWith(actor);
     });
 
@@ -244,11 +244,7 @@ describe('AccessQueryService', () => {
       const result = await service.getAccessibleBoardIds(actor);
 
       expect(result).toEqual(
-        expect.arrayContaining([
-          'board-open',
-          'board-creator',
-          'board-member',
-        ]),
+        expect.arrayContaining(['board-open', 'board-creator', 'board-member']),
       );
       expect(result).toHaveLength(3);
       expect(mockBoardRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
@@ -256,9 +252,7 @@ describe('AccessQueryService', () => {
     });
 
     it('should return empty when actor has no boards', async () => {
-      boardQb.getRawMany
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([]);
+      boardQb.getRawMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
       memberQb.getRawMany.mockResolvedValueOnce([]);
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
@@ -312,11 +306,7 @@ describe('AccessQueryService', () => {
       const result = await service.getAccessibleDocSpaceIds(actor);
 
       expect(result).toEqual(
-        expect.arrayContaining([
-          'space-open',
-          'space-creator',
-          'space-member',
-        ]),
+        expect.arrayContaining(['space-open', 'space-creator', 'space-member']),
       );
       expect(result).toHaveLength(3);
       expect(mockDocSpaceRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
@@ -324,9 +314,7 @@ describe('AccessQueryService', () => {
     });
 
     it('should return empty when actor has no spaces', async () => {
-      docSpaceQb.getRawMany
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([]);
+      docSpaceQb.getRawMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
       docSpaceMemberQb.getRawMany.mockResolvedValueOnce([]);
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
@@ -375,9 +363,7 @@ describe('AccessQueryService', () => {
     });
 
     it('should cache board ids within the same request context', async () => {
-      boardQb.getRawMany
-        .mockResolvedValueOnce([{ id: 'board-open' }])
-        .mockResolvedValueOnce([]);
+      boardQb.getRawMany.mockResolvedValueOnce([{ id: 'board-open' }]).mockResolvedValueOnce([]);
       memberQb.getRawMany.mockResolvedValueOnce([]);
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
@@ -394,9 +380,7 @@ describe('AccessQueryService', () => {
       expect(mockMemberRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
     });
     it('should cache docspace ids within the same request context', async () => {
-      docSpaceQb.getRawMany
-        .mockResolvedValueOnce([{ id: 'space-open' }])
-        .mockResolvedValueOnce([]);
+      docSpaceQb.getRawMany.mockResolvedValueOnce([{ id: 'space-open' }]).mockResolvedValueOnce([]);
       docSpaceMemberQb.getRawMany.mockResolvedValueOnce([]);
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };

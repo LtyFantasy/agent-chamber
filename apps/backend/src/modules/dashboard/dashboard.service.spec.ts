@@ -193,9 +193,7 @@ describe('DashboardService', () => {
         { agentId: 'a1', count: '5' },
         { agentId: 'a2', count: '3' },
       ]);
-      (mockTaskRepo.manager.query as jest.Mock).mockResolvedValue([
-        { agentId: 'a1', count: '2' },
-      ]);
+      (mockTaskRepo.manager.query as jest.Mock).mockResolvedValue([{ agentId: 'a1', count: '2' }]);
 
       const result = await service.agentActivity();
 
@@ -250,11 +248,26 @@ describe('DashboardService', () => {
 
       expect(result).toHaveLength(3);
       // a3: 20 + 1*3 = 23
-      expect(result[0]).toMatchObject({ id: 'a3', messageCount: 20, completedTaskCount: 1, activityScore: 23 });
+      expect(result[0]).toMatchObject({
+        id: 'a3',
+        messageCount: 20,
+        completedTaskCount: 1,
+        activityScore: 23,
+      });
       // a2: 5 + 5*3 = 20
-      expect(result[1]).toMatchObject({ id: 'a2', messageCount: 5, completedTaskCount: 5, activityScore: 20 });
+      expect(result[1]).toMatchObject({
+        id: 'a2',
+        messageCount: 5,
+        completedTaskCount: 5,
+        activityScore: 20,
+      });
       // a1: 10 + 2*3 = 16
-      expect(result[2]).toMatchObject({ id: 'a1', messageCount: 10, completedTaskCount: 2, activityScore: 16 });
+      expect(result[2]).toMatchObject({
+        id: 'a1',
+        messageCount: 10,
+        completedTaskCount: 2,
+        activityScore: 16,
+      });
     });
 
     it('should include actor avatarUrl and fall back to null when unset', async () => {

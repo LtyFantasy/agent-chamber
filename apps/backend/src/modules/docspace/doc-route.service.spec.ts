@@ -77,11 +77,7 @@ describe('DocRouteService', () => {
 
     docService = { sectionExistsByHeadingPath: jest.fn() };
 
-    service = new DocRouteService(
-      routeRepo,
-      docRepo,
-      docService as unknown as DocService,
-    );
+    service = new DocRouteService(routeRepo, docRepo, docService as unknown as DocService);
   });
 
   afterEach(() => jest.resetAllMocks());
@@ -162,9 +158,7 @@ describe('DocRouteService', () => {
 
       const dto = { intent: 'i', primaryDocId: 'doc-1' } as any;
       await service.create('space-1', dto, mockActor as any);
-      expect(routeRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({ sortOrder: 0 }),
-      );
+      expect(routeRepo.create).toHaveBeenCalledWith(expect.objectContaining({ sortOrder: 0 }));
     });
   });
 
@@ -239,11 +233,12 @@ describe('DocRouteService', () => {
     it('passes when primary headingPath resolves (exact match through docService)', async () => {
       docRepo.findOne.mockResolvedValue(makeDoc());
       docService.sectionExistsByHeadingPath.mockResolvedValue(true);
-      await service.create('space-1', dto({ primaryHeadingPath: '## 3. 架构总览' }), mockActor as any);
-      expect(docService.sectionExistsByHeadingPath).toHaveBeenCalledWith(
-        'doc-1',
-        '## 3. 架构总览',
+      await service.create(
+        'space-1',
+        dto({ primaryHeadingPath: '## 3. 架构总览' }),
+        mockActor as any,
       );
+      expect(docService.sectionExistsByHeadingPath).toHaveBeenCalledWith('doc-1', '## 3. 架构总览');
     });
 
     // ── codeEntry 非法矩阵（三种 + 超长）──
@@ -323,7 +318,10 @@ describe('DocRouteService', () => {
       routeRepo.findOne.mockResolvedValue(makeRoute());
       routeRepo.save.mockImplementation(async (r: any) => r);
 
-      const result = await service.update('route-1', { intent: '新意图', category: 'guide' } as any);
+      const result = await service.update('route-1', {
+        intent: '新意图',
+        category: 'guide',
+      } as any);
       expect(result.intent).toBe('新意图');
       expect(result.category).toBe('guide');
       expect(routeRepo.save).toHaveBeenCalled();

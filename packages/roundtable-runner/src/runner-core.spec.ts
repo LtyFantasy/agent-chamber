@@ -107,11 +107,7 @@ class FakeDriver implements SeatDriver {
     this.emit({ type: 'message_complete', seatId, stopReason: 'end_turn' });
   }
 
-  async answerPermission(
-    seatId: string,
-    requestId: string,
-    optionId: string,
-  ): Promise<void> {
+  async answerPermission(seatId: string, requestId: string, optionId: string): Promise<void> {
     this.answered.push({ seatId, requestId, optionId });
   }
 
@@ -313,7 +309,7 @@ describe('RunnerCore seat.assign 落地', () => {
 });
 
 describe('RunnerCore seat.inject 装配与上行', () => {
-  it('prompt 文本 = ruleHeader + \'\\n\\n\' + JSON.stringify(body, null, 2)；事件上行透传', async () => {
+  it("prompt 文本 = ruleHeader + '\\n\\n' + JSON.stringify(body, null, 2)；事件上行透传", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'core-inject-'));
     const h = await makeHarness();
     serverSend(h.server, assignEnvelope({ ...SEAT_CONFIG, cwd }));
@@ -589,7 +585,10 @@ describe('RunnerCore 默认驱动工厂（vendor → 懒加载）', () => {
   it('未知 vendor（如 gpt）→ 座位 status offline（detail 带 vendor 名），不 crash 不拉起', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'core-unknown-vendor-'));
     const h = await makeHarness();
-    serverSend(h.server, assignEnvelope({ ...SEAT_CONFIG, seatId: 'seat-gpt', vendor: 'gpt', cwd }));
+    serverSend(
+      h.server,
+      assignEnvelope({ ...SEAT_CONFIG, seatId: 'seat-gpt', vendor: 'gpt', cwd }),
+    );
     const statusEnv = await waitForEvent(
       h.messages,
       (m) =>
@@ -650,7 +649,9 @@ describe('RunnerCore R1 审批缓存跨座位隔离（seatId 前缀 key）', () 
       ),
     );
     await waitUntil(() => h.driver.answered.length === 1);
-    expect(h.driver.answered).toEqual([{ seatId: 'seat-a', requestId: '0', optionId: 'allow_once' }]);
+    expect(h.driver.answered).toEqual([
+      { seatId: 'seat-a', requestId: '0', optionId: 'allow_once' },
+    ]);
     // seat-b 的 verdict 照常路由（缓存未被 seat-a 的 verdict 清掉）
     serverSend(
       h.server,
@@ -661,7 +662,11 @@ describe('RunnerCore R1 审批缓存跨座位隔离（seatId 前缀 key）', () 
       ),
     );
     await waitUntil(() => h.driver.answered.length === 2);
-    expect(h.driver.answered[1]).toEqual({ seatId: 'seat-b', requestId: '0', optionId: 'reject_once' });
+    expect(h.driver.answered[1]).toEqual({
+      seatId: 'seat-b',
+      requestId: '0',
+      optionId: 'reject_once',
+    });
     await h.core.stop();
     await new Promise<void>((resolve) => h.server.close(() => resolve()));
   });

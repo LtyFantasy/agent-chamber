@@ -39,7 +39,12 @@ describe('DocController', () => {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
 
-  const space = { id: 'space-1', name: 'Space', settings: { visibility: Visibility.OPEN }, creatorId: 'user-1' };
+  const space = {
+    id: 'space-1',
+    name: 'Space',
+    settings: { visibility: Visibility.OPEN },
+    creatorId: 'user-1',
+  };
 
   beforeEach(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -76,9 +81,7 @@ describe('DocController', () => {
       docService.upsert.mockResolvedValue(result);
 
       const dto = { path: 'test.md', content: '# Hello' };
-      expect(
-        await controller.upsert('space-1', dto, mockActor),
-      ).toBe(result);
+      expect(await controller.upsert('space-1', dto, mockActor)).toBe(result);
 
       expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
@@ -94,7 +97,9 @@ describe('DocController', () => {
       await expect(
         controller.upsert('space-1', { path: 'test.md', content: '# Hello' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
       expect(docService.upsert).not.toHaveBeenCalled();
     });
@@ -105,7 +110,15 @@ describe('DocController', () => {
   describe('findAll', () => {
     it('calls service.findAll after ensuring read permission', async () => {
       docSpaceService.findById.mockResolvedValue(space);
-      const result = { items: [], total: 0, page: 1, pageSize: 20, totalPages: 0, hasNext: false, hasPrev: false };
+      const result = {
+        items: [],
+        total: 0,
+        page: 1,
+        pageSize: 20,
+        totalPages: 0,
+        hasNext: false,
+        hasPrev: false,
+      };
       docService.findAll.mockResolvedValue(result);
 
       const query = { page: 1, pageSize: 20 };
@@ -157,7 +170,12 @@ describe('DocController', () => {
       const doc = { id: 'doc-1', spaceId: 'space-1' };
       docService.findById.mockResolvedValue(doc);
       docSpaceService.findById.mockResolvedValue(space);
-      const content = { docId: 'doc-1', docPath: 'test.md', title: 'Test', content: '# Hello\n\nWorld' };
+      const content = {
+        docId: 'doc-1',
+        docPath: 'test.md',
+        title: 'Test',
+        content: '# Hello\n\nWorld',
+      };
       docService.getContent.mockResolvedValue(content);
 
       expect(await controller.getContent('doc-1', mockActor)).toBe(content);
@@ -171,7 +189,15 @@ describe('DocController', () => {
       const doc = { id: 'doc-1', spaceId: 'space-1' };
       docService.findById.mockResolvedValue(doc);
       docSpaceService.findById.mockResolvedValue(space);
-      const section = { docId: 'doc-1', docPath: 'test.md', position: 0, headingPath: 'Intro', headingLevel: 1, content: 'Hello', tokenEstimate: 10 };
+      const section = {
+        docId: 'doc-1',
+        docPath: 'test.md',
+        position: 0,
+        headingPath: 'Intro',
+        headingLevel: 1,
+        content: 'Hello',
+        tokenEstimate: 10,
+      };
       docService.getSection.mockResolvedValue(section);
 
       expect(await controller.getSection('doc-1', 0, undefined, mockActor)).toBe(section);
@@ -181,7 +207,15 @@ describe('DocController', () => {
       const doc = { id: 'doc-1', spaceId: 'space-1' };
       docService.findById.mockResolvedValue(doc);
       docSpaceService.findById.mockResolvedValue(space);
-      const section = { docId: 'doc-1', docPath: 'test.md', position: 1, headingPath: 'Setup', headingLevel: 2, content: 'Steps', tokenEstimate: 20 };
+      const section = {
+        docId: 'doc-1',
+        docPath: 'test.md',
+        position: 1,
+        headingPath: 'Setup',
+        headingLevel: 2,
+        content: 'Steps',
+        tokenEstimate: 20,
+      };
       docService.getSection.mockResolvedValue(section);
 
       await controller.getSection('doc-1', 0, 'Setup', mockActor);
@@ -222,16 +256,20 @@ describe('DocController', () => {
 
   describe('permission matrix', () => {
     it('non-member gets read rejected on private space', async () => {
-      const privateSpace = { id: 'space-1', settings: { visibility: Visibility.PRIVATE }, creatorId: 'other' };
+      const privateSpace = {
+        id: 'space-1',
+        settings: { visibility: Visibility.PRIVATE },
+        creatorId: 'other',
+      };
       docSpaceService.findById.mockResolvedValue(privateSpace);
       permService.ensureCan.mockRejectedValue(
         new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
       );
 
-      await expect(
-        controller.findAll('space-1', {}, nonAdminActor),
-      ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+      await expect(controller.findAll('space-1', {}, nonAdminActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
 
@@ -244,7 +282,9 @@ describe('DocController', () => {
       await expect(
         controller.upsert('space-1', { path: 'test.md', content: '# Hello' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });

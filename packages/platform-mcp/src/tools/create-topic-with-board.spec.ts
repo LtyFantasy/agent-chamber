@@ -36,10 +36,7 @@ describe('create_topic_with_board', () => {
 
     request.mockResolvedValueOnce(topic).mockResolvedValueOnce(board);
 
-    const result = await createTopicWithBoardTool.handler(
-      { title: 'New Topic' },
-      ctx(),
-    );
+    const result = await createTopicWithBoardTool.handler({ title: 'New Topic' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -61,10 +58,7 @@ describe('create_topic_with_board', () => {
         new PlatformApiError({ status: 400, code: 3001, message: 'Board creation failed' }),
       );
 
-    const result = await createTopicWithBoardTool.handler(
-      { title: 'New Topic' },
-      ctx(),
-    );
+    const result = await createTopicWithBoardTool.handler({ title: 'New Topic' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -76,14 +70,9 @@ describe('create_topic_with_board', () => {
 
   it('topic 失败 → isError + failedStep=create_topic，不调 board', async () => {
     const request = mockRequest();
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 401, message: 'Unauthorized' }),
-    );
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 401, message: 'Unauthorized' }));
 
-    const result = await createTopicWithBoardTool.handler(
-      { title: 'X' },
-      ctx(),
-    );
+    const result = await createTopicWithBoardTool.handler({ title: 'X' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -94,9 +83,7 @@ describe('create_topic_with_board', () => {
 
   it('visibility 未传时默认 private（显式传值覆盖服务端 open 默认）', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
     await createTopicWithBoardTool.handler({ title: 'T' }, ctx());
 
@@ -106,14 +93,9 @@ describe('create_topic_with_board', () => {
 
   it('visibility 显式传 open 时透传', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
-    await createTopicWithBoardTool.handler(
-      { title: 'T', visibility: 'open' },
-      ctx(),
-    );
+    await createTopicWithBoardTool.handler({ title: 'T', visibility: 'open' }, ctx());
 
     const topicBody = request.mock.calls[0][2].body;
     expect(topicBody.visibility).toBe('open');
@@ -121,9 +103,7 @@ describe('create_topic_with_board', () => {
 
   it('boardName 未传时默认为 title', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
     await createTopicWithBoardTool.handler({ title: 'My Project' }, ctx());
 
@@ -133,9 +113,7 @@ describe('create_topic_with_board', () => {
 
   it('boardName 显式传值时使用之', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
     await createTopicWithBoardTool.handler(
       { title: 'My Project', boardName: 'Custom Board' },
@@ -148,9 +126,7 @@ describe('create_topic_with_board', () => {
 
   it('lists 未传时默认三列', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
     await createTopicWithBoardTool.handler({ title: 'T' }, ctx());
 
@@ -164,15 +140,13 @@ describe('create_topic_with_board', () => {
 
   it('lists 自定义时透传', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce({ id: 'b1' });
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce({ id: 'b1' });
 
-    const custom = [{ name: 'todo', mappedStatus: 'todo' }, { name: 'done', mappedStatus: 'done' }];
-    await createTopicWithBoardTool.handler(
-      { title: 'T', lists: custom },
-      ctx(),
-    );
+    const custom = [
+      { name: 'todo', mappedStatus: 'todo' },
+      { name: 'done', mappedStatus: 'done' },
+    ];
+    await createTopicWithBoardTool.handler({ title: 'T', lists: custom }, ctx());
 
     const boardBody = request.mock.calls[1][2].body;
     expect(boardBody.lists).toEqual(custom);

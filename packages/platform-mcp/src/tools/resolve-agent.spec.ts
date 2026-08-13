@@ -53,10 +53,7 @@ describe('resolve_agent', () => {
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'alice', scopeTopicId: 't1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'alice', scopeTopicId: 't1' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(1);
@@ -73,14 +70,17 @@ describe('resolve_agent', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Alice',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'ALICE', scopeTopicId: 't1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'ALICE', scopeTopicId: 't1' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(1);
@@ -90,15 +90,24 @@ describe('resolve_agent', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Alison', role: 'member', status: 'active' },
-        { participantId: 'u-2', participantType: 'agent', name: 'Alistair', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Alison',
+          role: 'member',
+          status: 'active',
+        },
+        {
+          participantId: 'u-2',
+          participantType: 'agent',
+          name: 'Alistair',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'Ali', scopeTopicId: 't1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'Ali', scopeTopicId: 't1' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(2);
@@ -114,10 +123,7 @@ describe('resolve_agent', () => {
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'Dana', scopeBoardId: 'b1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'Dana', scopeBoardId: 'b1' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(1);
@@ -130,13 +136,17 @@ describe('resolve_agent', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Sam', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Sam',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
     request.mockResolvedValueOnce({
-      members: [
-        { id: 'u-1', name: 'Sam', type: 'agent', role: 'editor' },
-      ],
+      members: [{ id: 'u-1', name: 'Sam', type: 'agent', role: 'editor' }],
     });
 
     const result = await resolveAgentTool.handler(
@@ -157,7 +167,13 @@ describe('resolve_agent', () => {
     // GET /topics/t1
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Worker', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Worker',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
     // GET /boards
@@ -170,10 +186,7 @@ describe('resolve_agent', () => {
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'Worker' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'Worker' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(1);
@@ -187,15 +200,18 @@ describe('resolve_agent', () => {
     request.mockResolvedValueOnce({ items: [{ id: 't1' }], total: 1 });
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Alice',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
     request.mockResolvedValueOnce({ items: [], total: 0 });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'NoSuchUser' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'NoSuchUser' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(0);
@@ -211,10 +227,7 @@ describe('resolve_agent', () => {
     });
     request.mockResolvedValueOnce({ items: [], total: 0 });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'x', limit: 5 },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'x', limit: 5 }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.truncated).toBe(true);
@@ -226,10 +239,7 @@ describe('resolve_agent', () => {
       new PlatformApiError({ status: 404, message: 'Topic not found' }),
     );
 
-    const result = await resolveAgentTool.handler(
-      { name: 'x', scopeTopicId: 't1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'x', scopeTopicId: 't1' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -242,10 +252,7 @@ describe('resolve_agent', () => {
       new PlatformApiError({ status: 404, message: 'Board not found' }),
     );
 
-    const result = await resolveAgentTool.handler(
-      { name: 'x', scopeBoardId: 'b1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'x', scopeBoardId: 'b1' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -256,15 +263,24 @@ describe('resolve_agent', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'FrontendDev', role: 'member', status: 'active' },
-        { participantId: 'u-2', participantType: 'agent', name: 'BackendDev', role: 'member', status: 'active' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'FrontendDev',
+          role: 'member',
+          status: 'active',
+        },
+        {
+          participantId: 'u-2',
+          participantType: 'agent',
+          name: 'BackendDev',
+          role: 'member',
+          status: 'active',
+        },
       ],
     });
 
-    const result = await resolveAgentTool.handler(
-      { name: 'dev', scopeTopicId: 't1' },
-      ctx(),
-    );
+    const result = await resolveAgentTool.handler({ name: 'dev', scopeTopicId: 't1' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.candidates.length).toBe(2);
@@ -278,14 +294,19 @@ describe('resolve_agent', () => {
     // topic 来源（participant 带 avatarUrl）
     request.mockResolvedValueOnce({
       participants: [
-        { participantId: 'u-1', participantType: 'agent', name: 'Sam', role: 'member', status: 'active', avatarUrl: '/sam.png' },
+        {
+          participantId: 'u-1',
+          participantType: 'agent',
+          name: 'Sam',
+          role: 'member',
+          status: 'active',
+          avatarUrl: '/sam.png',
+        },
       ],
     });
     // board 来源（member 带 avatarUrl）
     request.mockResolvedValueOnce({
-      members: [
-        { id: 'u-1', name: 'Sam', type: 'agent', role: 'editor', avatarUrl: '/sam.png' },
-      ],
+      members: [{ id: 'u-1', name: 'Sam', type: 'agent', role: 'editor', avatarUrl: '/sam.png' }],
     });
 
     const result = await resolveAgentTool.handler(
@@ -317,21 +338,31 @@ describe('resolve_agent', () => {
       request.mockResolvedValueOnce({ items: [{ id: 't1' }], total: 1 });
       request.mockResolvedValueOnce({
         participants: [
-          { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+          {
+            participantId: 'u-1',
+            participantType: 'agent',
+            name: 'Alice',
+            role: 'member',
+            status: 'active',
+          },
         ],
       });
       request.mockResolvedValueOnce({ items: [], total: 0 });
       // directory 兜底命中
       request.mockResolvedValueOnce({
         items: [
-          { id: 'd-1', name: 'Bob', type: 'agent', avatarUrl: '/bob.png', capabilities: ['chat'], status: 'active' },
+          {
+            id: 'd-1',
+            name: 'Bob',
+            type: 'agent',
+            avatarUrl: '/bob.png',
+            capabilities: ['chat'],
+            status: 'active',
+          },
         ],
       });
 
-      const result = await resolveAgentTool.handler(
-        { name: 'Bob' },
-        ctx(),
-      );
+      const result = await resolveAgentTool.handler({ name: 'Bob' }, ctx());
 
       const body = JSON.parse(result.content[0].text);
       expect(body.candidates.length).toBe(1);
@@ -349,14 +380,17 @@ describe('resolve_agent', () => {
       const request = mockRequest();
       request.mockResolvedValueOnce({
         participants: [
-          { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+          {
+            participantId: 'u-1',
+            participantType: 'agent',
+            name: 'Alice',
+            role: 'member',
+            status: 'active',
+          },
         ],
       });
 
-      const result = await resolveAgentTool.handler(
-        { name: 'Alice', scopeTopicId: 't1' },
-        ctx(),
-      );
+      const result = await resolveAgentTool.handler({ name: 'Alice', scopeTopicId: 't1' }, ctx());
 
       const body = JSON.parse(result.content[0].text);
       expect(body.candidates.length).toBe(1);
@@ -370,17 +404,20 @@ describe('resolve_agent', () => {
       request.mockResolvedValueOnce({ items: [{ id: 't1' }], total: 1 });
       request.mockResolvedValueOnce({
         participants: [
-          { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+          {
+            participantId: 'u-1',
+            participantType: 'agent',
+            name: 'Alice',
+            role: 'member',
+            status: 'active',
+          },
         ],
       });
       request.mockResolvedValueOnce({ items: [], total: 0 });
       // directory 也无结果
       request.mockResolvedValueOnce({ items: [], total: 0 });
 
-      const result = await resolveAgentTool.handler(
-        { name: 'NoSuchAgent' },
-        ctx(),
-      );
+      const result = await resolveAgentTool.handler({ name: 'NoSuchAgent' }, ctx());
 
       const body = JSON.parse(result.content[0].text);
       expect(body.candidates.length).toBe(0);
@@ -392,7 +429,13 @@ describe('resolve_agent', () => {
       request.mockResolvedValueOnce({ items: [{ id: 't1' }], total: 1 });
       request.mockResolvedValueOnce({
         participants: [
-          { participantId: 'u-1', participantType: 'agent', name: 'Alice', role: 'member', status: 'active' },
+          {
+            participantId: 'u-1',
+            participantType: 'agent',
+            name: 'Alice',
+            role: 'member',
+            status: 'active',
+          },
         ],
       });
       request.mockResolvedValueOnce({ items: [], total: 0 });
@@ -401,10 +444,7 @@ describe('resolve_agent', () => {
         new PlatformApiError({ status: 500, message: 'Internal Server Error' }),
       );
 
-      const result = await resolveAgentTool.handler(
-        { name: 'NoSuchAgent' },
-        ctx(),
-      );
+      const result = await resolveAgentTool.handler({ name: 'NoSuchAgent' }, ctx());
 
       const body = JSON.parse(result.content[0].text);
       expect(body.candidates.length).toBe(0);

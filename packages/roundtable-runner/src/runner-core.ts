@@ -122,7 +122,8 @@ export class RunnerCore {
   constructor(private readonly options: RunnerCoreOptions) {
     this.logger = options.logger ?? new ConsoleLogger({ level: 'info' });
     this.state =
-      options.state ?? new StateStore({ dir: options.stateDir ?? defaultStateDir(), logger: this.logger });
+      options.state ??
+      new StateStore({ dir: options.stateDir ?? defaultStateDir(), logger: this.logger });
     this.state.load();
     this.wsClient = new RunnerWsClient({
       platformUrl: options.platformUrl,
@@ -448,7 +449,9 @@ export class RunnerCore {
         );
         break;
       case 'status':
-        this.logger.info(`status seat ${event.seatId}: ${event.status}${event.detail ? ` (${event.detail})` : ''}`);
+        this.logger.info(
+          `status seat ${event.seatId}: ${event.status}${event.detail ? ` (${event.detail})` : ''}`,
+        );
         break;
       case 'permission_request':
         this.logger.info(
@@ -465,7 +468,9 @@ export class RunnerCore {
         );
         break;
       case 'tool_event':
-        this.logger.debug(`tool_event seat ${event.seatId}: ${JSON.stringify(event.tool).slice(0, 200)}`);
+        this.logger.debug(
+          `tool_event seat ${event.seatId}: ${JSON.stringify(event.tool).slice(0, 200)}`,
+        );
         break;
     }
     this.wsClient.sendSeatEvent(event.seatId, event);

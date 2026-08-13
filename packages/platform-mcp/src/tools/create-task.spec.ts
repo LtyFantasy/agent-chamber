@@ -61,9 +61,7 @@ describe('create_task', () => {
 
   it('status 默认 "backlog"', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({ id: 't1' });
 
     await createTaskTool.handler({ boardId: 'b1', title: 'T' }, ctx());
@@ -152,9 +150,7 @@ describe('create_task', () => {
 
   it('assigneeName 精确匹配', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({
       members: [
         { id: 'u-1', name: 'Alice', type: 'agent', role: 'editor' },
@@ -179,9 +175,7 @@ describe('create_task', () => {
 
   it('assigneeName 大小写不敏感', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({
       members: [{ id: 'u-1', name: 'Alice', type: 'agent', role: 'editor' }],
     });
@@ -198,9 +192,7 @@ describe('create_task', () => {
 
   it('assigneeName 歧义 → isError + 候选', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({
       members: [
         { id: 'u-1', name: 'Alice', type: 'agent', role: 'editor' },
@@ -225,9 +217,7 @@ describe('create_task', () => {
 
   it('assigneeName 0 候选 → isError + 列出成员名', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({
       members: [{ id: 'u-1', name: 'Alice', type: 'agent', role: 'editor' }],
     });
@@ -245,9 +235,7 @@ describe('create_task', () => {
 
   it('mappedStatus=null 时不带 status', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Custom Col', mappedStatus: null },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Custom Col', mappedStatus: null }]);
     request.mockResolvedValueOnce({ id: 't1' });
 
     const result = await createTaskTool.handler(
@@ -269,10 +257,7 @@ describe('create_task', () => {
       new PlatformApiError({ status: 404, message: 'Board not found' }),
     );
 
-    const result = await createTaskTool.handler(
-      { boardId: 'b1', title: 'T' },
-      ctx(),
-    );
+    const result = await createTaskTool.handler({ boardId: 'b1', title: 'T' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -281,17 +266,12 @@ describe('create_task', () => {
 
   it('create_task HTTP 失败 → isError', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockRejectedValueOnce(
       new PlatformApiError({ status: 400, message: 'Validation failed' }),
     );
 
-    const result = await createTaskTool.handler(
-      { boardId: 'b1', title: 'T' },
-      ctx(),
-    );
+    const result = await createTaskTool.handler({ boardId: 'b1', title: 'T' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -300,15 +280,10 @@ describe('create_task', () => {
 
   it('输出含幂等键提示 note', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({ id: 't1' });
 
-    const result = await createTaskTool.handler(
-      { boardId: 'b1', title: 'T' },
-      ctx(),
-    );
+    const result = await createTaskTool.handler({ boardId: 'b1', title: 'T' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.note).toContain('idempotency key');
@@ -316,9 +291,7 @@ describe('create_task', () => {
 
   it('传入 clientRequestId 时不输出 note 提示', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({ id: 't1' });
 
     const result = await createTaskTool.handler(
@@ -332,9 +305,7 @@ describe('create_task', () => {
 
   it('后端返回 idempotentReplay:true 时透传标记', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({ id: 't1', idempotentReplay: true, title: 'Existing' });
 
     const result = await createTaskTool.handler(
@@ -349,17 +320,16 @@ describe('create_task', () => {
 
   it('clientRequestId 传入时透传给 POST /tasks', async () => {
     const request = mockRequest();
-    request.mockResolvedValueOnce([
-      { id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' },
-    ]);
+    request.mockResolvedValueOnce([{ id: 'lst-1', name: 'Backlog', mappedStatus: 'backlog' }]);
     request.mockResolvedValueOnce({ id: 't1' });
 
-    await createTaskTool.handler(
-      { boardId: 'b1', title: 'T', clientRequestId: 'req-003' },
-      ctx(),
-    );
+    await createTaskTool.handler({ boardId: 'b1', title: 'T', clientRequestId: 'req-003' }, ctx());
 
-    const createCall = request.mock.calls[1] as [string, string, { body?: Record<string, unknown> }];
+    const createCall = request.mock.calls[1] as [
+      string,
+      string,
+      { body?: Record<string, unknown> },
+    ];
     expect(createCall[2].body?.clientRequestId).toBe('req-003');
   });
 });

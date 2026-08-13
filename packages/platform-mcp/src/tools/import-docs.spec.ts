@@ -155,10 +155,7 @@ describe('import_docs', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ items: [{ id: 'sp-1', name: 'Other', slug: 'other' }] });
 
-    const result = await importDocsTool.handler(
-      { spaceName: 'Ghost', docs: makeDocs(1) },
-      ctx(),
-    );
+    const result = await importDocsTool.handler({ spaceName: 'Ghost', docs: makeDocs(1) }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -175,10 +172,7 @@ describe('import_docs', () => {
       ],
     });
 
-    const result = await importDocsTool.handler(
-      { spaceName: 'Project', docs: makeDocs(1) },
-      ctx(),
-    );
+    const result = await importDocsTool.handler({ spaceName: 'Project', docs: makeDocs(1) }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -200,10 +194,7 @@ describe('import_docs', () => {
       summary: { created: 1, updated: 0, unchanged: 0, failed: 1 },
     });
 
-    const result = await importDocsTool.handler(
-      { spaceName: 'My Docs', docs: makeDocs(2) },
-      ctx(),
-    );
+    const result = await importDocsTool.handler({ spaceName: 'My Docs', docs: makeDocs(2) }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -219,10 +210,7 @@ describe('import_docs', () => {
     });
     request.mockRejectedValueOnce(new PlatformApiError({ status: 403, message: 'Forbidden' }));
 
-    const result = await importDocsTool.handler(
-      { spaceName: 'My Docs', docs: makeDocs(1) },
-      ctx(),
-    );
+    const result = await importDocsTool.handler({ spaceName: 'My Docs', docs: makeDocs(1) }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -237,10 +225,7 @@ describe('import_docs', () => {
     });
     request.mockResolvedValueOnce({ results: [], summary: {} });
 
-    const result = await importDocsTool.handler(
-      { spaceName: 'My Docs', docs: makeDocs(1) },
-      ctx(),
-    );
+    const result = await importDocsTool.handler({ spaceName: 'My Docs', docs: makeDocs(1) }, ctx());
 
     const text = result.content[0].text;
     expect(text).not.toContain('\n  ');

@@ -26,7 +26,11 @@ describe('AuthController (e2e)', () => {
 
   it('/auth/register (POST) - success (admin only)', async () => {
     const jwtService = app.get(JwtService);
-    const adminToken = jwtService.sign({ sub: '00000000-0000-0000-0000-000000000001', email: 'admin@example.com', role: 'admin' });
+    const adminToken = jwtService.sign({
+      sub: '00000000-0000-0000-0000-000000000001',
+      email: 'admin@example.com',
+      role: 'admin',
+    });
 
     // Mock findOne to return admin user for JWT validation (by id) and null for email check
     mockRepos.User.findOne.mockImplementation((options: any) => {
@@ -46,8 +50,14 @@ describe('AuthController (e2e)', () => {
       }
       return null;
     });
-    mockRepos.User.create.mockReturnValue({ id: '00000000-0000-0000-0000-000000000005', email: 'test@example.com' });
-    mockRepos.User.save.mockResolvedValue({ id: '00000000-0000-0000-0000-000000000005', email: 'test@example.com' });
+    mockRepos.User.create.mockReturnValue({
+      id: '00000000-0000-0000-0000-000000000005',
+      email: 'test@example.com',
+    });
+    mockRepos.User.save.mockResolvedValue({
+      id: '00000000-0000-0000-0000-000000000005',
+      email: 'test@example.com',
+    });
     mockRepos.RefreshToken.create.mockReturnValue({});
     mockRepos.RefreshToken.save.mockResolvedValue({});
 
@@ -65,7 +75,11 @@ describe('AuthController (e2e)', () => {
 
   it('/auth/register (POST) - failure when email already exists (admin only)', async () => {
     const jwtService = app.get(JwtService);
-    const adminToken = jwtService.sign({ sub: '00000000-0000-0000-0000-000000000001', email: 'admin@example.com', role: 'admin' });
+    const adminToken = jwtService.sign({
+      sub: '00000000-0000-0000-0000-000000000001',
+      email: 'admin@example.com',
+      role: 'admin',
+    });
 
     // Mock findOne to return admin user for JWT validation (by id) and existing user for email check
     mockRepos.User.findOne.mockImplementation((options: any) => {
@@ -206,7 +220,11 @@ describe('AuthController (e2e)', () => {
 
   it('/auth/logout (POST) - success', async () => {
     const jwtService = app.get(JwtService);
-    const token = jwtService.sign({ sub: '00000000-0000-0000-0000-000000000005', email: 'test@example.com', role: 'observer' });
+    const token = jwtService.sign({
+      sub: '00000000-0000-0000-0000-000000000005',
+      email: 'test@example.com',
+      role: 'observer',
+    });
 
     mockRepos.User.findOne.mockResolvedValue({
       id: '00000000-0000-0000-0000-000000000005',

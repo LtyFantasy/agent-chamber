@@ -53,10 +53,7 @@ function logError(msg: string): void {
   process.stderr.write(`${msg}\n`);
 }
 
-async function runTest<T>(
-  step: string,
-  fn: () => Promise<T>,
-): Promise<T | undefined> {
+async function runTest<T>(step: string, fn: () => Promise<T>): Promise<T | undefined> {
   try {
     const result = await fn();
     results.push({ step, passed: true });
@@ -87,9 +84,7 @@ async function main(): Promise<void> {
       await axios.get(SPEC_URL, { timeout: 3000 });
       log(green('  ✓ Backend Swagger JSON accessible'));
     } catch {
-      logError(
-        red(`\nBackend not running at ${BACKEND_URL}, please start it first.`),
-      );
+      logError(red(`\nBackend not running at ${BACKEND_URL}, please start it first.`));
       logError(`  cd agent-chamber && pnpm dev\n`);
       process.exit(1);
     }
@@ -155,9 +150,7 @@ async function main(): Promise<void> {
 
       const tools = (res.data.result as { tools: Array<{ name: string }> }).tools;
       if (tools.length !== EXPECTED_TOOL_COUNT) {
-        throw new Error(
-          `Expected ${EXPECTED_TOOL_COUNT} tools, got ${tools.length}`,
-        );
+        throw new Error(`Expected ${EXPECTED_TOOL_COUNT} tools, got ${tools.length}`);
       }
       return tools;
     },

@@ -195,8 +195,9 @@ describe('DocRouteController', () => {
       permService.ensureCan.mockRejectedValue(
         new ForbiddenException({ message: 'denied', code: ErrorCode.PERMISSION_DENIED }),
       );
-      await expect(controller.update('route-1', { sortOrder: 1 } as any, nonAdminActor)).rejects
-        .toThrow();
+      await expect(
+        controller.update('route-1', { sortOrder: 1 } as any, nonAdminActor),
+      ).rejects.toThrow();
       expect(routeService.update).not.toHaveBeenCalled();
     });
 
@@ -204,8 +205,9 @@ describe('DocRouteController', () => {
       routeService.findById.mockRejectedValue(
         new ForbiddenException({ message: 'not found', code: ErrorCode.DOC_ROUTE_NOT_FOUND }),
       );
-      await expect(controller.update('route-1', { sortOrder: 1 } as any, mockActor)).rejects
-        .toThrow();
+      await expect(
+        controller.update('route-1', { sortOrder: 1 } as any, mockActor),
+      ).rejects.toThrow();
       expect(docSpaceService.findById).not.toHaveBeenCalled();
       expect(routeService.update).not.toHaveBeenCalled();
     });

@@ -350,7 +350,13 @@ export class AcpDriver implements SeatDriver {
       // 沉默判定：本侧累积全文，宽松解析（§3/§4 上行回复约定 r3 冻结）
       const silent = parseSilentReply(session.streamedText);
       // text 随 complete 上行：chamber 重启清空 chunk buffer 后仍能落库（dogfood 实测缺口）
-      this.emit({ type: 'message_complete', seatId, stopReason, silent, text: session.streamedText });
+      this.emit({
+        type: 'message_complete',
+        seatId,
+        stopReason,
+        silent,
+        text: session.streamedText,
+      });
       this.logger.info(
         `seat ${seatId} turn done stopReason=${stopReason} silent=${silent} (streamed ${session.streamedText.length} chars)`,
       );
@@ -361,7 +367,12 @@ export class AcpDriver implements SeatDriver {
       // 异常终结也要发 message_complete（释放 chamber 单飞行），stopReason='error' 标记
       this.emit({ type: 'message_complete', seatId, stopReason: 'error' });
       if (session.dead) {
-        this.emit({ type: 'status', seatId, status: 'offline', detail: `${this.profile.vendorName} acp exited` });
+        this.emit({
+          type: 'status',
+          seatId,
+          status: 'offline',
+          detail: `${this.profile.vendorName} acp exited`,
+        });
       }
       throw err;
     }
@@ -532,11 +543,18 @@ export class AcpDriver implements SeatDriver {
   private onChildError(session: AcpSession, err: Error): void {
     this.logger.error(`${this.profile.vendorName} acp spawn error: ${String(err)}`);
     session.dead = true;
-    this.rejectAll(session, new Error(`${this.profile.vendorName} acp spawn failed: ${String(err)}`));
+    this.rejectAll(
+      session,
+      new Error(`${this.profile.vendorName} acp spawn failed: ${String(err)}`),
+    );
   }
 
   /** 子进程退出：拒绝全部 pending（prompt 挂起方感知 turn 异常），标记 dead */
-  private onChildExit(session: AcpSession, code: number | null, signal: NodeJS.Signals | null): void {
+  private onChildExit(
+    session: AcpSession,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
     this.logger.warn(`${this.profile.vendorName} acp exited code=${code} signal=${String(signal)}`);
     session.dead = true;
     this.rejectAll(session, new Error(`${this.profile.vendorName} acp exited (code=${code})`));
@@ -652,7 +670,9 @@ export class AcpDriver implements SeatDriver {
       }
       // 未实现的反向方法：按 JSON-RPC 规范回 methodNotFound（driver 不声明 fs caps，
       // agent 不应发起 fs RPC；防御性应答避免挂起 agent 侧）
-      this.respond(session, id, { error: { code: -32601, message: `method not found: ${method}` } });
+      this.respond(session, id, {
+        error: { code: -32601, message: `method not found: ${method}` },
+      });
     } catch (err) {
       this.respond(session, id, {
         error: { code: -32603, message: String(err instanceof Error ? err.message : err) },
@@ -744,7 +764,11 @@ export class AcpDriver implements SeatDriver {
   }
 
   /** JSON-RPC 请求并等待响应（pending Map；畸形响应 → MalformedResponseError） */
-  private request(session: AcpSession, method: string, params: Record<string, unknown>): Promise<unknown> {
+  private request(
+    session: AcpSession,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
     const id = session.nextId++;
     return new Promise((resolve, reject) => {
       session.pending.set(id, { resolve, reject, method });
@@ -934,7 +958,7 @@ export class AcpDriver implements SeatDriver {
     const event: Extract<SeatEvent, { type: 'seat_info' }> = {
       type: 'seat_info',
       seatId: session.config.seatId,
-      ...(session.config.model ?? snap.model
+      ...((session.config.model ?? snap.model)
         ? { model: session.config.model ?? snap.model }
         : {}),
       ...(snap.thinking ? { thinking: snap.thinking } : {}),

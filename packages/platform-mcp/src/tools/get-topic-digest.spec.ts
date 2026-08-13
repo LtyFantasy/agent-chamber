@@ -38,9 +38,7 @@ describe('get_topic_digest', () => {
 
   it('默认 messageLimit=20', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 'topic-1', title: 'T' })
-      .mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ id: 'topic-1', title: 'T' }).mockResolvedValueOnce([]);
 
     await getTopicDigestTool.handler({ topicId: 'topic-1' }, ctx());
 
@@ -55,10 +53,7 @@ describe('get_topic_digest', () => {
     request.mockResolvedValueOnce({ id: 'topic-1' });
     request.mockResolvedValueOnce([]);
 
-    await getTopicDigestTool.handler(
-      { topicId: 'topic-1', messageLimit: 5 },
-      ctx(),
-    );
+    await getTopicDigestTool.handler({ topicId: 'topic-1', messageLimit: 5 }, ctx());
 
     const msgCall = request.mock.calls.find(
       ([, path]: any[]) => path === '/topics/topic-1/messages',
@@ -72,10 +67,7 @@ describe('get_topic_digest', () => {
       new PlatformApiError({ status: 404, message: 'Topic not found' }),
     );
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 'bad' },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 'bad' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -90,10 +82,7 @@ describe('get_topic_digest', () => {
     request.mockResolvedValueOnce(topic);
     request.mockResolvedValueOnce(messages);
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1', markRead: false },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1', markRead: false }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -122,10 +111,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce(unread)
       .mockResolvedValueOnce(markResult);
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1' },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -138,9 +124,7 @@ describe('get_topic_digest', () => {
     expect(body.unread.advanced).toBe(true);
 
     // 确认调了 mark
-    const markCall = request.mock.calls.find(
-      ([, path]: any[]) => path === `/topics/t1/read`,
-    );
+    const markCall = request.mock.calls.find(([, path]: any[]) => path === `/topics/t1/read`);
     expect(markCall).toBeDefined();
     expect(markCall[0]).toBe('POST');
   });
@@ -163,10 +147,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce(messages)
       .mockResolvedValueOnce(unread);
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1', markRead: false },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1', markRead: false }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.unread).toBeDefined();
@@ -175,9 +156,7 @@ describe('get_topic_digest', () => {
     expect(body.unread.advanced).toBeUndefined();
 
     // 确认未调 mark
-    const markCall = request.mock.calls.find(
-      ([, path]: any[]) => path === `/topics/t1/read`,
-    );
+    const markCall = request.mock.calls.find(([, path]: any[]) => path === `/topics/t1/read`);
     expect(markCall).toBeUndefined();
   });
 
@@ -200,10 +179,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce(unread)
       .mockRejectedValueOnce(new Error('POST /read failed'));
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1' },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -224,10 +200,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce(messages)
       .mockRejectedValueOnce(new Error('GET /unread failed'));
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1' },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -393,10 +366,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
       .mockResolvedValueOnce({ advanced: false });
 
-    const result = await getTopicDigestTool.handler(
-      { topicId: 't1', maxContentLength: 0 },
-      ctx(),
-    );
+    const result = await getTopicDigestTool.handler({ topicId: 't1', maxContentLength: 0 }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.recentMessages.messages[0].content).toBe(longContent);
@@ -418,10 +388,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
       .mockResolvedValueOnce({ advanced: false });
 
-    const r1 = await getTopicDigestTool.handler(
-      { topicId: 't1', maxContentLength: -5 },
-      ctx(),
-    );
+    const r1 = await getTopicDigestTool.handler({ topicId: 't1', maxContentLength: -5 }, ctx());
     const b1 = JSON.parse(r1.content[0].text);
     expect(b1.recentMessages.messages[0].content).toBe('d'.repeat(300));
     expect(b1.recentMessages.messages[0].contentTruncated).toBe(true);
@@ -433,10 +400,7 @@ describe('get_topic_digest', () => {
       .mockResolvedValueOnce({ topicId: 't1', unreadCount: 0, messages: [], hasMore: false })
       .mockResolvedValueOnce({ advanced: false });
 
-    const r2 = await getTopicDigestTool.handler(
-      { topicId: 't1', maxContentLength: 'abc' },
-      ctx(),
-    );
+    const r2 = await getTopicDigestTool.handler({ topicId: 't1', maxContentLength: 'abc' }, ctx());
     const b2 = JSON.parse(r2.content[0].text);
     expect(b2.recentMessages.messages[0].content).toBe('d'.repeat(300));
     expect(b2.recentMessages.messages[0].contentTruncated).toBe(true);
@@ -470,8 +434,17 @@ describe('get_topic_digest', () => {
 
   it('unreadCount>0 → 省略 recentMessages；includeRecent=true → 强制携带', async () => {
     const request = mockRequest();
-    const recentPage = { messages: [{ id: 'm1', content: 'hi' }], nextCursor: null, hasMore: false };
-    const unread = { topicId: 't1', unreadCount: 2, messages: [{ id: 'm2', content: 'new' }], hasMore: false };
+    const recentPage = {
+      messages: [{ id: 'm1', content: 'hi' }],
+      nextCursor: null,
+      hasMore: false,
+    };
+    const unread = {
+      topicId: 't1',
+      unreadCount: 2,
+      messages: [{ id: 'm2', content: 'new' }],
+      hasMore: false,
+    };
 
     // 场景 1：默认（unreadCount>0）→ 省略
     request

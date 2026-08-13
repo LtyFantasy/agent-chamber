@@ -35,7 +35,7 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
       if (!proto || !result || typeof result !== 'object') return result;
       const applyProto = (item: any) => {
         if (item && typeof item === 'object' && !item.constructor?.prototype?.name) {
-          Object.setPrototypeOf(item, proto);
+            Object.setPrototypeOf(item, proto);
         }
         return item;
       };

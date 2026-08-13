@@ -80,6 +80,9 @@ export class CreateMilestoneDto implements CreateMilestoneInput {
   @IsOptional()
   @IsString()
   @MaxLength(20000)
-  @ApiPropertyOptional({ description: 'Release body (Markdown, max 20000 chars)', example: '## 变更' })
+  @ApiPropertyOptional({
+    description: 'Release body (Markdown, max 20000 chars)',
+    example: '## 变更',
+  })
   body?: string;
 }

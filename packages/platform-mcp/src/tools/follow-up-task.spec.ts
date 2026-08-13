@@ -46,10 +46,7 @@ describe('follow_up_task', () => {
 
   it('自定义 commentLimit 透传', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 't1' })
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ id: 't1' }).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
 
     await followUpTaskTool.handler({ taskId: 't1', commentLimit: 5 }, ctx());
 
@@ -130,10 +127,7 @@ describe('follow_up_task', () => {
       ],
     };
 
-    request
-      .mockResolvedValueOnce(task)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce(task).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
 
     const result = await followUpTaskTool.handler({ taskId: 't1' }, ctx());
 

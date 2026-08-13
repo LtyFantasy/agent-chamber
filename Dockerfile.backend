@@ -17,6 +17,9 @@ RUN pnpm --filter @agent-chamber/backend build
 # ⚠️ docker build context 只含本目录（外层 oss-docs 不可见），脚本会 warn 跳过
 # integrations 拷贝——自部署栈的 /downloads/integrations/* 将 404，属已知边界
 # （本仓生产走宿主机 deploy.sh，oss-docs 四份指南正常进产物）。
+# alpine 无 bash（v1.51.0 install.sh 从零冒烟实测 exit 127），bundle 脚本全身
+# bashism（BASH_SOURCE/[[ ]]/pipefail），builder 阶段补装 bash 而非改写 POSIX
+RUN apk add --no-cache bash
 RUN bash scripts/build-runner-bundle.sh
 
 FROM node:22-alpine

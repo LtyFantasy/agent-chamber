@@ -29,7 +29,11 @@ describe('AgentController (e2e)', () => {
     ({ app, mockRepos } = await createTestingApp());
 
     const jwtService = app.get(JwtService);
-    authToken = jwtService.sign({ sub: '00000000-0000-4000-8000-000000000005', email: 'test@example.com', role: 'observer' });
+    authToken = jwtService.sign({
+      sub: '00000000-0000-4000-8000-000000000005',
+      email: 'test@example.com',
+      role: 'observer',
+    });
 
     // Support JwtStrategy validation for every request (Actor unified model)
     mockRepos.User.findOne.mockResolvedValue({
@@ -73,7 +77,10 @@ describe('AgentController (e2e)', () => {
 
   it('POST /agents - success', async () => {
     mockRepos.Agent.create.mockReturnValue({ name: 'Test Agent' });
-    mockRepos.Agent.save.mockResolvedValue({ id: '00000000-0000-4000-8000-000000000002', name: 'Test Agent' });
+    mockRepos.Agent.save.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000002',
+      name: 'Test Agent',
+    });
     mockRepos.ApiKey.create.mockReturnValue({});
     mockRepos.ApiKey.save.mockResolvedValue({});
 

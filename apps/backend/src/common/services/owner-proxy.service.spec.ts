@@ -42,10 +42,7 @@ describe('OwnerProxyService', () => {
     });
 
     it('returns false for agent actor without querying DB (agent cannot own agent)', async () => {
-      const result = await service.isOwnerProxy(
-        'agent-1',
-        makeActor({ type: ActorType.AGENT }),
-      );
+      const result = await service.isOwnerProxy('agent-1', makeActor({ type: ActorType.AGENT }));
       expect(result).toBe(false);
       expect(agentRepo.exists).not.toHaveBeenCalled();
     });
@@ -57,10 +54,7 @@ describe('OwnerProxyService', () => {
     });
 
     it('returns false for system actor without querying DB', async () => {
-      const result = await service.isOwnerProxy(
-        'agent-1',
-        makeActor({ type: ActorType.SYSTEM }),
-      );
+      const result = await service.isOwnerProxy('agent-1', makeActor({ type: ActorType.SYSTEM }));
       expect(result).toBe(false);
       expect(agentRepo.exists).not.toHaveBeenCalled();
     });

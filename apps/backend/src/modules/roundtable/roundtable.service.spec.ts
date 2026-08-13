@@ -1871,7 +1871,11 @@ describe('RoundtableService', () => {
         eventPayload('seat_info', { model: 'kimi-k2', thinking: 'high', mode: 'auto' }),
       ),
     );
-    expect(seat.state.modelInfo).toMatchObject({ model: 'kimi-k2', thinking: 'high', mode: 'auto' });
+    expect(seat.state.modelInfo).toMatchObject({
+      model: 'kimi-k2',
+      thinking: 'high',
+      mode: 'auto',
+    });
     expect(typeof seat.state.modelInfo.at).toBe('string'); // 落库时间戳
     expect(seat.lastEventSeq).toBe('1');
   });
@@ -2741,7 +2745,12 @@ describe('RoundtableService', () => {
       makeSeat({
         state: {
           recentInjects: [],
-          modelInfo: { model: 'kimi-k2', thinking: 'high', mode: 'auto', at: '2026-08-08T00:00:00Z' },
+          modelInfo: {
+            model: 'kimi-k2',
+            thinking: 'high',
+            mode: 'auto',
+            at: '2026-08-08T00:00:00Z',
+          },
         },
       }),
     ]);
@@ -2785,10 +2794,38 @@ describe('RoundtableService', () => {
 
     it('排序契约：online 优先，同状态 lastSeenAt 倒序（null 沉底）', async () => {
       runnerRepo.find.mockResolvedValue([
-        { id: 'r-off', name: 'off', status: 'offline', version: null, vendors: [], lastSeenAt: new Date('2026-08-11T03:00:00Z') },
-        { id: 'r-on-old', name: 'on-old', status: 'online', version: null, vendors: [], lastSeenAt: new Date('2026-08-11T01:00:00Z') },
-        { id: 'r-on-new', name: 'on-new', status: 'online', version: null, vendors: [], lastSeenAt: new Date('2026-08-11T02:00:00Z') },
-        { id: 'r-null', name: 'null', status: 'offline', version: null, vendors: [], lastSeenAt: null },
+        {
+          id: 'r-off',
+          name: 'off',
+          status: 'offline',
+          version: null,
+          vendors: [],
+          lastSeenAt: new Date('2026-08-11T03:00:00Z'),
+        },
+        {
+          id: 'r-on-old',
+          name: 'on-old',
+          status: 'online',
+          version: null,
+          vendors: [],
+          lastSeenAt: new Date('2026-08-11T01:00:00Z'),
+        },
+        {
+          id: 'r-on-new',
+          name: 'on-new',
+          status: 'online',
+          version: null,
+          vendors: [],
+          lastSeenAt: new Date('2026-08-11T02:00:00Z'),
+        },
+        {
+          id: 'r-null',
+          name: 'null',
+          status: 'offline',
+          version: null,
+          vendors: [],
+          lastSeenAt: null,
+        },
       ]);
       const list = await service.listRunners();
       expect(list.map((r) => r.id)).toEqual(['r-on-new', 'r-on-old', 'r-off', 'r-null']);
@@ -3029,7 +3066,11 @@ describe('RoundtableService', () => {
 
     it('裁决（TOPIC-PERM 收口）：editor 参与方（非 creator 非 admin）→ 403，裁决保持 creator-only', async () => {
       // 覆盖 beforeEach 的 topic mock（creatorId=user-1 → creator-9），write 已放宽仍须收口
-      topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't', creatorId: 'creator-9' });
+      topicService.findById.mockResolvedValue({
+        id: 'topic-1',
+        title: 't',
+        creatorId: 'creator-9',
+      });
       permService.ensureCan.mockResolvedValue(undefined);
       const editorActor = { id: 'editor-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
 
@@ -3891,7 +3932,9 @@ describe('RoundtableService', () => {
 
     it('status online → idle；status offline → offline', async () => {
       expect((await presenceAfter(1, { type: 'status', status: 'online' }))?.phase).toBe('idle');
-      expect((await presenceAfter(2, { type: 'status', status: 'offline' }))?.phase).toBe('offline');
+      expect((await presenceAfter(2, { type: 'status', status: 'offline' }))?.phase).toBe(
+        'offline',
+      );
     });
 
     it('tool_event in_progress → tool（带 toolTitle）；completed → 回 thinking（r1 漏边修正）', async () => {
@@ -3909,10 +3952,12 @@ describe('RoundtableService', () => {
     });
 
     it('message_chunk → replying；message_complete → idle', async () => {
-      expect((await presenceAfter(1, { type: 'message_chunk', text: '好的' }))?.phase).toBe('replying');
-      expect(
-        (await presenceAfter(2, { type: 'message_complete', stopReason: 'end' }))?.phase,
-      ).toBe('idle');
+      expect((await presenceAfter(1, { type: 'message_chunk', text: '好的' }))?.phase).toBe(
+        'replying',
+      );
+      expect((await presenceAfter(2, { type: 'message_complete', stopReason: 'end' }))?.phase).toBe(
+        'idle',
+      );
     });
 
     it('silent 轮 message_complete → idle（沉默不是相位，💤 由 idle+上轮 silent 在 web 推导）', async () => {
@@ -3969,15 +4014,21 @@ describe('RoundtableService', () => {
 
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(1, eventPayload('tool_event', {
-          tool: { title: 'read_file', kind: 'read', status: 'in_progress' },
-        })),
+        seatEventEnvelope(
+          1,
+          eventPayload('tool_event', {
+            tool: { title: 'read_file', kind: 'read', status: 'in_progress' },
+          }),
+        ),
       );
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(2, eventPayload('tool_event', {
-          tool: { title: 'write_file', kind: 'write', status: 'completed' },
-        })),
+        seatEventEnvelope(
+          2,
+          eventPayload('tool_event', {
+            tool: { title: 'write_file', kind: 'write', status: 'completed' },
+          }),
+        ),
       );
       // 工具事件不落库：state 无 recentActivity（R3 冲刷式，高频不写放大）
       expect(seat.state.recentActivity).toBeUndefined();
@@ -4028,14 +4079,20 @@ describe('RoundtableService', () => {
       for (let i = 1; i <= 11; i += 1) {
         await service.handleSeatEvent(
           'runner-1',
-          seatEventEnvelope(i, eventPayload('tool_event', {
-            tool: { title: `tool-${i}`, status: 'in_progress' },
-          })),
+          seatEventEnvelope(
+            i,
+            eventPayload('tool_event', {
+              tool: { title: `tool-${i}`, status: 'in_progress' },
+            }),
+          ),
         );
       }
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(12, eventPayload('message_complete', { stopReason: 'end', text: '完毕' })),
+        seatEventEnvelope(
+          12,
+          eventPayload('message_complete', { stopReason: 'end', text: '完毕' }),
+        ),
       );
       expect(seat.state.recentActivity).toHaveLength(10);
       // 最旧两条（tool-1/tool-2）被淘汰，最新 turn 保留
@@ -4053,21 +4110,27 @@ describe('RoundtableService', () => {
       const longTitle = 'x'.repeat(120);
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(1, eventPayload('tool_event', {
-          tool: {
-            title: '/tmp/seat/project/src/x.ts',
-            kind: 'read',
-            status: 'in_progress',
-            rawInput: 'SECRET_CONTENT',
-            locations: ['/etc/passwd'],
-          },
-        })),
+        seatEventEnvelope(
+          1,
+          eventPayload('tool_event', {
+            tool: {
+              title: '/tmp/seat/project/src/x.ts',
+              kind: 'read',
+              status: 'in_progress',
+              rawInput: 'SECRET_CONTENT',
+              locations: ['/etc/passwd'],
+            },
+          }),
+        ),
       );
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(2, eventPayload('tool_event', {
-          tool: { title: longTitle, status: 'in_progress' },
-        })),
+        seatEventEnvelope(
+          2,
+          eventPayload('tool_event', {
+            tool: { title: longTitle, status: 'in_progress' },
+          }),
+        ),
       );
       await service.handleSeatEvent(
         'runner-1',
@@ -4095,11 +4158,14 @@ describe('RoundtableService', () => {
 
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(1, eventPayload('permission_request', {
-          requestId: 'req-1',
-          tool: { title: 'bash', kind: 'shell' },
-          options: [],
-        })),
+        seatEventEnvelope(
+          1,
+          eventPayload('permission_request', {
+            requestId: 'req-1',
+            tool: { title: 'bash', kind: 'shell' },
+            options: [],
+          }),
+        ),
       );
       await flushMicrotasks(); // 公告 fire-and-forget
       expect(seat.state.recentActivity).toEqual([
@@ -4114,11 +4180,14 @@ describe('RoundtableService', () => {
       permReqRepo.findOne.mockResolvedValue({ id: 'pr-1', status: 'pending' });
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(1, eventPayload('permission_request', {
-          requestId: 'req-1',
-          tool: { title: 'bash' },
-          options: [],
-        })),
+        seatEventEnvelope(
+          1,
+          eventPayload('permission_request', {
+            requestId: 'req-1',
+            tool: { title: 'bash' },
+            options: [],
+          }),
+        ),
       );
       await flushMicrotasks();
       expect(seat.state.recentActivity).toBeUndefined();
@@ -4130,9 +4199,12 @@ describe('RoundtableService', () => {
       seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
       await service.handleSeatEvent(
         'runner-1',
-        seatEventEnvelope(1, eventPayload('tool_event', {
-          tool: { title: 'read_file', status: 'in_progress' },
-        })),
+        seatEventEnvelope(
+          1,
+          eventPayload('tool_event', {
+            tool: { title: 'read_file', status: 'in_progress' },
+          }),
+        ),
       );
       seatRepo.find.mockResolvedValue([seat]);
       await service.onRunnerOffline('runner-1');

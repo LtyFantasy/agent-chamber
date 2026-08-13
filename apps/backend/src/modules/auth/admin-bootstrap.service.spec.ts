@@ -91,13 +91,15 @@ describe('AdminBootstrapService', () => {
       passwordHash: 'hashed-admin-password',
       role: UserRole.ADMIN,
     });
-    expect(mockUserRepo.save).toHaveBeenCalledWith(expect.objectContaining({
-      id: 'admin-actor-1',
-      actor,
-      email,
-      role: UserRole.ADMIN,
-      passwordHash: 'hashed-admin-password',
-    }));
+    expect(mockUserRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'admin-actor-1',
+        actor,
+        email,
+        role: UserRole.ADMIN,
+        passwordHash: 'hashed-admin-password',
+      }),
+    );
     expect(managerSave.mock.invocationCallOrder[0]).toBeLessThan(
       mockUserRepo.save.mock.invocationCallOrder[0],
     );
@@ -111,5 +113,4 @@ describe('AdminBootstrapService', () => {
 
     await expect(service.onApplicationBootstrap()).resolves.toBeUndefined();
   });
-
 });

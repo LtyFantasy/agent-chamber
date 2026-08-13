@@ -168,13 +168,17 @@ export const getBoardDigestTool: CustomTool = {
     if (!boardId) {
       const boardName = args.boardName as string | undefined;
       if (!boardName) {
-        const err = Object.assign(
-          new Error('Either "boardId" or "boardName" must be provided.'),
-          { isAmbiguous: false },
-        );
+        const err = Object.assign(new Error('Either "boardId" or "boardName" must be provided.'), {
+          isAmbiguous: false,
+        });
         const body = resolutionFailureBody(err);
         return {
-          content: [{ type: 'text', text: JSON.stringify({ error: true, failedStep: 'resolve_board', ...body }) }],
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: true, failedStep: 'resolve_board', ...body }),
+            },
+          ],
           isError: true,
         };
       }
@@ -254,9 +258,13 @@ export const getBoardDigestTool: CustomTool = {
       if (value !== undefined && value !== null && value !== '') params[key] = value;
     }
     try {
-      const digest = await client.request<Record<string, unknown>>('GET', `/boards/${boardId}/digest`, {
-        params,
-      });
+      const digest = await client.request<Record<string, unknown>>(
+        'GET',
+        `/boards/${boardId}/digest`,
+        {
+          params,
+        },
+      );
 
       return {
         content: [{ type: 'text', text: JSON.stringify(digest) }],

@@ -45,9 +45,7 @@ describe('DocSpacePolicy', () => {
   // ─── Helper: mock doc_space_members lookup ───
   const mockMember = (role: string | null) => {
     memberRepo.findOne.mockResolvedValue(
-      role
-        ? ({ spaceId: 'space-1', actorId: 'actor-1', role } as DocSpaceMember)
-        : null,
+      role ? ({ spaceId: 'space-1', actorId: 'actor-1', role } as DocSpaceMember) : null,
     );
   };
 
@@ -111,11 +109,7 @@ describe('DocSpacePolicy', () => {
       const space = makeSpace({
         settings: { visibility: Visibility.PRIVATE },
       });
-      const result = await policy.can(
-        makeActor({ id: 'existing-member-1' }),
-        space,
-        'read',
-      );
+      const result = await policy.can(makeActor({ id: 'existing-member-1' }), space, 'read');
       expect(result).toBe(true);
       // 验证查的是 doc_space_members
       expect(memberRepo.findOne).toHaveBeenCalledWith(
@@ -172,16 +166,10 @@ describe('DocSpacePolicy', () => {
       });
       // creator
       expect(
-        await policy.can(
-          makeActor({ id: 'creator-1', type: ActorType.HUMAN }),
-          space,
-          'read',
-        ),
+        await policy.can(makeActor({ id: 'creator-1', type: ActorType.HUMAN }), space, 'read'),
       ).toBe(true);
       // stranger
-      expect(
-        await policy.can(makeActor({ id: 'stranger-1' }), space, 'read'),
-      ).toBe(false);
+      expect(await policy.can(makeActor({ id: 'stranger-1' }), space, 'read')).toBe(false);
     });
   });
 
@@ -240,11 +228,7 @@ describe('DocSpacePolicy', () => {
   describe('admin bypass', () => {
     it('admin can read any space', async () => {
       const space = makeSpace({ settings: { visibility: Visibility.PRIVATE } });
-      const result = await policy.can(
-        makeActor({ role: UserRole.ADMIN }),
-        space,
-        'read',
-      );
+      const result = await policy.can(makeActor({ role: UserRole.ADMIN }), space, 'read');
       expect(result).toBe(true);
       // admin bypass 不应该查 DB
       expect(memberRepo.findOne).not.toHaveBeenCalled();
@@ -252,11 +236,7 @@ describe('DocSpacePolicy', () => {
 
     it('admin can write any space', async () => {
       const space = makeSpace({ creatorId: 'other-creator' });
-      const result = await policy.can(
-        makeActor({ role: UserRole.ADMIN }),
-        space,
-        'write',
-      );
+      const result = await policy.can(makeActor({ role: UserRole.ADMIN }), space, 'write');
       expect(result).toBe(true);
     });
   });
@@ -266,30 +246,18 @@ describe('DocSpacePolicy', () => {
       mockMember(null);
       const space = makeSpace();
       expect(
-        await policy.can(
-          makeActor({ id: 'creator-1', type: ActorType.HUMAN }),
-          space,
-          'write',
-        ),
+        await policy.can(makeActor({ id: 'creator-1', type: ActorType.HUMAN }), space, 'write'),
       ).toBe(true);
-      expect(
-        await policy.can(makeActor({ id: 'stranger-1' }), space, 'write'),
-      ).toBe(false);
+      expect(await policy.can(makeActor({ id: 'stranger-1' }), space, 'write')).toBe(false);
     });
 
     it('only creator can delete', async () => {
       mockMember(null);
       const space = makeSpace();
       expect(
-        await policy.can(
-          makeActor({ id: 'creator-1', type: ActorType.HUMAN }),
-          space,
-          'delete',
-        ),
+        await policy.can(makeActor({ id: 'creator-1', type: ActorType.HUMAN }), space, 'delete'),
       ).toBe(true);
-      expect(
-        await policy.can(makeActor({ id: 'stranger-1' }), space, 'delete'),
-      ).toBe(false);
+      expect(await policy.can(makeActor({ id: 'stranger-1' }), space, 'delete')).toBe(false);
     });
   });
 
@@ -299,11 +267,7 @@ describe('DocSpacePolicy', () => {
       const space = makeSpace({
         settings: { visibility: Visibility.PRIVATE },
       });
-      const result = await policy.can(
-        makeActor({ id: 'editor-1' }),
-        space,
-        'read',
-      );
+      const result = await policy.can(makeActor({ id: 'editor-1' }), space, 'read');
       expect(result).toBe(true);
     });
 
@@ -312,11 +276,7 @@ describe('DocSpacePolicy', () => {
       const space = makeSpace({
         settings: { visibility: Visibility.PRIVATE },
       });
-      const result = await policy.can(
-        makeActor({ id: 'editor-1' }),
-        space,
-        'write',
-      );
+      const result = await policy.can(makeActor({ id: 'editor-1' }), space, 'write');
       expect(result).toBe(true);
     });
 
@@ -325,11 +285,7 @@ describe('DocSpacePolicy', () => {
       const space = makeSpace({
         settings: { visibility: Visibility.PRIVATE },
       });
-      const result = await policy.can(
-        makeActor({ id: 'editor-1' }),
-        space,
-        'delete',
-      );
+      const result = await policy.can(makeActor({ id: 'editor-1' }), space, 'delete');
       expect(result).toBe(false);
     });
   });

@@ -159,7 +159,11 @@ describe('AllExceptionsFilter', () => {
   });
 
   it('should map PostgreSQL UUID syntax error to 400 VALIDATION_ERROR', () => {
-    const exception = new QueryFailedError('SELECT', [], new Error('invalid input syntax for type uuid: "xyz"'));
+    const exception = new QueryFailedError(
+      'SELECT',
+      [],
+      new Error('invalid input syntax for type uuid: "xyz"'),
+    );
 
     filter.catch(exception, mockHost as unknown as ArgumentsHost);
 
@@ -332,10 +336,7 @@ describe('AllExceptionsFilter', () => {
       filter.catch(exception, mockHost as unknown as ArgumentsHost);
 
       expect(errorSpy).toHaveBeenCalledTimes(1);
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('500'),
-        expect.any(String),
-      );
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('500'), expect.any(String));
       expect(warnSpy).not.toHaveBeenCalled();
     });
 
@@ -345,10 +346,7 @@ describe('AllExceptionsFilter', () => {
       filter.catch(exception, mockHost as unknown as ArgumentsHost);
 
       expect(errorSpy).toHaveBeenCalledTimes(1);
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('500'),
-        expect.any(String),
-      );
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('500'), expect.any(String));
       expect(warnSpy).not.toHaveBeenCalled();
     });
   });

@@ -1977,7 +1977,10 @@ export class RoundtableService {
         );
         this.chunkBuffers.delete(seat.id);
         // M4b-1：silent 轮也记近况 turn 条目（「沉默」），随本次 save 一次落库（R3 冲刷式）
-        this.pushRecentActivityBuffer(seat.id, this.turnRecentActivityItem(true, 0, payload.stopReason));
+        this.pushRecentActivityBuffer(
+          seat.id,
+          this.turnRecentActivityItem(true, 0, payload.stopReason),
+        );
         this.flushRecentActivity(seat);
         // 游标取 max 不回退（重放失败 seq 时不得低于已推进游标，RT-DEBT-1）
         seat.lastEventSeq = String(Math.max(parseInt(seat.lastEventSeq ?? '0', 10), seq));
@@ -1997,7 +2000,10 @@ export class RoundtableService {
         this.logger.warn(`message_complete seat ${seat.id} seq ${seq} 正文为空且非沉默，跳过落库`);
         this.chunkBuffers.delete(seat.id);
         // M4b-1：空正文也记近况 turn 条目（「回复 0 字」，异常轮可观测）
-        this.pushRecentActivityBuffer(seat.id, this.turnRecentActivityItem(false, 0, payload.stopReason));
+        this.pushRecentActivityBuffer(
+          seat.id,
+          this.turnRecentActivityItem(false, 0, payload.stopReason),
+        );
         this.flushRecentActivity(seat);
         // 空正文非沉默：不加任何计数（roundsWithoutHuman 只认「落库成功」的轮次，r7）
         seat.lastEventSeq = String(Math.max(parseInt(seat.lastEventSeq ?? '0', 10), seq));
@@ -2048,7 +2054,10 @@ export class RoundtableService {
       const tripped = threshold > 0 && nextRounds === threshold;
       this.clearFailedSeq(seat, seq); // 重放成功落库 → 清失败留档（RT-DEBT-1）
       // M4b-1：正常终结 → 近况冲刷（「回复 n 字」+ 当轮 tool 条目，随本次 save 一次落库）
-      this.pushRecentActivityBuffer(seat.id, this.turnRecentActivityItem(false, content.length, payload.stopReason));
+      this.pushRecentActivityBuffer(
+        seat.id,
+        this.turnRecentActivityItem(false, content.length, payload.stopReason),
+      );
       this.flushRecentActivity(seat);
       seat.state = {
         ...seat.state,
@@ -2110,7 +2119,8 @@ export class RoundtableService {
    */
   private summarizeToolTitle(seat: RoundtableSeat, rawTitle: unknown): string {
     let title = typeof rawTitle === 'string' && rawTitle.length > 0 ? rawTitle : '';
-    const cwd = typeof seat.config?.cwd === 'string' && seat.config.cwd.length > 0 ? seat.config.cwd : null;
+    const cwd =
+      typeof seat.config?.cwd === 'string' && seat.config.cwd.length > 0 ? seat.config.cwd : null;
     if (title && cwd && title.startsWith(cwd)) {
       title = title.slice(cwd.length).replace(/^[/\\]+/, '');
     }
@@ -2125,7 +2135,10 @@ export class RoundtableService {
    * result:<status>}`）。R5 摘要化：只提取 title/kind/status 三个展示字段——
    * rawInput/locations 等敏感载荷天然剥离（不复制进条目）。
    */
-  private toolRecentActivityItem(seat: RoundtableSeat, tool: Record<string, unknown>): RecentActivityItem {
+  private toolRecentActivityItem(
+    seat: RoundtableSeat,
+    tool: Record<string, unknown>,
+  ): RecentActivityItem {
     const title = this.summarizeToolTitle(seat, tool.title ?? tool.name);
     const kind = typeof tool.kind === 'string' && tool.kind.length > 0 ? tool.kind : '';
     return {
@@ -2141,7 +2154,10 @@ export class RoundtableService {
    * result:'pending'}`）。title 走同一摘要化（ToolBrief 真机形状 {title, toolCallId,
    * content}——content 可能含敏感内容，只提取 title）。
    */
-  private permissionRecentActivityItem(seat: RoundtableSeat, tool: Record<string, unknown>): RecentActivityItem {
+  private permissionRecentActivityItem(
+    seat: RoundtableSeat,
+    tool: Record<string, unknown>,
+  ): RecentActivityItem {
     const title = this.summarizeToolTitle(seat, tool.title ?? tool.name);
     return {
       at: new Date().toISOString(),
@@ -2156,7 +2172,11 @@ export class RoundtableService {
    * '回复 <n> 字', result: stopReason}`）。n = 回复字符数；stopReason 原文透传
    * （cancelled/end_turn 等，web 端可据此区分取消收尾）。
    */
-  private turnRecentActivityItem(silent: boolean, charCount: number, stopReason: string): RecentActivityItem {
+  private turnRecentActivityItem(
+    silent: boolean,
+    charCount: number,
+    stopReason: string,
+  ): RecentActivityItem {
     return {
       at: new Date().toISOString(),
       kind: 'turn',

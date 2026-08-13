@@ -2,14 +2,7 @@
  * [前端 Response] apps/web/src/types/index.ts (TopicParticipant interface)
  * [注意] 修改字段时需同步检查前端 TopicParticipant Response 类型
  */
-import {
-  Entity,
-  PrimaryColumn,
-  Column,
-  ManyToOne,
-  JoinColumn,
-  Index,
-} from 'typeorm';
+import { Entity, PrimaryColumn, Column, ManyToOne, JoinColumn, Index } from 'typeorm';
 import { ActorType } from '@agent-chamber/shared';
 import { Topic } from './topic.entity';
 

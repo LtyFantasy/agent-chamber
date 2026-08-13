@@ -203,7 +203,9 @@ export class RunnerWsClient {
     }
     if (code === CLOSE_REPLACED) {
       // 被同 key 新 runner 顶替：停止重连（否则与新 runner 互踢循环，§7 一 key 一 runner）
-      this.logger.warn(`connection replaced by a newer runner (4012) — stopping to avoid kick loop`);
+      this.logger.warn(
+        `connection replaced by a newer runner (4012) — stopping to avoid kick loop`,
+      );
       this.stopped = true;
       this.options.onFatal?.(`replaced by a newer runner (4012): ${reason}`);
       return;
@@ -286,7 +288,9 @@ export class RunnerWsClient {
    */
   sendSeatEvent(seatId: string, event: SeatEvent): void {
     const seq = this.options.state.persistSentEvent(seatId, event);
-    this.send(buildEnvelope('seat.event', event as unknown as Record<string, unknown>, { seatId, seq }));
+    this.send(
+      buildEnvelope('seat.event', event as unknown as Record<string, unknown>, { seatId, seq }),
+    );
   }
 
   /** 发送信封（未连接时丢弃——seat.event 已落盘由重放兜底；hello/pong 仅在连接态发送） */
@@ -363,7 +367,9 @@ export class RunnerWsClient {
         // 幂等去重（§4）：≤ 已收最大 seq 丢弃；先落盘游标再处理（崩溃后不重复注入）
         const lastReceived = this.options.state.getLastReceivedSeq(seatId);
         if (envelope.seq <= lastReceived) {
-          this.logger.debug(`seat.inject dedup: seat ${seatId} seq ${envelope.seq} ≤ ${lastReceived}`);
+          this.logger.debug(
+            `seat.inject dedup: seat ${seatId} seq ${envelope.seq} ≤ ${lastReceived}`,
+          );
           return;
         }
         this.options.state.setLastReceivedSeq(seatId, envelope.seq);

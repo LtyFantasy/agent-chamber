@@ -43,10 +43,7 @@ describe('delete_doc', () => {
       path: 'docs/x.md',
     });
 
-    const result = await deleteDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/x.md' },
-      ctx(),
-    );
+    const result = await deleteDocTool.handler({ spaceName: 'My Docs', path: 'docs/x.md' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -66,10 +63,7 @@ describe('delete_doc', () => {
       path: 'docs/y.md',
     });
 
-    const result = await deleteDocTool.handler(
-      { docId: 'd2' },
-      ctx(),
-    );
+    const result = await deleteDocTool.handler({ docId: 'd2' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -92,10 +86,7 @@ describe('delete_doc', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ items: [] });
 
-    const result = await deleteDocTool.handler(
-      { spaceName: 'Ghost', path: 'x.md' },
-      ctx(),
-    );
+    const result = await deleteDocTool.handler({ spaceName: 'Ghost', path: 'x.md' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -111,10 +102,7 @@ describe('delete_doc', () => {
       ],
     });
 
-    const result = await deleteDocTool.handler(
-      { spaceName: 'Project', path: 'x.md' },
-      ctx(),
-    );
+    const result = await deleteDocTool.handler({ spaceName: 'Project', path: 'x.md' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -151,10 +139,7 @@ describe('delete_doc', () => {
       new PlatformApiError({ status: 403, message: 'Permission denied' }),
     );
 
-    const result = await deleteDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/x.md' },
-      ctx(),
-    );
+    const result = await deleteDocTool.handler({ spaceName: 'My Docs', path: 'docs/x.md' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);

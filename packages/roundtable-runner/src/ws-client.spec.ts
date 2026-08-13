@@ -241,7 +241,10 @@ describe('RunnerWsClient 下行幂等去重', () => {
     expect(h.downlinks.map((e) => e.seq)).toEqual([1, 2]);
     expect(h.state.getLastReceivedSeq('seat-a')).toBe(2);
     // 新实例 load（模拟重启）游标仍在 → 重启后重放的同 seq 注入被去重
-    const reopened = new StateStore({ dir: h.state.getStatePath().replace(/state\.json$/, ''), logger: new NoopLogger() });
+    const reopened = new StateStore({
+      dir: h.state.getStatePath().replace(/state\.json$/, ''),
+      logger: new NoopLogger(),
+    });
     reopened.load();
     expect(reopened.getLastReceivedSeq('seat-a')).toBe(2);
     await h.client.stop();
@@ -319,7 +322,11 @@ describe('RunnerWsClient 重连与未确认队列重放', () => {
     client2.start();
     await waitUntil(() => messages1.some((m) => m.type === 'hello'));
     client2.sendSeatEvent('seat-a', { type: 'message_chunk', seatId: 'seat-a', text: 'a' });
-    client2.sendSeatEvent('seat-a', { type: 'message_complete', seatId: 'seat-a', stopReason: 'end_turn' });
+    client2.sendSeatEvent('seat-a', {
+      type: 'message_complete',
+      seatId: 'seat-a',
+      stopReason: 'end_turn',
+    });
     await waitUntil(() => messages1.filter((m) => m.type === 'seat.event').length === 2);
     expect(state.getPendingEvents('seat-a')).toHaveLength(2);
 
@@ -341,7 +348,11 @@ describe('RunnerWsClient 重连与未确认队列重放', () => {
         if (msg.type === 'hello') {
           socket.send(
             JSON.stringify(
-              buildEnvelope('hello_ack', { seats: { 'seat-a': { lastEventSeq: 2, failedEventSeqs: [] } } }, {}),
+              buildEnvelope(
+                'hello_ack',
+                { seats: { 'seat-a': { lastEventSeq: 2, failedEventSeqs: [] } } },
+                {},
+              ),
             ),
           );
         }

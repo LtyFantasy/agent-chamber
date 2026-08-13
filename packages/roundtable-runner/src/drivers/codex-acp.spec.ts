@@ -78,7 +78,12 @@ const createdDrivers: CodexAcpDriver[] = [];
 const ORIGINAL_PATH = process.env.PATH;
 
 function makeHarness(
-  options: { persistedSessionId?: string; model?: string; codexBin?: string; cancelKillTimeoutMs?: number } = {},
+  options: {
+    persistedSessionId?: string;
+    model?: string;
+    codexBin?: string;
+    cancelKillTimeoutMs?: number;
+  } = {},
 ): Harness {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-acp-spec-'));
   const fixturePath = path.join(dir, 'fixture.json');
@@ -211,7 +216,10 @@ describe('CodexAcpDriver 全链路（initialize/new/prompt/流式）', () => {
     // complete 携带本侧累积全文（chamber 重启清空 chunk buffer 后仍能落库）
     expect(complete.text).toBe('Hello world');
 
-    const chunks = h.events.filter((e) => e.type === 'message_chunk') as Extract<SeatEvent, { type: 'message_chunk' }>[];
+    const chunks = h.events.filter((e) => e.type === 'message_chunk') as Extract<
+      SeatEvent,
+      { type: 'message_chunk' }
+    >[];
     expect(chunks.map((c) => c.text).join('')).toBe('Hello world');
   });
 
@@ -267,7 +275,11 @@ describe('CodexAcpDriver 全链路（initialize/new/prompt/流式）', () => {
 
   it('initialize 不声明 fs caps（行为档案 #4 安全线沿用），clientInfo 正确', async () => {
     const h = makeHarness();
-    h.setFixture(startFixture('auto', [{ emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } }]));
+    h.setFixture(
+      startFixture('auto', [
+        { emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } },
+      ]),
+    );
     await h.driver.start(CODEX_CONFIG);
     await h.driver.inject('seat-1', { text: 'x' });
     const initReq = h.getLog().find((r) => r.method === 'initialize');
@@ -282,7 +294,13 @@ describe('CodexAcpDriver 全链路（initialize/new/prompt/流式）', () => {
 describe('CodexAcpDriver 权限档位映射（mode + collaboration_mode）', () => {
   it.each([
     ['default', [['mode', 'read-only']]],
-    ['plan', [['mode', 'read-only'], ['collaboration_mode', 'plan']]],
+    [
+      'plan',
+      [
+        ['mode', 'read-only'],
+        ['collaboration_mode', 'plan'],
+      ],
+    ],
     ['auto', [['mode', 'agent']]],
     ['yolo', [['mode', 'agent-full-access']]],
   ] as Array<[PermissionMode, Array<[string, string]>]>)(

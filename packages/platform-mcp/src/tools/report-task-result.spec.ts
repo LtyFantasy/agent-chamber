@@ -34,10 +34,7 @@ describe('report_task_result', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ id: 't1', status: 'done' });
 
-    const result = await reportTaskResultTool.handler(
-      { taskId: 't1', status: 'done' },
-      ctx(),
-    );
+    const result = await reportTaskResultTool.handler({ taskId: 't1', status: 'done' }, ctx());
 
     // 只应有一次调用（PATCH status）
     expect(request).toHaveBeenCalledTimes(1);
@@ -52,12 +49,9 @@ describe('report_task_result', () => {
     const request = mockRequest();
     request
       .mockResolvedValueOnce({ id: 'c1', content: '已完成' }) // comment
-      .mockResolvedValueOnce({ id: 't1', status: 'done' });    // PATCH
+      .mockResolvedValueOnce({ id: 't1', status: 'done' }); // PATCH
 
-    await reportTaskResultTool.handler(
-      { taskId: 't1', status: 'done', comment: '已完成' },
-      ctx(),
-    );
+    await reportTaskResultTool.handler({ taskId: 't1', status: 'done', comment: '已完成' }, ctx());
 
     const commentBody = request.mock.calls[0][2].body;
     expect(commentBody.content).toBe('已完成');
@@ -65,9 +59,7 @@ describe('report_task_result', () => {
 
   it('仅 commitSha → 发评论，文本="Commit: <sha>"', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 'c1' })
-      .mockResolvedValueOnce({ id: 't1', status: 'done' });
+    request.mockResolvedValueOnce({ id: 'c1' }).mockResolvedValueOnce({ id: 't1', status: 'done' });
 
     await reportTaskResultTool.handler(
       { taskId: 't1', status: 'done', commitSha: 'abc123' },
@@ -80,9 +72,7 @@ describe('report_task_result', () => {
 
   it('comment + commitSha → 拼接为 "comment\\n\\nCommit: <sha>"', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 'c1' })
-      .mockResolvedValueOnce({ id: 't1', status: 'done' });
+    request.mockResolvedValueOnce({ id: 'c1' }).mockResolvedValueOnce({ id: 't1', status: 'done' });
 
     await reportTaskResultTool.handler(
       { taskId: 't1', status: 'done', comment: '修复完成', commitSha: 'abc123' },
@@ -95,14 +85,9 @@ describe('report_task_result', () => {
 
   it('先评论后改状态的顺序正确', async () => {
     const request = mockRequest();
-    request
-      .mockResolvedValueOnce({ id: 'c1' })
-      .mockResolvedValueOnce({ id: 't1', status: 'done' });
+    request.mockResolvedValueOnce({ id: 'c1' }).mockResolvedValueOnce({ id: 't1', status: 'done' });
 
-    await reportTaskResultTool.handler(
-      { taskId: 't1', status: 'done', comment: 'done' },
-      ctx(),
-    );
+    await reportTaskResultTool.handler({ taskId: 't1', status: 'done', comment: 'done' }, ctx());
 
     expect(request).toHaveBeenCalledTimes(2);
     // 第一步：POST /tasks/t1/comments
@@ -153,9 +138,7 @@ describe('report_task_result', () => {
     const commentResult = { id: 'c1', content: 'done' };
     const taskResult = { id: 't1', status: 'done' };
 
-    request
-      .mockResolvedValueOnce(commentResult)
-      .mockResolvedValueOnce(taskResult);
+    request.mockResolvedValueOnce(commentResult).mockResolvedValueOnce(taskResult);
 
     const result = await reportTaskResultTool.handler(
       { taskId: 't1', status: 'done', comment: 'done' },
@@ -171,10 +154,7 @@ describe('report_task_result', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ id: 't1', status: 'done' });
 
-    const result = await reportTaskResultTool.handler(
-      { taskId: 't1', status: 'done' },
-      ctx(),
-    );
+    const result = await reportTaskResultTool.handler({ taskId: 't1', status: 'done' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.task).toEqual({ id: 't1', status: 'done' });
@@ -185,10 +165,7 @@ describe('report_task_result', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ id: 't1', status: 'done' });
 
-    await reportTaskResultTool.handler(
-      { taskId: 't1', status: 'done', comment: '' },
-      ctx(),
-    );
+    await reportTaskResultTool.handler({ taskId: 't1', status: 'done', comment: '' }, ctx());
 
     // 空字符串 → 跳过评论，直接 PATCH
     expect(request).toHaveBeenCalledTimes(1);

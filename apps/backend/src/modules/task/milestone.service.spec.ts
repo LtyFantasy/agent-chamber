@@ -143,8 +143,16 @@ describe('MilestoneService', () => {
 
     it('should default status to dev when version is set', async () => {
       const dto = { name: 'v1.42.0', boardId: 'board-1', version: '1.42.0' };
-      milestoneRepo.create.mockReturnValue({ id: 'ms-1', ...dto, status: MilestoneStatus.DEV } as unknown as Milestone);
-      milestoneRepo.save.mockResolvedValue({ id: 'ms-1', ...dto, status: MilestoneStatus.DEV } as unknown as Milestone);
+      milestoneRepo.create.mockReturnValue({
+        id: 'ms-1',
+        ...dto,
+        status: MilestoneStatus.DEV,
+      } as unknown as Milestone);
+      milestoneRepo.save.mockResolvedValue({
+        id: 'ms-1',
+        ...dto,
+        status: MilestoneStatus.DEV,
+      } as unknown as Milestone);
 
       const result = await service.create(dto, actor);
 
@@ -185,14 +193,24 @@ describe('MilestoneService', () => {
     });
 
     it('should reject explicit deployed status when version is set (deploy via endpoint only)', async () => {
-      const dto = { name: 'v1.42.0', boardId: 'board-1', version: '1.42.0', status: MilestoneStatus.DEPLOYED };
+      const dto = {
+        name: 'v1.42.0',
+        boardId: 'board-1',
+        version: '1.42.0',
+        status: MilestoneStatus.DEPLOYED,
+      };
 
       await expect(service.create(dto, actor)).rejects.toMatchObject({
         response: { code: ErrorCode.MILESTONE_DEPLOY_VIA_ENDPOINT },
       });
     });
 
-    it.each([MilestoneStatus.DEV, MilestoneStatus.READY, MilestoneStatus.DEPLOYED, MilestoneStatus.VERIFIED])(
+    it.each([
+      MilestoneStatus.DEV,
+      MilestoneStatus.READY,
+      MilestoneStatus.DEPLOYED,
+      MilestoneStatus.VERIFIED,
+    ])(
       'should reject %s status for normal milestone without version (普通态隔离)',
       async (status) => {
         const dto = { name: 'S1', boardId: 'board-1', status };
@@ -298,10 +316,9 @@ describe('MilestoneService', () => {
       const result = await service.findAll({}, actor);
 
       expect(accessQuery.getAccessibleBoardIds).toHaveBeenCalledWith(actor);
-      expect(qb.andWhere).toHaveBeenCalledWith(
-        'milestone.board_id IN (:...accessibleBoardIds)',
-        { accessibleBoardIds: ['board-1'] },
-      );
+      expect(qb.andWhere).toHaveBeenCalledWith('milestone.board_id IN (:...accessibleBoardIds)', {
+        accessibleBoardIds: ['board-1'],
+      });
       expect(result.total).toBe(1);
       expect(result.items).toHaveLength(1);
     });
@@ -495,10 +512,14 @@ describe('MilestoneService', () => {
         status: MilestoneStatus.ACTIVE,
       } as Milestone);
 
-      const result = await service.update('ms-1', {
-        name: 'v1.3.1',
-        status: MilestoneStatus.ACTIVE,
-      }, actor);
+      const result = await service.update(
+        'ms-1',
+        {
+          name: 'v1.3.1',
+          status: MilestoneStatus.ACTIVE,
+        },
+        actor,
+      );
 
       expect(result.name).toBe('v1.3.1');
       expect(result.status).toBe(MilestoneStatus.ACTIVE);
@@ -624,7 +645,7 @@ describe('MilestoneService', () => {
         deployMeta: null,
         deployedAt: null,
         verifiedAt: null,
-      } as unknown as Milestone);
+      }) as unknown as Milestone;
     const normalMilestone = (status: MilestoneStatus): Milestone =>
       ({
         id: 'ms-1',
@@ -635,7 +656,7 @@ describe('MilestoneService', () => {
         deployMeta: null,
         deployedAt: null,
         verifiedAt: null,
-      } as unknown as Milestone);
+      }) as unknown as Milestone;
 
     // 合法流转（dev→ready/deployed/cancelled；ready→deployed/cancelled；deployed→verified；
     // deployed→deployed 重部署 = 同值 no-op；verified=终态。deployed 目标只经端点）
@@ -741,17 +762,16 @@ describe('MilestoneService', () => {
     });
 
     // 普通态隔离：version 为空的 milestone 禁落 release 四态，其余既有行为零变更
-    it.each([
-      MilestoneStatus.DEV,
-      MilestoneStatus.READY,
-      MilestoneStatus.VERIFIED,
-    ])('普通 milestone planned -> %s 非法 (400)', async (to) => {
-      milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
+    it.each([MilestoneStatus.DEV, MilestoneStatus.READY, MilestoneStatus.VERIFIED])(
+      '普通 milestone planned -> %s 非法 (400)',
+      async (to) => {
+        milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
 
-      await expect(service.update('ms-1', { status: to }, actor)).rejects.toMatchObject({
-        response: { code: ErrorCode.MILESTONE_INVALID_TRANSITION },
-      });
-    });
+        await expect(service.update('ms-1', { status: to }, actor)).rejects.toMatchObject({
+          response: { code: ErrorCode.MILESTONE_INVALID_TRANSITION },
+        });
+      },
+    );
 
     it('普通 milestone planned -> deployed 非法（version 为空分支，非端点码）', async () => {
       milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
@@ -790,7 +810,11 @@ describe('MilestoneService', () => {
       async (to) => {
         const milestone = normalMilestone(MilestoneStatus.PLANNED);
         milestoneRepo.findOne.mockResolvedValue(milestone);
-        milestoneRepo.save.mockResolvedValue({ ...milestone, version: '1.42.0', status: to } as unknown as Milestone);
+        milestoneRepo.save.mockResolvedValue({
+          ...milestone,
+          version: '1.42.0',
+          status: to,
+        } as unknown as Milestone);
 
         const result = await service.update('ms-1', { version: '1.42.0', status: to }, actor);
 
@@ -801,16 +825,18 @@ describe('MilestoneService', () => {
       },
     );
 
-    it.each([MilestoneStatus.PLANNED, MilestoneStatus.ACTIVE, MilestoneStatus.VERIFIED, MilestoneStatus.CANCELLED])(
-      '补挂 version + status=%s -> 400（禁止中间态）',
-      async (to) => {
-        milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
+    it.each([
+      MilestoneStatus.PLANNED,
+      MilestoneStatus.ACTIVE,
+      MilestoneStatus.VERIFIED,
+      MilestoneStatus.CANCELLED,
+    ])('补挂 version + status=%s -> 400（禁止中间态）', async (to) => {
+      milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
 
-        await expect(
-          service.update('ms-1', { version: '1.42.0', status: to }, actor),
-        ).rejects.toMatchObject({ response: { code: ErrorCode.MILESTONE_INVALID_TRANSITION } });
-      },
-    );
+      await expect(
+        service.update('ms-1', { version: '1.42.0', status: to }, actor),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.MILESTONE_INVALID_TRANSITION } });
+    });
 
     it('补挂 version + status=deployed -> 400（端点专属码）', async () => {
       milestoneRepo.findOne.mockResolvedValue(normalMilestone(MilestoneStatus.PLANNED));
@@ -828,9 +854,9 @@ describe('MilestoneService', () => {
         constraint: 'uq_milestones_board_version',
       });
 
-      await expect(
-        service.update('ms-1', { version: '1.42.1' }, actor),
-      ).rejects.toMatchObject({ response: { code: ErrorCode.MILESTONE_VERSION_CONFLICT } });
+      await expect(service.update('ms-1', { version: '1.42.1' }, actor)).rejects.toMatchObject({
+        response: { code: ErrorCode.MILESTONE_VERSION_CONFLICT },
+      });
     });
 
     it('非 version 冲突的 23505 原样抛出（不误翻译）', async () => {
@@ -861,7 +887,7 @@ describe('MilestoneService', () => {
         deployMeta: null,
         deployedAt: null,
         verifiedAt: null,
-      } as unknown as Milestone);
+      }) as unknown as Milestone;
 
     it('dev -> deployed 成功：置状态、deployedAt=now、deployMeta 写入、响应含 stats', async () => {
       const milestone = releaseMilestone(MilestoneStatus.DEV);
@@ -913,11 +939,7 @@ describe('MilestoneService', () => {
       milestoneRepo.save.mockImplementation((m) => Promise.resolve(m as Milestone));
       taskRepo.find.mockResolvedValue([]);
 
-      await service.markDeployed(
-        'ms-1',
-        { backup: 'new.sql', migrations: ['M2'] },
-        actor,
-      );
+      await service.markDeployed('ms-1', { backup: 'new.sql', migrations: ['M2'] }, actor);
 
       // 只覆盖显式提供的键：backup 更新、anchors 保留、migrations 新增
       expect(milestone.deployMeta).toEqual({
@@ -927,7 +949,9 @@ describe('MilestoneService', () => {
       });
       expect(milestone.status).toBe(MilestoneStatus.DEPLOYED);
       // deployedAt 刷新为 now（> 旧时间）
-      expect(milestone.deployedAt!.getTime()).toBeGreaterThan(new Date('2026-08-04T02:00:00.000Z').getTime());
+      expect(milestone.deployedAt!.getTime()).toBeGreaterThan(
+        new Date('2026-08-04T02:00:00.000Z').getTime(),
+      );
     });
 
     it.each([MilestoneStatus.VERIFIED, MilestoneStatus.CANCELLED])(

@@ -54,10 +54,7 @@ describe('mark_topic_read', () => {
       advanced: true,
     });
 
-    await markTopicReadTool.handler(
-      { topicId: 't1', messageId: 'm42' },
-      ctx(),
-    );
+    await markTopicReadTool.handler({ topicId: 't1', messageId: 'm42' }, ctx());
 
     const call = request.mock.calls[0];
     expect(call[0]).toBe('POST');
@@ -70,10 +67,7 @@ describe('mark_topic_read', () => {
     const body = { topicId: 't1', lastReadMessageId: 'm1', advanced: true };
     request.mockResolvedValueOnce(body);
 
-    const result = await markTopicReadTool.handler(
-      { topicId: 't1', messageId: 'm1' },
-      ctx(),
-    );
+    const result = await markTopicReadTool.handler({ topicId: 't1', messageId: 'm1' }, ctx());
 
     expect(result.isError).toBeFalsy();
     expect(JSON.parse(result.content[0].text)).toEqual(body);
@@ -85,10 +79,7 @@ describe('mark_topic_read', () => {
       new PlatformApiError({ status: 404, message: 'Topic not found' }),
     );
 
-    const result = await markTopicReadTool.handler(
-      { topicId: 'bad' },
-      ctx(),
-    );
+    const result = await markTopicReadTool.handler({ topicId: 'bad' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);

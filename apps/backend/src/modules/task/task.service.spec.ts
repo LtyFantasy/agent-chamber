@@ -306,7 +306,9 @@ describe('TaskService', () => {
       const qb = mockTaskRepo.createQueryBuilder();
       (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 3]);
       mockAgentRepo.findBy.mockResolvedValue([{ id: 'agent-1', name: 'Kimi' } as Agent]);
-      mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', username: 'alice', displayName: 'Alice' } as User]);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'user-1', username: 'alice', displayName: 'Alice' } as User,
+      ]);
 
       const result = await service.findAll({});
 
@@ -577,7 +579,7 @@ describe('TaskService', () => {
         title: 'Dep Task',
         status: TaskStatus.IN_PROGRESS,
       });
-      expect((result.dependencies![0].dependsOnTask as any)).not.toHaveProperty('description');
+      expect(result.dependencies![0].dependsOnTask as any).not.toHaveProperty('description');
 
       // dependents: task 应仅有 {id, title, status}
       expect(result.dependents).toHaveLength(1);
@@ -586,7 +588,7 @@ describe('TaskService', () => {
         title: 'Dependent Task',
         status: TaskStatus.DONE,
       });
-      expect((result.dependents![0].task as any)).not.toHaveProperty('description');
+      expect(result.dependents![0].task as any).not.toHaveProperty('description');
     });
 
     it('should throw NotFoundException when task not found', async () => {
@@ -621,9 +623,16 @@ describe('TaskService', () => {
         innerJoin: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
-        getRawMany: jest.fn().mockResolvedValue([
-          { d_id: 'doc-1', d_path: 'docs/readme.md', d_title: 'Readme', d_summary: 'A readme file' },
-        ]),
+        getRawMany: jest
+          .fn()
+          .mockResolvedValue([
+            {
+              d_id: 'doc-1',
+              d_path: 'docs/readme.md',
+              d_title: 'Readme',
+              d_summary: 'A readme file',
+            },
+          ]),
         getOne: jest.fn(),
         getMany: jest.fn(),
         getManyAndCount: jest.fn(),
@@ -847,7 +856,9 @@ describe('TaskService', () => {
         boardId: 'board-2',
       } as Milestone);
 
-      await expect(service.create(dto)).rejects.toThrow('Milestone does not belong to the same board as the task');
+      await expect(service.create(dto)).rejects.toThrow(
+        'Milestone does not belong to the same board as the task',
+      );
     });
 
     it('should support optional status field on create', async () => {
@@ -991,12 +1002,22 @@ describe('TaskService', () => {
         clientRequestId: 'req-001',
       };
       const createdTask = createMockTask({ title: 'Idempotent Task', assigneeId: 'creator-1' });
-      const savedTask = createMockTask({ id: 'task-idem-1', title: 'Idempotent Task', assigneeId: 'creator-1' });
+      const savedTask = createMockTask({
+        id: 'task-idem-1',
+        title: 'Idempotent Task',
+        assigneeId: 'creator-1',
+      });
 
       mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
       mockTaskRepo.create.mockReturnValue(createdTask);
       mockTaskRepo.save.mockResolvedValue(savedTask);
-      mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-1', actorId: 'creator-1', clientRequestId: 'req-001', entityType: 'task', entityId: 'task-idem-1' } as IdempotencyRecord);
+      mockIdempotencyRepo.save.mockResolvedValue({
+        id: 'rec-1',
+        actorId: 'creator-1',
+        clientRequestId: 'req-001',
+        entityType: 'task',
+        entityId: 'task-idem-1',
+      } as IdempotencyRecord);
 
       const result = await service.create(dto, 'creator-1', ActorType.HUMAN);
 
@@ -1068,7 +1089,9 @@ describe('TaskService', () => {
       });
       mockDataSource.transaction.mockRejectedValueOnce(pgError);
 
-      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toThrow('other unique violation');
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toThrow(
+        'other unique violation',
+      );
     });
 
     it('should rethrow non-23505 error', async () => {
@@ -1083,9 +1106,10 @@ describe('TaskService', () => {
 
       mockDataSource.transaction.mockRejectedValueOnce(new Error('connection error'));
 
-      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toThrow('connection error');
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toThrow(
+        'connection error',
+      );
     });
-
   });
 
   describe('update', () => {
@@ -1118,7 +1142,10 @@ describe('TaskService', () => {
       mockTaskRepo.findOne.mockResolvedValue(task);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
       // P2: milestone 必须存在且同 board；boardId 经 listId→BoardList 显式查询推断
-      mockBoardListRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
       mockMilestoneRepo.findOne.mockResolvedValue({
         id: 'ms-new',
         boardId: 'board-1',
@@ -1372,16 +1399,19 @@ describe('TaskService', () => {
       const task = createMockTask({ listId: 'list-1', list: { boardId: 'board-1' } as BoardList });
       mockTaskRepo.findOne.mockResolvedValue(task);
       // task 所在 board 经 listId→BoardList 显式查询推断为 board-1
-      mockBoardListRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
       // milestone 属于 board-2，与 task 的 board-1 不同
       mockMilestoneRepo.findOne.mockResolvedValue({
         id: 'ms-1',
         boardId: 'board-2',
       } as Milestone);
 
-      await expect(
-        service.update('task-1', { milestoneId: 'ms-1' }),
-      ).rejects.toThrow('Milestone does not belong to the same board as the task');
+      await expect(service.update('task-1', { milestoneId: 'ms-1' })).rejects.toThrow(
+        'Milestone does not belong to the same board as the task',
+      );
     });
 
     it('should allow unbinding milestone when milestoneId is null (P2)', async () => {
@@ -1656,9 +1686,9 @@ describe('TaskService', () => {
     it('should throw NotFoundException when task not found', async () => {
       mockTaskRepo.findOne.mockResolvedValue(null);
 
-      await expect(
-        service.assign('not-found', { assigneeId: 'user-2' }),
-      ).rejects.toThrow(NotFoundException);
+      await expect(service.assign('not-found', { assigneeId: 'user-2' })).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 
@@ -1851,7 +1881,12 @@ describe('TaskService', () => {
       // No existing link
       mockDocLinkRepo.findOne.mockResolvedValue(null);
 
-      const link = { id: 'link-1', taskId: 'task-1', docId: 'doc-1', createdBy: 'user-1' } as unknown as TaskDocLink;
+      const link = {
+        id: 'link-1',
+        taskId: 'task-1',
+        docId: 'doc-1',
+        createdBy: 'user-1',
+      } as unknown as TaskDocLink;
       mockDocLinkRepo.create.mockReturnValue(link);
       mockDocLinkRepo.save.mockResolvedValue(link);
 
@@ -1860,7 +1895,11 @@ describe('TaskService', () => {
       expect(result).toEqual(link);
       expect(result.taskId).toBe('task-1');
       expect(result.docId).toBe('doc-1');
-      expect(mockDocLinkRepo.create).toHaveBeenCalledWith({ taskId: 'task-1', docId: 'doc-1', createdBy: 'user-1' });
+      expect(mockDocLinkRepo.create).toHaveBeenCalledWith({
+        taskId: 'task-1',
+        docId: 'doc-1',
+        createdBy: 'user-1',
+      });
       expect(mockDocLinkRepo.save).toHaveBeenCalled();
     });
 
@@ -1872,7 +1911,12 @@ describe('TaskService', () => {
       mockDocSpaceRepo.createQueryBuilder = jest.fn().mockReturnValue(createDocQb(space));
       mockDocSpacePolicy.can.mockResolvedValue(true);
 
-      const existing = { id: 'link-1', taskId: 'task-1', docId: 'doc-1', createdBy: 'user-1' } as unknown as TaskDocLink;
+      const existing = {
+        id: 'link-1',
+        taskId: 'task-1',
+        docId: 'doc-1',
+        createdBy: 'user-1',
+      } as unknown as TaskDocLink;
       mockDocLinkRepo.findOne.mockResolvedValue(existing);
 
       const result = await service.addDocLink('task-1', 'doc-1', actor);
@@ -1882,7 +1926,7 @@ describe('TaskService', () => {
       expect(mockDocLinkRepo.save).not.toHaveBeenCalled();
     });
 
-    it('throws 403 when actor lacks read access to doc\'s space', async () => {
+    it("throws 403 when actor lacks read access to doc's space", async () => {
       const doc = { id: 'doc-1', spaceId: 'space-1' } as Doc;
       const space = { id: 'space-1' } as DocSpace;
 
@@ -1893,7 +1937,9 @@ describe('TaskService', () => {
       // Policy denies read
       mockDocSpacePolicy.can.mockResolvedValue(false);
 
-      await expect(service.addDocLink('task-1', 'doc-1', actor)).rejects.toThrow(ForbiddenException);
+      await expect(service.addDocLink('task-1', 'doc-1', actor)).rejects.toThrow(
+        ForbiddenException,
+      );
     });
 
     it('throws 404 when doc not found', async () => {

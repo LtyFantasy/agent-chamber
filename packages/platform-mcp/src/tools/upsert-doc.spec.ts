@@ -184,9 +184,7 @@ describe('upsert_doc', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 500, message: 'DB error' }),
-    );
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 500, message: 'DB error' }));
 
     const result = await upsertDocTool.handler(
       { spaceName: 'My Docs', path: 'x.md', content: 'x' },

@@ -49,10 +49,7 @@ describe('search_docs', () => {
       },
     ]);
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'architecture' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'architecture' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -99,10 +96,7 @@ describe('search_docs', () => {
       },
     ]);
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.hits[0].boosts).toEqual({ route: 'primary', taskLinks: 4 });
@@ -128,10 +122,7 @@ describe('search_docs', () => {
       },
     ]);
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.hits[0].contentTruncated).toBe(true);
@@ -145,7 +136,14 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce([]);
 
     await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test', type: 'spec', tag: 'backend', category: 'docs', limit: 10 },
+      {
+        spaceName: 'My Docs',
+        q: 'test',
+        type: 'spec',
+        tag: 'backend',
+        category: 'docs',
+        limit: 10,
+      },
       ctx(),
     );
 
@@ -166,10 +164,7 @@ describe('search_docs', () => {
     });
     request.mockResolvedValueOnce([]);
 
-    await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test' },
-      ctx(),
-    );
+    await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     const searchCall = request.mock.calls[1];
     expect(searchCall[2].params.limit).toBe(5);
@@ -179,10 +174,7 @@ describe('search_docs', () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({ items: [] });
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'Ghost', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'Ghost', q: 'test' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -199,10 +191,7 @@ describe('search_docs', () => {
       ],
     });
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'A', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'A', q: 'test' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -215,14 +204,9 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 500, message: 'Search failed' }),
-    );
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 500, message: 'Search failed' }));
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -236,10 +220,7 @@ describe('search_docs', () => {
     });
     request.mockResolvedValueOnce([]);
 
-    const result = await searchDocsTool.handler(
-      { spaceName: 'My Docs', q: 'test' },
-      ctx(),
-    );
+    const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     const text = result.content[0].text;
     expect(text).not.toContain('\n  ');

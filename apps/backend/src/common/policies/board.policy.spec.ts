@@ -46,9 +46,7 @@ describe('BoardPolicy', () => {
   // ─── Helper: mock board_members lookup ───
   const mockMember = (role: string | null) => {
     memberRepo.findOne.mockResolvedValue(
-      role
-        ? ({ boardId: 'board-1', actorId: 'actor-1', role } as BoardMember)
-        : null,
+      role ? ({ boardId: 'board-1', actorId: 'actor-1', role } as BoardMember) : null,
     );
   };
 
@@ -203,7 +201,11 @@ describe('BoardPolicy', () => {
       mockMember(null);
       ownerProxy.isOwnerProxy.mockResolvedValue(false);
       expect(
-        await policy.can(makeActor({ id: 'stranger-human', type: ActorType.HUMAN }), agentBoard, 'read'),
+        await policy.can(
+          makeActor({ id: 'stranger-human', type: ActorType.HUMAN }),
+          agentBoard,
+          'read',
+        ),
       ).toBe(false);
     });
 
@@ -211,7 +213,11 @@ describe('BoardPolicy', () => {
       mockMember(null);
       ownerProxy.isOwnerProxy.mockResolvedValue(false);
       expect(
-        await policy.can(makeActor({ id: 'stranger-human', type: ActorType.HUMAN }), agentBoard, 'delete'),
+        await policy.can(
+          makeActor({ id: 'stranger-human', type: ActorType.HUMAN }),
+          agentBoard,
+          'delete',
+        ),
       ).toBe(false);
     });
 

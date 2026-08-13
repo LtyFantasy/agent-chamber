@@ -57,7 +57,14 @@ interface Harness {
   /** onSessionId 落盘回调收到的 sessionId 序列（断言 resume/new 后落盘值用） */
   sessionIds: string[];
   setFixture(entries: unknown[]): void;
-  getLog(): Array<{ direction: string; id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown }>;
+  getLog(): Array<{
+    direction: string;
+    id?: number;
+    method?: string;
+    params?: Record<string, unknown>;
+    result?: unknown;
+    error?: unknown;
+  }>;
 }
 
 /** 全部测试创建的 driver（afterEach 统一 stop，杀子进程防 jest worker 泄漏） */
@@ -183,13 +190,20 @@ describe('KimiAcpDriver 全链路（initialize/new/prompt/流式）', () => {
     expect(chunkIdx).toBeGreaterThanOrEqual(0);
     expect(completeIdx).toBeGreaterThan(chunkIdx);
     // 流式文本拼装完整
-    const chunks = h.events.filter((e) => e.type === 'message_chunk') as Extract<SeatEvent, { type: 'message_chunk' }>[];
+    const chunks = h.events.filter((e) => e.type === 'message_chunk') as Extract<
+      SeatEvent,
+      { type: 'message_chunk' }
+    >[];
     expect(chunks.map((c) => c.text).join('')).toBe('Hello world');
   });
 
   it('initialize 不声明 fs caps（行为档案 #4），clientInfo 正确', async () => {
     const h = makeHarness();
-    h.setFixture(startFixture([{ emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } }]));
+    h.setFixture(
+      startFixture([
+        { emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } },
+      ]),
+    );
     await h.driver.start(CONFIG);
     await h.driver.inject('seat-1', { text: 'x' });
     const initReq = h.getLog().find((r) => r.method === 'initialize');
@@ -202,7 +216,11 @@ describe('KimiAcpDriver 全链路（initialize/new/prompt/流式）', () => {
 
   it('session/new 参数：cwd 透传座位工作目录（座位环境边界）', async () => {
     const h = makeHarness();
-    h.setFixture(startFixture([{ emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } }]));
+    h.setFixture(
+      startFixture([
+        { emit: [chunkNotification('ok')], respond: { result: { stopReason: 'end_turn' } } },
+      ]),
+    );
     await h.driver.start(CONFIG);
     await h.driver.inject('seat-1', { text: 'x' });
     const newReq = h.getLog().find((r) => r.method === 'session/new');
@@ -221,9 +239,13 @@ describe('KimiAcpDriver 全链路（initialize/new/prompt/流式）', () => {
     await h.driver.start({ ...CONFIG, model: 'kimi-k2' });
     await h.driver.inject('seat-1', { text: 'x' });
     const log = h.getLog();
-    const modeReq = log.find((r) => r.method === 'session/set_config_option' && r.params!.configId === 'mode');
+    const modeReq = log.find(
+      (r) => r.method === 'session/set_config_option' && r.params!.configId === 'mode',
+    );
     expect(modeReq!.params!.value).toBe('auto');
-    const modelReq = log.find((r) => r.method === 'session/set_config_option' && r.params!.configId === 'model');
+    const modelReq = log.find(
+      (r) => r.method === 'session/set_config_option' && r.params!.configId === 'model',
+    );
     expect(modelReq!.params!.value).toBe('kimi-k2');
   });
 });
@@ -435,7 +457,9 @@ describe('KimiAcpDriver 审批（行为档案 #2）', () => {
     });
     expect(warnSpy).toHaveBeenCalled();
     expect(
-      warnSpy.mock.calls.map((c) => String(c[0])).some((m) => m.includes('optionId no-such-option')),
+      warnSpy.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes('optionId no-such-option')),
     ).toBe(true);
 
     // 未知 requestId（审批已关闭）：幂等忽略不抛错
@@ -761,7 +785,10 @@ describe('KimiAcpDriver seat_info（M3 阶段 5：实际在跑配置观测上行
       ...startFixture([
         {
           emit: [
-            { method: 'current_mode_update', params: { sessionId: 'sess-1', configId: 'mode', value: 'yolo' } },
+            {
+              method: 'current_mode_update',
+              params: { sessionId: 'sess-1', configId: 'mode', value: 'yolo' },
+            },
             chunkNotification('ok'),
           ],
           respond: { result: { stopReason: 'end_turn' } },
@@ -772,8 +799,7 @@ describe('KimiAcpDriver seat_info（M3 阶段 5：实际在跑配置观测上行
     const hotPromise = waitForEvent(
       h.events,
       (e) =>
-        e.type === 'seat_info' &&
-        (e as Extract<SeatEvent, { type: 'seat_info' }>).mode === 'yolo',
+        e.type === 'seat_info' && (e as Extract<SeatEvent, { type: 'seat_info' }>).mode === 'yolo',
     );
     await h.driver.inject('seat-1', { text: 'x' });
     const hot = (await hotPromise) as Extract<SeatEvent, { type: 'seat_info' }>;
@@ -904,16 +930,12 @@ describe('KimiAcpDriver 沉默判定（§3/§4 r3 冻结）', () => {
 describe('KimiAcpDriver stop/cancel', () => {
   it('stop：杀子进程 + status offline；再 start 重新拉起（新会话）', async () => {
     const h = makeHarness();
-    h.setFixture([
-      ...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }]),
-    ]);
+    h.setFixture([...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }])]);
     await h.driver.start(CONFIG);
     await h.driver.stop('seat-1');
     expect(h.events).toContainEqual({ type: 'status', seatId: 'seat-1', status: 'offline' });
     // 停止后重新 start（本次无落盘 sessionId → session/new）
-    h.setFixture([
-      ...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }]),
-    ]);
+    h.setFixture([...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }])]);
     await h.driver.start(CONFIG);
     await h.driver.inject('seat-1', { text: 'x' });
     expect(h.getLog().filter((r) => r.method === 'session/new')).toHaveLength(2);
@@ -982,9 +1004,7 @@ describe('KimiAcpDriver 优雅取消（M4b-1：session/cancel 通知 + 超时兜
 
   it('空闲取消（busy=false）→ 幂等 no-op：不发通知、不 kill、会话存活（R1 busy 门控）', async () => {
     const h = makeHarness({ cancelKillTimeoutMs: 100 });
-    h.setFixture([
-      ...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }]),
-    ]);
+    h.setFixture([...startFixture([{ respond: { result: { stopReason: 'end_turn' } } }])]);
     await h.driver.start(CONFIG);
     await h.driver.cancel('seat-1'); // 无 in-flight prompt → 直接返回
     // 等待超过兜底超时：确认未触发任何 kill（busy 门控禁止 kill 空闲会话）

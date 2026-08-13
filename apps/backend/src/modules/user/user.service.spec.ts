@@ -64,9 +64,12 @@ function createMockUser(overrides: Partial<User> & Partial<Actor> = {}): User {
   actor.type = ActorType.HUMAN;
   actor.displayName = overrides.displayName !== undefined ? overrides.displayName : 'Test User';
   actor.avatarUrl = overrides.avatarUrl !== undefined ? overrides.avatarUrl : null;
-  actor.status = (overrides.status as string) !== undefined ? (overrides.status as string) : 'active';
-  actor.createdAt = overrides.createdAt !== undefined ? overrides.createdAt : new Date('2024-01-01');
-  actor.updatedAt = overrides.updatedAt !== undefined ? overrides.updatedAt : new Date('2024-01-01');
+  actor.status =
+    (overrides.status as string) !== undefined ? (overrides.status as string) : 'active';
+  actor.createdAt =
+    overrides.createdAt !== undefined ? overrides.createdAt : new Date('2024-01-01');
+  actor.updatedAt =
+    overrides.updatedAt !== undefined ? overrides.updatedAt : new Date('2024-01-01');
   actor.deletedAt = overrides.deletedAt !== undefined ? overrides.deletedAt : null;
   if (overrides.actor) {
     Object.assign(actor, overrides.actor);
@@ -570,7 +573,9 @@ describe('UserService', () => {
 
       await service.createByAdmin(dto);
 
-      expect(mockRepo.create).toHaveBeenCalledWith(expect.objectContaining({ role: UserRole.EDITOR }));
+      expect(mockRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ role: UserRole.EDITOR }),
+      );
     });
 
     it('should use provided role when specified', async () => {
@@ -588,7 +593,9 @@ describe('UserService', () => {
 
       await service.createByAdmin(dto);
 
-      expect(mockRepo.create).toHaveBeenCalledWith(expect.objectContaining({ role: UserRole.ADMIN }));
+      expect(mockRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ role: UserRole.ADMIN }),
+      );
     });
 
     it('should default status to active', async () => {

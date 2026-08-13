@@ -114,10 +114,7 @@ describe('RunnerRegistryService', () => {
       );
       expect(runnerRepo.save).toHaveBeenCalled();
       // 在线表生效：sendToRunner 可送达
-      const ok = service.sendToRunner(
-        'runner-1',
-        buildEnvelope('ping', {}, {}),
-      );
+      const ok = service.sendToRunner('runner-1', buildEnvelope('ping', {}, {}));
       expect(ok).toBe(true);
       expect(socket.send).toHaveBeenCalled();
     });
@@ -143,7 +140,10 @@ describe('RunnerRegistryService', () => {
 
     it('一 key 一 runner（§7）：同 actor 新连接踢掉旧连接 close(4012)', async () => {
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
 
       const oldSocket = makeSocket();
@@ -199,7 +199,10 @@ describe('RunnerRegistryService', () => {
     it('匹配 bindActorId + vendor + 可绑定状态 → 落库并逐座位下行 seat.assign', async () => {
       const socket = makeSocket();
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
       await service.register(makeAgent(), asWs(socket));
 
@@ -216,10 +219,9 @@ describe('RunnerRegistryService', () => {
 
       expect(bound).toEqual([seat]);
       // 绑定规则断言（M1 自审补：bindActorId == runner actor 且 vendor ∈ hello.vendors）
-      expect(qb.where).toHaveBeenCalledWith(
-        `seat.config->>'bindActorId' = :actorId`,
-        { actorId: 'agent-1' },
-      );
+      expect(qb.where).toHaveBeenCalledWith(`seat.config->>'bindActorId' = :actorId`, {
+        actorId: 'agent-1',
+      });
       expect(qb.andWhere).toHaveBeenCalledWith(`seat.vendor IN (:...vendors)`, {
         vendors: ['kimi'],
       });
@@ -242,7 +244,10 @@ describe('RunnerRegistryService', () => {
     it('已被其他 runner 绑定的座位不抢（跳过且不下发）', async () => {
       const socket = makeSocket();
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
       await service.register(makeAgent(), asWs(socket));
 
@@ -264,7 +269,10 @@ describe('RunnerRegistryService', () => {
       expect(await service.bindSeats('runner-missing', ['kimi'])).toEqual([]);
       const socket = makeSocket();
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
       await service.register(makeAgent(), asWs(socket));
       expect(await service.bindSeats('runner-1', [])).toEqual([]);
@@ -276,7 +284,10 @@ describe('RunnerRegistryService', () => {
     it('在线 → socket.send(JSON 信封)，返回 true', async () => {
       const socket = makeSocket();
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
       await service.register(makeAgent(), asWs(socket));
 
@@ -286,9 +297,7 @@ describe('RunnerRegistryService', () => {
     });
 
     it('离线/未知 runner → false（调用方自行兜底）', () => {
-      expect(
-        service.sendToRunner('runner-ghost', buildEnvelope('ping', {}, {})),
-      ).toBe(false);
+      expect(service.sendToRunner('runner-ghost', buildEnvelope('ping', {}, {}))).toBe(false);
     });
   });
 
@@ -296,7 +305,10 @@ describe('RunnerRegistryService', () => {
     it('移除在线表 + runner/seat DB status=offline，返回 runnerId', async () => {
       const socket = makeSocket();
       runnerRepo.findOne.mockResolvedValue(null);
-      runnerRepo.create.mockImplementation((input: unknown) => ({ id: 'runner-1', ...(input as object) }));
+      runnerRepo.create.mockImplementation((input: unknown) => ({
+        id: 'runner-1',
+        ...(input as object),
+      }));
       runnerRepo.save.mockResolvedValue({ id: 'runner-1', actorId: 'agent-1' });
       await service.register(makeAgent(), asWs(socket));
 
@@ -308,10 +320,7 @@ describe('RunnerRegistryService', () => {
         { id: 'runner-1' },
         expect.objectContaining({ status: 'offline' }),
       );
-      expect(seatRepo.update).toHaveBeenCalledWith(
-        { runnerId: 'runner-1' },
-        { status: 'offline' },
-      );
+      expect(seatRepo.update).toHaveBeenCalledWith({ runnerId: 'runner-1' }, { status: 'offline' });
     });
 
     it('未知连接 → null（幂等）', async () => {

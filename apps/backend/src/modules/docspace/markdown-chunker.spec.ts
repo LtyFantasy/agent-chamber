@@ -80,7 +80,11 @@ describe('markdown-chunker', () => {
     });
 
     it('frontmatter-only document returns empty level-0 chunk', () => {
-      const content = ['---', 'title: Only Frontmatter', '---'].join('\n');
+      const content = [
+        '---',
+        'title: Only Frontmatter',
+        '---',
+      ].join('\n');
 
       const result = chunkMarkdown(content, 'Empty Doc');
       expect(result).toHaveLength(1);
@@ -152,9 +156,16 @@ describe('markdown-chunker', () => {
     });
 
     it('rebuilds ancestor chain on same-level heading (resets sibling)', () => {
-      const content = ['# A', 'content a', '', '## B', 'content b', '', '## C', 'content c'].join(
-        '\n',
-      );
+      const content = [
+        '# A',
+        'content a',
+        '',
+        '## B',
+        'content b',
+        '',
+        '## C',
+        'content c',
+      ].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(3);
@@ -165,7 +176,13 @@ describe('markdown-chunker', () => {
     });
 
     it('handles higher-level heading popping ancestors', () => {
-      const content = ['## Deep', 'deep content', '', '# Shallow', 'shallow content'].join('\n');
+      const content = [
+        '## Deep',
+        'deep content',
+        '',
+        '# Shallow',
+        'shallow content',
+      ].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(2);
@@ -306,13 +323,25 @@ describe('markdown-chunker', () => {
       for (let i = 0; i < result.length; i++) {
         expect(result[i].position).toBe(i);
       }
-      expect(result.map((c) => c.content)).toEqual(['content a', '', 'content c', '']);
+      expect(result.map((c) => c.content)).toEqual([
+        'content a',
+        '',
+        'content c',
+        '',
+      ]);
     });
 
     it('positions increment monotonically', () => {
-      const content = ['# A', 'content a', '', '## B', 'content b', '', '### C', 'content c'].join(
-        '\n',
-      );
+      const content = [
+        '# A',
+        'content a',
+        '',
+        '## B',
+        'content b',
+        '',
+        '### C',
+        'content c',
+      ].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
       for (let i = 0; i < result.length; i++) {
@@ -321,8 +350,7 @@ describe('markdown-chunker', () => {
     });
 
     it('tokenEstimate is consistent: CJK paragraph ≈ char count', () => {
-      const chineseText =
-        '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
+      const chineseText = '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
       const result = chunkMarkdown('# Title\n' + chineseText, 'Doc');
       expect(result).toHaveLength(1);
       // CJK estimate ≈ char count (each char ≈ 1 token)

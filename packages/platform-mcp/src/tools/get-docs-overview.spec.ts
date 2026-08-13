@@ -47,10 +47,7 @@ describe('get_docs_overview', () => {
       truncated: false,
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'My Docs' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -78,10 +75,7 @@ describe('get_docs_overview', () => {
       uncategorized: [],
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'Proj' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'Proj' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -103,10 +97,7 @@ describe('get_docs_overview', () => {
       uncategorized: [],
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'Beta' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'Beta' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -116,9 +107,7 @@ describe('get_docs_overview', () => {
   it('大小写不敏感', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
-      items: [
-        { id: 'sp-1', name: 'My Docs', slug: 'my-docs' },
-      ],
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
     request.mockResolvedValueOnce({
       spaceId: 'sp-1',
@@ -127,10 +116,7 @@ describe('get_docs_overview', () => {
       uncategorized: [],
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'my docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'my docs' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
@@ -140,15 +126,10 @@ describe('get_docs_overview', () => {
   it('0 候选 → isError + availableNames', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
-      items: [
-        { id: 'sp-1', name: 'Alpha', slug: 'alpha' },
-      ],
+      items: [{ id: 'sp-1', name: 'Alpha', slug: 'alpha' }],
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'Ghost' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'Ghost' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -165,10 +146,7 @@ describe('get_docs_overview', () => {
       ],
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'Project' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'Project' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -179,14 +157,9 @@ describe('get_docs_overview', () => {
 
   it('list_doc_spaces HTTP 失败 → isError', async () => {
     const request = mockRequest();
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 500, message: 'Internal error' }),
-    );
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 500, message: 'Internal error' }));
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'My Docs' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -202,10 +175,7 @@ describe('get_docs_overview', () => {
       new PlatformApiError({ status: 404, message: 'Space not found' }),
     );
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'My Docs' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -225,10 +195,7 @@ describe('get_docs_overview', () => {
       truncated: true,
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'My Docs' }, ctx());
 
     const body = JSON.parse(result.content[0].text);
     expect(body.truncated).toBe(true);
@@ -244,10 +211,7 @@ describe('get_docs_overview', () => {
       spaceName: 'My Docs',
     });
 
-    const result = await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs' },
-      ctx(),
-    );
+    const result = await getDocsOverviewTool.handler({ spaceName: 'My Docs' }, ctx());
 
     const text = result.content[0].text;
     // 紧凑 JSON 不应含换行缩进
@@ -302,10 +266,7 @@ describe('get_docs_overview', () => {
     });
     request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
 
-    await getDocsOverviewTool.handler(
-      { spaceName: 'My Docs', includeDescription: true },
-      ctx(),
-    );
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', includeDescription: true }, ctx());
 
     const overviewCall = request.mock.calls[1];
     expect(overviewCall[2].params).toEqual({ includeDescription: true });

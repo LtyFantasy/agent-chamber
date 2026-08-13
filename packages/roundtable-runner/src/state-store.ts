@@ -134,13 +134,20 @@ export class StateStore {
       }
       // 逐座位规范化：旧数据/手改文件缺字段时补默认，防下游拿到 undefined
       const seats: Record<string, SeatPersistedState> = {};
-      for (const [seatId, rec] of Object.entries(parsed.seats as Record<string, Partial<SeatPersistedState>>)) {
+      for (const [seatId, rec] of Object.entries(
+        parsed.seats as Record<string, Partial<SeatPersistedState>>,
+      )) {
         seats[seatId] = {
           sessionId: typeof rec.sessionId === 'string' ? rec.sessionId : undefined,
-          lastSentSeq: Number.isInteger(rec.lastSentSeq) && rec.lastSentSeq! >= 0 ? rec.lastSentSeq! : 0,
+          lastSentSeq:
+            Number.isInteger(rec.lastSentSeq) && rec.lastSentSeq! >= 0 ? rec.lastSentSeq! : 0,
           lastReceivedSeq:
-            Number.isInteger(rec.lastReceivedSeq) && rec.lastReceivedSeq! >= 0 ? rec.lastReceivedSeq! : 0,
-          pendingEvents: Array.isArray(rec.pendingEvents) ? (rec.pendingEvents as PendingEventRecord[]) : [],
+            Number.isInteger(rec.lastReceivedSeq) && rec.lastReceivedSeq! >= 0
+              ? rec.lastReceivedSeq!
+              : 0,
+          pendingEvents: Array.isArray(rec.pendingEvents)
+            ? (rec.pendingEvents as PendingEventRecord[])
+            : [],
         };
       }
       this.state = { version: STATE_VERSION, seats };
