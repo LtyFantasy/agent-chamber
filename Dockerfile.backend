@@ -6,11 +6,17 @@ COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./
 COPY apps/backend/package.json ./apps/backend/
 COPY packages/shared/package.json ./packages/shared/
+# backend 运行时依赖 roundtable-protocol（workspace:*，runner.gateway 直接 import）——
+# 缺装缺编译则 backend tsc 产物 require 被改写成直指 .ts 源码的相对路径，容器启动必挂
+# （2026-08-08 圆桌首发事故的 docker 版复现，v1.51.2 从零冒烟第五层 bug）
+COPY packages/roundtable-protocol/package.json ./packages/roundtable-protocol/
 # lockfile 已随仓导出，严格 --frozen-lockfile：回退只会掩盖 lockfile 漂移
 RUN pnpm install --frozen-lockfile
 COPY . .
-# 必须先编译 shared，backend 运行时通过 workspace symlink 依赖其 dist
+# 必须先编译 shared 与 roundtable-protocol（workspace 依赖拓扑序），
+# backend 运行时通过 workspace symlink 依赖其 dist
 RUN pnpm --filter @agent-chamber/shared build
+RUN pnpm --filter @agent-chamber/roundtable-protocol build
 RUN pnpm --filter @agent-chamber/backend build
 # 构建 runner standalone bundle（install-runner.sh / roundtable-runner.tar.gz）
 # 与宿主机 deploy.sh 复用同一脚本，保证两种部署方式的资产同源同版本。
