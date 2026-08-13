@@ -33,6 +33,7 @@ import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { DocPicker, type DocPick } from '@/components/docs/doc-picker';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
+import { confirm } from '@/lib/notify';
 
 /**
  * DocEditor 组件 props 契约（plan §3.1 R5 定稿，逐字遵守）。
@@ -68,7 +69,7 @@ export interface DocEditorProps {
  * - 预览态：ReactMarkdown + remarkGfm + MARKDOWN_CLASSES 共享常量
  * - 新建模式：底部 path 输入框（必填、≤512、冲突预检）
  *
- * 脏状态：content !== original，取消时 window.confirm 防误丢。
+ * 脏状态：content !== original，取消时全局 confirm 防误丢（danger 红钮）。
  * 保存只发 { path, content }——title/summary/docType/tags/category 全部由
  * 后端 upsert 的 ?? existing 兜底保留。
  */
@@ -84,6 +85,7 @@ export function DocEditor({
   onCancel,
 }: DocEditorProps) {
   const t = useTranslations('docs.editor');
+  const tGlobal = useTranslations();
   const [tab, setTab] = useState('edit');
   const [content, setContent] = useState(initialContent);
   /** 新建模式路径输入值 */
@@ -103,11 +105,21 @@ export function DocEditor({
   /**
    * 尝试退出编辑器（R1 统一脏状态守卫）：
    * 取消按钮/切文档/返回列表/搜索跳转——所有退出路径都走此函数。
+   * 脏状态时弹全局 confirm（danger 红钮：放弃编辑不可逆），确认才放行。
    */
-  const tryExit = useCallback(() => {
-    if (dirty && !window.confirm(t('discardConfirm'))) return;
+  const tryExit = useCallback(async () => {
+    if (dirty) {
+      const ok = await confirm({
+        title: t('discardTitle'),
+        description: t('discardConfirm'),
+        confirmText: tGlobal('common.confirm'),
+        cancelText: tGlobal('common.cancel'),
+        confirmVariant: 'danger',
+      });
+      if (!ok) return;
+    }
     onCancel();
-  }, [dirty, onCancel, t]);
+  }, [dirty, onCancel, t, tGlobal]);
 
   /**
    * 提交保存：create 模式先预检 path 冲突，通过后调用 onSave。
@@ -228,7 +240,7 @@ export function DocEditor({
           variant="outline"
           size="sm"
           className="h-8 text-xs"
-          onClick={tryExit}
+          onClick={() => void tryExit()}
           disabled={saving}
         >
           {t('cancel')}

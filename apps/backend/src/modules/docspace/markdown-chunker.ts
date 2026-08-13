@@ -9,6 +9,12 @@
  * [踩坑索引]
  *   - bug f2549375：围栏代码块内的 `# 注释`（curl/bash 示例）曾被识别为 ATX 标题，
  *     导致 section 切错 + headingPath 顶层误植；标题扫描必须先走围栏状态机（见 step 1）
+ *   - 任务 e6eaf06d：空正文标题曾不产 chunk（仅入祖先栈），「全文读 + upsert 回写」往返
+ *     永久丢失空标题行（典型 H2 分组标题），文档结构渐进退化；空标题现在也产 content='' 的 chunk
+ *   - 任务 e6eaf06d 第二张脸：单 section >4000 字符按段落二次切分时，子 chunk 共用同一
+ *     headingPath/headingLevel（step 4 正确设计，勿改）——reconstruct 侧（doc.service.ts
+ *     reconstructContent）靠 run-dedup 保证兄弟 chunk 只插回一次标题，修改两侧任一侧前先跑
+ *     docspace 测试验证往返幂等
  *
  * [铁律关联] #11(注释) #17(测试契约)
  *
@@ -27,9 +33,13 @@
  *
  * 规格严格按 plan §4.4：
  * - 按 ATX 标题 (#{1,6}) 切段；文首无标题内容 → level 0 段，headingPath=文档 title
+ * - 空正文标题（无自身正文，后紧跟下一标题或 EOF）同样产出 content='' 的 chunk——
+ *   保证「全文读 + upsert 回写」往返不丢标题行（丢空标题 = 静默数据损耗，见 AGENT-HOOK e6eaf06d）
  * - 围栏代码块（``` / ~~~）内的行不识别为标题（防代码注释污染标题栈）
  * - headingPath=祖先标题链 "父 § 子" 拼接（截断 512）
- * - 单 section >4000 字符按段落二次切分
+ * - 单 section >4000 字符按段落二次切分；子 chunk 共用同一 headingPath/headingLevel，
+ *   reconstruct 侧（doc.service.ts reconstructContent）靠 run-dedup 保证标题只插回一次
+ *   （任务 e6eaf06d 第二张脸）
  * - CJK 感知 tokenEstimate：cjkCharCount + ceil(nonCjkLength / 4)
  * - 防御性跳过开头 "---...---" frontmatter 块
  */
@@ -219,7 +229,21 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
     }
 
     if (!body) {
-      // Empty heading section: still push to ancestors (may have child sections)
+      // 空正文标题（heading 后紧跟下一标题或 EOF）也产出 content='' 的 chunk。
+      // rationale: 分块与 reconstructContent 重建互逆——若不产 chunk，doc_sections 缺失该
+      // 标题行，任何「全文读 + upsert 回写」往返都会永久丢失空标题（典型 H2 分组标题），
+      // 文档结构渐进退化（任务 e6eaf06d）。heading 位于 EOF 的无 body 情形由同一分支天然覆盖。
+      chunks.push({
+        headingPath: buildHeadingPath(
+          ancestors.map((a) => a.title),
+          h.title,
+        ),
+        headingLevel: h.level,
+        position: chunks.length,
+        content: '',
+        tokenEstimate: 0,
+      });
+      // 当前标题入祖先栈（供后续子标题使用）
       ancestors.push({ level: h.level, title: h.title });
       continue;
     }

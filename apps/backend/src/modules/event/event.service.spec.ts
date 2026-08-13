@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Repository, ObjectLiteral, SelectQueryBuilder, Brackets } from 'typeorm';
 import { EventService } from './event.service';
 import { Event } from '../../database/entities/event.entity';
@@ -48,6 +49,7 @@ describe('EventService', () => {
   let service: EventService;
   let mockRepo: jest.Mocked<Repository<Event>>;
   let mockAccessQuery: jest.Mocked<AccessQueryService>;
+  let mockEventEmitter: { emit: jest.Mock };
   let queryBuilderChain: {
     orderBy: jest.Mock;
     take: jest.Mock;
@@ -76,6 +78,7 @@ describe('EventService', () => {
       queryBuilderChain as unknown as SelectQueryBuilder<Event>,
     );
     mockAccessQuery = createMockAccessQuery();
+    mockEventEmitter = { emit: jest.fn() };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
@@ -83,6 +86,8 @@ describe('EventService', () => {
         { provide: getRepositoryToken(Event), useValue: mockRepo },
         { provide: SseService, useValue: { emit: jest.fn() } },
         { provide: AccessQueryService, useValue: mockAccessQuery },
+        // 事件总线 mock（M1 圆桌计划决策 2：create() 末尾 emit('event.created')）
+        { provide: EventEmitter2, useValue: mockEventEmitter },
       ],
     }).compile();
 
@@ -169,9 +174,7 @@ describe('EventService', () => {
     it('should return nextCursor = last event cursor when cursor=now and events exist', async () => {
       const fakeNow = 1721800000000;
       jest.spyOn(Date, 'now').mockReturnValue(fakeNow);
-      const events = [
-        { id: 'evt-4', cursor: String(fakeNow * 1000 + 500) },
-      ] as Event[];
+      const events = [{ id: 'evt-4', cursor: String(fakeNow * 1000 + 500) }] as Event[];
       queryBuilderChain.getMany.mockResolvedValue(events);
       mockAccessQuery.getAccessibleTopicIds.mockResolvedValue(['topic-1']);
       mockAccessQuery.getAccessibleBoardIds.mockResolvedValue(['board-1']);
@@ -194,7 +197,11 @@ describe('EventService', () => {
     });
 
     it('should not apply visibility filter for admin actor', async () => {
-      const adminActor: UnifiedActor = { id: 'admin-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+      const adminActor: UnifiedActor = {
+        id: 'admin-1',
+        type: ActorType.HUMAN,
+        role: UserRole.ADMIN,
+      };
       const events = [{ id: 'evt-1', cursor: '100' }] as Event[];
       queryBuilderChain.getMany.mockResolvedValue(events);
 
@@ -213,9 +220,7 @@ describe('EventService', () => {
 
       await service.poll({}, mockActor);
 
-      expect(queryBuilderChain.where).toHaveBeenCalledWith(
-        expect.any(Brackets),
-      );
+      expect(queryBuilderChain.where).toHaveBeenCalledWith(expect.any(Brackets));
       expect(queryBuilderChain.andWhere).not.toHaveBeenCalled();
     });
   });
@@ -240,6 +245,8 @@ describe('EventService', () => {
       expect(mockRepo.create).toHaveBeenCalledWith(dto);
       expect(mockRepo.save).toHaveBeenCalledWith(created);
       expect(result).toEqual(saved);
+      // 事件总线挂点：落库成功后同步派发（新增行为，铁律 #17 同步覆盖）
+      expect(mockEventEmitter.emit).toHaveBeenCalledWith('event.created', saved);
     });
   });
 });

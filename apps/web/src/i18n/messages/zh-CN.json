@@ -34,7 +34,8 @@
     "openMenu": "打开菜单",
     "closeMenu": "关闭菜单",
     "logout": "退出登录",
-    "language": "语言"
+    "language": "语言",
+    "pendingApprovals": "{count} 项圆桌审批待处理"
   },
   "settings": {
     "language": {
@@ -191,7 +192,20 @@
       "description": "描述",
       "visibility": "可见性",
       "titlePlaceholder": "话题标题",
-      "descPlaceholder": "话题描述（可选）"
+      "descPlaceholder": "话题描述（可选）",
+      "kind": "类型",
+      "kindNormalDesc": "普通（标准讨论话题）",
+      "kindRoundtableDesc": "圆桌（多 Agent 座位会议）",
+      "kindImmutableHint": "类型创建后不可修改；座位在创建后进入话题详情添加",
+      "wakePolicy": "唤醒策略",
+      "wakeMention": "@ 提及唤醒（默认，仅 @座位 或 @all 时注入）",
+      "wakeBroadcast": "广播唤醒（每条新消息注入全部座位）",
+      "maxRounds": "安全阀轮数上限（可选）",
+      "maxRoundsPlaceholder": "缺省 8；0 = 关闭"
+    },
+    "kind": {
+      "normal": "普通",
+      "roundtable": "圆桌"
     },
     "delete": {
       "confirmTitle": "确认删除",
@@ -263,7 +277,27 @@
       "copied": "已复制",
       "deleteConfirm": "确定要删除这条消息吗？",
       "deleteTitle": "删除消息",
-      "senderSelf": "我"
+      "senderSelf": "我",
+      "thinkingSummary": "过程记录",
+      "mentionHint": "@座位名 唤醒对应座位，@all 唤醒全部",
+      "mentionAllDesc": "唤醒全部座位",
+      "mentionNoMatch": "无匹配座位",
+      "allWakeTitle": "唤醒全部座位",
+      "allWakeConfirm": "将唤醒全部 {count} 个座位，确认发送？",
+      "coordinatorBadge": "主脑",
+      "coordinatorTitle": "主脑座位：调度指令以 topic 正文明说可观测"
+    },
+    "permissionRequest": {
+      "title": "{count} 项待审批",
+      "seatFallback": "座位 {id}",
+      "alreadyResolved": "该请求已被他人裁决，列表已刷新",
+      "verdictFailed": "裁决失败，请重试",
+      "verdictSuccess": "已提交裁决",
+      "option": {
+        "approveOnce": "允许一次",
+        "approveAlways": "本会话内允许",
+        "reject": "拒绝"
+      }
     },
     "messageType": {
       "chat": "聊天",
@@ -274,6 +308,106 @@
       "task": "任务",
       "artifact": "产物",
       "status_update": "状态"
+    },
+    "seatMgmt": {
+      "title": "圆桌座位",
+      "addSeat": "添加座位",
+      "pendingCount": "{count} 个座位待连接 →",
+      "noRunnerOnline": "当前没有在线 runner——座位创建后，需在对应 Agent 的环境启动 runner 才会被接管：",
+      "copyCommand": "复制启动命令",
+      "copied": "已复制"
+    },
+    "seatCreate": {
+      "title": "添加座位",
+      "desc": "为圆桌添加一个 Agent 座位；runner 上线后按绑定 Agent + 厂商自动认领",
+      "label": "座位名",
+      "labelPlaceholder": "如 kimi-1",
+      "vendor": "厂商",
+      "vendorNoRunner": "当前没有支持 {vendor} 的在线 runner——可以先创建，runner 上线后自动认领",
+      "bindAgent": "绑定 Agent",
+      "bindAgentPlaceholder": "选择绑定的 Agent",
+      "cwd": "工作目录",
+      "cwdPlaceholder": "/home/user/projects/demo",
+      "cwdHint": "runner 所在机器上的目录，座位 Agent 只能在此目录内工作",
+      "permissionMode": "权限模式",
+      "pmDefaultDesc": "default（只读，写操作逐项审批）",
+      "pmPlanDesc": "plan（只读 + 计划协作模式）",
+      "pmAutoDesc": "auto（自动执行，敏感操作走审批，推荐）",
+      "pmYoloDesc": "yolo（完全放权不审批，谨慎使用）",
+      "advanced": "高级选项",
+      "model": "模型覆盖（可选）",
+      "modelPlaceholder": "如 kimi-k2",
+      "coordinator": "主脑座位（coordinator）",
+      "batchWindow": "攒批窗口毫秒（可选）",
+      "batchWindowPlaceholder": "缺省 30000；0 = 直通",
+      "cancel": "取消",
+      "submit": "创建",
+      "success": "座位「{label}」已创建——runner 上线后会自动认领。接下来连接它：",
+      "done": "完成",
+      "failed": "创建座位失败，请重试",
+      "forbidden": "无权限在该话题创建座位"
+    },
+    "seatManager": {
+      "title": "座位（{count}）",
+      "coordinator": "主脑",
+      "coordinatorTitle": "主脑座位",
+      "thinking": "思考等级",
+      "pendingConnect": "待连接",
+      "remove": "移除",
+      "removeTitle": "移除座位",
+      "removeConfirm": "确定要移除座位 {label} 吗？将停止其会话并从本桌移除。",
+      "removeFailed": "移除失败，请重试",
+      "removedForbidden": "没有权限移除该座位",
+      "leftGroup": "座位（成员已离桌）"
+    },
+    "seatPresence": {
+      "thinking": "思考中",
+      "replying": "回复中",
+      "silent": "沉默",
+      "offline": "离线",
+      "cancel": "取消发言",
+      "cancelTitle": "取消发言",
+      "cancelConfirm": "确定要取消座位 {label} 的当前发言吗？将中断其本次回复。",
+      "cancelSent": "取消指令已发送",
+      "cancelConflict": "该座位已完成发言。列表已刷新。",
+      "cancelForbidden": "没有权限取消该座位的发言",
+      "cancelFailed": "取消失败，请重试",
+      "recentActivity": "近况",
+      "noActivity": "暂无近况",
+      "silentCount": "沉默轮数：{count}",
+      "usage": "用量 {used}/{size} tokens"
+    },
+    "seatGuide": {
+      "model": "runner 从装有 CLI 的机器拨出连接平台（不一定是部署平台那台），用所绑定 Agent 的 API Key 认领座位。",
+      "expandButton": "连接座位「{label}」",
+      "connectTitle": "连接座位「{label}」",
+      "connectDesc": "该座位还没有 runner 认领——按下方路径接入后自动验证连接。",
+      "apiKeyLabel": "Agent API Key（可选）",
+      "apiKeyPlaceholder": "粘贴绑定 Agent 的 API Key；不填则指令/命令里留占位符",
+      "apiKeyHint": "仅保存在本页内存，不会上传或落盘",
+      "forgotKey": "忘记 Key？去该 Agent 的密钥页重置",
+      "pathATitle": "方式 A（推荐）：复制给 Agent 的指令",
+      "pathADesc": "把指令发给目标 Agent（或粘贴到它的 CLI），它会阅读指南并启动 runner：",
+      "copyPrompt": "复制指令",
+      "pathBTitle": "方式 B：人类一行命令",
+      "pathBDesc": "在装有 CLI 的机器上执行（Linux/macOS，Windows 用 WSL）；首次运行会自动下载并安装 runner：",
+      "copyCommand": "复制命令",
+      "repoAltTitle": "已 clone 仓库？",
+      "repoAltDesc": "在仓库根目录改为执行以下两条，然后启动：",
+      "verifyTitle": "连接验证（自动）",
+      "stepRunner": "等待支持 {vendor} 的 runner 上线",
+      "stepRunnerOk": "支持 {vendor} 的 runner 已上线",
+      "stepClaim": "等待座位「{label}」被认领",
+      "stepClaimOk": "座位「{label}」已被认领",
+      "stepAlive": "等待座位活跃",
+      "stepAliveOk": "座位已在线",
+      "stuckTitle": "runner 已在线，但座位一直没有被认领",
+      "stuckHint": "检查 runner 使用的 API Key 是否属于座位绑定的 Agent（可在其密钥页重置/新建 Key），且 CLI 厂商为 {vendor}。",
+      "allGreen": "连接完成——座位已就绪，打个招呼吧！",
+      "goMention": "去 @ 它试试",
+      "mentionCopied": "已复制「@{label} 」——回到话题粘贴即可 @ 它",
+      "copied": "已复制",
+      "promptText": "你是圆桌座位「{label}」（厂商 {vendor}）的运行 Agent。座位已在平台创建完毕，请勿重复创建座位。请按以下步骤接入：\n1. 阅读连接指南：{guideUrl}\n2. 在装有 CLI 的机器上启动 runner，连接平台 {platformUrl}，使用 API Key：{apiKey}\n3. 认领座位「{label}」后，向话题汇报你已就绪。"
     }
   },
   "tasks": {
@@ -372,7 +506,8 @@
     "updated": "更新 {time}",
     "delete": {
       "confirm": "确定要删除此任务吗？"
-    }
+    },
+    "deleteTitle": "删除任务"
   },
   "boards": {
     "title": "看板",
@@ -462,8 +597,14 @@
       "versionReadonlyHint": "版本创建后不可修改（release 身份标识）",
       "bodyPlaceholder": "发布说明（可选；编辑时留空保持不变）"
     },
-    "descriptionExpand": "展开描述",
-    "descriptionCollapse": "收起描述",
+    "legend": {
+      "view": "查看图例",
+      "add": "添加图例",
+      "title": "看板图例",
+      "placeholder": "看板图例（长 markdown，随 digest 全量送达）",
+      "edit": "编辑",
+      "saveError": "图例保存失败"
+    },
     "filter": {
       "activeTasks": "活跃任务",
       "allStatuses": "全部状态",
@@ -495,6 +636,17 @@
       "createTitle": "新建文档空间",
       "createDesc": "创建绑定本看板的文档空间",
       "namePlaceholder": "空间名称"
+    },
+    "settings": {
+      "title": "看板设置",
+      "name": "看板名称",
+      "namePlaceholder": "看板名称",
+      "description": "看板图例",
+      "descPlaceholder": "看板图例（长 markdown，随 digest 全量送达）",
+      "visibility": "可见性",
+      "visibilityPublic": "公开",
+      "visibilityPrivate": "私有",
+      "editorHint": "结构字段（可见性）仅创建者可修改"
     }
   },
   "docs": {
@@ -552,7 +704,8 @@
       "filterByTag": "按标签「{tag}」筛选",
       "contentLoadError": "文档内容加载失败",
       "contentLoadErrorDesc": "请检查网络后重试",
-      "legend": "图例"
+      "legend": "图例",
+      "browse": "文档目录"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",
@@ -585,12 +738,19 @@
       "noAvailableAgents": "没有可用的活跃 Agent",
       "setEditor": "设为编辑者",
       "remove": "移除",
-      "actionFailed": "操作失败，请重试"
+      "actionFailed": "操作失败，请重试",
+      "transferCreator": "转让创建者",
+      "transferTitle": "转让创建者",
+      "transferConfirm": "将创建者转让给「{name}」？原创建者将失去全部权限（私密空间将无法访问），此操作不可逆。",
+      "transferConfirmButton": "确认转让",
+      "transferSuccess": "创建者已转让",
+      "transferFailed": "转让失败，请重试"
     },
     "categories": {
       "manage": "管理分类",
       "title": "分类",
       "namePlaceholder": "分类名称",
+      "deleteTitle": "删除分类",
       "deleteConfirm": "删除分类「{name}」？其下文档将归入未分类。",
       "actionFailed": "操作失败，请重试"
     },
@@ -608,10 +768,12 @@
       "bindingBoards": "看板",
       "bindingTopics": "话题",
       "bindingHint": "空间入口会显示在所选看板/话题下；变更或解除不影响文档内容与任务链接",
+      "bindingTitle": "变更关联",
       "bindingConfirm": "变更关联会把空间入口移动到新对象（或解除入口）。文档内容和任务链接不受影响，确认继续？",
       "save": "保存",
       "saveSuccess": "空间设置已更新",
-      "saveError": "保存失败，请重试"
+      "saveError": "保存失败，请重试",
+      "editorHint": "可见性与关联绑定仅空间创建者可修改"
     },
     "picker": {
       "addLabel": "关联文档",
@@ -637,6 +799,7 @@
       "saveSuccess": "文档已保存",
       "unchanged": "内容无变化，无需保存",
       "saveError": "保存失败，请重试",
+      "discardTitle": "放弃修改",
       "discardConfirm": "内容已修改，确定放弃？",
       "pathConflict": "路径已存在，请换一个",
       "pathCheckFailed": "路径唯一性校验失败，请重试",
@@ -692,24 +855,29 @@
   },
   "search": {
     "title": "全局搜索",
-    "description": "搜索消息、任务...",
-    "placeholder": "搜索消息、任务...",
+    "description": "搜索消息、任务、文档...",
+    "placeholder": "搜索消息、任务、文档...",
     "startSearch": "开始搜索",
-    "startSearchHint": "输入关键词搜索消息和任务",
+    "startSearchHint": "输入关键词搜索消息、任务和文档",
     "noResults": "未找到结果",
     "noResultsDesc": "未找到与 \"{query}\" 相关的内容",
     "noMessages": "未找到消息",
     "noMessagesDesc": "未找到与 \"{query}\" 相关的消息",
     "noTasks": "未找到任务",
     "noTasksDesc": "未找到与 \"{query}\" 相关的任务",
+    "noDocs": "未找到文档",
+    "noDocsDesc": "未找到与 \"{query}\" 相关的文档",
     "loadMore": "加载更多",
     "assigned": "已分配",
     "sectionMessages": "消息 ({count})",
     "sectionTasks": "任务 ({count})",
+    "sectionDocs": "文档 ({count})",
+    "openDoc": "打开文档 {title}",
     "tab": {
       "all": "全部",
       "messages": "消息",
-      "tasks": "任务"
+      "tasks": "任务",
+      "docs": "文档"
     },
     "sender": {
       "human": "用户",
@@ -898,6 +1066,9 @@
     }
   },
   "skills": {
+    "title": "Skill 库",
+    "subtitle": "Agent 接入指南与开发规范,公开可访问,支持浏览、下载与一键安装。",
+    "empty": "暂无可用 Skill",
     "notFound": "Skill 不存在",
     "notFoundHint": "找不到名为 <code>{name}</code> 的 Skill",
     "backToLogin": "返回登录页",
@@ -906,6 +1077,9 @@
     "copied": "已复制",
     "copyInstallCommand": "复制安装命令",
     "downloadSkillMd": "下载 SKILL.md",
+    "subSkills": "子 Skill",
+    "subEmpty": "该 Skill 无子 Skill",
+    "subDownload": "下载此 SKILL.md",
     "footerHint": "该 Skill 用于指导 Agent 接入本平台，可公开访问。",
     "goToLogin": "去登录 →"
   }

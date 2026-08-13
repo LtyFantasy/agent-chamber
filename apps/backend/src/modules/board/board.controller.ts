@@ -8,11 +8,16 @@
  *   - 任务分页: docs/api-definition.md §7（Boards/Tasks 分页与字段精简契约，v1.16.0）
  *   新增 GET /boards/:id/lists 与 /boards/:id/lists/:listId/tasks；findOne 不再返回 tasks。
  *
- * [踩坑索引] D5(权限迁移) B-51(admin-403显式检查) B-45(reorder返回null) B-41(列表页任务统计) B-50(列表权限过滤) OWNER-PROXY(update+成员4端点视同creator)
+ * [踩坑索引] D5(权限迁移) B-51(admin-403显式检查) B-45(reorder返回null) B-41(列表页任务统计) B-50(列表权限过滤) OWNER-PROXY(update+成员4端点视同creator) TOPIC-PERM(update结构字段显式403替代静默剥离)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先)
  *
  * [详细踩坑]（最多 5 条）
+ *   TOPIC-PERM: v1.46 update 删除 v1.37 静默剥离分支（非 creator 解构 name/description，
+ *       结构字段静默丢弃 → 200 装傻，前端编辑 dialog 恒带 visibility 全靠此兜底）。
+ *       改为 DocSpace v1.45 同构：结构字段（topicId/visibility/invitedAgentIds）任一
+ *       `!== undefined`（显式 null 也算）→ 非 creator/admin 整体 403 列字段名；
+ *       前端 boards 列表页编辑按钮已门控 creator/admin 防 403 回归。
  *   BoardDetail 解耦 tasks: findOne 返回 lists 为 BoardListSummary[]（无 tasks 数组），
  *     任务列表通过 GET /boards/:id/lists/:listId/tasks 按列分页获取。
  *   B-51: 成员管理端点(invite/uninvite/editor)改用显式 isCreator 检查时遗漏 admin
@@ -168,7 +173,8 @@ export class BoardController {
   @ApiQuery({
     name: 'includeDescription',
     required: false,
-    description: "Include the board description (legend). Default true; pass 'false' to set description to null.",
+    description:
+      "Include the board description (legend). Default true; pass 'false' to set description to null.",
     type: Boolean,
   })
   @ApiResponse({ status: 200, description: 'Board digest returned successfully' })
@@ -245,10 +251,16 @@ export class BoardController {
   @Patch(':id')
   @ApiOperation({
     summary: 'Update board',
-    description: 'Update board by ID. Editors can only modify name and description.',
+    description:
+      'Update board by ID. Field-level permission split (v1.46 TOPIC-PERM, 对齐 DocSpace v1.45): ' +
+      'content fields (name/description) require write access (creator, editor, owner-proxy, ' +
+      'or admin); structural fields (topicId/visibility/invitedAgentIds) require creator (or ' +
+      'admin). An editor request containing any structural field is rejected as a whole (403) ' +
+      '— no partial application.',
   })
   @ApiParam({ name: 'id', description: 'Board ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Board updated successfully' })
+  @ApiResponse({ status: 403, description: 'Structural fields require creator permission' })
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateBoardDto,
@@ -257,13 +269,32 @@ export class BoardController {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'write');
 
-    // v1.37 owner 代理：人类 owner 对其 agent 创建的 board 视同创建者（允许全字段修改）
-    const isCreator =
-      board.creatorId === actor.id || (await this.ownerProxy.isOwnerProxy(board.creatorId, actor));
-    if (!isCreator) {
-      // editor 只允许修改 name/description
-      const { name, description } = dto;
-      return this.boardService.update(id, { name, description } as UpdateBoardDto);
+    // D6（v1.46 TOPIC-PERM）：删除 v1.37 的静默剥离分支（非 creator 只解构 name/description，
+    // 结构字段被静默丢弃 → 200 装傻），改为 DocSpace v1.45 同构的显式 403。
+    // ⚠️ 结构字段存在性必须 `!== undefined`（显式 null 也算「出现」= 解绑语义）——
+    // truthy 判断会漏掉 { topicId: null } 解绑请求，让 editor 绕过结构字段检查。
+    const hasStructural =
+      dto.topicId !== undefined ||
+      dto.visibility !== undefined ||
+      dto.invitedAgentIds !== undefined;
+    if (hasStructural) {
+      // v1.37 owner 代理：人类 owner 对其 agent 创建的 board 视同创建者（允许全字段修改）
+      const isCreator =
+        board.creatorId === actor.id ||
+        (await this.ownerProxy.isOwnerProxy(board.creatorId, actor));
+      const isAdmin = actor?.role === UserRole.ADMIN;
+      if (!isCreator && !isAdmin) {
+        // R1：403 消息列出实际出现的结构字段名（editor 请求含任一结构字段 → 整体 403，
+        // 不做部分应用），agent 消费者可据消息自修正
+        const presentStructural: string[] = [];
+        if (dto.topicId !== undefined) presentStructural.push('topicId');
+        if (dto.visibility !== undefined) presentStructural.push('visibility');
+        if (dto.invitedAgentIds !== undefined) presentStructural.push('invitedAgentIds');
+        throw new ForbiddenException({
+          message: `Structural fields require creator permission: ${presentStructural.join(', ')}`,
+          code: ErrorCode.PERMISSION_DENIED,
+        });
+      }
     }
 
     return this.boardService.update(id, dto);

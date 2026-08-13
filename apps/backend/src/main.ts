@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
+import { WsAdapter } from '@nestjs/platform-ws';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { json, urlencoded } from 'express';
 import { AppModule } from './app.module';
@@ -32,6 +33,12 @@ async function bootstrap() {
 
   // Global prefix
   app.setGlobalPrefix('/api/v1');
+
+  // WebSocket 适配器（M1 圆桌计划决策 3：平台首个 WS 服务端）。
+  // WsAdapter 挂载后 @WebSocketGateway 生效；WS 路径（/ws/runner 等）不受全局
+  // /api/v1 前缀影响。全局 APP_GUARD/INTERCEPTOR/FILTER 对 WS context 同样生效，
+  // 行为实测结论见阶段 2 WS spike（roundtable gateway 只走 client.send、入站返回 void）。
+  app.useWebSocketAdapter(new WsAdapter(app));
 
   // Swagger
   const config = new DocumentBuilder()

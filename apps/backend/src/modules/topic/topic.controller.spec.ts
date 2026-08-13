@@ -2,15 +2,23 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { TopicController } from './topic.controller';
 import { TopicService } from './topic.service';
 import { PermissionService } from '../../common/services/permission.service';
+import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { TopicStatus, ActorType, UserRole } from '@agent-chamber/shared';
+import { TopicStatus, ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
 
 describe('TopicController', () => {
   let controller: TopicController;
   let service: typeof mockService;
   let permService: typeof mockPermService;
+  let ownerProxy: { isOwnerProxy: jest.Mock };
 
+  // admin（全局 bypass，沿用历史 mockActor 语义）
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+  // 非 creator 非 admin（editor 参与方身份由 policy/ownerProxy mock 模拟——controller
+  // 层只测 ensureCreatorOrAdmin 收口：非 creator 级 → 403）
+  const editorActor = { id: 'editor-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+  // 非 admin 的创建者（R4 语义：creator 判定必须用非 admin 身份验证，防 admin bypass 污染）
+  const creatorActor = { id: 'creator-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
   const mockAgentActor = { id: 'agent-1', type: ActorType.AGENT };
 
   const mockService = {
@@ -34,6 +42,8 @@ describe('TopicController', () => {
     inviteAgent: jest.fn(),
     uninviteAgent: jest.fn(),
     uninviteUser: jest.fn(),
+    addEditor: jest.fn(),
+    removeEditor: jest.fn(),
   };
 
   const mockPermService = {
@@ -46,6 +56,10 @@ describe('TopicController', () => {
       providers: [
         { provide: TopicService, useValue: mockService },
         { provide: PermissionService, useValue: mockPermService },
+        {
+          provide: OwnerProxyService,
+          useValue: { isOwnerProxy: jest.fn().mockResolvedValue(false) },
+        },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -57,6 +71,9 @@ describe('TopicController', () => {
     permService = module.get<PermissionService>(
       PermissionService,
     ) as unknown as typeof mockPermService;
+    ownerProxy = module.get<OwnerProxyService>(OwnerProxyService) as unknown as {
+      isOwnerProxy: jest.Mock;
+    };
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -122,6 +139,98 @@ describe('TopicController', () => {
       expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.update).toHaveBeenCalledWith('topic-1', dto);
     });
+
+    // ─── 字段级分权（D3，v1.46 TOPIC-PERM：内容字段 policy write / 结构字段 creator-only）───
+
+    it('editor 纯内容字段（title/description）→ 放行（policy write）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      const dto = { description: 'Updated' };
+      const result = { id: 'topic-1', description: 'Updated' };
+      service.findById.mockResolvedValue(topic);
+      service.update.mockResolvedValue(result);
+
+      expect(await controller.update('topic-1', dto, editorActor)).toBe(result);
+      // 内容路径直接走 policy write（不自造 isCreatorOrEditor 判断）
+      expect(permService.ensureCan).toHaveBeenCalledWith(topic, editorActor, 'write');
+      expect(service.update).toHaveBeenCalledWith('topic-1', dto);
+    });
+
+    it('editor + visibility → 403，消息列出结构字段名（整体拒绝，无部分应用）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.update('topic-1', { visibility: Visibility.PRIVATE }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('visibility'),
+          }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor + status: null 显式值也算结构字段出现（`!== undefined` 探测，truthy 判断是 bug）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.update('topic-1', { status: null as never }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('status'),
+          }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor + 多结构字段 → 403 消息列出全部出现字段（R1 自修正能力）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.update(
+          'topic-1',
+          { visibility: Visibility.PRIVATE, invitedAgentIds: [] },
+          editorActor,
+        ),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            message: expect.stringContaining('visibility'),
+          }),
+        }),
+      );
+      await expect(
+        controller.update(
+          'topic-1',
+          { visibility: Visibility.PRIVATE, invitedAgentIds: [] },
+          editorActor,
+        ),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            message: expect.stringContaining('invitedAgentIds'),
+          }),
+        }),
+      );
+    });
+
+    it('creator（非 admin）全字段可更新（结构字段也放行）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'creator-1' };
+      const dto = { title: 'Updated', visibility: Visibility.PRIVATE };
+      const result = { id: 'topic-1', title: 'Updated' };
+      service.findById.mockResolvedValue(topic);
+      service.update.mockResolvedValue(result);
+
+      expect(await controller.update('topic-1', dto, creatorActor)).toBe(result);
+      expect(service.update).toHaveBeenCalledWith('topic-1', dto);
+    });
   });
 
   describe('remove', () => {
@@ -137,53 +246,61 @@ describe('TopicController', () => {
   });
 
   describe('close', () => {
-    it('should ensure write permission then change status to CLOSED', async () => {
+    it('admin 可 close（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const result = { id: 'topic-1', status: TopicStatus.CLOSED };
       service.findById.mockResolvedValue(topic);
       service.changeStatus.mockResolvedValue(result);
 
       expect(await controller.close('topic-1', mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.CLOSED);
+    });
+
+    it('editor（非 creator 非 admin）close → 403（结构端点收口代表用例）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(controller.close('topic-1', editorActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.changeStatus).not.toHaveBeenCalled();
     });
   });
 
   describe('pause', () => {
-    it('should ensure write permission then change status to PAUSED', async () => {
+    it('admin 可 pause（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const result = { id: 'topic-1', status: TopicStatus.PAUSED };
       service.findById.mockResolvedValue(topic);
       service.changeStatus.mockResolvedValue(result);
 
       expect(await controller.pause('topic-1', mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.PAUSED);
     });
   });
 
   describe('resume', () => {
-    it('should ensure write permission then change status to ACTIVE', async () => {
+    it('admin 可 resume（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const result = { id: 'topic-1', status: TopicStatus.ACTIVE };
       service.findById.mockResolvedValue(topic);
       service.changeStatus.mockResolvedValue(result);
 
       expect(await controller.resume('topic-1', mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.ACTIVE);
     });
   });
 
   describe('archive', () => {
-    it('should ensure write permission then change status to ARCHIVED', async () => {
+    it('admin 可 archive（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const result = { id: 'topic-1', status: TopicStatus.ARCHIVED };
       service.findById.mockResolvedValue(topic);
       service.changeStatus.mockResolvedValue(result);
 
       expect(await controller.archive('topic-1', mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.ARCHIVED);
     });
   });
@@ -231,7 +348,7 @@ describe('TopicController', () => {
   });
 
   describe('removeParticipant', () => {
-    it('should ensure write permission then remove participant', async () => {
+    it('admin 可移除参与者（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const result = { topicId: 'topic-1', participantId: 'agent-1', leftAt: new Date() };
       service.findById.mockResolvedValue(topic);
@@ -242,7 +359,6 @@ describe('TopicController', () => {
           participantId: 'agent-1',
         }),
       ).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.removeParticipant).toHaveBeenCalledWith('topic-1', mockActor.id, 'agent-1');
     });
   });
@@ -301,12 +417,7 @@ describe('TopicController', () => {
       expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'read', {
         hasAccess: true,
       });
-      expect(service.getUnread).toHaveBeenCalledWith(
-        'topic-1',
-        {},
-        mockActor.id,
-        mockActor.type,
-      );
+      expect(service.getUnread).toHaveBeenCalledWith('topic-1', {}, mockActor.id, mockActor.type);
     });
   });
 
@@ -329,7 +440,7 @@ describe('TopicController', () => {
   });
 
   describe('updateAgenda', () => {
-    it('should ensure write permission then update agenda', async () => {
+    it('admin 可更新 agenda（D2 ensureCreatorOrAdmin bypass；agenda 归结构字段）', async () => {
       const topic = { id: 'topic-1' };
       const dto = { agenda: [{ title: 'Test', status: 'pending' as const, order: 1 }] };
       const result = { id: 'topic-1', agenda: dto.agenda };
@@ -337,13 +448,12 @@ describe('TopicController', () => {
       service.updateAgenda.mockResolvedValue(result);
 
       expect(await controller.updateAgenda('topic-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.updateAgenda).toHaveBeenCalledWith('topic-1', dto);
     });
   });
 
   describe('inviteAgent', () => {
-    it('should ensure write permission then invite agent', async () => {
+    it('admin 可邀请 agent（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const dto = { agentId: 'agent-1' };
       const result = { id: 'topic-1' };
@@ -351,13 +461,37 @@ describe('TopicController', () => {
       service.inviteAgent.mockResolvedValue(result);
 
       expect(await controller.inviteAgent('topic-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
+      expect(service.inviteAgent).toHaveBeenCalledWith('topic-1', 'agent-1');
+    });
+
+    it('editor（非 creator 非 admin）invite-agent → 403（成员管理收口代表用例）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.inviteAgent('topic-1', { agentId: 'agent-1' }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.inviteAgent).not.toHaveBeenCalled();
+    });
+
+    it('creator（非 admin）可邀请 agent（owner 代理同规）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'creator-1' };
+      const dto = { agentId: 'agent-1' };
+      const result = { id: 'topic-1' };
+      service.findById.mockResolvedValue(topic);
+      service.inviteAgent.mockResolvedValue(result);
+
+      expect(await controller.inviteAgent('topic-1', dto, creatorActor)).toBe(result);
       expect(service.inviteAgent).toHaveBeenCalledWith('topic-1', 'agent-1');
     });
   });
 
   describe('uninviteAgent', () => {
-    it('should ensure write permission then uninvite agent', async () => {
+    it('admin 可取消邀请（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const dto = { agentId: 'agent-1' };
       const result = { id: 'topic-1' };
@@ -365,13 +499,12 @@ describe('TopicController', () => {
       service.uninviteAgent.mockResolvedValue(result);
 
       expect(await controller.uninviteAgent('topic-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.uninviteAgent).toHaveBeenCalledWith('topic-1', 'agent-1');
     });
   });
 
   describe('inviteUser', () => {
-    it('should ensure write permission then join user as human participant', async () => {
+    it('admin 可邀请人类用户（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const dto = { userId: 'user-2' };
       const result = { topicId: 'topic-1', participantId: 'user-2', joinedAt: new Date() };
@@ -379,13 +512,12 @@ describe('TopicController', () => {
       service.join.mockResolvedValue(result);
 
       expect(await controller.inviteUser('topic-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.join).toHaveBeenCalledWith('topic-1', 'user-2', ActorType.HUMAN);
     });
   });
 
   describe('uninviteUser', () => {
-    it('should ensure write permission then uninvite user from participants', async () => {
+    it('admin 可移除人类用户（D2 ensureCreatorOrAdmin bypass）', async () => {
       const topic = { id: 'topic-1' };
       const dto = { userId: 'user-2' };
       const result = { topicId: 'topic-1', participantId: 'user-2', leftAt: new Date() };
@@ -393,8 +525,85 @@ describe('TopicController', () => {
       service.uninviteUser.mockResolvedValue(result);
 
       expect(await controller.uninviteUser('topic-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.uninviteUser).toHaveBeenCalledWith('topic-1', 'user-2');
+    });
+  });
+
+  // ─── add-editor / remove-editor（v1.46 TOPIC-PERM：creator/admin-only） ───
+
+  describe('addEditor', () => {
+    it('creator（非 admin）可提升 editor', async () => {
+      const topic = { id: 'topic-1', creatorId: 'creator-1' };
+      const dto = { agentId: 'agent-2' };
+      const result = { id: 'topic-1' };
+      service.findById.mockResolvedValue(topic);
+      service.addEditor.mockResolvedValue(result);
+
+      expect(await controller.addEditor('topic-1', dto, creatorActor)).toBe(result);
+      expect(service.addEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+    });
+
+    it('admin bypass：admin 可提升 editor', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      const dto = { agentId: 'agent-2' };
+      const result = { id: 'topic-1' };
+      service.findById.mockResolvedValue(topic);
+      service.addEditor.mockResolvedValue(result);
+
+      expect(await controller.addEditor('topic-1', dto, mockActor)).toBe(result);
+      expect(service.addEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+    });
+
+    it('editor（非 creator 非 admin）→ 403（成员管理收口）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.addEditor('topic-1', { agentId: 'agent-2' }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.addEditor).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeEditor', () => {
+    it('creator（非 admin）可撤销 editor', async () => {
+      const topic = { id: 'topic-1', creatorId: 'creator-1' };
+      const dto = { agentId: 'agent-2' };
+      const result = { id: 'topic-1' };
+      service.findById.mockResolvedValue(topic);
+      service.removeEditor.mockResolvedValue(result);
+
+      expect(await controller.removeEditor('topic-1', dto, creatorActor)).toBe(result);
+      expect(service.removeEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+    });
+
+    it('admin bypass：admin 可撤销 editor', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      const dto = { agentId: 'agent-2' };
+      const result = { id: 'topic-1' };
+      service.findById.mockResolvedValue(topic);
+      service.removeEditor.mockResolvedValue(result);
+
+      expect(await controller.removeEditor('topic-1', dto, mockActor)).toBe(result);
+      expect(service.removeEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+    });
+
+    it('editor（非 creator 非 admin）→ 403（成员管理收口）', async () => {
+      const topic = { id: 'topic-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(topic);
+
+      await expect(
+        controller.removeEditor('topic-1', { agentId: 'agent-2' }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.removeEditor).not.toHaveBeenCalled();
     });
   });
 });

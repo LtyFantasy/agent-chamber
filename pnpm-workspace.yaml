@@ -8,3 +8,4 @@ allowBuilds:
   bcrypt: true
   esbuild: true
   sharp: true
+workspaceConcurrency: 3

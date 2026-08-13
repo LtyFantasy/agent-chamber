@@ -6,7 +6,14 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.3 (文档读/文档写), plan §4.4 (chunking), plan §1.1-13 (sectionId 不稳定契约)
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [踩坑索引]
+ *   - 任务 e6eaf06d 第二张脸：chunker step 4 段落切分产生的兄弟 chunk 共用同一 headingPath，
+ *     重建时若逐个插标题行，同一标题会重复 N 次（生产实证 12~180 次），且「全文读 + upsert
+ *     回写」每轮固化重复标题，文档越往返越臃肿；reconstructContent 已实现 run-dedup
+ *     （相邻 section 同 (headingPath, headingLevel) 只插回一次标题）——修改该逻辑前先跑
+ *     docspace 测试验证往返幂等（长文 round-trip 用例）
+ *   - 互斥查询参数（path= 与 q=）同传是请求格式错误：400 VALIDATION_ERROR，禁止用
+ *     RESOURCE_CONFLICT（2026-08-09 修复 edad7a9，原误挂 RESOURCE_CONFLICT）
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
  *
@@ -33,7 +40,7 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Board } from '../../database/entities/board.entity';
-import { ErrorCode, AuditAction, EventType } from '@agent-chamber/shared';
+import { ErrorCode, AuditAction, EventType, HEADING_PATH_SEPARATOR } from '@agent-chamber/shared';
 import type {
   DocSummary,
   DocDetail,
@@ -596,7 +603,7 @@ export class DocService {
     if (path && q) {
       throw new BadRequestException({
         message: 'path= and q= are mutually exclusive',
-        code: ErrorCode.RESOURCE_CONFLICT,
+        code: ErrorCode.VALIDATION_ERROR,
       });
     }
 
@@ -680,6 +687,12 @@ export class DocService {
     const outline: DocSectionOutline[] = sections.map((s) => ({
       position: s.position,
       headingPath: s.headingPath,
+      // heading 派生：headingPath 末段 = 本地标题（展示用；与 reconstructContent 的
+      // lastSegment 同款派生）。headingPath 为 null（headingLevel 0 文首无标题段）→ null；
+      // headingPath 本身保留作寻址地址，语义不变。
+      heading: s.headingPath
+        ? (s.headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '')
+        : null,
       headingLevel: s.headingLevel,
       tokenEstimate: s.tokenEstimate,
     }));
@@ -694,7 +707,12 @@ export class DocService {
     // 生效阈值：显式 maxFullTokens 优先（0 = 强制 outline），缺省用模块常量
     const threshold = maxFullTokens ?? FULL_CONTENT_TOKEN_THRESHOLD;
 
-    if (threshold > 0 && doc.tokenEstimate && doc.tokenEstimate > 0 && doc.tokenEstimate <= threshold) {
+    if (
+      threshold > 0 &&
+      doc.tokenEstimate &&
+      doc.tokenEstimate > 0 &&
+      doc.tokenEstimate <= threshold
+    ) {
       // full 分支独立第二次查询（全量 sections 含 content 大字段）——outline 分支零额外开销。
       // 复用 reconstructContent 渲染去重语义（skipDuplicateTitle=true，与 web /content 默认一致）。
       const fullSections = await this.sectionRepo
@@ -748,6 +766,17 @@ export class DocService {
    * headingLevel 0 = 文首无标题段，不插标题行；标题文本取 headingPath 末段，
    * 与前端 scrollToHeading 的匹配逻辑一致。
    *
+   * 空 content 的 section（空正文标题，chunker 保真产出）只渲染标题行、不追加正文段——
+   * join 后与相邻段之间恰好一个空行，保证「全文读 + upsert 回写」往返幂等
+   * （否则空 H2 分组标题会在重建中被吞掉，见 markdown-chunker AGENT-HOOK e6eaf06d）。
+   *
+   * run-dedup：chunker step 4 对 >4000 字符的 section 按段落二次切分，子 chunk 共用同一
+   * headingPath/headingLevel 且相邻——重建时逐个插回标题行会把同一标题重复 N 次（生产实证
+   * 同标题重复 12~180 次），每轮「全文读 + upsert 回写」还会把重复标题固化进下一轮存储。
+   * 因此相邻 section 的 (headingPath, headingLevel) 相同 = 同一切分段，仅首个插标题行、
+   * 后续兄弟只接正文。已知取舍：原文「同父同名且相邻」的病态重复标题会被合并
+   * （极罕见，且本身就是坏文档）。
+   *
    * @param skipDuplicateTitle 渲染侧去重：position 0 的 H1 若与 doc.title 同名则不重复
    *   插标题行（web 渲染层已用 header 元数据卡展示 title）；链接巡检等语义消费方应传
    *   false，保证与 upsert 时原文计算口径一致。
@@ -757,19 +786,36 @@ export class DocService {
     sections: { content: string; headingLevel: number; headingPath: string | null }[],
     skipDuplicateTitle: boolean,
   ): string {
-    return sections
+    const parts = sections
       .map((s, idx) => {
         if (s.headingLevel > 0 && s.headingPath) {
-          const lastSegment = s.headingPath.split('§').pop()?.trim() ?? '';
-          const isDuplicateTitle = skipDuplicateTitle && idx === 0 && lastSegment === doc.title;
-          if (lastSegment && !isDuplicateTitle) {
-            const prefix = '#'.repeat(Math.min(s.headingLevel, 6));
-            return `${prefix} ${lastSegment}\n\n${s.content}`;
+          // run-dedup：与前一 section 同 (headingPath, headingLevel) 视为段落切分兄弟 chunk
+          // （chunker step 4 共用同一 headingPath 的产物），只由首个插标题行，后续只接正文。
+          // 与 idx===0 的 skipDuplicateTitle 去重独立生效：idx 0 被去重后，idx 1 若同
+          // headingPath 也不插标题（正确，本就是同一切分段）。
+          const prev = idx > 0 ? sections[idx - 1] : null;
+          const isSiblingParagraphChunk =
+            prev !== null &&
+            prev.headingPath === s.headingPath &&
+            prev.headingLevel === s.headingLevel;
+          if (!isSiblingParagraphChunk) {
+            const lastSegment = s.headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '';
+            const isDuplicateTitle = skipDuplicateTitle && idx === 0 && lastSegment === doc.title;
+            if (lastSegment && !isDuplicateTitle) {
+              const prefix = '#'.repeat(Math.min(s.headingLevel, 6));
+              // 空 content section 只插标题行（不追加 "\n\n"），避免 join 后产生多余空行
+              return s.content
+                ? `${prefix} ${lastSegment}\n\n${s.content}`
+                : `${prefix} ${lastSegment}`;
+            }
           }
         }
         return s.content;
       })
-      .join('\n\n');
+      // 过滤被去重吞掉（isDuplicateTitle）或 level-0 且内容为空的 section 产生的空串，
+      // 防止 join 拼接出多余空行；正常 section 的 content 非空，不受影响
+      .filter((part) => part !== '');
+    return parts.join('\n\n');
   }
 
   /**

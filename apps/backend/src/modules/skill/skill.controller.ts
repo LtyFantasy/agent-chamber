@@ -109,11 +109,44 @@ export class SkillController {
   }
 
   /**
+   * 获取 Skill 的子 Skill 列表。
+   *
+   * 返回主 Skill 目录下所有直接子目录（如 topics、taskboard、docs）的元数据，
+   * 供 Web 端渲染子 Skill 导航、install-skill.sh 递归安装使用。
+   *
+   * ⚠️ 路由顺序：本方法必须声明在 `@Get(':name/:subpath')` 之前——
+   * NestJS 按方法声明顺序匹配路由，否则 `subs` 会被当子路径吃进 findSubSkill。
+   *
+   * @param name 父 Skill 名称
+   * @returns 子 Skill 元数据数组
+   */
+  @Get(':name/subs')
+  @Public()
+  @ApiOperation({
+    summary: 'List sub skills',
+    description:
+      'Return metadata for all sub-documents under the specified skill, e.g. topics, taskboard, docs.',
+  })
+  @ApiParam({ name: 'name', description: 'Parent skill name', example: 'agent-chamber' })
+  @ApiResponse({ status: 200, description: 'Sub skill list', type: [SkillListItemDto] })
+  @ApiResponse({ status: 404, description: 'Skill not found' })
+  async findSubSkills(@Param('name') name: string): Promise<SkillListItemDto[]> {
+    return this.skillService.findSubSkills(name);
+  }
+
+  /**
    * Get child skill details。
+   *
+   * - 默认返回 JSON 格式的 `SkillDetailDto`。
+   * - 传 `?format=raw` 时返回原始 Markdown（含 frontmatter），Content-Type 为 `text/markdown; charset=utf-8`。
+   *
+   * 与 `findOne` 同构：同一端点需要同时支持统一 JSON 包装和裸 Markdown，直接使用 Response 对象输出。
    *
    * @param name 父 Skill 名称
    * @param subpath 子 Skill 路径（如 taskboard、topics）
-   * @returns 子 Skill 详情，由全局 ResponseInterceptor 包装
+   * @param format 返回格式
+   * @param res Express Response
+   * @param req Express Request
    */
   @Get(':name/:subpath')
   @Public()
@@ -123,12 +156,35 @@ export class SkillController {
   })
   @ApiParam({ name: 'name', description: 'Parent skill name', example: 'agent-chamber' })
   @ApiParam({ name: 'subpath', description: 'Child skill path', example: 'taskboard' })
+  @ApiQuery({
+    name: 'format',
+    required: false,
+    enum: ['raw'],
+    description: 'Response format; pass "raw" for raw Markdown',
+  })
   @ApiResponse({ status: 200, description: 'Child skill details' })
   @ApiResponse({ status: 404, description: 'Skill not found' })
   async findSubSkill(
     @Param('name') name: string,
     @Param('subpath') subpath: string,
-  ): Promise<SkillDetailDto> {
-    return this.skillService.findSubSkill(name, subpath);
+    @Query('format') format: string,
+    @Res() res: Response,
+    @Req() req: Request,
+  ): Promise<void> {
+    if (format === 'raw') {
+      const content = await this.skillService.getSubRaw(name, subpath);
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.send(content);
+      return;
+    }
+
+    const detail = await this.skillService.findSubSkill(name, subpath);
+    res.json({
+      code: ErrorCode.SUCCESS,
+      message: 'success',
+      data: detail,
+      timestamp: new Date().toISOString(),
+      requestId: req['requestId'] || 'unknown',
+    });
   }
 }

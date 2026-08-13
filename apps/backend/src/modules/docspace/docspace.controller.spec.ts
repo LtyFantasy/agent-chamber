@@ -28,6 +28,8 @@ describe('DocSpaceController', () => {
     uninviteAgent: jest.fn(),
     addEditor: jest.fn(),
     removeEditor: jest.fn(),
+    // v1.45 DOCSPACE-PERM：creator 转让
+    transferCreator: jest.fn(),
     createCategory: jest.fn(),
     findCategoryById: jest.fn(),
     updateCategory: jest.fn(),
@@ -52,7 +54,10 @@ describe('DocSpaceController', () => {
         { provide: DocSpaceService, useValue: mockService },
         { provide: PermissionService, useValue: mockPermService },
         { provide: BoardService, useValue: mockBoardService },
-        { provide: OwnerProxyService, useValue: { isOwnerProxy: jest.fn().mockResolvedValue(false) } },
+        {
+          provide: OwnerProxyService,
+          useValue: { isOwnerProxy: jest.fn().mockResolvedValue(false) },
+        },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -64,9 +69,7 @@ describe('DocSpaceController', () => {
     permService = moduleRef.get<PermissionService>(
       PermissionService,
     ) as unknown as typeof permService;
-    boardService = moduleRef.get<BoardService>(
-      BoardService,
-    ) as unknown as typeof boardService;
+    boardService = moduleRef.get<BoardService>(BoardService) as unknown as typeof boardService;
   });
 
   afterEach(() => jest.resetAllMocks());
@@ -75,7 +78,15 @@ describe('DocSpaceController', () => {
 
   describe('findAll', () => {
     it('calls service.findAll with query and actor', async () => {
-      const result = { items: [], total: 0, page: 1, pageSize: 20, totalPages: 0, hasNext: false, hasPrev: false };
+      const result = {
+        items: [],
+        total: 0,
+        page: 1,
+        pageSize: 20,
+        totalPages: 0,
+        hasNext: false,
+        hasPrev: false,
+      };
       service.findAll.mockResolvedValue(result);
 
       const query = { page: 2, pageSize: 10 };
@@ -100,7 +111,9 @@ describe('DocSpaceController', () => {
     it('throws 400 on both topicId and boardId', async () => {
       const dto = { name: 'Test', topicId: 't-1', boardId: 'b-1' };
       await expect(controller.create(mockActor, dto)).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.RESOURCE_CONFLICT }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
       );
       expect(service.create).not.toHaveBeenCalled();
     });
@@ -150,7 +163,9 @@ describe('DocSpaceController', () => {
       );
 
       await expect(controller.updateRepoManifest('space-1', dto, nonAdminActor)).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
       expect(service.updateRepoManifest).not.toHaveBeenCalled();
     });
@@ -161,7 +176,9 @@ describe('DocSpaceController', () => {
       );
 
       await expect(controller.updateRepoManifest('space-1', dto, mockActor)).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.DOC_SPACE_NOT_FOUND }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.DOC_SPACE_NOT_FOUND }),
+        }),
       );
       expect(permService.ensureCan).not.toHaveBeenCalled();
     });
@@ -184,42 +201,146 @@ describe('DocSpaceController', () => {
     });
 
     it('returns 404 for private space when unauthorized', async () => {
-      const space = { id: 'space-1', name: 'Private', settings: { visibility: Visibility.PRIVATE }, creatorId: 'other' };
+      const space = {
+        id: 'space-1',
+        name: 'Private',
+        settings: { visibility: Visibility.PRIVATE },
+        creatorId: 'other',
+      };
       service.findById.mockResolvedValue(space);
       permService.ensureCan.mockRejectedValue(
         new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
       );
 
       await expect(controller.findOne('space-1', nonAdminActor)).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });
 
-  // ─── update ───────────────────────────────────────────────
+  // ─── update（v1.45 字段级分权：内容字段 policy write / 结构字段 creator-only）───
 
   describe('update', () => {
-    it('allows creator to update', async () => {
+    // 非 admin 的创建者（R4 语义：creator 判定必须用非 admin 身份验证，防 admin bypass 污染）
+    const creatorActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+    // 非 creator 非 admin（editor 成员身份由 permService mock 模拟）
+    const editorActor = { id: 'editor-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+
+    it('creator（非 admin）全字段可更新', async () => {
       const space = { id: 'space-1', creatorId: 'user-1' };
       const result = { id: 'space-1', name: 'Updated' };
       service.findById.mockResolvedValue(space);
       service.update.mockResolvedValue(result);
 
-      const dto = { name: 'Updated' };
-      expect(await controller.update('space-1', dto, mockActor)).toBe(result);
+      const dto = { name: 'Updated', visibility: Visibility.PRIVATE };
+      expect(await controller.update('space-1', dto, creatorActor)).toBe(result);
       expect(service.update).toHaveBeenCalledWith('space-1', dto);
     });
 
-    it('rejects non-creator', async () => {
+    it('editor 纯内容字段（name/description）→ 放行（policy write）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      const result = { id: 'space-1', name: 'Updated' };
+      service.findById.mockResolvedValue(space);
+      service.update.mockResolvedValue(result);
+
+      const dto = { name: 'Updated' };
+      expect(await controller.update('space-1', dto, editorActor)).toBe(result);
+      // 内容路径直接走 policy write（不自造 isCreatorOrEditor 判断）
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, editorActor, 'write');
+      expect(service.update).toHaveBeenCalledWith('space-1', dto);
+    });
+
+    it('editor + visibility → 403，消息列出结构字段名（R1）', async () => {
       const space = { id: 'space-1', creatorId: 'other-user' };
       service.findById.mockResolvedValue(space);
 
       await expect(
-        controller.update('space-1', { name: 'Test' }, nonAdminActor),
+        controller.update('space-1', { visibility: Visibility.PRIVATE }, editorActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('visibility'),
+          }),
+        }),
       );
       expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor + boardId: null → 403（显式 null 也算「出现」= 解绑语义，truthy 判断是 bug）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(space);
+
+      await expect(controller.update('space-1', { boardId: null }, editorActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('boardId'),
+          }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor + 多结构字段 → 403 消息列出全部出现字段（R1 自修正能力）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(space);
+
+      await expect(
+        controller.update(
+          'space-1',
+          { visibility: Visibility.PRIVATE, boardId: null },
+          editorActor,
+        ),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            message: expect.stringContaining('visibility'),
+          }),
+        }),
+      );
+      await expect(
+        controller.update(
+          'space-1',
+          { visibility: Visibility.PRIVATE, boardId: null },
+          editorActor,
+        ),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            message: expect.stringContaining('boardId'),
+          }),
+        }),
+      );
+    });
+
+    it('非成员 human + name → 403（policy write 拒绝）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      service.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(controller.update('space-1', { name: 'Test' }, editorActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('admin 结构字段可更新（全局 bypass，非 creator 也放行）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      const result = { id: 'space-1', visibility: Visibility.PRIVATE };
+      service.findById.mockResolvedValue(space);
+      service.update.mockResolvedValue(result);
+
+      expect(
+        await controller.update('space-1', { visibility: Visibility.PRIVATE }, mockActor),
+      ).toBe(result);
+      expect(service.update).toHaveBeenCalledWith('space-1', { visibility: Visibility.PRIVATE });
     });
 
     it('validates board binding on re-bind', async () => {
@@ -254,7 +375,9 @@ describe('DocSpaceController', () => {
       service.findById.mockResolvedValue(space);
 
       await expect(controller.remove('space-1', nonAdminActor)).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });
@@ -279,7 +402,9 @@ describe('DocSpaceController', () => {
       await expect(
         controller.inviteAgent('space-1', { agentId: 'agent-1' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });
@@ -301,7 +426,9 @@ describe('DocSpaceController', () => {
       await expect(
         controller.uninviteAgent('space-1', { agentId: 'agent-1' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });
@@ -323,7 +450,9 @@ describe('DocSpaceController', () => {
       await expect(
         controller.addEditor('space-1', { agentId: 'agent-1' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
     });
   });
@@ -345,8 +474,54 @@ describe('DocSpaceController', () => {
       await expect(
         controller.removeEditor('space-1', { agentId: 'agent-1' }, nonAdminActor),
       ).rejects.toThrow(
-        expect.objectContaining({ response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }) }),
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
       );
+    });
+  });
+
+  describe('transferCreator', () => {
+    const creatorActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+
+    it('creator（非 admin）可转让，返回 enrich 后的 space', async () => {
+      const space = { id: 'space-1', creatorId: 'user-1' };
+      const updated = { id: 'space-1', creatorId: 'agent-9' };
+      const enriched = { id: 'space-1', creatorId: 'agent-9', members: [], categories: [] };
+      service.findById.mockResolvedValue(space);
+      service.transferCreator.mockResolvedValue(updated);
+      service.enrich.mockResolvedValue(enriched);
+
+      const dto = { newCreatorId: 'agent-9' };
+      expect(await controller.transferCreator('space-1', dto, creatorActor)).toBe(enriched);
+      expect(service.transferCreator).toHaveBeenCalledWith('space-1', 'agent-9');
+      expect(service.enrich).toHaveBeenCalledWith(updated);
+    });
+
+    it('rejects non-creator（editor 403，service 不调用）', async () => {
+      const space = { id: 'space-1', creatorId: 'other' };
+      service.findById.mockResolvedValue(space);
+
+      await expect(
+        controller.transferCreator('space-1', { newCreatorId: 'agent-9' }, nonAdminActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.transferCreator).not.toHaveBeenCalled();
+    });
+
+    it('admin 可转让（全局 bypass，非 creator 也放行）', async () => {
+      const space = { id: 'space-1', creatorId: 'other-user' };
+      const updated = { id: 'space-1', creatorId: 'agent-9' };
+      service.findById.mockResolvedValue(space);
+      service.transferCreator.mockResolvedValue(updated);
+      service.enrich.mockResolvedValue(updated);
+
+      expect(
+        await controller.transferCreator('space-1', { newCreatorId: 'agent-9' }, mockActor),
+      ).toBe(updated);
     });
   });
 
@@ -371,7 +546,13 @@ describe('DocSpaceController', () => {
   describe('getOverview', () => {
     it('ensures read permission and returns overview', async () => {
       const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
-      const result = { spaceId: 'space-1', spaceName: 'Test', categories: [], uncategorized: [], truncated: false };
+      const result = {
+        spaceId: 'space-1',
+        spaceName: 'Test',
+        categories: [],
+        uncategorized: [],
+        truncated: false,
+      };
       service.findById.mockResolvedValue(space);
       service.getOverview.mockResolvedValue(result);
 

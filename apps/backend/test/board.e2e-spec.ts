@@ -196,7 +196,10 @@ describe('BoardController (e2e)', () => {
   it('GET /boards/:id/lists/:listId/tasks returns 404 when list belongs to another board', async () => {
     mockRepos.Board.findOne.mockResolvedValue(makeBoard([makeList()]));
     mockRepos.BoardList.findOne.mockResolvedValue(
-      makeList({ id: '00000000-0000-0000-0000-000000000099', boardId: '00000000-0000-0000-0000-000000000002' }),
+      makeList({
+        id: '00000000-0000-0000-0000-000000000099',
+        boardId: '00000000-0000-4000-8000-000000000002',
+      }),
     );
 
     return request(app.getHttpServer())
@@ -323,7 +326,7 @@ describe('BoardController (e2e)', () => {
     docs?: any[];
   }) => {
     mockRepos.Board.findOne.mockResolvedValue(
-      makeBoard([makeList()]) // findById 返回含 lists；digest 用 listRepo 重查列
+      makeBoard([makeList()]), // findById 返回含 lists；digest 用 listRepo 重查列
     );
     mockRepos.BoardList.find.mockResolvedValue([makeList()]);
     // taskRepo.createQueryBuilder 被 3 次复用：列计数(getRawMany) / countTasksByBoard(getRawOne) / risks(getMany)
@@ -339,7 +342,9 @@ describe('BoardController (e2e)', () => {
       addOrderBy: jest.fn().mockReturnThis(),
       take: jest.fn().mockReturnThis(),
       getRawMany: jest.fn().mockResolvedValue([{ listId, count: '3' }]),
-      getRawOne: jest.fn().mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
+      getRawOne: jest
+        .fn()
+        .mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
       getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
     });
     // taskRepo.find 按查询形状分发：milestone stats / done / open
@@ -370,14 +375,31 @@ describe('BoardController (e2e)', () => {
   it('GET /boards/:id/digest returns assembled project overview (v1.41)', async () => {
     makeDigestMocks({
       openTasks: [
-        makeTask({ id: 't1', title: 'Fix auth', status: TaskStatus.TODO, priority: 'p0', labels: ['bug'] }),
+        makeTask({
+          id: 't1',
+          title: 'Fix auth',
+          status: TaskStatus.TODO,
+          priority: 'p0',
+          labels: ['bug'],
+        }),
         makeTask({ id: 't2', title: 'Refactor', status: TaskStatus.IN_PROGRESS, priority: 'p2' }),
       ],
       riskRows: [
-        makeTask({ id: 't1', title: 'Fix auth', status: TaskStatus.TODO, priority: 'p0', labels: ['bug'] }),
+        makeTask({
+          id: 't1',
+          title: 'Fix auth',
+          status: TaskStatus.TODO,
+          priority: 'p0',
+          labels: ['bug'],
+        }),
       ],
       doneRows: [
-        makeTask({ id: 't9', title: 'Ship digest', status: TaskStatus.DONE, completedAt: new Date('2024-01-05') }),
+        makeTask({
+          id: 't9',
+          title: 'Ship digest',
+          status: TaskStatus.DONE,
+          completedAt: new Date('2024-01-05'),
+        }),
       ],
       total: '5',
       completed: '1',
@@ -386,9 +408,7 @@ describe('BoardController (e2e)', () => {
         name: 'Project Docs',
         description: '空间图例',
       },
-      docs: [
-        { id: 'd1', path: 'docs/a.md', title: 'A', updatedAt: new Date('2024-01-02') },
-      ],
+      docs: [{ id: 'd1', path: 'docs/a.md', title: 'A', updatedAt: new Date('2024-01-02') }],
     });
 
     return request(app.getHttpServer())
@@ -402,7 +422,9 @@ describe('BoardController (e2e)', () => {
         // taskCount 口径 = board 详情（countTasksByBoard 返回值直通）
         expect(data.taskCount).toBe(5);
         expect(data.completedTaskCount).toBe(1);
-        expect(data.lists).toEqual([{ id: listId, name: 'To Do', mappedStatus: 'todo', taskCount: 3 }]);
+        expect(data.lists).toEqual([
+          { id: listId, name: 'To Do', mappedStatus: 'todo', taskCount: 3 },
+        ]);
         // priorityDistribution：open 任务内存聚合
         expect(data.priorityDistribution.open).toEqual({ p0: 1, p1: 0, p2: 1, p3: 0 });
         expect(data.nextUp).toHaveLength(2);
@@ -465,6 +487,77 @@ describe('BoardController (e2e)', () => {
       .expect(400)
       .expect((res: any) => {
         expect(res.body.code).toBe(ErrorCode.BAD_REQUEST);
+      });
+  });
+
+  // ==================== v1.46 TOPIC-PERM：PATCH /boards 结构字段显式 403 ====================
+
+  const otherCreatorBoard = () => ({
+    ...makeBoard(),
+    creatorId: '00000000-0000-0000-0000-000000000009', // 非当前用户
+  });
+
+  it('PATCH /boards/:id - editor PATCH topicId → 403，消息列出结构字段名（不再 200 装傻）', async () => {
+    mockRepos.Board.findOne.mockResolvedValue(otherCreatorBoard());
+    // editor 成员身份：board_members 行 role=editor（BoardPolicy write 放行后仍须 D6 收口）
+    mockRepos.BoardMember.findOne.mockResolvedValue({ boardId, actorId, role: 'editor' });
+    // D6 结构字段路径走 isCreatorOf → owner 代理查询（非 owner → false）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch(`/boards/${boardId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ topicId: '00000000-0000-4000-8000-000000000002' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+        expect(res.body.message).toContain('topicId');
+      });
+  });
+
+  it('PATCH /boards/:id - editor 纯内容字段（name/description）→ 200 回读生效', async () => {
+    mockRepos.Board.findOne.mockResolvedValue(otherCreatorBoard());
+    mockRepos.BoardMember.findOne.mockResolvedValue({ boardId, actorId, role: 'editor' });
+    mockRepos.Board.save.mockResolvedValue({
+      ...otherCreatorBoard(),
+      name: 'Renamed By Editor',
+      description: 'Edited legend',
+    });
+
+    return request(app.getHttpServer())
+      .patch(`/boards/${boardId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ name: 'Renamed By Editor', description: 'Edited legend' })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('name', 'Renamed By Editor');
+        expect(res.body.data).toHaveProperty('description', 'Edited legend');
+      });
+  });
+
+  it('PATCH /boards/:id - creator PATCH topicId → 200 回读生效（creator 全字段）', async () => {
+    // creatorId 必须与 guard 注入的 actor id（'00000000-0000-4000-8000-000000000005'）一致，
+    // 否则 creator 判定落空走到 ownerProxy（Agent.exists 未 mock → 500）
+    mockRepos.Board.findOne.mockResolvedValue({
+      ...makeBoard(),
+      creatorId: '00000000-0000-4000-8000-000000000005',
+    });
+    // boardService.update 对 topicId 变更做 Topic 存在性校验（resourceValidator.exists → findOne）
+    mockRepos.Topic.findOne.mockResolvedValue({ id: '00000000-0000-4000-8000-000000000002' });
+    mockRepos.Board.save.mockResolvedValue({
+      ...makeBoard(),
+      topicId: '00000000-0000-4000-8000-000000000002',
+    });
+
+    return request(app.getHttpServer())
+      .patch(`/boards/${boardId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ topicId: '00000000-0000-4000-8000-000000000002' })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('topicId', '00000000-0000-4000-8000-000000000002');
       });
   });
 });

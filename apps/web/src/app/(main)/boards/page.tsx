@@ -1,12 +1,14 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Visibility } from '@agent-chamber/shared';
 import type { Board } from '@agent-chamber/shared';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { isCreatorOrOwner } from '@/lib/is-resource-owner';
+import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -35,6 +37,7 @@ export default function BoardsPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('boards');
   const tGlobal = useTranslations();
+  const { user } = useAuthStore();
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [newDesc, setNewDesc] = useState('');
@@ -52,6 +55,22 @@ export default function BoardsPage() {
     queryKey: ['boards', 'list'],
     queryFn: () => Api.boards.list({ pageSize: 100 }),
   });
+
+  /** 我的 agent id 集合（owner 代理：agent 创建的 board 视同我创建） */
+  const { data: agentsData } = useQuery({
+    queryKey: ['agents', 'list'],
+    queryFn: () => Api.agents.listAll(),
+  });
+  const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
+
+  /**
+   * 列表页编辑/删除门控（v1.46 TOPIC-PERM 回归闸）：编辑 dialog 的 payload 恒含
+   * visibility（结构字段）——后端 D6 起非 creator/admin 提交结构字段整体 403，
+   * 故编辑/删除按钮只对 admin|creator（含 owner 代理）显示；editor 的 name/description
+   * 编辑走详情页图例模态框/后续入口，避免列表页 403 回归。
+   */
+  const canManageBoard = (b: Board): boolean =>
+    user?.role === 'admin' || isCreatorOrOwner(b.creatorId, user?.id, myAgentIds);
 
   const createMutation = useMutation({
     mutationFn: Api.boards.create,
@@ -161,30 +180,34 @@ export default function BoardsPage() {
                       )}
                     </CardTitle>
                     <div className="flex items-center gap-1">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 w-8 p-0"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          void openEdit(board);
-                        }}
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 w-8 p-0"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setDeleteId(board.id);
-                        }}
-                      >
-                        <Trash2 className="h-4 w-4 text-destructive" />
-                      </Button>
+                      {canManageBoard(board) && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void openEdit(board);
+                          }}
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                      )}
+                      {canManageBoard(board) && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setDeleteId(board.id);
+                          }}
+                        >
+                          <Trash2 className="h-4 w-4 text-destructive" />
+                        </Button>
+                      )}
                       <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10">
                         <KanbanSquare className="h-4 w-4 text-primary" />
                       </div>

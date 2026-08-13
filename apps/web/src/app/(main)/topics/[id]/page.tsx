@@ -9,6 +9,8 @@ import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
+import { confirm } from '@/lib/notify';
+import { useEventPoll } from '@/lib/use-event-poll';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -30,31 +32,27 @@ import {
   SheetDescription,
   SheetFooter,
 } from '@/components/ui/sheet';
-import { formatRelativeTime } from '@/lib/utils';
 // framer-motion：新消息进入动画（仅 opacity+transform，见 docs/ui-design-system.md §5）
 import { motion, useReducedMotion } from 'framer-motion';
 import { fadeSlideUp } from '@/lib/animations';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { MARKDOWN_CHAT_CLASSES } from '@/lib/markdown-classes';
-import { CollapsibleMarkdown } from '@/components/topics/collapsible-markdown';
+import { MessageBubble } from '@/components/topics/message-bubble';
+import { RoundtableMentionHint } from '@/components/topics/roundtable-mention-hint';
+import { PermissionRequestCard } from '@/components/topics/permission-request-card';
+import { SeatBadges } from '@/components/topics/seat-badges';
+import { SeatManagement } from '@/components/topics/seat-management';
+import { SeatPresenceBar } from '@/components/topics/seat-presence-bar';
+import { TopicComposer } from '@/components/topics/topic-composer';
 import {
   ArrowLeft,
-  Send,
   AlertCircle,
   Pencil,
-  Lightbulb,
-  Vote,
   CheckSquare,
   FileText,
-  Brain,
-  Activity,
-  Trash2,
   Lock,
   Globe,
-  Copy,
   SlidersHorizontal,
   Users,
+  UsersRound,
   Layout,
   FolderKanban,
   Plus,
@@ -75,7 +73,6 @@ export default function TopicDetailPage() {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const currentUser = useAuthStore((state) => state.user);
   const [messageContent, setMessageContent] = useState('');
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [confirmDialog, setConfirmDialog] = useState<{ type: 'close' | 'archive'; open: boolean }>({
     type: 'close',
     open: false,
@@ -143,6 +140,18 @@ export default function TopicDetailPage() {
     enabled: !!id,
   });
 
+  // 实时刷新兜底：agent 座位等「他人消息」落库后前端无本地触发源（发送/删除/裁决
+  // 的 invalidate 只覆盖用户自身操作），只能靠事件轮询感知。仅本 topic 的
+  // new_message 事件才失效消息查询——前缀失效（['topics','messages',id]）连带
+  // filterSender 变体一起刷新；轮询生命周期由 useEventPoll 内部管理，页面不关心。
+  useEventPoll({
+    onEvent: (event) => {
+      if (event.eventType === 'new_message' && event.topicId === id) {
+        void queryClient.invalidateQueries({ queryKey: ['topics', 'messages', id] });
+      }
+    },
+  });
+
   const { data: unreadData } = useQuery({
     queryKey: ['topics', 'unread', id],
     queryFn: () => Api.topics.getUnread(id),
@@ -194,9 +203,7 @@ export default function TopicDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['topics', 'messages', id] });
       void queryClient.invalidateQueries({ queryKey: ['topics', 'unread', id] });
       setMessageContent('');
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
+      // 输入框高度重置由 TopicComposer 内部监听 value 清空完成（textareaRef 已随组件下沉）
 
       // 新消息发送后滚动到底部
       setTimeout(() => {
@@ -421,26 +428,22 @@ export default function TopicDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messagesLoading, allMessages.length, isAuthenticated, id]);
 
-  const adjustTextareaHeight = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
-  };
+  /** 圆桌 @ 补全候选源（M2 web 批次）：仅 kind='roundtable' 拉座位，active 座位 label 作为 mentionTargets */
+  const isRoundtable = topic?.kind === 'roundtable';
+  const { data: seatsData } = useQuery({
+    queryKey: ['roundtable', 'seats', id],
+    queryFn: () => Api.roundtable.listSeats(id),
+    enabled: isRoundtable,
+    staleTime: 30_000,
+  });
+  const mentionTargets = useMemo(() => {
+    if (!isRoundtable) return null;
+    return (seatsData ?? []).filter((s) => s.status === 'active').map((s) => s.label);
+  }, [isRoundtable, seatsData]);
 
   const handleSend = () => {
     if (!messageContent.trim()) return;
     sendMessageMutation.mutate(messageContent);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
   };
 
   const openConfirm = (type: 'close' | 'archive') => {
@@ -473,7 +476,7 @@ export default function TopicDetailPage() {
 
   if (topicLoading) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
         <Loading size="lg" />
       </div>
     );
@@ -481,7 +484,7 @@ export default function TopicDetailPage() {
 
   if (!topic) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] flex-col items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <AlertCircle className="h-12 w-12 text-muted-foreground mb-4" />
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
         <Link href="/topics" className="mt-4 text-primary hover:underline">
@@ -574,9 +577,12 @@ export default function TopicDetailPage() {
   };
 
   return (
-    <div className="flex h-[calc(100vh-6rem)] md:h-[calc(100vh-8rem)] flex-col">
-      {/* Header：玻璃化壳层（允许 backdrop-blur），半透明底让网格纹透出 */}
-      <div className="glass mb-3 flex items-center gap-2 md:mb-4 min-w-0 rounded-xl px-3 py-2">
+    <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col">
+      {/* Header：玻璃化壳层（允许 backdrop-blur），半透明底让网格纹透出。
+          relative z-20：.glass 的 backdrop-filter 会创建 stacking context，header 内
+          ⋮ 下拉（z-50 被困其中）需整层抬到 SeatPresenceBar（z-10）之上才不遮盖；
+          仍低于 navbar z-30 / 移动侧栏遮罩 z-40 / dialog z-50，全局层级秩序不破 */}
+      <div className="glass relative z-20 mb-3 flex items-center gap-2 md:mb-4 min-w-0 rounded-xl px-3 py-2">
         <Link href="/topics" className="shrink-0">
           <Button variant="ghost" size="sm">
             <ArrowLeft className="h-4 w-4" />
@@ -599,6 +605,15 @@ export default function TopicDetailPage() {
                 className="shrink-0 gap-1 text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
               >
                 <Globe className="h-3 w-3" /> {t('visibility.public')}
+              </Badge>
+            )}
+            {/* 圆桌标识 badge（v1.49.0，与列表页卡片同款紫色系） */}
+            {topic.kind === 'roundtable' && (
+              <Badge
+                variant="outline"
+                className="shrink-0 gap-1 text-violet-300 border-violet-500/40 bg-violet-500/10"
+              >
+                <UsersRound className="h-3 w-3" /> {t('kind.roundtable')}
               </Badge>
             )}
           </div>
@@ -661,6 +676,20 @@ export default function TopicDetailPage() {
         </div>
       </div>
 
+      {/* 圆桌座位实时态顶部常驻条（M4b-1）：glass header 下方，仅 kind='roundtable'
+          渲染——chip 实时相位（presence 5s 轮询经 useSeatPresence hook）+ 近况浮层 +
+          取消发言按钮（busy + 治理权限）；空态零渲染；canManage 与参与者管理同规：
+          平台 admin ｜ topic 创建者/owner 代理（后端同样 403，前端是体验层闸） */}
+      <SeatPresenceBar
+        topicId={id}
+        enabled={isRoundtable}
+        participants={topic.participants}
+        canManage={
+          currentUser?.role === 'admin' ||
+          isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
+        }
+      />
+
       {/* Participants & Invite Sheet */}
       <Sheet open={participantsOpen} onOpenChange={setParticipantsOpen}>
         <SheetHeader>
@@ -678,6 +707,20 @@ export default function TopicDetailPage() {
         </SheetHeader>
 
         <div className="mt-6 space-y-6">
+          {/* 圆桌座位管理分区（v1.49.0，C2）：runner 在线状态 + 无在线 runner
+              指引（可复制启动命令）+ 建座入口；仅 kind='roundtable' 渲染，
+              canManage 与参与者管理同规（平台 admin ｜ topic 创建者/owner 代理） */}
+          {isRoundtable && (
+            <SeatManagement
+              topicId={id}
+              canManage={
+                currentUser?.role === 'admin' ||
+                isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
+              }
+              onExitGuide={() => setParticipantsOpen(false)}
+            />
+          )}
+
           {/* 活跃参与者 */}
           <div className="space-y-3">
             <h3 className="text-sm font-medium">
@@ -722,6 +765,27 @@ export default function TopicDetailPage() {
                             : t('participant.agent')}{' '}
                           · {p.role || t('participant.member')}
                         </p>
+                        {/* 圆桌座位 chip 组（M3 阶段 3 改版）：agent 行名下按
+                            config.bindActorId 归组渲染该 actor 的座位——label/status/
+                            主脑/三件套 + 管理员移除（SeatBadges 内部空座位零渲染）；
+                            未认领座位 chip 可点击打开连接向导模态框（2026-08-12，
+                            onExitGuide = 关闭参与者 Sheet，与 SeatManagement 同规）；
+                            仅 kind='roundtable' 渲染（seats 查询仅圆桌拉取）；
+                            canManage 与参与者管理同规：平台 admin ｜ topic 创建者/
+                            owner 代理（后端同样 403，前端是体验层闸） */}
+                        {isRoundtable && p.participantType === 'agent' && (
+                          <SeatBadges
+                            topicId={id}
+                            seats={(seatsData ?? []).filter(
+                              (s) => s.config?.bindActorId === p.participantId,
+                            )}
+                            canManage={
+                              currentUser?.role === 'admin' ||
+                              isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
+                            }
+                            onExitGuide={() => setParticipantsOpen(false)}
+                          />
+                        )}
                       </div>
                       <Badge variant="outline" className="text-[10px] shrink-0">
                         {p.role === 'moderator'
@@ -752,6 +816,38 @@ export default function TopicDetailPage() {
                         )}
                     </div>
                   ))}
+                  {/* 圆桌座位兜底组（M3 阶段 3 改版）：bindActorId 不匹配任何活跃
+                      参与者的座位（罕见：actor 已离桌/被移除，座位残留）——独立小组
+                      展示，管理员仍可移除清理；无此类座位零渲染 */}
+                  {isRoundtable &&
+                    (() => {
+                      const activeParticipantIds = new Set(
+                        (topic.participants || [])
+                          .filter((p) => p.status === 'active')
+                          .map((p) => p.participantId),
+                      );
+                      const leftSeats = (seatsData ?? []).filter(
+                        (s) =>
+                          s.config?.bindActorId && !activeParticipantIds.has(s.config.bindActorId),
+                      );
+                      if (leftSeats.length === 0) return null;
+                      return (
+                        <div className="space-y-2">
+                          <h4 className="text-xs font-medium text-muted-foreground">
+                            {t('seatManager.leftGroup')}
+                          </h4>
+                          <SeatBadges
+                            topicId={id}
+                            seats={leftSeats}
+                            canManage={
+                              currentUser?.role === 'admin' ||
+                              isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
+                            }
+                            onExitGuide={() => setParticipantsOpen(false)}
+                          />
+                        </div>
+                      );
+                    })()}
                 </div>
               );
             })()}
@@ -1150,18 +1246,24 @@ export default function TopicDetailPage() {
             </div>
           ) : relatedTab === 'boards' ? (
             <div className="space-y-2">
-              <Button
-                variant="outline"
-                size="sm"
-                className="w-full"
-                onClick={() => {
-                  setSelectedBoardId('');
-                  setLinkBoardOpen(true);
-                }}
-              >
-                <Plus className="h-3.5 w-3.5 mr-1" />
-                {t('related.linkBoard')}
-              </Button>
+              {/*
+                关联/解绑看板提交结构字段 topicId（PATCH /boards）——v1.46 D6 起非 creator
+                （含 owner 代理）提交整体 403，故入口只对 topic 创建者级显示（与后端收口一致）
+              */}
+              {isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds) && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  onClick={() => {
+                    setSelectedBoardId('');
+                    setLinkBoardOpen(true);
+                  }}
+                >
+                  <Plus className="h-3.5 w-3.5 mr-1" />
+                  {t('related.linkBoard')}
+                </Button>
+              )}
               {topic.boards && topic.boards.length > 0 ? (
                 topic.boards.map((b: { id: string; name: string; taskCount?: number }) => (
                   <div
@@ -1181,19 +1283,29 @@ export default function TopicDetailPage() {
                         </p>
                       </div>
                     </Link>
-                    <button
-                      onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (confirm(t('related.unlinkConfirm', { name: b.name }))) {
-                          unlinkBoardMutation.mutate(b.id);
-                        }
-                      }}
-                      className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive shrink-0 p-1"
-                      title={t('related.unlink')}
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
+                    {isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds) && (
+                      <button
+                        onClick={async (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          // 解除看板关联（v1.48.1 收尾：全局确认弹框替代 window.confirm）
+                          if (
+                            await confirm({
+                              title: t('related.unlinkConfirm', { name: b.name }),
+                              confirmText: tGlobal('common.confirm'),
+                              cancelText: tGlobal('common.cancel'),
+                              confirmVariant: 'danger',
+                            })
+                          ) {
+                            unlinkBoardMutation.mutate(b.id);
+                          }
+                        }}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive shrink-0 p-1"
+                        title={t('related.unlink')}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                   </div>
                 ))
               ) : (
@@ -1295,6 +1407,17 @@ export default function TopicDetailPage() {
         </DialogFooter>
       </Dialog>
 
+      {/* 圆桌审批裁决卡片（M3 阶段 2）：仅 kind='roundtable' 启用——pending 列表 +
+          裁决按钮组，30s 轮询与全局角标同节奏；空态零渲染；enabled 短路保证
+          普通 topic 不请求审批 API、不渲染卡片；participants 供行内头像查找
+          （seatId → bindActorId，照 SeatPresenceBar 同源数据） */}
+      <PermissionRequestCard
+        topicId={id}
+        seats={seatsData}
+        enabled={isRoundtable}
+        participants={topic.participants}
+      />
+
       {/* Messages */}
       <Card className="flex-1 overflow-hidden">
         <CardContent className="flex h-full flex-col p-2 md:p-4">
@@ -1332,17 +1455,21 @@ export default function TopicDetailPage() {
                   variants={fadeSlideUp}
                   initial={entryAnimReadyRef.current && !shouldReduceMotion ? 'hidden' : false}
                   animate="show"
-                  className={`group flex gap-2 md:gap-3 ${msg.senderType === 'human' ? 'flex-row-reverse' : ''}`}
+                  className={`group flex gap-2 md:gap-3 ${msg.senderType === 'human' ? 'flex-row-reverse' : ''} ${
+                    msg.senderType === 'system' ? 'w-full justify-center' : ''
+                  }`}
                 >
-                  <div className="shrink-0">
-                    <Avatar
-                      src={msg.senderAvatar}
-                      fallback={msg.senderName}
-                      size="sm"
-                      actorType={msg.senderType === 'agent' ? 'agent' : 'human'}
-                      seed={msg.senderId}
-                    />
-                  </div>
+                  {msg.senderType !== 'system' && (
+                    <div className="shrink-0">
+                      <Avatar
+                        src={msg.senderAvatar}
+                        fallback={msg.senderName}
+                        size="sm"
+                        actorType={msg.senderType === 'agent' ? 'agent' : 'human'}
+                        seed={msg.senderId}
+                      />
+                    </div>
+                  )}
                   <MessageBubble
                     msg={msg}
                     currentUserId={currentUser?.id}
@@ -1380,30 +1507,20 @@ export default function TopicDetailPage() {
             </div>
           )}
 
-          {/* Input：玻璃输入框（壳层元素允许 blur）+ focus 青光环；发送按钮走 default 渐变变体 */}
-          <div className="mt-2 md:mt-4 flex items-center gap-2 border-t border-border/60 pt-2 md:pt-4">
-            <textarea
-              ref={textareaRef}
-              placeholder={t('message.inputPlaceholder')}
-              value={messageContent}
-              onChange={(e) => {
-                setMessageContent(e.target.value);
-                requestAnimationFrame(adjustTextareaHeight);
-              }}
-              onKeyDown={handleKeyDown}
-              disabled={sendMessageMutation.isPending}
-              rows={1}
-              className="glass flex-1 min-h-[36px] max-h-32 overflow-y-auto resize-none rounded-md px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-primary/50 focus-visible:ring-2 focus-visible:ring-ring/70 disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <Button
-              onClick={handleSend}
-              isLoading={sendMessageMutation.isPending}
-              disabled={!messageContent.trim()}
-              className="shrink-0"
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          </div>
+          {/* 输入区：TopicComposer（含 @ 补全 + backdrop 高亮，仅圆桌 mentionTargets 启用；
+              普通 topic 退化 = 原 textarea 行为）。发送按钮并入组件，玻璃输入框样式不变 */}
+          <TopicComposer
+            value={messageContent}
+            onChange={setMessageContent}
+            onSend={handleSend}
+            disabled={sendMessageMutation.isPending}
+            isSending={sendMessageMutation.isPending}
+            placeholder={t('message.inputPlaceholder')}
+            mentionTargets={mentionTargets}
+          />
+          {/* 圆桌 mention 模式提示（M2 阶段 6）：仅 kind=roundtable && wakePolicy=mention
+              时渲染——提醒「未 @ 不唤醒」（roundtable-design §6），文案走 i18n */}
+          <RoundtableMentionHint kind={topic?.kind} wakePolicy={topic?.wakePolicy} />
         </CardContent>
       </Card>
 
@@ -1470,221 +1587,6 @@ export default function TopicDetailPage() {
           </Button>
         </DialogFooter>
       </Dialog>
-    </div>
-  );
-}
-
-function MessageBubble({
-  msg,
-  currentUserId,
-  onDelete,
-  isDeleting,
-  copiedId,
-  onCopy,
-  copiedContentId,
-  onCopyContent,
-}: {
-  msg: import('@/types').Message;
-  currentUserId?: string;
-  onDelete?: (messageId: string) => void;
-  isDeleting?: boolean;
-  copiedId?: string | null;
-  onCopy?: (messageId: string) => void;
-  copiedContentId?: string | null;
-  onCopyContent?: (messageId: string, content: string) => void;
-}) {
-  const t = useTranslations('topics');
-  // 8 种消息类型配色体系（docs/ui-design-system.md §6）：
-  // status_update 青 / system 红 / artifact 紫 / thinking 灰+呼吸微光 /
-  // proposal 绿 / vote 琥珀 / task 靛——全部暗色适配（半透明底 + 亮阶文字）。
-  // strong 字段 = markdown 强调同族提亮（2026-08-02 用户拍板）：彩色气泡内
-  // **强调** 取同一色相的 100 亮阶（emerald-100 等），不借中性白——纯白不属
-  // 任何色相家族，叠加彩色正文会触发同时对比残影（红旁白泛青绿等）；
-  // thinking 灰泡是无彩色，不设 strong，沿用默认档近白（黑白同族提亮）。
-  const typeConfig: Record<
-    string,
-    {
-      icon: React.ReactNode;
-      labelKey: string;
-      bg: string;
-      text: string;
-      border: string;
-      /** markdown strong 同族提亮覆盖（&& 提权）；缺省 = 共享默认档近白 */
-      strong?: string;
-    }
-  > = {
-    status_update: {
-      icon: <Activity className="h-3 w-3" />,
-      labelKey: 'topics.messageType.status_update',
-      bg: 'bg-primary/10',
-      text: 'text-primary',
-      border: 'border-primary/25',
-      strong: '[&&_strong]:text-cyan-100',
-    },
-    system: {
-      icon: <AlertCircle className="h-3 w-3" />,
-      labelKey: 'topics.messageType.system',
-      bg: 'bg-destructive/15',
-      text: 'text-red-300',
-      border: 'border-destructive/25',
-      strong: '[&&_strong]:text-red-100',
-    },
-    artifact: {
-      icon: <FileText className="h-3 w-3" />,
-      labelKey: 'topics.messageType.artifact',
-      bg: 'bg-violet-glow/15',
-      text: 'text-violet-300',
-      border: 'border-violet-glow/25',
-      strong: '[&&_strong]:text-violet-100',
-    },
-    thinking: {
-      icon: <Brain className="h-3 w-3" />,
-      labelKey: 'topics.messageType.thinking',
-      bg: 'bg-muted/50',
-      text: 'text-muted-foreground',
-      border: 'border-border/60',
-    },
-    proposal: {
-      icon: <Lightbulb className="h-3 w-3" />,
-      labelKey: 'topics.messageType.proposal',
-      bg: 'bg-emerald-500/15',
-      text: 'text-emerald-300',
-      border: 'border-emerald-500/25',
-      strong: '[&&_strong]:text-emerald-100',
-    },
-    vote: {
-      icon: <Vote className="h-3 w-3" />,
-      labelKey: 'topics.messageType.vote',
-      bg: 'bg-amber-500/15',
-      text: 'text-amber-300',
-      border: 'border-amber-500/25',
-      strong: '[&&_strong]:text-amber-100',
-    },
-    task: {
-      icon: <CheckSquare className="h-3 w-3" />,
-      labelKey: 'topics.messageType.task',
-      bg: 'bg-indigo-500/15',
-      text: 'text-indigo-300',
-      border: 'border-indigo-500/25',
-      strong: '[&&_strong]:text-indigo-100',
-    },
-  };
-
-  const tGlobal = useTranslations();
-
-  const cfg = msg.type ? typeConfig[msg.type] : null;
-  const isUser = msg.senderType === 'human';
-
-  // 气泡底（滚动区重复元素，红线：禁 backdrop-blur，一律半透实色底/工具类）
-  let bubbleClass: string;
-  if (cfg) {
-    bubbleClass = `${cfg.bg} ${cfg.text} border ${cfg.border}`;
-  } else if (isUser) {
-    // 人类消息靠右：主光色青→紫渐变底 + 微光（克制的点缀发光）
-    bubbleClass =
-      'bg-gradient-to-br from-primary/25 via-primary/15 to-violet-glow/15 text-foreground border border-primary/30 shadow-glow-sm';
-  } else if (msg.senderType === 'system') {
-    // 系统消息：警示红但克制（与 system 类型同色系）
-    bubbleClass = 'bg-destructive/15 text-red-300 border border-destructive/25';
-  } else {
-    // Agent chat：半透实色玻璃平替（无 blur）
-    bubbleClass = 'glass-flat';
-  }
-
-  return (
-    <div className={`max-w-[82%] md:max-w-[70%] rounded-lg px-3 py-2 md:px-4 ${bubbleClass}`}>
-      <div className="flex items-center gap-1.5 md:gap-2 mb-1 flex-wrap">
-        {cfg && (
-          // thinking 类型附呼吸微光（animate-breathing 仅 opacity+transform，符合动效红线）
-          <span
-            className={`inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded bg-background/60 ${msg.type === 'thinking' ? 'animate-breathing' : ''}`}
-          >
-            {cfg.icon}
-            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-            {tGlobal(cfg.labelKey as any)}
-          </span>
-        )}
-        <span className="text-xs font-medium opacity-80 truncate max-w-[120px] md:max-w-none">
-          {msg.senderName}
-        </span>
-        <span className="text-xs opacity-60">{formatRelativeTime(msg.createdAt)}</span>
-        <code
-          className="text-[10px] opacity-40 font-mono cursor-pointer hover:opacity-70 transition-opacity relative"
-          title={t('message.copyId')}
-          onClick={(e) => {
-            e.stopPropagation();
-            onCopy?.(msg.id);
-          }}
-        >
-          {msg.id}
-          {copiedId === msg.id && (
-            <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-[10px] bg-popover text-popover-foreground border border-border/60 px-1.5 py-0.5 rounded whitespace-nowrap">
-              {t('message.copied')}
-            </span>
-          )}
-        </code>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onCopyContent?.(msg.id, msg.content);
-          }}
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground relative"
-          title={t('message.copyContent')}
-        >
-          <Copy className="h-3 w-3" />
-          {copiedContentId === msg.id && (
-            <span className="absolute -top-5 left-1/2 -translate-x-1/2 text-[10px] bg-popover text-popover-foreground border border-border/60 px-1.5 py-0.5 rounded whitespace-nowrap">
-              {t('message.copied')}
-            </span>
-          )}
-        </button>
-        {currentUserId &&
-          msg.senderId === currentUserId &&
-          msg.senderType === 'human' &&
-          onDelete && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                if (window.confirm(t('message.deleteConfirm'))) {
-                  onDelete(msg.id);
-                }
-              }}
-              disabled={isDeleting}
-              className="ml-1 opacity-0 group-hover:opacity-100 transition-opacity text-destructive hover:text-destructive/80 disabled:opacity-30"
-              title={t('message.deleteTitle')}
-            >
-              <Trash2 className="h-3 w-3" />
-            </button>
-          )}
-      </div>
-      {/* Markdown 暗色适配（共享紧凑版，单一事实源 lib/markdown-classes.ts，
-          设计约定见 docs/ui-design-system.md §6.1）：
-          - whitespace-pre-wrap 有意保留：聊天换行语义（Enter 发送 / Shift+Enter 换行），
-            段落间距由 pre-wrap 保留的换行提供，故聊天版不含 [&_p] margin（叠加会双倍空行）
-          - 条件覆盖用 `&&` 双写父选择器提权——与共享类同属性冲突时，胜负由生成
-            样式表规则顺序决定（与 className 书写顺序无关），&& 使特异性 2>1 确定性胜出：
-            · 彩色类型气泡：strong 同族提亮（cfg.strong，emerald-100/red-100 等，
-              见 typeConfig 头注释；thinking 灰泡不设，沿用默认档近白）
-            · 无类型 chat（人类/Agent 普通消息）：strong 改青色——中性气泡正文已是
-              foreground，共享默认档（白）无区分
-            · 无类型 system 发送者：红泡同上同族提亮（red-100）
-            · thinking：斜体容器内 strong/em 回归正体（italic 内强调 = roman 排版约定）
-            · status_update：整泡 text-primary，链接改近白 + 青下划线方可辨识
-          - 外层由 CollapsibleMarkdown 包装（components/topics/collapsible-markdown.tsx）：
-            Agent 长消息默认折叠（实测高度阈值，8 种消息类型统一），详见 ui-design-system §6.1 */}
-      <CollapsibleMarkdown
-        className={`text-sm whitespace-pre-wrap break-words ${MARKDOWN_CHAT_CLASSES}${
-          cfg?.strong ? ` ${cfg.strong}` : ''
-        }${!cfg && msg.senderType !== 'system' ? ' [&&_strong]:text-primary' : ''}${
-          !cfg && msg.senderType === 'system' ? ' [&&_strong]:text-red-100' : ''
-        }${msg.type === 'thinking' ? ' italic opacity-80 [&&_strong]:not-italic [&&_em]:not-italic' : ''}${
-          msg.type === 'status_update'
-            ? ' [&&_a]:text-foreground [&&_a]:decoration-primary [&&_a]:decoration-2'
-            : ''
-        }`}
-      >
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-      </CollapsibleMarkdown>
     </div>
   );
 }

@@ -19,6 +19,7 @@
     "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts"
   },
   "dependencies": {
+    "@agent-chamber/roundtable-protocol": "workspace:*",
     "@agent-chamber/shared": "workspace:*",
     "@nestjs/axios": "^3.0.0",
     "@nestjs/common": "^10.3.0",
@@ -28,9 +29,11 @@
     "@nestjs/jwt": "^10.2.0",
     "@nestjs/passport": "^10.0.0",
     "@nestjs/platform-express": "^10.3.0",
+    "@nestjs/platform-ws": "^10.4.22",
     "@nestjs/swagger": "^7.3.0",
     "@nestjs/throttler": "^5.1.0",
     "@nestjs/typeorm": "^10.0.0",
+    "@nestjs/websockets": "^10.4.22",
     "bcrypt": "^5.1.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
@@ -42,7 +45,8 @@
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.0",
     "typeorm": "^0.3.20",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "ws": "^8.21.2"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.0",
@@ -55,6 +59,7 @@
     "@types/passport-jwt": "^4.0.0",
     "@types/supertest": "^6.0.0",
     "@types/uuid": "^9.0.0",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.60.1",
     "@typescript-eslint/parser": "^8.60.1",
     "eslint": "^8.57.0",

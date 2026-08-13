@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
-import { Priority, TaskStatus } from '@agent-chamber/shared';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Priority, TaskStatus, Visibility } from '@agent-chamber/shared';
 import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
@@ -11,6 +11,7 @@ import remarkGfm from 'remark-gfm';
 import { Api } from '@/lib/api';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
+import { confirm } from '@/lib/notify';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -46,6 +47,8 @@ import {
   Users,
   UserPlus,
   FileText,
+  BookOpen,
+  Settings,
 } from 'lucide-react';
 import {
   DndContext,
@@ -70,6 +73,15 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { BoardListSummary, TaskSummary, TaskDetail, Agent, Milestone } from '@/types';
+
+/**
+ * mutation 错误统一提示（范式照抄 docs/[id]/page.tsx alertMutationError）：
+ * 优先透传服务端 error.response.data.message（4xx 业务原因），兜底 axios message / 领域文案。
+ */
+const alertMutationError = (fallback: string) => (err: unknown) => {
+  const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
+  alert(axiosErr?.response?.data?.message || axiosErr?.message || fallback);
+};
 
 // ──────────────────────────────────────────────
 // 任务卡视觉映射 — 新色板状态色/优先级色（docs/ui-design-system.md §2.2：
@@ -364,10 +376,19 @@ function SortableBoardColumn({
     setEditMappedStatus((list.mappedStatus as TaskStatus) || null);
   };
 
-  const handleDeleteList = () => {
+  const handleDeleteList = async () => {
     const totalTasks = list.taskCount ?? tasks.length;
     if (totalTasks === 0) {
-      if (!confirm(t('list.deleteConfirmSimple', { name: list.name }))) return;
+      // 空列直接删：全局确认弹框（v1.48.1 收尾，替代 window.confirm）
+      if (
+        !(await confirm({
+          title: t('list.deleteConfirmSimple', { name: list.name }),
+          confirmText: tGlobal('common.confirm'),
+          cancelText: tGlobal('common.cancel'),
+          confirmVariant: 'danger',
+        }))
+      )
+        return;
       deleteListMutation.mutate(undefined);
       return;
     }
@@ -967,8 +988,16 @@ function MilestoneManageDialog({
                   <Pencil className="h-3 w-3" />
                 </button>
                 <button
-                  onClick={() => {
-                    if (confirm(t('milestone.deleteConfirm', { name: m.name }))) {
+                  onClick={async () => {
+                    // 删除里程碑（破坏性，danger 确认弹框，v1.48.1 收尾）
+                    if (
+                      await confirm({
+                        title: t('milestone.deleteConfirm', { name: m.name }),
+                        confirmText: tGlobal('common.confirm'),
+                        cancelText: tGlobal('common.cancel'),
+                        confirmVariant: 'danger',
+                      })
+                    ) {
                       deleteMutation.mutate(m.id);
                     }
                   }}
@@ -1033,17 +1062,27 @@ export default function BoardDetailPage() {
     enabled: !!id,
   });
 
-  /** 看板 description 折叠（v1.42 B6）：markdown 渲染（复用 MARKDOWN_CLASSES），超长（>max-h-64）折叠 + 展开/收起 */
-  const [descExpanded, setDescExpanded] = useState(false);
-  const [descOverflowing, setDescOverflowing] = useState(false);
-  const descRef = useRef<HTMLDivElement>(null);
+  /** 看板图例（description）只读查看模态框（v1.47.0-dev UX 统一）：编辑入口 = 设置 Dialog */
+  const [descModalOpen, setDescModalOpen] = useState(false);
 
-  // 描述内容变化后测量是否超长（max-h-64 = 256px）；overflow-hidden 下 scrollHeight 仍返回内容全高
-  useLayoutEffect(() => {
-    const el = descRef.current;
-    if (!el) return;
-    setDescOverflowing(el.scrollHeight > 256);
-  }, [board?.description]);
+  /** 看板设置 Dialog（v1.47.0-dev UX 统一，对齐 DocSpace 空间设置）：name + description（图例）+ visibility（结构字段） */
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsForm, setSettingsForm] = useState({
+    name: '',
+    description: '',
+    visibility: Visibility.PRIVATE,
+  });
+
+  /** 打开设置 Dialog 并预填当前值（canManage 内容字段；结构字段仅 creator/admin 可编辑） */
+  const openSettings = useCallback(() => {
+    if (!board) return;
+    setSettingsForm({
+      name: board.name,
+      description: board.description ?? '',
+      visibility: board.visibility === Visibility.OPEN ? Visibility.OPEN : Visibility.PRIVATE,
+    });
+    setSettingsOpen(true);
+  }, [board]);
 
   /** 绑定本看板的文档空间（头部 Docs 徽章用） */
   const { data: boardSpacesData } = useQuery({
@@ -1071,6 +1110,42 @@ export default function BoardDetailPage() {
 
   /** v1.37 owner 代理：我的 agent id 集合（agent 创建的 board 视同我创建） */
   const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
+
+  /**
+   * 管理权（v1.46 D9，对齐 docs/[id] canManage）：admin | creator（含 owner 代理）|
+   * editor 成员（BoardMember 字段是 id/role，非 actorId——注意 board.members 投影形状）。
+   * canManage 决定图例模态框的编辑能力（查看态人人可开，编辑态仅 canManage）。
+   */
+  const canManage =
+    !!currentUser &&
+    (currentUser.role === 'admin' ||
+      isCreatorOrOwner(board?.creatorId, currentUser.id, myAgentIds) ||
+      board?.members?.some((m) => m.id === currentUser.id && m.role === 'editor'));
+
+  /**
+   * 结构字段门控（v1.47.0-dev，对齐 DocSpace isOwnerLike）：admin | creator（含 owner 代理）——
+   * editor 不包含（结构字段 creator-only，与 PATCH /boards 后端分权一致）。
+   * canManage 管内容字段（name/description），isBoardOwnerLike 管结构字段（visibility）。
+   */
+  const isBoardOwnerLike = useMemo(
+    () =>
+      !!currentUser &&
+      (currentUser.role === 'admin' ||
+        isCreatorOrOwner(board?.creatorId, currentUser.id, myAgentIds)),
+    [currentUser, board?.creatorId, myAgentIds],
+  );
+
+  /** 设置保存 mutation（v1.47.0-dev）：name + description + visibility（仅 owner-like 发）一次提交；description 清空发 ''（UpdateBoardDto 无 MinLength，'' 合法） */
+  const updateBoardSettingsMutation = useMutation({
+    mutationFn: (payload: { name: string; description: string; visibility?: Visibility }) =>
+      Api.boards.update(id, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
+      void queryClient.invalidateQueries({ queryKey: ['boards', 'list'] });
+      setSettingsOpen(false);
+    },
+    onError: alertMutationError(t('legend.saveError')),
+  });
 
   const activeAgents = (agentsData ?? []).filter((a) => a.status === 'active');
 
@@ -1465,7 +1540,7 @@ export default function BoardDetailPage() {
 
   if (isLoading) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
         <Loading size="lg" />
       </div>
     );
@@ -1473,7 +1548,7 @@ export default function BoardDetailPage() {
 
   if (!board) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] flex-col items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
         <Link href="/boards" className="mt-4 text-primary hover:underline">
           {t('backToList')}
@@ -1483,7 +1558,7 @@ export default function BoardDetailPage() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-8rem)] flex-col">
+    <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col">
       {/* 看板头部：移动端垂直堆叠，桌面端水平排列，防止操作按钮溢出视口 */}
       <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex items-center gap-3 min-w-0">
@@ -1512,28 +1587,31 @@ export default function BoardDetailPage() {
                 </Badge>
               )}
             </h1>
-            {board.description && (
-              <div
-                ref={descRef}
-                className={`text-sm text-muted-foreground ${MARKDOWN_CLASSES} ${
-                  descExpanded ? '' : 'max-h-64 overflow-hidden'
-                }`}
-              >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{board.description}</ReactMarkdown>
-              </div>
-            )}
-            {descOverflowing && (
+            {/*
+              看板图例（description）收纳（v1.46 D9，用户拍板）：默认完全不渲染在标题下
+              （可达 20000 字符的长 markdown 挤压视觉空间）；按钮点开统一模态框查看/编辑。
+              canManage → 恒显示（空 description 也可点开新增）；非 canManage → 仅非空显示。
+            */}
+            {(canManage || board.description) && (
               <button
                 type="button"
-                onClick={() => setDescExpanded((v) => !v)}
-                className="mt-1 text-xs text-primary hover:underline"
+                onClick={() => setDescModalOpen(true)}
+                className="mt-1 inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-primary"
               >
-                {descExpanded ? t('descriptionCollapse') : t('descriptionExpand')}
+                <BookOpen className="h-3.5 w-3.5" />
+                {board.description ? t('legend.view') : t('legend.add')}
               </button>
             )}
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          {/* 看板设置（v1.47.0-dev UX 统一，对齐 DocSpace 空间设置）：name/description/visibility */}
+          {canManage && (
+            <Button variant="outline" size="sm" onClick={openSettings}>
+              <Settings className="mr-1 h-4 w-4" />
+              {t('settings.title')}
+            </Button>
+          )}
           {/* Docs 徽章：有绑定空间 → 名称+docCount 点击直达；无 → creator/admin 显示新建小 Dialog */}
           {linkedSpace ? (
             <Link
@@ -1683,10 +1761,18 @@ export default function BoardDetailPage() {
       {/* 任务详情右侧 Sheet 抽屉 */}
       <Sheet
         open={taskStack.length > 0}
-        onOpenChange={(open) => {
+        onOpenChange={async (open) => {
           if (!open) {
             if (isPanelDirty) {
-              if (!confirm(t('unsavedConfirm'))) return;
+              // 未保存守卫（v1.48.1 收尾）：全局确认弹框替代 window.confirm
+              if (
+                !(await confirm({
+                  title: t('unsavedConfirm'),
+                  confirmText: tGlobal('common.confirm'),
+                  cancelText: tGlobal('common.cancel'),
+                }))
+              )
+                return;
             }
             setTaskStack([]);
             setIsPanelDirty(false);
@@ -1762,6 +1848,124 @@ export default function BoardDetailPage() {
           onClose={() => setMilestoneManageOpen(false)}
         />
       )}
+
+      {/* 看板图例只读查看模态框（v1.47.0-dev UX 统一）：markdown 渲染；编辑入口 = 设置 Dialog */}
+      <Dialog open={descModalOpen} onOpenChange={setDescModalOpen}>
+        <DialogHeader>
+          <DialogTitle>{t('legend.title')}</DialogTitle>
+          <DialogDescription>{board.name}</DialogDescription>
+        </DialogHeader>
+        <div className="py-4">
+          <div className={`text-sm text-muted-foreground ${MARKDOWN_CLASSES}`}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{board.description ?? ''}</ReactMarkdown>
+          </div>
+        </div>
+        <DialogFooter>
+          {canManage ? (
+            <Button
+              variant="outline"
+              onClick={() => {
+                setDescModalOpen(false);
+                openSettings();
+              }}
+            >
+              {t('legend.edit')}
+            </Button>
+          ) : (
+            <Button variant="outline" onClick={() => setDescModalOpen(false)}>
+              {tGlobal('common.close')}
+            </Button>
+          )}
+        </DialogFooter>
+      </Dialog>
+
+      {/* 看板设置 Dialog（v1.47.0-dev UX 统一，对齐 DocSpace 空间设置）：name/description 内容字段 canManage 可改；visibility 结构字段仅 creator/admin */}
+      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <DialogHeader>
+          <DialogTitle>{t('settings.title')}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-4">
+          {/* name */}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{t('settings.name')}</label>
+            <Input
+              value={settingsForm.name}
+              onChange={(e) => setSettingsForm((prev) => ({ ...prev, name: e.target.value }))}
+              placeholder={t('settings.namePlaceholder')}
+              maxLength={100}
+              className="h-9"
+            />
+          </div>
+          {/* description（图例，长 markdown 可达 20000 字符：min-h≈240px，不用 docs 的 rows=3 小输入框） */}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{t('settings.description')}</label>
+            <textarea
+              value={settingsForm.description}
+              onChange={(e) =>
+                setSettingsForm((prev) => ({ ...prev, description: e.target.value }))
+              }
+              placeholder={t('settings.descPlaceholder')}
+              maxLength={20000}
+              className="flex min-h-[240px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-primary/50 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+          </div>
+          {/* editor 提示（v1.47.0-dev 拆权）：结构字段（可见性）仅 creator 可改 */}
+          {!isBoardOwnerLike && (
+            <p className="text-xs text-muted-foreground">{t('settings.editorHint')}</p>
+          )}
+          {/* visibility（结构字段，creator-only——editor 隐藏，payload 也不发） */}
+          {isBoardOwnerLike && (
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">{t('settings.visibility')}</label>
+              <div className="flex gap-4">
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="board-visibility"
+                    value={Visibility.OPEN}
+                    checked={settingsForm.visibility === Visibility.OPEN}
+                    onChange={() =>
+                      setSettingsForm((prev) => ({ ...prev, visibility: Visibility.OPEN }))
+                    }
+                  />
+                  {t('settings.visibilityPublic')}
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="board-visibility"
+                    value={Visibility.PRIVATE}
+                    checked={settingsForm.visibility === Visibility.PRIVATE}
+                    onChange={() =>
+                      setSettingsForm((prev) => ({ ...prev, visibility: Visibility.PRIVATE }))
+                    }
+                  />
+                  {t('settings.visibilityPrivate')}
+                </label>
+              </div>
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setSettingsOpen(false)}>
+            {tGlobal('common.close')}
+          </Button>
+          <Button
+            disabled={!settingsForm.name.trim()}
+            isLoading={updateBoardSettingsMutation.isPending}
+            onClick={() =>
+              updateBoardSettingsMutation.mutate({
+                name: settingsForm.name,
+                description: settingsForm.description,
+                // 结构字段仅 owner-like 发送（editor 不发 visibility，避免 403）
+                ...(isBoardOwnerLike ? { visibility: settingsForm.visibility } : {}),
+              })
+            }
+          >
+            {tGlobal('common.save')}
+          </Button>
+        </DialogFooter>
+      </Dialog>
 
       {/* 看板成员 Sheet */}
       <Sheet open={inviteSheetOpen} onOpenChange={setInviteSheetOpen}>

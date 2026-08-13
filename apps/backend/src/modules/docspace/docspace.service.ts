@@ -6,7 +6,7 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.1-§4.3 (W2 空间/分类/成员 API)
 
- * [踩坑索引] B4(jsonb脏数据防御)
+ * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
  *
@@ -14,6 +14,9 @@
  *   B4: settings.overviewFilter 的 excludeTypes/excludeCategories 手工改库可能存成字符串，
  *      字符串也有 .includes() 会静默产生错误语义。修复：resolveOverviewFilters 加 Array.isArray
  *      防御（非数组视为无默认过滤）。见 memory/2026-08-03.md §B4
+ *   B5: 互斥参数同传（topicId+boardId / path+q）是请求格式错误，必须 400 VALIDATION_ERROR；
+ *      历史上误用 403 Forbidden / 409 Conflict + RESOURCE_CONFLICT（2026-08-09 修复 edad7a9，
+ *      三处统一）。RESOURCE_CONFLICT 只用于真实资源状态冲突（slug/source 等，本文件 845+ 各区）
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -21,7 +24,12 @@
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
  * =============================================================================
  */
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, IsNull } from 'typeorm';
 import * as crypto from 'crypto';
@@ -385,12 +393,12 @@ export class DocSpaceService {
 
   // ─── Validation helpers ─────────────────────────────────────
 
-  /** Validate topicId/boardId mutual exclusivity (both → 400). */
+  /** Validate topicId/boardId mutual exclusivity (both → 400 VALIDATION_ERROR). */
   private validateBinding(dto: { topicId?: string; boardId?: string }): void {
     if (dto.topicId && dto.boardId) {
-      throw new ConflictException({
+      throw new BadRequestException({
         message: 'topicId and boardId are mutually exclusive — provide at most one',
-        code: ErrorCode.RESOURCE_CONFLICT,
+        code: ErrorCode.VALIDATION_ERROR,
       });
     }
   }
@@ -939,6 +947,43 @@ export class DocSpaceService {
     await this.memberRepo.save(existing);
 
     return space;
+  }
+
+  /**
+   * 转让空间创建者（v1.45 DOCSPACE-PERM，D2 决策）——「干净交接」语义：
+   * - 旧 creator 不自动获得任何角色：PRIVATE 空间下转让后旧 creator 失去读权限
+   *   （前端 confirm 已明示不可逆，R5）；不创建/保留任何 member 行。
+   * - 新 creator 若有既有 member 行则删除（creator 身份覆盖成员身份，避免角色残留）。
+   * - 目标是 agent 时，其人类 owner 经 owner-proxy（isCreatorOf 只比 id）自动视同
+   *   creator——人类把空间转给自己的 agent 后不会锁死自己（兜底语义）。
+   * - 与 invite/add-editor 一致：不发 event/audit（D4）。
+   *
+   * @param spaceId 空间 ID（Controller 已 findById 判空 + creator-only 权限检查）
+   * @param newCreatorId 目标 actor ID（人/agent 统一 actors 表）
+   * @throws NotFoundException - 目标 actor 不存在（ErrorCode.ACTOR_NOT_FOUND）
+   * @throws ConflictException - 目标已是当前 creator（RESOURCE_CONFLICT）
+   * @returns 转让后的 DocSpace 实体
+   */
+  async transferCreator(spaceId: string, newCreatorId: string): Promise<DocSpace> {
+    const space = await this.findById(spaceId);
+
+    // 双层校验第二层：目标必须真实存在于 actors 表（铁律 #21/#22）
+    await this.resourceValidator.exists(this.actorRepo, newCreatorId, ErrorCode.ACTOR_NOT_FOUND);
+
+    // 转给自己 = 无操作请求：真实资源状态冲突，用 RESOURCE_CONFLICT（B5 语义，不误用 400/403）
+    if (space.creatorId === newCreatorId) {
+      throw new ConflictException({
+        message: 'Target is already the space creator',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
+    // 干净交接：删除新 creator 的既有 member 行（若有）——creator 身份覆盖成员身份。
+    // delete 幂等：无 member 行时 affected=0，非错误。
+    await this.memberRepo.delete({ spaceId, actorId: newCreatorId });
+
+    space.creatorId = newCreatorId;
+    return this.spaceRepo.save(space);
   }
 
   // ─── Categories ─────────────────────────────────────────────

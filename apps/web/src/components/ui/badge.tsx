@@ -2,7 +2,7 @@ import * as React from 'react';
 import { cn } from '@/lib/utils';
 
 export interface BadgeProps extends React.HTMLAttributes<HTMLDivElement> {
-  variant?: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning';
+  variant?: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning' | 'subtle';
 }
 
 function Badge({ className, variant = 'default', ...props }: BadgeProps) {
@@ -16,6 +16,9 @@ function Badge({ className, variant = 'default', ...props }: BadgeProps) {
     // dark-only 后不再保留 dark: 前缀双份写法）
     success: 'border-transparent bg-emerald-500/15 text-emerald-300',
     warning: 'border-transparent bg-amber-500/15 text-amber-300',
+    // subtle：中性低调标签（圆桌座位 badge 等展示性标签）——半透明中性底 + 前景色，
+    // 不抢正文视觉（Mission Control 暗色主题协调，同 success/warning 的半透明派生法）
+    subtle: 'border-transparent bg-foreground/10 text-foreground/80',
   };
 
   return (

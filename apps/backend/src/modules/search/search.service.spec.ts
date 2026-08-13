@@ -10,6 +10,9 @@ import { SearchQueryDto, SearchType } from './dto';
 import { ActorType, UserRole } from '@agent-chamber/shared';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import type { UnifiedActor } from '../../common/types/actor.types';
+import { Doc } from '../../database/entities/doc.entity';
+import { DocSearchService } from '../docspace/doc-search.service';
+import type { DocSearchHit, DocSearchHitWithSpace } from '@agent-chamber/shared';
 
 /** 创建一个链式 QueryBuilder mock */
 function createMockQueryBuilder() {
@@ -137,6 +140,8 @@ describe('SearchService', () => {
   let mockTaskRepo: jest.Mocked<Repository<Task>>;
   let mockAgentRepo: jest.Mocked<Repository<Agent>>;
   let mockUserRepo: jest.Mocked<Repository<User>>;
+  let mockDocRepo: jest.Mocked<Repository<Doc>>;
+  let mockDocSearchService: jest.Mocked<DocSearchService>;
   let mockAccessQuery: jest.Mocked<AccessQueryService>;
   let messageQb: ReturnType<typeof createMockQueryBuilder>;
   let taskQb: ReturnType<typeof createMockQueryBuilder>;
@@ -158,9 +163,19 @@ describe('SearchService', () => {
     const userRepoPair = createMockRepo<User>();
     mockUserRepo = userRepoPair.mock;
 
+    const docRepoPair = createMockRepo<Doc>();
+    mockDocRepo = docRepoPair.mock;
+
+    // DocSearchService 默认空命中：type=all 的既有用例（不关心 docs）不会因 docs 分支崩掉；
+    // docs 专项用例在 setupDocSearchMock 中覆盖默认值
+    mockDocSearchService = {
+      search: jest.fn().mockResolvedValue([]),
+    } as unknown as jest.Mocked<DocSearchService>;
+
     mockAccessQuery = {
       getAccessibleTopicIds: jest.fn(),
       getAccessibleBoardIds: jest.fn(),
+      getAccessibleDocSpaceIds: jest.fn(),
     } as unknown as jest.Mocked<AccessQueryService>;
 
     // resolveBoardTopicIds 使用的 raw query builder
@@ -177,6 +192,8 @@ describe('SearchService', () => {
         { provide: getRepositoryToken(Task), useValue: mockTaskRepo },
         { provide: getRepositoryToken(Agent), useValue: mockAgentRepo },
         { provide: getRepositoryToken(User), useValue: mockUserRepo },
+        { provide: getRepositoryToken(Doc), useValue: mockDocRepo },
+        { provide: DocSearchService, useValue: mockDocSearchService },
         { provide: AccessQueryService, useValue: mockAccessQuery },
       ],
     }).compile();
@@ -238,6 +255,23 @@ describe('SearchService', () => {
       .mockReturnValueOnce(highlightQb as unknown as SelectQueryBuilder<Task>);
   }
 
+  /**
+   * 设置 Doc 搜索的 mock：权限查询 + DocSearchService 命中 + spaceId 补全查询
+   *
+   * @param accessibleSpaceIds 白名单（null=admin 全量；[]=无空间）
+   * @param hits DocSearchService 返回的原始命中（不含 spaceId）
+   * @param spaceRows docRepo 补查返回的 { id, spaceId } 行
+   */
+  function setupDocSearchMock(
+    accessibleSpaceIds: string[] | null,
+    hits: DocSearchHit[],
+    spaceRows: Array<{ id: string; spaceId: string }> = [],
+  ) {
+    mockAccessQuery.getAccessibleDocSpaceIds.mockResolvedValue(accessibleSpaceIds);
+    mockDocSearchService.search.mockResolvedValue(hits);
+    mockDocRepo.find.mockResolvedValue(spaceRows as unknown as Doc[]);
+  }
+
   // ============================================================================
   // 摘要字段回归断言工具
   // ============================================================================
@@ -247,8 +281,15 @@ describe('SearchService', () => {
    */
   function expectMessageSummaryKeys(item: Record<string, unknown>) {
     const allowedKeys = [
-      'id', 'topicId', 'senderId', 'senderType', 'senderName',
-      'type', 'createdAt', 'contentSnippet', 'highlight',
+      'id',
+      'topicId',
+      'senderId',
+      'senderType',
+      'senderName',
+      'type',
+      'createdAt',
+      'contentSnippet',
+      'highlight',
     ];
     const actualKeys = Object.keys(item).sort();
     const extraKeys = actualKeys.filter((k) => !allowedKeys.includes(k));
@@ -269,8 +310,15 @@ describe('SearchService', () => {
     }
     // 必含字段
     const requiredKeys = [
-      'id', 'listId', 'title', 'status', 'priority',
-      'boardId', 'topicId', 'descriptionSnippet', 'highlight',
+      'id',
+      'listId',
+      'title',
+      'status',
+      'priority',
+      'boardId',
+      'topicId',
+      'descriptionSnippet',
+      'highlight',
     ];
     for (const key of requiredKeys) {
       expect(item).toHaveProperty(key);
@@ -287,7 +335,9 @@ describe('SearchService', () => {
 
       // sender resolution
       mockAgentRepo.findBy.mockResolvedValue([]);
-      mockUserRepo.findBy.mockResolvedValue([{ id: 'sender-1', displayName: 'Test User', username: 'test' } as any]);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'sender-1', displayName: 'Test User', username: 'test' } as any,
+      ]);
 
       // boardId/topicId resolution
       boardTopicQb.getRawMany.mockResolvedValue([
@@ -326,6 +376,9 @@ describe('SearchService', () => {
       expect(result.tasks!.items[0].boardId).toBe('board-1');
       expect(result.tasks!.items[0].topicId).toBe('topic-1');
       expect(result.tasks!.total).toBe(1);
+
+      // 文档断言（本用例未造文档命中，默认 mock 返回空）
+      expect(result.docs).toEqual([]);
     });
 
     it('should return empty paginated results when no matches', async () => {
@@ -385,7 +438,9 @@ describe('SearchService', () => {
       const messages = [makeMsg({ id: 'msg-1', content: longContent, senderId: 'sender-1' })];
 
       mockAgentRepo.findBy.mockResolvedValue([]);
-      mockUserRepo.findBy.mockResolvedValue([{ id: 'sender-1', displayName: 'U', username: 'u' } as any]);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'sender-1', displayName: 'U', username: 'u' } as any,
+      ]);
 
       setupMessageSearchMock(['topic-1'], messages, 1, new Map([['msg-1', '<<<x>>>']]));
 
@@ -472,6 +527,80 @@ describe('SearchService', () => {
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.tasks!.items[0].descriptionSnippet).toBeNull();
+    });
+  });
+
+  // ============================================================================
+  // search with type=docs（v1.48.0：全局搜索接入 DocSpace 文档）
+  // ============================================================================
+  describe('search with type=docs', () => {
+    /** 构造最小 DocSearchHit mock */
+    function makeHit(overrides: Partial<DocSearchHit> = {}): DocSearchHit {
+      return {
+        docId: 'doc-1',
+        docPath: 'docs/architecture.md',
+        docTitle: 'Architecture',
+        position: 0,
+        headingPath: 'Architecture',
+        snippet: 'hello from doc',
+        score: 0.5,
+        ...overrides,
+      };
+    }
+
+    it('should return only docs, null messages/tasks, and inject spaceId', async () => {
+      setupDocSearchMock(
+        ['space-1'],
+        [makeHit({ docId: 'doc-1' }), makeHit({ docId: 'doc-2' })],
+        [
+          { id: 'doc-1', spaceId: 'space-1' },
+          { id: 'doc-2', spaceId: 'space-1' },
+        ],
+      );
+
+      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
+
+      expect(result.messages).toBeNull();
+      expect(result.tasks).toBeNull();
+      expect(result.docs).not.toBeNull();
+      expect(result.docs).toHaveLength(2);
+      expect(result.docs![0]).toMatchObject({
+        docId: 'doc-1',
+        spaceId: 'space-1',
+        docTitle: 'Architecture',
+      });
+      expect(result.docs![1].spaceId).toBe('space-1');
+      // 权限白名单 + limit=20 透传给 DocSearchService
+      expect(mockDocSearchService.search).toHaveBeenCalledWith(['space-1'], {
+        q: 'hello',
+        limit: 20,
+      });
+    });
+
+    it('should pass null (admin all-spaces) to DocSearchService and skip spaceId query on empty hits', async () => {
+      setupDocSearchMock(null, [], []);
+
+      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const result = await service.search(dto, { id: 'admin-1', type: ActorType.HUMAN });
+
+      expect(result.docs).toEqual([]);
+      // admin：白名单为 null 原样透传（DocSearchService 语义：null=全量不过滤）
+      expect(mockDocSearchService.search).toHaveBeenCalledWith(null, { q: 'hello', limit: 20 });
+      // 空命中短路：不触发 docRepo 补查（避免无谓查询）
+      expect(mockDocRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('should pass empty whitelist through and return empty docs (non-admin with no accessible spaces)', async () => {
+      setupDocSearchMock([], [], []);
+
+      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
+
+      expect(result.docs).toEqual([]);
+      // 空白名单语义对齐 messages/tasks：透传 []（DocSearchService 内部短路），不触发补查
+      expect(mockDocSearchService.search).toHaveBeenCalledWith([], { q: 'hello', limit: 20 });
+      expect(mockDocRepo.find).not.toHaveBeenCalled();
     });
   });
 
@@ -622,7 +751,11 @@ describe('SearchService', () => {
         page: 1,
         pageSize: 20,
       };
-      const adminActor: UnifiedActor = { id: 'admin-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+      const adminActor: UnifiedActor = {
+        id: 'admin-1',
+        type: ActorType.HUMAN,
+        role: UserRole.ADMIN,
+      };
       const result = await service.search(dto, adminActor);
 
       // Admin 触发权限查询但返回 null（不过滤）

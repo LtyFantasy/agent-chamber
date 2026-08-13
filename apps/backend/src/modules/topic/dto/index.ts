@@ -7,6 +7,8 @@ export * from './update-agenda.dto';
 export * from './mark-as-read.dto';
 export * from './invite-topic-agent.dto';
 export * from './uninvite-topic-agent.dto';
+export * from './add-topic-editor.dto';
+export * from './remove-topic-editor.dto';
 export * from './invite-topic-user.dto';
 export * from './uninvite-topic-user.dto';
 export * from './remove-topic-participant.dto';

@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { ValidationPipe } from '@nestjs/common';
+import { WsAdapter } from '@nestjs/platform-ws';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository, ObjectLiteral, DataSource } from 'typeorm';
 import * as entities from '../src/database/entities';
@@ -34,7 +35,7 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
       if (!proto || !result || typeof result !== 'object') return result;
       const applyProto = (item: any) => {
         if (item && typeof item === 'object' && !item.constructor?.prototype?.name) {
-            Object.setPrototypeOf(item, proto);
+          Object.setPrototypeOf(item, proto);
         }
         return item;
       };
@@ -208,6 +209,11 @@ export async function createTestingApp(): Promise<{
   );
 
   const app = moduleRef.createNestApplication();
+
+  // 与 main.ts 对齐注册 WsAdapter：M1阶段3 起 AppModule 含 runner WS gateway，
+  // E2E 绕开 main.ts 引导，缺 WS driver 会在 app.init() 抛
+  // "No driver (WebSockets) has been selected"（6 suites 全灭的既有债）
+  app.useWebSocketAdapter(new WsAdapter(app));
 
   app.useGlobalPipes(
     new ValidationPipe({

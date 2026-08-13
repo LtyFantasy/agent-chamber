@@ -105,14 +105,16 @@ describe('AvatarController', () => {
     /**
      * 直接实例化真实 Guard（mock 其全部依赖），验证无 Authorization / X-API-Key
      * 时抛出 401，确保 PUT 端点的认证语义来自 Guard 而非偶然。
+     * 注意：M1 圆桌计划决策 4 后构造函数为 (jwtService, configService, userRepo,
+     * apiKeyAuthService)——第 4 参从 apiKeyRepo+agentRepo 合并为 ApiKeyAuthService；
+     * 未认证路径不会触碰 service，mock 对象即可。
      */
     it('should throw 401 UnauthorizedException when no credentials are provided', async () => {
       const guard = new JwtOrApiKeyGuard(
         { verify: jest.fn() } as never,
         { get: jest.fn() } as never,
         { findOne: jest.fn() } as never,
-        { findOne: jest.fn() } as never,
-        { findOne: jest.fn() } as never,
+        { authenticate: jest.fn() } as never,
       );
       const ctx = {
         switchToHttp: () => ({

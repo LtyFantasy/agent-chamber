@@ -1,10 +1,11 @@
 import type { PaginatedResponse } from '../interfaces';
 import type { TaskSummary } from './task-response.dto';
+import type { DocSearchHit } from './docspace-response.dto';
 
 /**
  * 搜索类型
  */
-export type SearchType = 'all' | 'messages' | 'tasks';
+export type SearchType = 'all' | 'messages' | 'tasks' | 'docs';
 
 /**
  * 搜索查询
@@ -63,6 +64,18 @@ export interface TaskSearchResult extends TaskSummary {
 }
 
 /**
+ * 全局搜索结果中的文档命中项
+ *
+ * DocSearchHit 本身不含 spaceId（空间内搜索的调用方已知所属空间）；
+ * 全局搜索需要跳转目标 `/docs/:spaceId?doc=:docId`，由 SearchService
+ * 在命中后批量补全 spaceId（见 search.service.ts searchDocs）。
+ */
+export interface DocSearchHitWithSpace extends DocSearchHit {
+  /** 所属 DocSpace ID */
+  spaceId: string;
+}
+
+/**
  * 搜索结果聚合
  */
 export interface SearchResult {
@@ -70,4 +83,11 @@ export interface SearchResult {
   messages: PaginatedResponse<MessageSearchResult> | null;
   /** 任务搜索结果 */
   tasks: PaginatedResponse<TaskSearchResult> | null;
+  /**
+   * 文档搜索结果（非分页，固定 limit 20，与空间内搜索同构）
+   *
+   * 复用 DocSearchService.search（无 count/offset 分页语义），
+   * 全局搜索暂不做文档分页（MVP 决策，见 v1.48.0 plan）。
+   */
+  docs: DocSearchHitWithSpace[] | null;
 }

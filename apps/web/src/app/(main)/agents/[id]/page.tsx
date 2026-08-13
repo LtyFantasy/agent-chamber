@@ -58,7 +58,7 @@ export default function AgentDetailPage() {
 
   if (isLoading) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
         <Loading size="lg" />
       </div>
     );
@@ -66,7 +66,7 @@ export default function AgentDetailPage() {
 
   if (!agent) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] flex-col items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
         <Link href="/agents" className="mt-4 text-primary hover:underline">
           {t('backToList')}

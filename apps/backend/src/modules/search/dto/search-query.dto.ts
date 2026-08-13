@@ -15,6 +15,7 @@ export enum SearchType {
   ALL = 'all',
   MESSAGES = 'messages',
   TASKS = 'tasks',
+  DOCS = 'docs',
 }
 
 /**
@@ -28,12 +29,12 @@ export class SearchQueryDto {
   @ApiProperty({ description: 'Search keyword', example: 'Search keyword' })
   q: string;
 
-  /** 搜索范围：all(全部) / messages(消息) / tasks(任务) */
+  /** 搜索范围：all(全部) / messages(消息) / tasks(任务) / docs(文档) */
   @IsOptional()
   @IsEnum(SearchType)
   @ApiPropertyOptional({
     enum: Object.values(SearchType),
-    description: 'Search scope: all, messages, tasks',
+    description: 'Search scope: all, messages, tasks, docs',
     example: SearchType.ALL,
   })
   type?: SearchType = SearchType.ALL;

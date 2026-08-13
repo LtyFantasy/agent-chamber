@@ -34,7 +34,8 @@
     "openMenu": "Open menu",
     "closeMenu": "Close menu",
     "logout": "Logout",
-    "language": "Language"
+    "language": "Language",
+    "pendingApprovals": "{count} roundtable approvals pending"
   },
   "settings": {
     "language": {
@@ -191,7 +192,20 @@
       "description": "Description",
       "visibility": "Visibility",
       "titlePlaceholder": "Topic title",
-      "descPlaceholder": "Topic description (optional)"
+      "descPlaceholder": "Topic description (optional)",
+      "kind": "Type",
+      "kindNormalDesc": "Normal (standard discussion topic)",
+      "kindRoundtableDesc": "Roundtable (multi-agent seat meeting)",
+      "kindImmutableHint": "Type cannot be changed after creation; add seats from the topic detail page",
+      "wakePolicy": "Wake policy",
+      "wakeMention": "Mention to wake (default; seats only receive @seat or @all)",
+      "wakeBroadcast": "Broadcast (every new message goes to all seats)",
+      "maxRounds": "Safety-valve round limit (optional)",
+      "maxRoundsPlaceholder": "Default 8; 0 = disabled"
+    },
+    "kind": {
+      "normal": "Normal",
+      "roundtable": "Roundtable"
     },
     "delete": {
       "confirmTitle": "Confirm deletion",
@@ -263,7 +277,27 @@
       "copied": "Copied",
       "deleteConfirm": "Are you sure you want to delete this message?",
       "deleteTitle": "Delete message",
-      "senderSelf": "Me"
+      "senderSelf": "Me",
+      "thinkingSummary": "Process log",
+      "mentionHint": "@seat-name wakes that seat, @all wakes everyone",
+      "mentionAllDesc": "Notify all seats",
+      "mentionNoMatch": "No matching seat",
+      "allWakeTitle": "Wake all seats",
+      "allWakeConfirm": "This will wake all {count} seats. Send anyway?",
+      "coordinatorBadge": "Coordinator",
+      "coordinatorTitle": "Coordinator seat: dispatch instructions are observable in topic messages"
+    },
+    "permissionRequest": {
+      "title": "{count, plural, one {# pending approval} other {# pending approvals}}",
+      "seatFallback": "Seat {id}",
+      "alreadyResolved": "This request was already resolved by someone else. List refreshed.",
+      "verdictFailed": "Failed to resolve. Please try again.",
+      "verdictSuccess": "Verdict submitted",
+      "option": {
+        "approveOnce": "Allow once",
+        "approveAlways": "Allow for session",
+        "reject": "Reject"
+      }
     },
     "messageType": {
       "chat": "Chat",
@@ -274,6 +308,106 @@
       "task": "Task",
       "artifact": "Artifact",
       "status_update": "Status"
+    },
+    "seatMgmt": {
+      "title": "Roundtable seats",
+      "addSeat": "Add seat",
+      "pendingCount": "{count, plural, one {# seat awaiting connection} other {# seats awaiting connection}} →",
+      "noRunnerOnline": "No runner online — after creating a seat, start a runner in the bound agent's environment to take it over:",
+      "copyCommand": "Copy startup command",
+      "copied": "Copied"
+    },
+    "seatCreate": {
+      "title": "Add seat",
+      "desc": "Add an agent seat to the roundtable; an online runner claims it by bound agent + vendor",
+      "label": "Seat label",
+      "labelPlaceholder": "e.g. kimi-1",
+      "vendor": "Vendor",
+      "vendorNoRunner": "No online runner supports {vendor} — you can create the seat now and the runner will claim it when it comes online",
+      "bindAgent": "Bound agent",
+      "bindAgentPlaceholder": "Select an agent to bind",
+      "cwd": "Working directory",
+      "cwdPlaceholder": "/home/user/projects/demo",
+      "cwdHint": "A directory on the runner's machine; the seat agent can only work inside it",
+      "permissionMode": "Permission mode",
+      "pmDefaultDesc": "default (read-only, writes need approval)",
+      "pmPlanDesc": "plan (read-only + plan collaboration mode)",
+      "pmAutoDesc": "auto (auto-execute, sensitive ops need approval — recommended)",
+      "pmYoloDesc": "yolo (full access, no approvals — use with caution)",
+      "advanced": "Advanced options",
+      "model": "Model override (optional)",
+      "modelPlaceholder": "e.g. kimi-k2",
+      "coordinator": "Coordinator seat",
+      "batchWindow": "Batch window ms (optional)",
+      "batchWindowPlaceholder": "Default 30000; 0 = direct",
+      "cancel": "Cancel",
+      "submit": "Create",
+      "success": "Seat \"{label}\" created — an online runner will claim it automatically. Next, connect it:",
+      "done": "Done",
+      "failed": "Failed to create seat, please retry",
+      "forbidden": "No permission to create a seat in this topic"
+    },
+    "seatManager": {
+      "title": "Seats ({count})",
+      "coordinator": "Coordinator",
+      "coordinatorTitle": "Coordinator seat",
+      "thinking": "Thinking",
+      "pendingConnect": "Not connected",
+      "remove": "Remove",
+      "removeTitle": "Remove seat",
+      "removeConfirm": "Remove seat {label}? Its session will be stopped and it will leave this table.",
+      "removeFailed": "Failed to remove seat, please retry",
+      "removedForbidden": "No permission to remove this seat",
+      "leftGroup": "Seats (member left the table)"
+    },
+    "seatPresence": {
+      "thinking": "Thinking",
+      "replying": "Replying",
+      "silent": "Silent",
+      "offline": "Offline",
+      "cancel": "Cancel",
+      "cancelTitle": "Cancel reply",
+      "cancelConfirm": "Cancel seat {label}? Its current reply will be interrupted.",
+      "cancelSent": "Cancel command sent",
+      "cancelConflict": "This seat has already finished its reply. List refreshed.",
+      "cancelForbidden": "No permission to cancel this seat",
+      "cancelFailed": "Failed to cancel, please retry",
+      "recentActivity": "Recent activity",
+      "noActivity": "No recent activity",
+      "silentCount": "Silent rounds: {count}",
+      "usage": "Usage {used}/{size} tokens"
+    },
+    "seatGuide": {
+      "model": "A runner dials into the platform from the machine where its CLI is installed — not necessarily the machine hosting the platform — and claims seats with the bound agent's API key.",
+      "expandButton": "Connect seat \"{label}\"",
+      "connectTitle": "Connect seat \"{label}\"",
+      "connectDesc": "This seat has no runner yet — connect one via the paths below; the result is verified automatically.",
+      "apiKeyLabel": "Agent API Key (optional)",
+      "apiKeyPlaceholder": "Paste the bound agent's API key; leave blank to keep a placeholder",
+      "apiKeyHint": "Kept in this page's memory only — never uploaded or saved",
+      "forgotKey": "Forgot the key? Reset it on the agent's keys page",
+      "pathATitle": "Option A (recommended): copy instructions for the agent",
+      "pathADesc": "Send this to the target agent (or paste it into its CLI) — it will read the guide and start the runner:",
+      "copyPrompt": "Copy instructions",
+      "pathBTitle": "Option B: one-line command for humans",
+      "pathBDesc": "Run on a machine with a CLI installed (Linux/macOS; Windows via WSL). First run auto-downloads and installs the runner:",
+      "copyCommand": "Copy command",
+      "repoAltTitle": "Already cloned the repo?",
+      "repoAltDesc": "From the repo root, run these instead, then start:",
+      "verifyTitle": "Connection check (automatic)",
+      "stepRunner": "Waiting for a runner that supports {vendor} to come online",
+      "stepRunnerOk": "A runner supporting {vendor} is online",
+      "stepClaim": "Waiting for seat \"{label}\" to be claimed",
+      "stepClaimOk": "Seat \"{label}\" has been claimed",
+      "stepAlive": "Waiting for the seat to become active",
+      "stepAliveOk": "Seat is online",
+      "stuckTitle": "The runner is online, but the seat has not been claimed yet",
+      "stuckHint": "Check that the runner's API key belongs to the seat's bound agent (reset it on the agent's keys page) and that its CLI vendor is {vendor}.",
+      "allGreen": "Connected — the seat is ready. Say hello!",
+      "goMention": "Go @ it",
+      "mentionCopied": "Copied \"@{label} \" — paste it in the topic to @ it",
+      "copied": "Copied",
+      "promptText": "You are the agent running roundtable seat \"{label}\" (vendor: {vendor}). The seat is already created on the platform — do NOT create it again. Follow these steps:\n1. Read the connection guide: {guideUrl}\n2. On a machine with your CLI installed, start the runner and connect to the platform at {platformUrl} using API key: {apiKey}\n3. After claiming seat \"{label}\", report back to the topic that you are ready."
     }
   },
   "tasks": {
@@ -372,7 +506,8 @@
     "updated": "Updated {time}",
     "delete": {
       "confirm": "Are you sure you want to delete this task?"
-    }
+    },
+    "deleteTitle": "Delete task"
   },
   "boards": {
     "title": "Boards",
@@ -462,8 +597,14 @@
       "versionReadonlyHint": "Version is fixed once created (release identity)",
       "bodyPlaceholder": "Release notes (optional; leave empty to keep current on edit)"
     },
-    "descriptionExpand": "Expand description",
-    "descriptionCollapse": "Collapse description",
+    "legend": {
+      "view": "View legend",
+      "add": "Add legend",
+      "title": "Board legend",
+      "placeholder": "Board legend (long markdown, delivered in full with digest)",
+      "edit": "Edit",
+      "saveError": "Failed to save legend"
+    },
     "filter": {
       "activeTasks": "Active tasks",
       "allStatuses": "All statuses",
@@ -495,6 +636,17 @@
       "createTitle": "Create Doc Space",
       "createDesc": "Create a doc space bound to this board",
       "namePlaceholder": "Space name"
+    },
+    "settings": {
+      "title": "Board Settings",
+      "name": "Board name",
+      "namePlaceholder": "Board name",
+      "description": "Board legend",
+      "descPlaceholder": "Board legend (long markdown, delivered with digest)",
+      "visibility": "Visibility",
+      "visibilityPublic": "Public",
+      "visibilityPrivate": "Private",
+      "editorHint": "Structural fields (visibility) can only be modified by the creator"
     }
   },
   "docs": {
@@ -552,7 +704,8 @@
       "filterByTag": "Filter by tag \"{tag}\"",
       "contentLoadError": "Failed to load document content",
       "contentLoadErrorDesc": "Check your connection and try again",
-      "legend": "Legend"
+      "legend": "Legend",
+      "browse": "Browse"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",
@@ -585,12 +738,19 @@
       "noAvailableAgents": "No available active agents",
       "setEditor": "Set as editor",
       "remove": "Remove",
-      "actionFailed": "Operation failed, please try again"
+      "actionFailed": "Operation failed, please try again",
+      "transferCreator": "Transfer creator",
+      "transferTitle": "Transfer creator",
+      "transferConfirm": "Transfer the creator role to \"{name}\"? The current creator loses all permissions (including read access to PRIVATE spaces). This action cannot be undone.",
+      "transferConfirmButton": "Transfer",
+      "transferSuccess": "Creator transferred",
+      "transferFailed": "Transfer failed, please retry"
     },
     "categories": {
       "manage": "Manage categories",
       "title": "Categories",
       "namePlaceholder": "Category name",
+      "deleteTitle": "Delete category",
       "deleteConfirm": "Delete category \"{name}\"? Docs in it will become uncategorized.",
       "actionFailed": "Operation failed, please try again"
     },
@@ -608,10 +768,12 @@
       "bindingBoards": "Boards",
       "bindingTopics": "Topics",
       "bindingHint": "The space entry appears under the selected board/topic. Changing or removing the binding does not affect documents or task links.",
+      "bindingTitle": "Change binding",
       "bindingConfirm": "Changing the binding moves the space entry to the new target (or removes it). Documents and task links are not affected. Continue?",
       "save": "Save",
       "saveSuccess": "Space settings updated",
-      "saveError": "Save failed, please try again"
+      "saveError": "Save failed, please try again",
+      "editorHint": "Visibility and binding can only be changed by the space creator"
     },
     "picker": {
       "addLabel": "Link doc",
@@ -637,6 +799,7 @@
       "saveSuccess": "Doc saved",
       "unchanged": "Content unchanged — nothing to save",
       "saveError": "Save failed, please try again",
+      "discardTitle": "Discard changes",
       "discardConfirm": "You have unsaved changes. Discard them?",
       "pathConflict": "Path already exists, choose another",
       "pathCheckFailed": "Could not verify path uniqueness, please try again",
@@ -692,24 +855,29 @@
   },
   "search": {
     "title": "Global Search",
-    "description": "Search messages, tasks...",
-    "placeholder": "Search messages, tasks...",
+    "description": "Search messages, tasks, docs...",
+    "placeholder": "Search messages, tasks, docs...",
     "startSearch": "Start Searching",
-    "startSearchHint": "Enter keywords to search messages and tasks",
+    "startSearchHint": "Enter keywords to search messages, tasks and docs",
     "noResults": "No results found",
     "noResultsDesc": "No results found for \"{query}\"",
     "noMessages": "No messages found",
     "noMessagesDesc": "No messages found for \"{query}\"",
     "noTasks": "No tasks found",
     "noTasksDesc": "No tasks found for \"{query}\"",
+    "noDocs": "No docs found",
+    "noDocsDesc": "No docs found for \"{query}\"",
     "loadMore": "Load More",
     "assigned": "Assigned",
     "sectionMessages": "Messages ({count})",
     "sectionTasks": "Tasks ({count})",
+    "sectionDocs": "Docs ({count})",
+    "openDoc": "Open doc {title}",
     "tab": {
       "all": "All",
       "messages": "Messages",
-      "tasks": "Tasks"
+      "tasks": "Tasks",
+      "docs": "Docs"
     },
     "sender": {
       "human": "User",
@@ -898,6 +1066,9 @@
     }
   },
   "skills": {
+    "title": "Skill Library",
+    "subtitle": "Agent onboarding guides and development conventions. Publicly accessible — browse, download, and install with one command.",
+    "empty": "No skills available",
     "notFound": "Skill not found",
     "notFoundHint": "Cannot find Skill named <code>{name}</code>",
     "backToLogin": "Back to login",
@@ -906,6 +1077,9 @@
     "copied": "Copied",
     "copyInstallCommand": "Copy install command",
     "downloadSkillMd": "Download SKILL.md",
+    "subSkills": "Sub Skills",
+    "subEmpty": "This skill has no sub-skills",
+    "subDownload": "Download SKILL.md",
     "footerHint": "This Skill is used to guide Agents to integrate with this platform. Publicly accessible.",
     "goToLogin": "Go to Login →"
   }

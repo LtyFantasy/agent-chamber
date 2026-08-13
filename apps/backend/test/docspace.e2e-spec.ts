@@ -3,6 +3,7 @@ import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createTestingApp } from './test-setup';
 import { ErrorCode, TaskStatus } from '@agent-chamber/shared';
+import { JwtOrApiKeyGuard } from '../src/common/guards/jwt-or-api-key.guard';
 
 jest.mock('bcrypt', () => ({
   hash: jest.fn().mockResolvedValue('hashed-password'),
@@ -26,14 +27,14 @@ describe('DocSpaceController (e2e)', () => {
   let authToken: string;
 
   // Valid UUID v4 format (version=4, variant=8xxx)
-  const spaceId   = '00000000-0000-4000-8000-000000000100';
-  const boardId   = '00000000-0000-4000-8000-000000000200';
-  const listId    = '00000000-0000-4000-8000-000000000210';
-  const taskId    = '00000000-0000-4000-8000-000000000300';
-  const docId     = '00000000-0000-4000-8000-000000000400';
+  const spaceId = '00000000-0000-4000-8000-000000000100';
+  const boardId = '00000000-0000-4000-8000-000000000200';
+  const listId = '00000000-0000-4000-8000-000000000210';
+  const taskId = '00000000-0000-4000-8000-000000000300';
+  const docId = '00000000-0000-4000-8000-000000000400';
   const sectionId = '00000000-0000-4000-8000-000000000410';
-  const actorId   = '00000000-0000-4000-8000-000000000005';
-  const catId     = '00000000-0000-4000-8000-000000000500';
+  const actorId = '00000000-0000-4000-8000-000000000005';
+  const catId = '00000000-0000-4000-8000-000000000500';
 
   beforeEach(async () => {
     ({ app, mockRepos } = await createTestingApp());
@@ -425,9 +426,7 @@ describe('DocSpaceController (e2e)', () => {
     // 1st: outer wrapper search
     // 2nd: ts_headline snippet
     const mgr: any = mockRepos.DocSection.manager;
-    mgr.createQueryBuilder = jest.fn()
-      .mockReturnValueOnce(searchQb)
-      .mockReturnValue(headlineQb);
+    mgr.createQueryBuilder = jest.fn().mockReturnValueOnce(searchQb).mockReturnValue(headlineQb);
 
     // Also, the sectionRepo.findOne for the fallback snippet
     mockRepos.DocSection.findOne.mockResolvedValue(null);
@@ -543,9 +542,9 @@ describe('DocSpaceController (e2e)', () => {
     const updateQb = genericQb({ execute: jest.fn().mockResolvedValue({ affected: 1 }) });
 
     mockRepos.Doc.createQueryBuilder
-      .mockReturnValueOnce(docFindQb)  // (a) controller findById
-      .mockReturnValueOnce(docFindQb)  // (b) service.remove findById
-      .mockReturnValue(updateQb);      // (c) soft-delete update
+      .mockReturnValueOnce(docFindQb) // (a) controller findById
+      .mockReturnValueOnce(docFindQb) // (b) service.remove findById
+      .mockReturnValue(updateQb); // (c) soft-delete update
 
     // DocSpaceService.findById
     mockRepos.DocSpace.findOne.mockResolvedValue(space);
@@ -599,7 +598,8 @@ describe('DocSpaceController (e2e)', () => {
     });
     const updateQb = genericQb({ execute: jest.fn().mockResolvedValue({ affected: 1 }) });
     const dsManager: any = mockRepos.DocSpace.manager;
-    dsManager.createQueryBuilder = jest.fn()
+    dsManager.createQueryBuilder = jest
+      .fn()
       .mockReturnValueOnce(sectionSelectQb)
       .mockReturnValue(updateQb);
 
@@ -699,7 +699,8 @@ describe('DocSpaceController (e2e)', () => {
     });
     const updateQb = genericQb({ execute: jest.fn().mockResolvedValue({ affected: 1 }) });
     const dsManager: any = mockRepos.DocSpace.manager;
-    dsManager.createQueryBuilder = jest.fn()
+    dsManager.createQueryBuilder = jest
+      .fn()
       .mockReturnValueOnce(sectionSelectQb)
       .mockReturnValue(updateQb);
 
@@ -709,6 +710,148 @@ describe('DocSpaceController (e2e)', () => {
       .expect(200)
       .expect((res: any) => {
         expect(res.body.data).toHaveProperty('deleted', true);
+      });
+  });
+
+  // ==================== v1.45 DOCSPACE-PERM：update 字段级分权 + creator 转让 ====================
+  // R4：旧 creator 断言一律用非 admin 身份（observer 用户），防 admin bypass 污染判定。
+
+  it('PATCH /doc-spaces/:id - editor 可改 name/description（内容字段走 policy write）', async () => {
+    // 空间创建者是别人（非测试 actor），actor 以 editor 成员身份访问
+    mockRepos.DocSpace.findOne.mockResolvedValue(
+      makeSpace({ creatorId: '00000000-0000-4000-8000-0000000000bb' }),
+    );
+    // policy write：member 行 role=editor → 放行
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue({ role: 'editor' });
+
+    return request(app.getHttpServer())
+      .patch(`/doc-spaces/${spaceId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ name: 'Editor Renamed', description: 'Editor written legend' })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('name', 'Editor Renamed');
+        expect(res.body.data).toHaveProperty('description', 'Editor written legend');
+      });
+  });
+
+  it('PATCH /doc-spaces/:id - editor PATCH visibility → 403（结构字段 creator-only，R1 消息列字段名）', async () => {
+    mockRepos.DocSpace.findOne.mockResolvedValue(
+      makeSpace({ creatorId: '00000000-0000-4000-8000-0000000000bb' }),
+    );
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue({ role: 'editor' });
+    // owner-proxy 未命中（Agent.exists 显式 false；mock repo 默认无 exists 方法，不设会 500）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch(`/doc-spaces/${spaceId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ visibility: 'private' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+        expect(res.body.message).toContain('visibility');
+      });
+  });
+
+  it('POST /doc-spaces/:id/transfer-creator - creator 转让给 agent：新 creator（agent 身份）可改 visibility，旧 creator 403', async () => {
+    const newCreatorAgentId = '00000000-0000-4000-8000-0000000000dd';
+    // 旧 creator = 测试 observer 用户（非 admin，R4）
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    // 双层校验第二层：目标存在性 → actors 表 findOne（ACTOR_NOT_FOUND）
+    mockRepos.Actor.findOne.mockResolvedValue({ id: newCreatorAgentId, type: 'agent' });
+    // owner-proxy 未命中（mock repo 默认无 exists 方法，不设会 500）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+    // transfer 响应走 enrich（memberRepo.find/categoryRepo.find 默认 []，count 需 getRawOne）
+    const countQb = genericQb({ getRawOne: jest.fn().mockResolvedValue({ count: '0' }) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(countQb);
+    mockRepos.TaskDocLink.createQueryBuilder.mockReturnValue(countQb);
+
+    // 转让：creator 闸门命中（creatorId === actor.id）→ service 置 creatorId 并 save
+    await request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/transfer-creator`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ newCreatorId: newCreatorAgentId })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('creatorId', newCreatorAgentId);
+      });
+
+    // 旧 creator 的 member 行被删（干净交接：memberRepo.delete 被调）
+    expect(mockRepos.DocSpaceMember.delete).toHaveBeenCalledWith({
+      spaceId,
+      actorId: newCreatorAgentId,
+    });
+
+    // ── 新 creator（agent 身份，API key → req.agent）PATCH visibility 成功 ──
+    const guard: any = app.get(JwtOrApiKeyGuard);
+    const originalCanActivate = guard.canActivate;
+    guard.canActivate = (context: any) => {
+      const req = context.switchToHttp().getRequest();
+      req.user = undefined;
+      req.agent = { id: newCreatorAgentId, name: 'Transfer Target Agent', permissions: ['*'] };
+      return true;
+    };
+    try {
+      mockRepos.DocSpace.findOne.mockResolvedValue({
+        ...space,
+        creatorId: newCreatorAgentId,
+      });
+      await request(app.getHttpServer())
+        .patch(`/doc-spaces/${spaceId}`)
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ visibility: 'private' })
+        .expect(200)
+        .expect((res: any) => {
+          expect(res.body.data).toHaveProperty('creatorId', newCreatorAgentId);
+          expect(res.body.data.settings).toHaveProperty('visibility', 'private');
+        });
+    } finally {
+      guard.canActivate = originalCanActivate;
+    }
+
+    // ── 旧 creator（人类 observer）再 PATCH visibility → 403（已非 creator，owner-proxy 未命中）──
+    mockRepos.DocSpace.findOne.mockResolvedValue({ ...space, creatorId: newCreatorAgentId });
+    return request(app.getHttpServer())
+      .patch(`/doc-spaces/${spaceId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ visibility: 'private' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+      });
+  });
+
+  it('POST /doc-spaces/:id/transfer-creator - 目标 actor 不存在 → 404 ACTOR_NOT_FOUND', async () => {
+    mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+    // Actor.findOne 默认 undefined → resourceValidator 抛 404
+    mockRepos.Actor.findOne.mockResolvedValue(undefined);
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/transfer-creator`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ newCreatorId: '00000000-0000-4000-8000-0000000000ee' })
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.ACTOR_NOT_FOUND);
+      });
+  });
+
+  it('POST /doc-spaces/:id/transfer-creator - 转给自己 → 409 RESOURCE_CONFLICT', async () => {
+    mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+    // 目标存在（自己也是合法 actor），但已是 creator → 409
+    mockRepos.Actor.findOne.mockResolvedValue({ id: actorId, type: 'human' });
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/transfer-creator`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ newCreatorId: actorId })
+      .expect(409)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.RESOURCE_CONFLICT);
       });
   });
 
@@ -1091,7 +1234,9 @@ describe('DocSpaceController (e2e)', () => {
     mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
 
     // doc 存在但属于其他空间（空间归属不符）
-    mockRepos.Doc.findOne.mockResolvedValue(makeDoc({ spaceId: '00000000-0000-4000-8000-000000000999' }));
+    mockRepos.Doc.findOne.mockResolvedValue(
+      makeDoc({ spaceId: '00000000-0000-4000-8000-000000000999' }),
+    );
 
     return request(app.getHttpServer())
       .post(`/doc-spaces/${spaceId}/routes`)

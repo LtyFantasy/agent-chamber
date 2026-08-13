@@ -37,10 +37,15 @@ import { Message } from '../../database/entities/message.entity';
 import { Task } from '../../database/entities/task.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
+import { Doc } from '../../database/entities/doc.entity';
+import { DocSearchService } from '../docspace/doc-search.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { SearchQueryDto, SearchType } from './dto';
-import type { PaginatedResponse } from '@agent-chamber/shared';
+import type { PaginatedResponse, DocSearchHitWithSpace } from '@agent-chamber/shared';
+
+/** 全局搜索文档一路的固定返回条数（对齐空间内搜索 MAX_LIMIT=20，非分页 MVP 决策） */
+const GLOBAL_DOC_SEARCH_LIMIT = 20;
 
 /**
  * 消息搜索结果（摘要视图）
@@ -117,6 +122,8 @@ export interface TaskSearchResult {
 export interface SearchResponse {
   messages: PaginatedResponse<MessageSearchResult> | null;
   tasks: PaginatedResponse<TaskSearchResult> | null;
+  /** 文档搜索结果（非分页数组，固定 limit 20） */
+  docs: DocSearchHitWithSpace[] | null;
 }
 
 /**
@@ -126,8 +133,8 @@ export interface SearchResponse {
  * 触发器自动维护 search_vector（见 migration AddSearchVectorTriggers）。
  *
  * 权限模型：
- * - 通过 AccessQueryService 计算当前 actor 可访问的 topic/board 白名单
- * - 再用白名单 IN 过滤消息/任务，避免 JOIN 条件误放行
+ * - 通过 AccessQueryService 计算当前 actor 可访问的 topic/board/docspace 白名单
+ * - 再用白名单 IN 过滤消息/任务，文档一路复用 DocSearchService（同款白名单语义）
  */
 @Injectable()
 export class SearchService {
@@ -140,13 +147,16 @@ export class SearchService {
     private agentRepo: Repository<Agent>,
     @InjectRepository(User)
     private userRepo: Repository<User>,
+    @InjectRepository(Doc)
+    private docRepo: Repository<Doc>,
     private accessQuery: AccessQueryService,
+    private docSearchService: DocSearchService,
   ) {}
 
   /**
    * 执行全文搜索
    * @param dto 搜索查询参数
-   * @returns 按类型分组的分页搜索结果
+   * @returns 按类型分组的分页搜索结果（docs 一路为非分页数组）
    */
   async search(dto: SearchQueryDto, actor?: UnifiedActor): Promise<SearchResponse> {
     const { q, type, page = 1, pageSize = 20 } = dto;
@@ -154,7 +164,8 @@ export class SearchService {
     const promises: [
       Promise<PaginatedResponse<MessageSearchResult>> | undefined,
       Promise<PaginatedResponse<TaskSearchResult>> | undefined,
-    ] = [undefined, undefined];
+      Promise<DocSearchHitWithSpace[]> | undefined,
+    ] = [undefined, undefined, undefined];
 
     if (type === SearchType.ALL || type === SearchType.MESSAGES) {
       promises[0] = this.searchMessages(q, page, pageSize, actor);
@@ -162,12 +173,16 @@ export class SearchService {
     if (type === SearchType.ALL || type === SearchType.TASKS) {
       promises[1] = this.searchTasks(q, page, pageSize, actor);
     }
+    if (type === SearchType.ALL || type === SearchType.DOCS) {
+      promises[2] = this.searchDocs(q, actor);
+    }
 
-    const [messages, tasks] = await Promise.all(promises);
+    const [messages, tasks, docs] = await Promise.all(promises);
 
     return {
       messages: messages ?? null,
       tasks: tasks ?? null,
+      docs: docs ?? null,
     };
   }
 
@@ -319,6 +334,42 @@ export class SearchService {
     }));
 
     return this.buildPaginatedResponse(items, total, page, pageSize);
+  }
+
+  /**
+   * 搜索文档（跨全部可访问 DocSpace）
+   *
+   * 复用 DocSpace 模块的 DocSearchService（双评分 + 意图融合 + 白名单过滤），
+   * limit 固定 20 条（对齐空间内搜索 MAX_LIMIT=20，非分页 MVP 决策）。
+   * 命中项补 spaceId（跳转 /docs/:spaceId?doc=:docId 必需）：
+   * DocSearchHit 不含 spaceId，按 docId 批量反查 docs 表避免 N+1。
+   *
+   * 权限过滤：
+   * - Admin（getAccessibleDocSpaceIds 返回 null）→ 全量空间
+   * - 普通用户 → 可访问空间白名单；空白名单由 DocSearchService 内部短路返回 []
+   */
+  private async searchDocs(q: string, actor?: UnifiedActor): Promise<DocSearchHitWithSpace[]> {
+    const accessibleSpaceIds = await this.accessQuery.getAccessibleDocSpaceIds(actor);
+    const hits = await this.docSearchService.search(accessibleSpaceIds, {
+      q,
+      limit: GLOBAL_DOC_SEARCH_LIMIT,
+    });
+
+    if (hits.length === 0) return [];
+
+    // 批量补 spaceId：一次 find 拉齐命中 doc 的空间归属（DocSearchService 已过滤权限，
+    // 这里只做归属投影；'' 兜底理论上不可达，防御性保证跳转地址字段恒为 string）
+    const docIds = [...new Set(hits.map((h) => h.docId))];
+    const docs = await this.docRepo.find({
+      select: ['id', 'spaceId'],
+      where: { id: In(docIds) },
+    });
+    const spaceByDocId = new Map(docs.map((d) => [d.id, d.spaceId]));
+
+    return hits.map((hit) => ({
+      ...hit,
+      spaceId: spaceByDocId.get(hit.docId) ?? '',
+    }));
   }
 
   /**

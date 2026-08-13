@@ -11,7 +11,18 @@ import { BoardMember } from '../../database/entities/board-member.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { Milestone } from '../../database/entities/milestone.entity';
-import { Visibility, ErrorCode, ActorType, UserRole, TaskStatus, BoardMemberRole, EventType, Priority } from '@agent-chamber/shared';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
+import { Message } from '../../database/entities/message.entity';
+import {
+  Visibility,
+  ErrorCode,
+  ActorType,
+  UserRole,
+  TaskStatus,
+  BoardMemberRole,
+  EventType,
+  Priority,
+} from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { NotFoundException, ConflictException } from '@nestjs/common';
 import { SelectQueryBuilder } from 'typeorm';
@@ -37,6 +48,8 @@ describe('BoardService', () => {
   let docSpaceRepo: jest.Mocked<Repository<DocSpace>>;
   let docRepo: jest.Mocked<Repository<Doc>>;
   let milestoneRepo: jest.Mocked<Repository<Milestone>>;
+  let seatRepo: jest.Mocked<Repository<RoundtableSeat>>;
+  let messageRepo: jest.Mocked<Repository<Message>>;
 
   beforeEach(() => {
     accessQuery = {
@@ -86,6 +99,8 @@ describe('BoardService', () => {
     } as unknown as jest.Mocked<Repository<Task>>;
     topicRepo = {
       findOne: jest.fn(),
+      // v1.44.0-dev digest roundtable 段：圆桌 topic 数（零态默认 0）
+      count: jest.fn().mockResolvedValue(0),
     } as unknown as jest.Mocked<Repository<Topic>>;
     memberRepo = {
       find: jest.fn(),
@@ -152,6 +167,19 @@ describe('BoardService', () => {
     milestoneRepo = {
       find: jest.fn().mockResolvedValue([]),
     } as unknown as jest.Mocked<Repository<Milestone>>;
+    // v1.44.0-dev digest roundtable 段：座位 repo（count/find 零态默认——无圆桌时全零）
+    seatRepo = {
+      count: jest.fn().mockResolvedValue(0),
+      find: jest.fn().mockResolvedValue([]),
+    } as unknown as jest.Mocked<Repository<RoundtableSeat>>;
+    // v1.44.0-dev digest roundtable 段：座位消息计数（零态默认 0；全时段 → 7 天窗口两次 getCount）
+    messageRepo = {
+      createQueryBuilder: jest.fn(() => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(0),
+      })),
+    } as unknown as jest.Mocked<Repository<Message>>;
 
     service = new BoardService(
       boardRepo,
@@ -169,6 +197,8 @@ describe('BoardService', () => {
       docSpaceRepo,
       docRepo,
       milestoneRepo,
+      seatRepo,
+      messageRepo,
     );
   });
 
@@ -192,22 +222,54 @@ describe('BoardService', () => {
         settings: { visibility: Visibility.PRIVATE },
       });
       memberRepo.find.mockResolvedValue([
-        { boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.MEMBER, invitedBy: 'creator-1', createdAt: new Date() } as BoardMember,
-        { boardId: 'board-1', actorId: 'agent-2', role: BoardMemberRole.MEMBER, invitedBy: 'creator-1', createdAt: new Date() } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-1',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-2',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
       ]);
       actorRepo.find.mockResolvedValue([
         { id: 'agent-1', type: ActorType.AGENT } as Actor,
         { id: 'agent-2', type: ActorType.AGENT } as Actor,
       ]);
       agentRepo.find.mockResolvedValue([
-        { id: 'agent-1', name: 'Kimi', avatarUrl: null, status: 'active', description: null } as any,
-        { id: 'agent-2', name: 'DeepSeek', avatarUrl: null, status: 'active', description: null } as any,
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
+        {
+          id: 'agent-2',
+          name: 'DeepSeek',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
       ]);
       const result = await service.enrich(board);
       expect(result.visibility).toBe(Visibility.PRIVATE);
       expect(result.members).toHaveLength(2);
-      expect(result.members![0]).toMatchObject({ id: 'agent-1', name: 'Kimi', role: BoardMemberRole.MEMBER });
-      expect(result.members![1]).toMatchObject({ id: 'agent-2', name: 'DeepSeek', role: BoardMemberRole.MEMBER });
+      expect(result.members![0]).toMatchObject({
+        id: 'agent-1',
+        name: 'Kimi',
+        role: BoardMemberRole.MEMBER,
+      });
+      expect(result.members![1]).toMatchObject({
+        id: 'agent-2',
+        name: 'DeepSeek',
+        role: BoardMemberRole.MEMBER,
+      });
     });
 
     it('returns empty members when board has no members', async () => {
@@ -222,16 +284,40 @@ describe('BoardService', () => {
         settings: { visibility: Visibility.OPEN },
       });
       memberRepo.find.mockResolvedValue([
-        { boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.EDITOR, invitedBy: 'creator-1', createdAt: new Date() } as BoardMember,
-        { boardId: 'board-1', actorId: 'agent-2', role: BoardMemberRole.EDITOR, invitedBy: 'creator-1', createdAt: new Date() } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-1',
+          role: BoardMemberRole.EDITOR,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-2',
+          role: BoardMemberRole.EDITOR,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
       ]);
       actorRepo.find.mockResolvedValue([
         { id: 'agent-1', type: ActorType.AGENT } as Actor,
         { id: 'agent-2', type: ActorType.AGENT } as Actor,
       ]);
       agentRepo.find.mockResolvedValue([
-        { id: 'agent-1', name: 'Kimi', avatarUrl: null, status: 'active', description: null } as any,
-        { id: 'agent-2', name: 'DeepSeek', avatarUrl: null, status: 'active', description: null } as any,
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
+        {
+          id: 'agent-2',
+          name: 'DeepSeek',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
       ]);
       const result = await service.enrich(board);
       expect(result.members).toHaveLength(2);
@@ -244,21 +330,61 @@ describe('BoardService', () => {
         settings: { visibility: Visibility.OPEN },
       });
       memberRepo.find.mockResolvedValue([
-        { boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.EDITOR, invitedBy: 'creator-1', createdAt: new Date('2024-01-01') } as BoardMember,
-        { boardId: 'board-1', actorId: 'agent-2', role: BoardMemberRole.MEMBER, invitedBy: 'creator-1', createdAt: new Date('2024-01-02') } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-1',
+          role: BoardMemberRole.EDITOR,
+          invitedBy: 'creator-1',
+          createdAt: new Date('2024-01-01'),
+        } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-2',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: new Date('2024-01-02'),
+        } as BoardMember,
       ]);
       actorRepo.find.mockResolvedValue([
         { id: 'agent-1', type: ActorType.AGENT } as Actor,
         { id: 'agent-2', type: ActorType.AGENT } as Actor,
       ]);
       agentRepo.find.mockResolvedValue([
-        { id: 'agent-1', name: 'Kimi', avatarUrl: 'https://a.com/1.png', status: 'active', description: null } as any,
-        { id: 'agent-2', name: 'DeepSeek', avatarUrl: 'https://a.com/2.png', status: 'pending', description: null } as any,
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          avatarUrl: 'https://a.com/1.png',
+          status: 'active',
+          description: null,
+        } as any,
+        {
+          id: 'agent-2',
+          name: 'DeepSeek',
+          avatarUrl: 'https://a.com/2.png',
+          status: 'pending',
+          description: null,
+        } as any,
       ]);
       const result = await service.enrich(board);
       expect(result.members).toEqual([
-        { id: 'agent-1', name: 'Kimi', type: 'agent', avatarUrl: 'https://a.com/1.png', role: BoardMemberRole.EDITOR, invitedBy: 'creator-1', createdAt: expect.any(Date) },
-        { id: 'agent-2', name: 'DeepSeek', type: 'agent', avatarUrl: 'https://a.com/2.png', role: BoardMemberRole.MEMBER, invitedBy: 'creator-1', createdAt: expect.any(Date) },
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          type: 'agent',
+          avatarUrl: 'https://a.com/1.png',
+          role: BoardMemberRole.EDITOR,
+          invitedBy: 'creator-1',
+          createdAt: expect.any(Date),
+        },
+        {
+          id: 'agent-2',
+          name: 'DeepSeek',
+          type: 'agent',
+          avatarUrl: 'https://a.com/2.png',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: expect.any(Date),
+        },
       ]);
     });
 
@@ -267,16 +393,19 @@ describe('BoardService', () => {
         settings: { visibility: Visibility.OPEN },
       });
       memberRepo.find.mockResolvedValue([
-        { boardId: 'board-1', actorId: 'agent-missing', role: BoardMemberRole.MEMBER, invitedBy: 'creator-1', createdAt: new Date() } as BoardMember,
+        {
+          boardId: 'board-1',
+          actorId: 'agent-missing',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
       ]);
-      actorRepo.find.mockResolvedValue([
-        { id: 'agent-missing', type: ActorType.AGENT } as Actor,
-      ]);
+      actorRepo.find.mockResolvedValue([{ id: 'agent-missing', type: ActorType.AGENT } as Actor]);
       agentRepo.find.mockResolvedValue([]);
       const result = await service.enrich(board);
       expect(result.members![0]).toMatchObject({ id: 'agent-missing', name: 'Unknown Agent' });
     });
-
   });
 
   describe('enrich lists', () => {
@@ -355,12 +484,10 @@ describe('BoardService', () => {
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         groupBy: jest.fn().mockReturnThis(),
-        getRawMany: jest
-          .fn()
-          .mockResolvedValue([
-            { listId: 'list-1', count: '3' },
-            { listId: 'list-2', count: '5' },
-          ]),
+        getRawMany: jest.fn().mockResolvedValue([
+          { listId: 'list-1', count: '3' },
+          { listId: 'list-2', count: '5' },
+        ]),
       } as any);
 
       const result = await service.findLists('board-1');
@@ -525,9 +652,7 @@ describe('BoardService', () => {
         addSelect: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
         groupBy: jest.fn().mockReturnThis(),
-        getRawMany: jest.fn().mockResolvedValue([
-          { boardId: 'board-1', count: '2' },
-        ]),
+        getRawMany: jest.fn().mockResolvedValue([{ boardId: 'board-1', count: '2' }]),
       } as any);
 
       const result = await service.findAll();
@@ -655,7 +780,10 @@ describe('BoardService', () => {
         settings: { visibility: Visibility.OPEN },
       } as unknown as Topic);
       resourceValidator.existsMany.mockRejectedValue(
-        new NotFoundException({ message: 'Some resources not found', code: ErrorCode.AGENT_NOT_FOUND }),
+        new NotFoundException({
+          message: 'Some resources not found',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(
@@ -685,7 +813,10 @@ describe('BoardService', () => {
       const board = makeBoard();
       boardRepo.findOne.mockResolvedValue(board);
       resourceValidator.existsMany.mockRejectedValue(
-        new NotFoundException({ message: 'Some resources not found', code: ErrorCode.AGENT_NOT_FOUND }),
+        new NotFoundException({
+          message: 'Some resources not found',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(
@@ -700,10 +831,17 @@ describe('BoardService', () => {
       memberRepo.find
         // 第一次调用：currentMembers（role='member'）
         .mockResolvedValueOnce([
-          { boardId: 'board-1', actorId: 'agent-member', role: BoardMemberRole.MEMBER } as BoardMember,
+          {
+            boardId: 'board-1',
+            actorId: 'agent-member',
+            role: BoardMemberRole.MEMBER,
+          } as BoardMember,
         ])
         // 第二次调用：existingAll（任意 role）
-        .mockResolvedValueOnce([{ actorId: 'agent-editor' }, { actorId: 'agent-member' }] as BoardMember[]);
+        .mockResolvedValueOnce([
+          { actorId: 'agent-editor' },
+          { actorId: 'agent-member' },
+        ] as BoardMember[]);
 
       await service.update('board-1', { invitedAgentIds: ['agent-editor', 'agent-new'] } as any);
 
@@ -767,7 +905,9 @@ describe('BoardService', () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
       memberRepo.findOne.mockResolvedValue({
-        boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.MEMBER,
+        boardId: 'board-1',
+        actorId: 'agent-1',
+        role: BoardMemberRole.MEMBER,
       } as BoardMember);
 
       await expect(service.inviteAgent('board-1', 'agent-1')).rejects.toThrow(ConflictException);
@@ -793,7 +933,9 @@ describe('BoardService', () => {
       });
       boardRepo.findOne.mockResolvedValue(board);
       memberRepo.findOne.mockResolvedValue({
-        boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.MEMBER,
+        boardId: 'board-1',
+        actorId: 'agent-1',
+        role: BoardMemberRole.MEMBER,
       } as BoardMember);
 
       const result = await service.uninviteAgent('board-1', 'agent-1');
@@ -820,9 +962,7 @@ describe('BoardService', () => {
       boardRepo.findOne.mockResolvedValue(board);
       memberRepo.findOne.mockResolvedValue(null);
 
-      await expect(service.uninviteAgent('board-1', 'agent-2')).rejects.toThrow(
-        ConflictException,
-      );
+      await expect(service.uninviteAgent('board-1', 'agent-2')).rejects.toThrow(ConflictException);
     });
 
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
@@ -873,7 +1013,9 @@ describe('BoardService', () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
       memberRepo.findOne.mockResolvedValue({
-        boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.EDITOR,
+        boardId: 'board-1',
+        actorId: 'agent-1',
+        role: BoardMemberRole.EDITOR,
       } as BoardMember);
 
       await expect(service.addEditor('board-1', 'agent-1')).rejects.toThrow(ConflictException);
@@ -897,13 +1039,17 @@ describe('BoardService', () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
       memberRepo.findOne.mockResolvedValue({
-        boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.EDITOR,
+        boardId: 'board-1',
+        actorId: 'agent-1',
+        role: BoardMemberRole.EDITOR,
       } as BoardMember);
 
       const result = await service.removeEditor('board-1', 'agent-1');
 
       expect(memberRepo.delete).toHaveBeenCalledWith({
-        boardId: 'board-1', actorId: 'agent-1', role: BoardMemberRole.EDITOR,
+        boardId: 'board-1',
+        actorId: 'agent-1',
+        role: BoardMemberRole.EDITOR,
       });
       expect(eventService.create).toHaveBeenCalledWith({
         eventType: EventType.AGENT_LEFT,
@@ -1032,23 +1178,26 @@ describe('BoardService', () => {
         makeBoard({ id: 'board-1', description: '## 项目图例\n\n由 PM 维护。' }),
       );
       listRepo.find.mockResolvedValue([makeList()] as unknown as BoardList[]);
-      taskRepo.createQueryBuilder.mockImplementation(() => ({
-        select: jest.fn().mockReturnThis(),
-        addSelect: jest.fn().mockReturnThis(),
-        innerJoin: jest.fn().mockReturnThis(),
-        where: jest.fn().mockReturnThis(),
-        andWhere: jest.fn().mockReturnThis(),
-        setParameter: jest.fn().mockReturnThis(),
-        groupBy: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        addOrderBy: jest.fn().mockReturnThis(),
-        take: jest.fn().mockReturnThis(),
-        getRawMany: jest.fn().mockResolvedValue(opts.listCounts ?? []),
-        getRawOne: jest
-          .fn()
-          .mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
-        getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
-      }) as any);
+      taskRepo.createQueryBuilder.mockImplementation(
+        () =>
+          ({
+            select: jest.fn().mockReturnThis(),
+            addSelect: jest.fn().mockReturnThis(),
+            innerJoin: jest.fn().mockReturnThis(),
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            setParameter: jest.fn().mockReturnThis(),
+            groupBy: jest.fn().mockReturnThis(),
+            orderBy: jest.fn().mockReturnThis(),
+            addOrderBy: jest.fn().mockReturnThis(),
+            take: jest.fn().mockReturnThis(),
+            getRawMany: jest.fn().mockResolvedValue(opts.listCounts ?? []),
+            getRawOne: jest
+              .fn()
+              .mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
+            getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
+          }) as any,
+      );
       taskRepo.find.mockImplementation(((query: any) => {
         if (query?.where?.milestoneId !== undefined) {
           return Promise.resolve(opts.milestoneTasks ?? []);
@@ -1060,17 +1209,26 @@ describe('BoardService', () => {
       }) as any);
       milestoneRepo.find.mockResolvedValue(opts.milestones ?? []);
       docSpaceRepo.findOne.mockResolvedValue(opts.space ?? null);
-      docRepo.createQueryBuilder.mockImplementation(() => ({
-        where: jest.fn().mockReturnThis(),
-        andWhere: jest.fn().mockReturnThis(),
-        orderBy: jest.fn().mockReturnThis(),
-        take: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue(opts.docs ?? []),
-      }) as any);
+      docRepo.createQueryBuilder.mockImplementation(
+        () =>
+          ({
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            orderBy: jest.fn().mockReturnThis(),
+            take: jest.fn().mockReturnThis(),
+            getMany: jest.fn().mockResolvedValue(opts.docs ?? []),
+          }) as any,
+      );
       // assignee 解析：agent-1 → Kimi
       actorRepo.find.mockResolvedValue([{ id: 'agent-1', type: ActorType.AGENT } as Actor]);
       agentRepo.find.mockResolvedValue([
-        { id: 'agent-1', name: 'Kimi', avatarUrl: null, status: 'active', description: null } as any,
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
       ]);
       userRepo.find.mockResolvedValue([]);
     };
@@ -1081,17 +1239,37 @@ describe('BoardService', () => {
           makeTaskRow({ id: 't1', title: 'Fix auth', priority: Priority.P0, labels: ['bug'] }),
           makeTaskRow({ id: 't2', title: 'Refactor', priority: Priority.P2 }),
         ],
-        riskRows: [makeTaskRow({ id: 't1', title: 'Fix auth', priority: Priority.P0, labels: ['bug'] })],
+        riskRows: [
+          makeTaskRow({ id: 't1', title: 'Fix auth', priority: Priority.P0, labels: ['bug'] }),
+        ],
         doneRows: [
-          makeTaskRow({ id: 't9', title: 'Ship digest', status: TaskStatus.DONE, completedAt: new Date('2024-01-05') }),
-          makeTaskRow({ id: 't8', title: 'Ship overview', status: TaskStatus.DONE, completedAt: new Date('2024-01-04') }),
+          makeTaskRow({
+            id: 't9',
+            title: 'Ship digest',
+            status: TaskStatus.DONE,
+            completedAt: new Date('2024-01-05'),
+          }),
+          makeTaskRow({
+            id: 't8',
+            title: 'Ship overview',
+            status: TaskStatus.DONE,
+            completedAt: new Date('2024-01-04'),
+          }),
         ],
         milestoneTasks: [
           makeTaskRow({ id: 't3', milestoneId: 'm1', status: TaskStatus.DONE }),
           makeTaskRow({ id: 't4', milestoneId: 'm1', status: TaskStatus.IN_PROGRESS }),
           makeTaskRow({ id: 't5', milestoneId: 'm1', status: TaskStatus.BACKLOG }),
         ],
-        milestones: [{ id: 'm1', name: 'v1.41', status: 'active', startDate: new Date('2024-01-01'), targetDate: new Date('2024-02-01') }],
+        milestones: [
+          {
+            id: 'm1',
+            name: 'v1.41',
+            status: 'active',
+            startDate: new Date('2024-01-01'),
+            targetDate: new Date('2024-02-01'),
+          },
+        ],
         listCounts: [{ listId: 'list-1', count: '3' }],
         total: '8',
         completed: '2',
@@ -1115,17 +1293,38 @@ describe('BoardService', () => {
       // taskCount 口径 = board 详情（countTasksByBoard 返回值直通）
       expect(result.taskCount).toBe(8);
       expect(result.completedTaskCount).toBe(2);
-      expect(result.lists).toEqual([{ id: 'list-1', name: 'To Do', mappedStatus: 'todo', taskCount: 3 }]);
+      expect(result.lists).toEqual([
+        { id: 'list-1', name: 'To Do', mappedStatus: 'todo', taskCount: 3 },
+      ]);
       // priorityDistribution：open 任务内存聚合（含 0 值形状稳定；t1=P0、t2=P2）
       expect(result.priorityDistribution.open).toEqual({ p0: 1, p1: 0, p2: 1, p3: 0 });
       // nextUp：open 任务 priority 序 + assigneeName 解析
       expect(result.nextUp).toEqual([
-        { id: 't1', title: 'Fix auth', priority: Priority.P0, status: TaskStatus.TODO, assigneeName: 'Kimi' },
-        { id: 't2', title: 'Refactor', priority: Priority.P2, status: TaskStatus.TODO, assigneeName: 'Kimi' },
+        {
+          id: 't1',
+          title: 'Fix auth',
+          priority: Priority.P0,
+          status: TaskStatus.TODO,
+          assigneeName: 'Kimi',
+        },
+        {
+          id: 't2',
+          title: 'Refactor',
+          priority: Priority.P2,
+          status: TaskStatus.TODO,
+          assigneeName: 'Kimi',
+        },
       ]);
       // risks：labels bug 命中；assigneeName 解析
       expect(result.risks).toEqual([
-        { id: 't1', title: 'Fix auth', priority: Priority.P0, status: TaskStatus.TODO, labels: ['bug'], assigneeName: 'Kimi' },
+        {
+          id: 't1',
+          title: 'Fix auth',
+          priority: Priority.P0,
+          status: TaskStatus.TODO,
+          labels: ['bug'],
+          assigneeName: 'Kimi',
+        },
       ]);
       expect(result.recentDone).toHaveLength(2);
       expect(result.recentDone[0].completedAt).toEqual(new Date('2024-01-05'));
@@ -1250,9 +1449,7 @@ describe('BoardService', () => {
 
     it('returns null description when board has no description', async () => {
       setupDigestMocks({});
-      boardRepo.findOne.mockResolvedValue(
-        makeBoard({ id: 'board-1', description: null }),
-      );
+      boardRepo.findOne.mockResolvedValue(makeBoard({ id: 'board-1', description: null }));
 
       const result = await service.getDigest('board-1');
 
@@ -1279,26 +1476,43 @@ describe('BoardService', () => {
     // ── v1.42 versions 版本区：三区口径 + 截断 + 零新查询（内存装配） ──
     it('versions: 无 release（version 全空）→ production/development null + history [] + total 0', async () => {
       setupDigestMocks({
-        milestones: [{ id: 'm1', name: 'v1.41', status: 'active', createdAt: new Date('2024-01-01') }],
+        milestones: [
+          { id: 'm1', name: 'v1.41', status: 'active', createdAt: new Date('2024-01-01') },
+        ],
       });
 
       const result = await service.getDigest('board-1');
 
-      expect(result.versions).toEqual({ production: null, development: null, history: [], total: 0 });
+      expect(result.versions).toEqual({
+        production: null,
+        development: null,
+        history: [],
+        total: 0,
+      });
       expect(result.truncated).toBe(false);
     });
 
     it('versions: 仅 dev release → development 命中、production null、history 含该行', async () => {
       setupDigestMocks({
         milestones: [
-          makeMilestone({ id: 'r1', name: 'v1.42', version: '1.42.0', status: 'dev', createdAt: new Date('2024-02-01') }),
+          makeMilestone({
+            id: 'r1',
+            name: 'v1.42',
+            version: '1.42.0',
+            status: 'dev',
+            createdAt: new Date('2024-02-01'),
+          }),
         ],
       });
 
       const result = await service.getDigest('board-1');
 
       expect(result.versions.production).toBeNull();
-      expect(result.versions.development).toMatchObject({ id: 'r1', version: '1.42.0', status: 'dev' });
+      expect(result.versions.development).toMatchObject({
+        id: 'r1',
+        version: '1.42.0',
+        status: 'dev',
+      });
       expect(result.versions.history).toHaveLength(1);
       expect(result.versions.history[0].version).toBe('1.42.0');
       expect(result.versions.total).toBe(1);
@@ -1308,15 +1522,23 @@ describe('BoardService', () => {
       setupDigestMocks({
         milestones: [
           makeMilestone({
-            id: 'r1', name: 'v1.40', version: '1.40.0', status: 'deployed',
-            deployedAt: new Date('2024-01-01'), createdAt: new Date('2024-01-01'),
+            id: 'r1',
+            name: 'v1.40',
+            version: '1.40.0',
+            status: 'deployed',
+            deployedAt: new Date('2024-01-01'),
+            createdAt: new Date('2024-01-01'),
           }),
         ],
       });
 
       const result = await service.getDigest('board-1');
 
-      expect(result.versions.production).toMatchObject({ id: 'r1', version: '1.40.0', status: 'deployed' });
+      expect(result.versions.production).toMatchObject({
+        id: 'r1',
+        version: '1.40.0',
+        status: 'deployed',
+      });
       expect(result.versions.development).toBeNull();
       expect(result.versions.total).toBe(1);
     });
@@ -1324,10 +1546,34 @@ describe('BoardService', () => {
     it('versions: 混合排序 deployedAt DESC NULLS LAST + createdAt DESC（未部署 release 沉底）', async () => {
       setupDigestMocks({
         milestones: [
-          makeMilestone({ id: 'r1', version: '1.0.0', status: 'deployed', deployedAt: new Date('2024-03-01'), createdAt: new Date('2024-01-01') }),
-          makeMilestone({ id: 'r2', version: '1.1.0', status: 'ready', deployedAt: null, createdAt: new Date('2024-02-01') }),
-          makeMilestone({ id: 'r3', version: '1.0.1', status: 'verified', deployedAt: new Date('2024-02-01'), createdAt: new Date('2024-01-15') }),
-          makeMilestone({ id: 'r4', version: '1.2.0', status: 'dev', deployedAt: null, createdAt: new Date('2024-03-01') }),
+          makeMilestone({
+            id: 'r1',
+            version: '1.0.0',
+            status: 'deployed',
+            deployedAt: new Date('2024-03-01'),
+            createdAt: new Date('2024-01-01'),
+          }),
+          makeMilestone({
+            id: 'r2',
+            version: '1.1.0',
+            status: 'ready',
+            deployedAt: null,
+            createdAt: new Date('2024-02-01'),
+          }),
+          makeMilestone({
+            id: 'r3',
+            version: '1.0.1',
+            status: 'verified',
+            deployedAt: new Date('2024-02-01'),
+            createdAt: new Date('2024-01-15'),
+          }),
+          makeMilestone({
+            id: 'r4',
+            version: '1.2.0',
+            status: 'dev',
+            deployedAt: null,
+            createdAt: new Date('2024-03-01'),
+          }),
         ],
       });
 
@@ -1367,7 +1613,12 @@ describe('BoardService', () => {
     it('versions: versionLimit=0 → history 空数组但不截断（对齐 limit=0 显式空段惯例）', async () => {
       setupDigestMocks({
         milestones: [
-          makeMilestone({ id: 'r1', version: '1.0.0', status: 'deployed', deployedAt: new Date('2024-01-01') }),
+          makeMilestone({
+            id: 'r1',
+            version: '1.0.0',
+            status: 'deployed',
+            deployedAt: new Date('2024-01-01'),
+          }),
         ],
       });
 
@@ -1382,9 +1633,14 @@ describe('BoardService', () => {
       setupDigestMocks({
         milestones: [
           makeMilestone({
-            id: 'm1', name: 'v1.42', version: '1.42.0', status: 'verified',
-            deployedAt: new Date('2024-01-01'), verifiedAt: new Date('2024-01-02'),
-            body: 'should-not-leak', deployMeta: { anchors: ['health-ok'] },
+            id: 'm1',
+            name: 'v1.42',
+            version: '1.42.0',
+            status: 'verified',
+            deployedAt: new Date('2024-01-01'),
+            verifiedAt: new Date('2024-01-02'),
+            body: 'should-not-leak',
+            deployMeta: { anchors: ['health-ok'] },
             createdAt: new Date('2024-01-01'),
           }),
         ],
@@ -1444,6 +1700,107 @@ describe('BoardService', () => {
       boardRepo.findOne.mockResolvedValue(null);
 
       await expect(service.getDigest('board-404')).rejects.toThrow(NotFoundException);
+    });
+
+    // ── v1.44.0-dev roundtable 段：圆桌平台级指标（M2 阶段 7，实时装配，永远输出） ──
+    // 口径（主 Agent 拍板，铁律 #20）：topic/seat/message 均不隶属于 board——本段统计
+    // 全平台；座位消息 = messages.metadata.seatLabel 非空；silentCount/valveTripCount 从
+    // seat.state JS 内存求和；silentRate 分母 = ΣsilentCount + 全时段座位消息数（非 7 天窗口）
+    it('roundtable: 零态（无任何圆桌 topic/座位/座位消息）→ 全零且永远输出该段', async () => {
+      setupDigestMocks({});
+      // beforeEach 默认 mock 即零态：topicRepo.count→0 / seatRepo.count→0 /
+      // seatRepo.find→[] / messageRepo getCount→0
+
+      const result = await service.getDigest('board-1');
+
+      // 形状可预测：key 恒存在（不返回 undefined），五值全零
+      expect(result.roundtable).toEqual({
+        topicCount: 0,
+        seatCount: 0,
+        dailyRounds: 0,
+        silentRate: 0,
+        valveTripCount: 0,
+      });
+    });
+
+    it('roundtable: 填充态五值口径正确（全平台计数 / 7 天窗口 / silentRate 分母）', async () => {
+      setupDigestMocks({});
+      // 全平台计数：kind='roundtable' topic 3 个、active 座位 4 个
+      topicRepo.count.mockResolvedValue(3);
+      seatRepo.count.mockResolvedValue(4);
+      // 座位 state 求和：silentCount 5+3+0=8；valveTripCount 2+0+0=2（缺省键 ?? 0）
+      seatRepo.find.mockResolvedValue([
+        { id: 's1', state: { silentCount: 5, valveTripCount: 2 } },
+        { id: 's2', state: { silentCount: 3 } },
+        { id: 's3', state: {} },
+      ] as any);
+      // 座位消息计数：第一次 getCount = 全时段（silentRate 分母）100，第二次 = 7 天窗口 70
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn(),
+      };
+      messageRepo.createQueryBuilder.mockReturnValue(qb as any);
+      qb.getCount.mockResolvedValueOnce(100).mockResolvedValueOnce(70);
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.roundtable.topicCount).toBe(3);
+      expect(result.roundtable.seatCount).toBe(4);
+      // dailyRounds = 70 ÷ 7 = 10，两位小数
+      expect(result.roundtable.dailyRounds).toBe(10);
+      // silentRate = 8 ÷ (8 + 100)，分母含全时段座位消息数
+      expect(result.roundtable.silentRate).toBeCloseTo(8 / 108, 10);
+      expect(result.roundtable.valveTripCount).toBe(2);
+
+      // 座位消息判定 SQL：metadata->>'seatLabel' 非空（两处查询同款条件）
+      expect(qb.where).toHaveBeenCalledWith("m.metadata ->> 'seatLabel' IS NOT NULL");
+      expect(qb.andWhere).toHaveBeenCalledWith("m.metadata ->> 'seatLabel' <> ''");
+      // 7 天窗口边界：cutoff ≈ 当前时刻前 7×24h（±60s 容差）
+      const cutoffCall = qb.andWhere.mock.calls.find(
+        (c: unknown[]) => c[0] === 'm.createdAt >= :cutoff',
+      );
+      expect(cutoffCall).toBeTruthy();
+      const cutoff = (cutoffCall as unknown[])[1] as { cutoff: Date };
+      expect(
+        Math.abs(cutoff.cutoff.getTime() - (Date.now() - 7 * 24 * 60 * 60 * 1000)),
+      ).toBeLessThan(60_000);
+      // dailyRounds 两位小数精度：70÷7 之外的边界（如 35 ÷ 7 = 5 不产生小数，用 34/7 验证四舍五入）
+    });
+
+    it('roundtable: dailyRounds 除法保留两位小数（34 ÷ 7 = 4.857… → 4.86）', async () => {
+      setupDigestMocks({});
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn(),
+      };
+      messageRepo.createQueryBuilder.mockReturnValue(qb as any);
+      qb.getCount.mockResolvedValueOnce(0).mockResolvedValueOnce(34);
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.roundtable.dailyRounds).toBe(4.86);
+    });
+
+    it('roundtable: silentRate 分母为 0（ΣsilentCount=0 且无座位消息）→ 0 防除零', async () => {
+      setupDigestMocks({});
+      // 座位存在但 silentCount 缺省 0；无任何座位消息 → 分母 0，禁止 NaN/Infinity
+      seatRepo.find.mockResolvedValue([{ id: 's1', state: { valveTripCount: 1 } }] as any);
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.roundtable.silentRate).toBe(0);
+      // 分母为 0 不影响其他计数
+      expect(result.roundtable.valveTripCount).toBe(1);
+    });
+
+    it('roundtable: seatCount 只数 active 座位（status 过滤传递到 repo.count）', async () => {
+      setupDigestMocks({});
+      seatRepo.count.mockResolvedValue(2);
+      // 断言 service 以 status='active' 作为计数条件（active/paused/parked/offline 四态中只数启用座）
+      await service.getDigest('board-1');
+      expect(seatRepo.count).toHaveBeenCalledWith({ where: { status: 'active' } });
     });
   });
 

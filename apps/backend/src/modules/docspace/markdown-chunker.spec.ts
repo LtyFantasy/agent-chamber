@@ -80,11 +80,7 @@ describe('markdown-chunker', () => {
     });
 
     it('frontmatter-only document returns empty level-0 chunk', () => {
-      const content = [
-        '---',
-        'title: Only Frontmatter',
-        '---',
-      ].join('\n');
+      const content = ['---', 'title: Only Frontmatter', '---'].join('\n');
 
       const result = chunkMarkdown(content, 'Empty Doc');
       expect(result).toHaveLength(1);
@@ -156,16 +152,9 @@ describe('markdown-chunker', () => {
     });
 
     it('rebuilds ancestor chain on same-level heading (resets sibling)', () => {
-      const content = [
-        '# A',
-        'content a',
-        '',
-        '## B',
-        'content b',
-        '',
-        '## C',
-        'content c',
-      ].join('\n');
+      const content = ['# A', 'content a', '', '## B', 'content b', '', '## C', 'content c'].join(
+        '\n',
+      );
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(3);
@@ -176,13 +165,7 @@ describe('markdown-chunker', () => {
     });
 
     it('handles higher-level heading popping ancestors', () => {
-      const content = [
-        '## Deep',
-        'deep content',
-        '',
-        '# Shallow',
-        'shallow content',
-      ].join('\n');
+      const content = ['## Deep', 'deep content', '', '# Shallow', 'shallow content'].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(2);
@@ -236,7 +219,7 @@ describe('markdown-chunker', () => {
       expect(result[0].content).toContain('Body line 1');
     });
 
-    it('skips empty heading sections', () => {
+    it('produces empty-content chunks for empty heading sections (round-trip fidelity)', () => {
       const content = [
         '# Section 1',
         'content 1',
@@ -248,22 +231,88 @@ describe('markdown-chunker', () => {
       ].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
-      expect(result).toHaveLength(2);
-      expect(result[0].headingPath).toBe('Section 1');
-      expect(result[1].headingPath).toBe('Section 3');
+      expect(result).toHaveLength(3);
+      expect(result[0]).toMatchObject({
+        headingPath: 'Section 1',
+        headingLevel: 1,
+        position: 0,
+      });
+      expect(result[0].content).toBe('content 1');
+      // 空正文标题必须产 chunk，否则「全文读 + upsert 回写」往返会永久丢失该标题行
+      expect(result[1]).toMatchObject({
+        headingPath: 'Section 2',
+        headingLevel: 1,
+        position: 1,
+        content: '',
+        tokenEstimate: 0,
+      });
+      expect(result[2]).toMatchObject({
+        headingPath: 'Section 3',
+        headingLevel: 1,
+        position: 2,
+      });
+      expect(result[2].content).toBe('content 3');
     });
 
-    it('positions increment monotonically', () => {
+    it('produces an empty-content chunk for a heading with no body at EOF', () => {
+      const content = ['# A', 'content a', '', '# B'].join('\n');
+
+      const result = chunkMarkdown(content, 'Doc');
+      expect(result).toHaveLength(2);
+      expect(result[1]).toMatchObject({
+        headingPath: 'B',
+        headingLevel: 1,
+        position: 1,
+        content: '',
+        tokenEstimate: 0,
+      });
+    });
+
+    it('empty parent heading still yields empty chunk while children get full path', () => {
+      // ## A 无正文（空父标题）→ 自身产空 chunk；### B 的 headingPath 走祖先链 "A § B"
+      const content = ['## A', '', '### B', '正文'].join('\n');
+
+      const result = chunkMarkdown(content, 'Doc');
+      expect(result).toHaveLength(2);
+      expect(result[0]).toMatchObject({
+        headingPath: 'A',
+        headingLevel: 2,
+        position: 0,
+        content: '',
+      });
+      expect(result[1]).toMatchObject({
+        headingPath: 'A § B',
+        headingLevel: 3,
+        position: 1,
+        content: '正文',
+      });
+    });
+
+    it('positions increment monotonically across empty and non-empty headings', () => {
       const content = [
         '# A',
         'content a',
         '',
-        '## B',
-        'content b',
+        '## B', // 空标题
         '',
         '### C',
         'content c',
+        '',
+        '## D', // 空标题，EOF 无正文
       ].join('\n');
+
+      const result = chunkMarkdown(content, 'Doc');
+      expect(result).toHaveLength(4);
+      for (let i = 0; i < result.length; i++) {
+        expect(result[i].position).toBe(i);
+      }
+      expect(result.map((c) => c.content)).toEqual(['content a', '', 'content c', '']);
+    });
+
+    it('positions increment monotonically', () => {
+      const content = ['# A', 'content a', '', '## B', 'content b', '', '### C', 'content c'].join(
+        '\n',
+      );
 
       const result = chunkMarkdown(content, 'Doc');
       for (let i = 0; i < result.length; i++) {
@@ -272,7 +321,8 @@ describe('markdown-chunker', () => {
     });
 
     it('tokenEstimate is consistent: CJK paragraph ≈ char count', () => {
-      const chineseText = '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
+      const chineseText =
+        '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
       const result = chunkMarkdown('# Title\n' + chineseText, 'Doc');
       expect(result).toHaveLength(1);
       // CJK estimate ≈ char count (each char ≈ 1 token)

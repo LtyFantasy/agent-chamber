@@ -34,6 +34,18 @@ export interface Topic {
   descriptionSnippet?: string | null;
   /** 话题状态 */
   status: 'draft' | 'open' | 'active' | 'voting' | 'paused' | 'closed' | 'archived';
+  /**
+   * 话题类型：normal（普通，缺省）/ roundtable（圆桌，设计 docs/roundtable-design.md §5）。
+   * 由 topics.kind 列透传（entity spread 自动带上），web/digest 据此渲染圆桌 UI。
+   */
+  kind?: 'normal' | 'roundtable';
+  /**
+   * 圆桌唤醒策略 effective 值（派生字段，仅详情视图且 kind='roundtable' 时返回）：
+   * settings.wakePolicy 显式值优先，缺省 'mention'——与 roundtable.service
+   * resolveWakePolicy 同规（设计 docs/roundtable-design.md §6 路由与唤醒策略）。
+   * normal topic 不输出该字段。
+   */
+  wakePolicy?: 'mention' | 'broadcast';
   /** 话题类型 */
   type?: string;
   /** 可见性 */
@@ -98,6 +110,19 @@ export interface Message {
   senderName: string;
   /** 发送者头像 */
   senderAvatar?: string;
+  /**
+   * 圆桌座位标签（座位子身份展示语义，设计 docs/roundtable-design.md §6/§7）：
+   * 仅透传 metadata.seatLabel 单键，不透全量 metadata（隐私/体积）；无该键时字段缺省。
+   * badge 是展示层语义，权限边界仍是 actor 级。
+   */
+  seatLabel?: string;
+  /**
+   * 圆桌主脑座位标记（设计 §6/§3：主脑座位的发言携带 `from.coordinator: true`，
+   * web 消息流据此渲染主脑 badge——人类一眼区分主脑指令）。仅透传
+   * metadata.seatCoordinator 单键（仅 coordinator 座位落库时写入，缺省不写），
+   * 无该键时字段缺省（普通座位/人类/系统消息响应无此字段，保持载荷瘦）。
+   */
+  seatCoordinator?: boolean;
   /** 消息内容 */
   content: string;
   /** 内容类型 */

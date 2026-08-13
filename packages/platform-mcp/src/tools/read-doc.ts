@@ -5,6 +5,10 @@
  * [设计文档]
  *   - 主文档: plan §5 W5 (read_doc 契约)
  *   - 补充: plan §4.3 (文档读 API), plan §1.1-13 (sectionId 不稳定 + 禁止持久化)
+ *   - 本批次（2026-08-08 read_doc 按意图投影）: 三分支投影——outline 精简 JSON /
+ *     full 原始 markdown 纯文本 / section 原始 markdown（标题行重建）；砍 section
+ *     模式 linkHealth 额外 HTTP 请求；shared 类型接线（DocDetail/DocSectionContent
+ *     + HEADING_PATH_SEPARATOR 常量），删除本地重复接口
  *
  * [踩坑索引] -
  *
@@ -21,6 +25,8 @@
  */
 
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
+import { HEADING_PATH_SEPARATOR } from '@agent-chamber/shared';
+import type { DocDetail, DocSectionContent } from '@agent-chamber/shared';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 
@@ -33,28 +39,6 @@ interface DocSpaceListItem {
   name: string;
   slug: string;
   [key: string]: unknown;
-}
-
-interface DocOutlineItem {
-  position: number;
-  headingPath?: string | null;
-  headingLevel: number;
-  tokenEstimate?: number;
-}
-
-/**
- * 链接健康巡检结果（对齐 packages/shared LinkHealth）
- *
- * 写入时机：upsert 事务内 chunking 后顺带计算。
- * NULL 表示尚未检查（兼容旧数据）。
- */
-interface LinkHealth {
-  /** 检测到的平台内链接总数 */
-  total: number;
-  /** 断链 href 列表（去重、保持出现顺序），无断链时为空数组 */
-  broken: string[];
-  /** 检查时间戳 ISO 8601 */
-  checkedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,18 +83,43 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
   };
 }
 
+/**
+ * 渲染 section 原始 markdown：把标题行插回（chunker 把标题存进 headingPath/headingLevel，
+ * section.content 不含标题行——没有标题正文缺上下文）。
+ *
+ * 标题行重建规则镜像 backend DocService.reconstructContent：headingLevel > 0 且
+ * headingPath 非空时，`'#'.repeat(min(headingLevel, 6)) + ' ' + headingPath 末段`；
+ * 标题文本为空则不插标题行，只返回 content。层级分隔符走 shared 常量
+ * HEADING_PATH_SEPARATOR（与 chunker 契约同源，避免字面量漂移）。
+ */
+function renderSectionMarkdown(section: DocSectionContent): string {
+  const headingText = section.headingPath
+    ? (section.headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '')
+    : '';
+  if (section.headingLevel > 0 && headingText) {
+    const prefix = '#'.repeat(Math.min(section.headingLevel, 6));
+    return `${prefix} ${headingText}\n\n${section.content}`;
+  }
+  return section.content;
+}
+
 // ---------------------------------------------------------------------------
 // 工具定义
 // ---------------------------------------------------------------------------
 
 /**
- * read_doc — 文档精读
+ * read_doc — 文档精读（三分支投影）
  *
  * 双通道定位：(spaceName+path) 精确匹配 或 裸 docId。
- * 无定位参数 → GET /docs/:id：小文档（tokenEstimate ≤ 2000，可用 maxFullTokens
- * 覆盖，0=强制 outline）直接内联全文（mode:'full' + content）；大文档返回大纲
- * （mode:'outline'）+ 按 section 精读。
- * 带 position 或 headingPath → 返回对应 section 正文。
+ * 无定位参数 → GET /docs/:id：小文档（tokenEstimate ≤ maxFullTokens 阈值，缺省 2000，
+ * 0=强制 outline）后端返 mode:'full' → 直接返回 content 原始 markdown 纯文本（不 JSON
+ * 包装、不加头部）；大文档返 mode:'outline' → 投影为精简 JSON（metadata + summary +
+ * sections 带 position；linkHealth 仅在此模式返回）。
+ * 带 position 或 headingPath → GET /docs/:id/sections/:position，返回该节原始 markdown
+ * （标题行按 reconstructContent 同规则重建：headingLevel>0 且 headingPath 非空 →
+ * '#'.repeat(min(level,6)) + ' ' + headingPath 末段 + 空行 + content）。
+ * headingPath 无 position 时先取大纲解析 position（必需）；不再为 section 模式额外
+ * 请求 linkHealth（该元数据仅 outline 模式返回）。
  * 不收 sectionId（不稳定契约），不走 /content 全文通道（仅 web 渲染用）。
  */
 export const readDocTool: CustomTool = {
@@ -119,12 +128,14 @@ export const readDocTool: CustomTool = {
     description:
       'Read a document by dual-channel location: (spaceName + path) via exact path match, ' +
       'or bare docId via direct lookup. ' +
-      'Without position/headingPath: small documents (tokenEstimate ≤ 2000 by default; ' +
-      'override with maxFullTokens, 0 = force outline) are inlined with full content ' +
-      '(mode:"full" + content); large documents return outline (mode:"outline") for ' +
-      'per-section targeted reading. ' +
-      'With position or headingPath: returns the matching section body. ' +
+      'Without position/headingPath: small documents (tokenEstimate ≤ maxFullTokens ' +
+      'threshold, default 2000) return the full content as raw markdown plain text; ' +
+      'large documents return a compact outline JSON — metadata + summary + section map ' +
+      'with positions (linkHealth is only returned in this mode). ' +
+      'With position or headingPath: returns that section as raw markdown with its ' +
+      'heading line reconstructed. ' +
       'Does NOT accept sectionId (unstable — changes on every content update). ' +
+      'Full text and section bodies are raw markdown, never JSON-escaped. ' +
       'Does NOT use the /content full-text channel (web rendering only).',
     inputSchema: {
       type: 'object',
@@ -146,7 +157,9 @@ export const readDocTool: CustomTool = {
         maxFullTokens: {
           type: 'integer',
           description:
-            'Optional. Inline-full-content token threshold override for outline mode ' +
+            'Optional. Threshold deciding between outline JSON and inlined full markdown ' +
+            'when no position/headingPath is given: documents with tokenEstimate ≤ threshold ' +
+            'return the full content as raw markdown, larger ones return outline JSON ' +
             '(default 2000; 0 = force outline; range 0-100000, enforced server-side). ' +
             'Only applies when no position/headingPath is given.',
         },
@@ -283,34 +296,58 @@ export const readDocTool: CustomTool = {
       }
     }
 
-    // ─── 读取：无定位参数 → 大纲（小文档内联全文）；有定位 → section 正文 ───
+    // ─── 读取：无定位参数 → outline/full 投影；有定位 → section 原始 markdown ───
     if (position === undefined && headingPath === undefined) {
-      // 大纲模式：maxFullTokens 透传到后端覆盖内联阈值（0 = 强制 outline）；
+      // maxFullTokens 透传到后端覆盖内联阈值（0 = 强制 outline）；
       // 未传时保持原调用形态（无 options），与既有行为一致
       try {
-        const options =
-          maxFullTokens !== undefined ? { params: { maxFullTokens } } : undefined;
-        const doc = await client.request<Record<string, unknown>>('GET', `/docs/${resolvedDocId}`, options);
+        const options = maxFullTokens !== undefined ? { params: { maxFullTokens } } : undefined;
+        const doc = await client.request<DocDetail>('GET', `/docs/${resolvedDocId}`, options);
+
+        // full 模式：小文档内联全文 → content 原始 markdown 纯文本直接作为 text content
+        // （不 JSON 包装、不加任何头部——Agent 已定位 docId/path，正文无需元数据信封）
+        if (doc.mode === 'full' && doc.content !== undefined) {
+          return {
+            content: [{ type: 'text', text: doc.content }],
+          };
+        }
+
+        // outline 模式：投影为精简 JSON——只保留消费价值高的元数据字段，砍掉
+        // spaceId/categoryId/source/sourceSha/createdBy/createdAt/mode 等低价值字段
+        // （sections 仅含定位元数据，不含 content；linkHealth 是文档级巡检元数据归此处）
         return {
-          content: [{ type: 'text', text: JSON.stringify(doc) }],
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                docId: doc.id,
+                path: doc.path,
+                title: doc.title,
+                summary: doc.summary,
+                docType: doc.docType,
+                tags: doc.tags,
+                tokenEstimate: doc.tokenEstimate,
+                sectionCount: doc.sectionCount,
+                updatedAt: doc.updatedAt,
+                linkHealth: doc.linkHealth,
+                sections: doc.sections,
+              }),
+            },
+          ],
         };
       } catch (err: unknown) {
         return handlePlatformError(err, 'read_doc_outline');
       }
     }
 
-    // Section 正文模式
+    // Section 正文模式：返回该节原始 markdown（标题行重建 + content）
     let resolvedPosition: number | undefined = position;
-    let docLinkHealth: LinkHealth | null | undefined = undefined;
 
     if (resolvedPosition === undefined && headingPath) {
       // headingPath 但无 position：先取大纲，按 headingPath 匹配找到 position
+      // （大纲请求仅用于解析定位，其 linkHealth 不再透传给 section 响应）
       try {
-        const doc = await client.request<{
-          sections?: DocOutlineItem[];
-          linkHealth?: LinkHealth | null;
-        }>('GET', `/docs/${resolvedDocId}`);
-        docLinkHealth = doc.linkHealth;
+        const doc = await client.request<DocDetail>('GET', `/docs/${resolvedDocId}`);
         const sections = doc.sections ?? [];
         const matches = sections.filter((s) => s.headingPath === headingPath);
         if (matches.length === 0) {
@@ -353,33 +390,15 @@ export const readDocTool: CustomTool = {
       }
     }
 
-    // position 直接提供时：先取 doc 元数据获取 linkHealth（不为 section 端点返回体自带）
-    if (docLinkHealth === undefined) {
-      try {
-        const doc = await client.request<{ linkHealth?: LinkHealth | null }>(
-          'GET',
-          `/docs/${resolvedDocId}`,
-        );
-        docLinkHealth = doc.linkHealth;
-      } catch (err: unknown) {
-        return handlePlatformError(err, 'read_doc_outline');
-      }
-    }
-
     // 读取 section（position 一旦确定即充分定位，不再附 headingPath query——后端 position 优先会忽略它）
     try {
-      const section = await client.request<Record<string, unknown>>(
+      const section = await client.request<DocSectionContent>(
         'GET',
         `/docs/${resolvedDocId}/sections/${resolvedPosition}`,
       );
 
-      // 透传 linkHealth（从 doc 元数据取，section 端点不返回此字段）
-      if (docLinkHealth !== undefined) {
-        (section as Record<string, unknown>).linkHealth = docLinkHealth;
-      }
-
       return {
-        content: [{ type: 'text', text: JSON.stringify(section) }],
+        content: [{ type: 'text', text: renderSectionMarkdown(section) }],
       };
     } catch (err: unknown) {
       return handlePlatformError(err, 'read_doc_section');

@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@agent-chamber/automcp": "workspace:*",
+    "@agent-chamber/shared": "workspace:*",
     "axios": "^1.6.0"
   },
   "devDependencies": {

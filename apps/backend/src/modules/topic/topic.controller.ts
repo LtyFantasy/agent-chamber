@@ -8,11 +8,16 @@
  *   D5: TopicController 权限检查从 Service 迁移到 Controller。
  *         findOne → findById() + ensureCan() + enrich()。见 memory/2026-06-05.md
  *
- * [踩坑索引] D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) OWNER-PROXY(sendMessage透传role)
+ * [踩坑索引] D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) OWNER-PROXY(sendMessage透传role) TOPIC-PERM(write放宽后结构端点收口)
  *
  * [铁律关联] #11(代理层透传) #21(双层校验) #22(findOne 判空) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条）
+ *   TOPIC-PERM: v1.46 TopicPolicy.write 放宽给 editor 参与方后，12 个共用 ensureCan(write)
+ *       的端点必须逐个收口——内容字段（title/description）走 policy write，结构端点
+ *       （状态流转/agenda/成员管理）与 PATCH 结构字段（status/agenda/visibility/
+ *       invitedAgentIds/config）改走 ensureCreatorOrAdmin（admin|creator|ownerProxy）。
+ *       漏收口 = editor 可 close/archive/invite（与目标语义表相悖）。
  *   B-55: TypeORM 0.3.30 在 skip/take + join + orderBy(关联字段) + select() 未包含该字段时，
  *         生成 count 子查询报 distinctAlias.xxx does not exist。修复：显式 select orderBy 依赖字段
  *         或改用 leftJoinAndSelect。见 memory/2026-07-02.md §B-55。
@@ -39,16 +44,19 @@ import {
   Query,
   UseGuards,
   BadRequestException,
+  ForbiddenException,
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { TopicService } from './topic.service';
 import { PermissionService } from '../../common/services/permission.service';
+import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { TopicStatus, ActorType, ErrorCode } from '@agent-chamber/shared';
+import { Topic } from '../../database/entities/topic.entity';
+import { TopicStatus, ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -60,6 +68,8 @@ import {
   InviteTopicUserDto,
   UninviteTopicUserDto,
   RemoveTopicParticipantDto,
+  AddTopicEditorDto,
+  RemoveTopicEditorDto,
   GetMessagesQueryDto,
   UnreadQueryDto,
   QueryTopicDto,
@@ -71,7 +81,35 @@ export class TopicController {
   constructor(
     private readonly topicService: TopicService,
     private readonly permService: PermissionService,
+    private readonly ownerProxy: OwnerProxyService,
   ) {}
+
+  /**
+   * 判定 actor 是否为话题创建者级（D2，v1.46 TOPIC-PERM 结构端点收口）：
+   * 直接 creator ｜ 人类 owner 代理（v1.37：owner 对其 agent 创建的 topic 视同 creator）。
+   * admin 不在此列（admin 由调用方按需 bypass——docspace isCreatorOf 同构）。
+   */
+  private async isCreatorOf(topic: Topic, actor: UnifiedActor | null): Promise<boolean> {
+    if (!actor) return false;
+    if (topic.creatorId === actor.id) return true;
+    return this.ownerProxy.isOwnerProxy(topic.creatorId, actor);
+  }
+
+  /**
+   * 判定 actor 是否为话题创建者级并强制放行，否则 403（D2，v1.46 TOPIC-PERM 结构端点收口）：
+   * admin bypass ｜ 直接 creator ｜ 人类 owner 代理。非创建者级 → 403（PERMISSION_DENIED）。
+   * 与 TopicPolicy.write 的关系：policy 放宽给 editor 参与方后，结构操作（状态流转/
+   * agenda/成员管理/结构字段）必须由本 helper 收口为 creator-only（镜像 DocSpace
+   * isCreatorOf 模式）。
+   */
+  private async ensureCreatorOrAdmin(topic: Topic, actor: UnifiedActor): Promise<void> {
+    if (actor?.role === UserRole.ADMIN) return;
+    if (await this.isCreatorOf(topic, actor)) return;
+    throw new ForbiddenException({
+      message: 'Only the topic creator can perform this action',
+      code: ErrorCode.PERMISSION_DENIED,
+    });
+  }
 
   @UseGuards(JwtOrApiKeyGuard)
   @Get()
@@ -152,7 +190,11 @@ export class TopicController {
   @ApiOperation({
     summary: 'Update topic',
     description:
-      'Update topic information such as title, description, agenda, visibility, configuration, etc.',
+      'Update topic by ID. Field-level permission split (v1.46 TOPIC-PERM): ' +
+      'content fields (title/description) require write access (creator, editor participant, ' +
+      'owner-proxy, or admin); structural fields (status/agenda/visibility/invitedAgentIds/config) ' +
+      'require creator (or admin). An editor request containing any structural field is rejected ' +
+      'as a whole (403) — no partial application.',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiResponse({ status: 200, description: 'Topic updated' })
@@ -165,7 +207,34 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    // 字段级分权（D3）：内容字段（title/description）走 policy write——permService.ensureCan
+    // 全覆盖 creator/editor 参与方/owner-proxy/admin（实现收敛，不自造 isCreatorOrEditor）；
+    // 结构字段（status/agenda/visibility/invitedAgentIds/config）creator-only（D2 helper）。
+    // ⚠️ 结构字段存在性必须 `!== undefined`（显式 null 也算「出现」）——truthy 判断会漏掉
+    // { visibility: null } 类请求，让 editor 绕过结构字段检查。agenda 归结构（驱动圆桌讨论流）。
+    const structuralFields = [
+      'status',
+      'agenda',
+      'visibility',
+      'invitedAgentIds',
+      'config',
+    ] as const;
+    const presentStructural = structuralFields.filter((f) => dto[f] !== undefined);
+    if (presentStructural.length > 0) {
+      // 整体 403 + 列出实际出现的结构字段名（R1：agent 消费者可据消息自修正），不做部分应用。
+      // ⚠️ admin bypass 别漏（与 DocSpace v1.45 模板同构）
+      const isAdmin = actor?.role === UserRole.ADMIN;
+      const isCreator = await this.isCreatorOf(topic, actor);
+      if (!isCreator && !isAdmin) {
+        throw new ForbiddenException({
+          message: `Structural fields require creator permission: ${presentStructural.join(', ')}`,
+          code: ErrorCode.PERMISSION_DENIED,
+        });
+      }
+    } else {
+      // 内容字段（title/description）：creator/editor 参与方/owner-proxy/admin 可改 → policy write
+      await this.permService.ensureCan(topic, actor, 'write');
+    }
     return this.topicService.update(id, dto);
   }
 
@@ -200,7 +269,7 @@ export class TopicController {
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async close(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.changeStatus(id, TopicStatus.CLOSED);
   }
 
@@ -217,7 +286,7 @@ export class TopicController {
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async pause(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.changeStatus(id, TopicStatus.PAUSED);
   }
 
@@ -234,7 +303,7 @@ export class TopicController {
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async open(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.changeStatus(id, TopicStatus.ACTIVE);
   }
 
@@ -251,7 +320,7 @@ export class TopicController {
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async resume(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.changeStatus(id, TopicStatus.ACTIVE);
   }
 
@@ -268,7 +337,7 @@ export class TopicController {
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async archive(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.changeStatus(id, TopicStatus.ARCHIVED);
   }
 
@@ -331,7 +400,7 @@ export class TopicController {
     @Body() dto: RemoveTopicParticipantDto,
   ) {
     const topic = await this.topicService.findById(topicId);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.removeParticipant(topicId, actor.id, dto.participantId);
   }
 
@@ -535,7 +604,7 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.updateAgenda(id, dto);
   }
 
@@ -557,7 +626,7 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.inviteAgent(id, dto.agentId);
   }
 
@@ -578,8 +647,61 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.uninviteAgent(id, dto.agentId);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post(':id/add-editor')
+  @ApiOperation({
+    summary: 'Add editor to topic (creator/admin only)',
+    description:
+      'Promote an agent to topic editor (v1.46 TOPIC-PERM). Editors can modify content fields ' +
+      '(title/description) without joining first — an invited editor can edit immediately. ' +
+      'Structural operations (status transitions, agenda, visibility, member management) ' +
+      'remain creator-only. Only the topic creator or an admin can perform this action.',
+  })
+  @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
+  @ApiResponse({ status: 201, description: 'Editor added successfully' })
+  @ApiResponse({ status: 400, description: 'Target is the topic creator (cannot be promoted)' })
+  @ApiResponse({ status: 401, description: 'Unauthenticated' })
+  @ApiResponse({ status: 403, description: 'Forbidden' })
+  @ApiResponse({ status: 404, description: 'Topic or agent not found' })
+  @ApiResponse({ status: 409, description: 'Agent has left the topic (re-invite first)' })
+  async addEditor(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AddTopicEditorDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const topic = await this.topicService.findById(id);
+    // 成员管理属结构操作（D2）：creator/admin-only（owner 代理含内）
+    await this.ensureCreatorOrAdmin(topic, actor);
+    return this.topicService.addEditor(id, dto.agentId);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post(':id/remove-editor')
+  @ApiOperation({
+    summary: 'Remove editor from topic (creator/admin only)',
+    description:
+      'Revoke an agent\u2019s topic editor role (v1.46 TOPIC-PERM). The agent is demoted to ' +
+      'member (status preserved — not removed from the topic). Only the topic creator or an ' +
+      'admin can perform this action.',
+  })
+  @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
+  @ApiResponse({ status: 201, description: 'Editor removed successfully' })
+  @ApiResponse({ status: 401, description: 'Unauthenticated' })
+  @ApiResponse({ status: 403, description: 'Forbidden' })
+  @ApiResponse({ status: 404, description: 'Topic, agent, or editor row not found' })
+  async removeEditor(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: RemoveTopicEditorDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const topic = await this.topicService.findById(id);
+    // 成员管理属结构操作（D2）：creator/admin-only（owner 代理含内）
+    await this.ensureCreatorOrAdmin(topic, actor);
+    return this.topicService.removeEditor(id, dto.agentId);
   }
 
   @UseGuards(JwtAuthGuard)
@@ -600,7 +722,7 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.join(id, dto.userId, ActorType.HUMAN);
   }
 
@@ -621,7 +743,7 @@ export class TopicController {
     @CurrentActor() actor: UnifiedActor,
   ) {
     const topic = await this.topicService.findById(id);
-    await this.permService.ensureCan(topic, actor, 'write');
+    await this.ensureCreatorOrAdmin(topic, actor);
     return this.topicService.uninviteUser(id, dto.userId);
   }
 }

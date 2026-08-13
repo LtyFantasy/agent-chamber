@@ -120,6 +120,35 @@ updatedAt: 2026-06-01
 
       expect(result).toEqual([]);
     });
+
+    it('should exclude internal skills from list', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+description: Project-local skill, not for distribution.
+internal: true
+---
+
+# Internal Skill
+`,
+      );
+      createSkillFile(
+        'public-skill/SKILL.md',
+        `---
+name: public-skill
+description: Public skill.
+---
+
+# Public Skill
+`,
+      );
+
+      const result = await service.findAll();
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('public-skill');
+    });
   });
 
   describe('findOne', () => {
@@ -155,10 +184,26 @@ updatedAt: 2026-06-17
     it('should throw NotFoundException for invalid name with directory traversal', async () => {
       await expect(service.findOne('../etc/passwd')).rejects.toThrow(NotFoundException);
     });
+
+    it('should throw NotFoundException for internal skill', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+internal: true
+---
+
+# Internal
+`,
+      );
+
+      await expect(service.findOne('internal-skill')).rejects.toThrow(NotFoundException);
+    });
   });
 
   describe('findSubSkill', () => {
     it('should return sub skill detail', async () => {
+      createSkillFile('agent-chamber/SKILL.md', '# Main\n');
       createSkillFile(
         'agent-chamber/taskboard/SKILL.md',
         `---
@@ -192,9 +237,7 @@ updatedAt: 2026-06-10
 
     it('should throw NotFoundException for invalid subpath', async () => {
       createSkillFile('agent-chamber/SKILL.md', '# Main\n');
-      await expect(service.findSubSkill('agent-chamber', '..')).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(service.findSubSkill('agent-chamber', '..')).rejects.toThrow(NotFoundException);
       await expect(service.findSubSkill('agent-chamber', 'sub/path')).rejects.toThrow(
         NotFoundException,
       );
@@ -207,6 +250,133 @@ updatedAt: 2026-06-10
       await expect(service.findSubSkill('agent-chamber', '../other-skill')).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('should throw NotFoundException when parent skill is internal', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+internal: true
+---
+
+# Internal
+`,
+      );
+      createSkillFile('internal-skill/sub/SKILL.md', '# Sub\n');
+
+      await expect(service.findSubSkill('internal-skill', 'sub')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+
+  describe('findSubSkills', () => {
+    it('should return sub skill metadata list', async () => {
+      createSkillFile(
+        'agent-chamber/SKILL.md',
+        `---
+name: agent-chamber
+description: Main skill.
+version: 1.0.0
+updatedAt: 2026-06-17
+---
+
+# Main Skill
+`,
+      );
+      createSkillFile(
+        'agent-chamber/taskboard/SKILL.md',
+        `---
+name: taskboard
+description: Task board skill.
+version: 1.1.0
+updatedAt: 2026-06-10
+---
+
+# Taskboard
+`,
+      );
+      createSkillFile(
+        'agent-chamber/topics/SKILL.md',
+        `---
+name: topics
+description: Topics skill.
+version: 1.2.0
+updatedAt: 2026-06-11
+---
+
+# Topics
+`,
+      );
+
+      const result = await service.findSubSkills('agent-chamber');
+
+      expect(result).toHaveLength(2);
+      expect(result).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'taskboard',
+            description: 'Task board skill.',
+            version: '1.1.0',
+            updatedAt: '2026-06-10',
+          }),
+          expect.objectContaining({
+            name: 'topics',
+            description: 'Topics skill.',
+            version: '1.2.0',
+            updatedAt: '2026-06-11',
+          }),
+        ]),
+      );
+    });
+
+    it('should return empty array when main skill has no sub directories', async () => {
+      createSkillFile(
+        'agent-chamber/SKILL.md',
+        `---
+name: agent-chamber
+---
+# Main
+`,
+      );
+
+      const result = await service.findSubSkills('agent-chamber');
+
+      expect(result).toEqual([]);
+    });
+
+    it('should skip sub directories without SKILL.md', async () => {
+      createSkillFile('agent-chamber/SKILL.md', '# Main\n');
+      fs.mkdirSync(path.resolve(tempDir, 'agent-chamber', 'empty-dir'), { recursive: true });
+
+      const result = await service.findSubSkills('agent-chamber');
+
+      expect(result).toEqual([]);
+    });
+
+    it('should throw NotFoundException when main skill does not exist', async () => {
+      await expect(service.findSubSkills('missing-skill')).rejects.toThrow(NotFoundException);
+    });
+
+    it('should throw NotFoundException for invalid name with directory traversal', async () => {
+      await expect(service.findSubSkills('../etc/passwd')).rejects.toThrow(NotFoundException);
+    });
+
+    it('should throw NotFoundException when parent skill is internal', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+internal: true
+---
+
+# Internal
+`,
+      );
+      createSkillFile('internal-skill/sub/SKILL.md', '# Sub\n');
+
+      await expect(service.findSubSkills('internal-skill')).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -227,6 +397,68 @@ name: agent-chamber
 
     it('should throw NotFoundException when skill does not exist', async () => {
       await expect(service.getRaw('missing-skill')).rejects.toThrow(NotFoundException);
+    });
+
+    it('should throw NotFoundException for internal skill', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+internal: true
+---
+
+# Internal
+`,
+      );
+
+      await expect(service.getRaw('internal-skill')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('getSubRaw', () => {
+    it('should return raw sub skill markdown content', async () => {
+      createSkillFile('agent-chamber/SKILL.md', '# Main\n');
+      const markdown = `---
+name: taskboard
+description: Task board skill.
+---
+
+# Raw Sub Content
+`;
+      createSkillFile('agent-chamber/taskboard/SKILL.md', markdown);
+
+      const result = await service.getSubRaw('agent-chamber', 'taskboard');
+
+      expect(result).toBe(markdown);
+    });
+
+    it('should throw NotFoundException when sub skill does not exist', async () => {
+      createSkillFile('agent-chamber/SKILL.md', '# Main\n');
+      await expect(service.getSubRaw('agent-chamber', 'missing-sub')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('should throw NotFoundException for invalid subpath', async () => {
+      await expect(service.getSubRaw('agent-chamber', 'sub/path')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('should throw NotFoundException when parent skill is internal', async () => {
+      createSkillFile(
+        'internal-skill/SKILL.md',
+        `---
+name: internal-skill
+internal: true
+---
+
+# Internal
+`,
+      );
+      createSkillFile('internal-skill/sub/SKILL.md', '# Sub\n');
+
+      await expect(service.getSubRaw('internal-skill', 'sub')).rejects.toThrow(NotFoundException);
     });
   });
 });

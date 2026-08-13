@@ -22,7 +22,17 @@ import {
 import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
 import { formatRelativeTime } from '@/lib/utils';
-import { Plus, MessageSquare, Users, ArrowRight, Pencil, Trash2, Lock, Globe } from 'lucide-react';
+import {
+  Plus,
+  MessageSquare,
+  Users,
+  UsersRound,
+  ArrowRight,
+  Pencil,
+  Trash2,
+  Lock,
+  Globe,
+} from 'lucide-react';
 
 const statusMap: Record<
   string,
@@ -48,6 +58,12 @@ export default function TopicsPage() {
   const [newTitle, setNewTitle] = useState('');
   const [newDesc, setNewDesc] = useState('');
   const [newVisibility, setNewVisibility] = useState<Visibility>(Visibility.OPEN);
+  // 圆桌创建入口（v1.49.0）：kind 创建后不可变（后端 topic.service update 忽略 kind），
+  // 仅创建表单提供选择；wakePolicy/maxRoundsWithoutHuman 落 topic.settings jsonb，
+  // 缺省值由后端兜底（mention / 8），表单留空即不提交
+  const [newKind, setNewKind] = useState<'normal' | 'roundtable'>('normal');
+  const [newWakePolicy, setNewWakePolicy] = useState<'mention' | 'broadcast'>('mention');
+  const [newMaxRounds, setNewMaxRounds] = useState('');
 
   const [editTopic, setEditTopic] = useState<{
     id: string;
@@ -69,6 +85,9 @@ export default function TopicsPage() {
       setCreateOpen(false);
       setNewTitle('');
       setNewDesc('');
+      setNewKind('normal');
+      setNewWakePolicy('mention');
+      setNewMaxRounds('');
     },
   });
 
@@ -107,7 +126,22 @@ export default function TopicsPage() {
 
   const handleCreate = () => {
     if (!newTitle.trim()) return;
-    createMutation.mutate({ title: newTitle, description: newDesc, visibility: newVisibility });
+    // 仅圆桌携带 config（普通话题不消费 wakePolicy/maxRounds，保持载荷瘦）；
+    // maxRoundsWithoutHuman 留空 = 后端缺省 8，显式 0 = 关闭安全阀（shared DTO 契约）
+    const config =
+      newKind === 'roundtable'
+        ? {
+            kind: 'roundtable' as const,
+            wakePolicy: newWakePolicy,
+            ...(newMaxRounds.trim() ? { maxRoundsWithoutHuman: Number(newMaxRounds) } : {}),
+          }
+        : undefined;
+    createMutation.mutate({
+      title: newTitle,
+      description: newDesc,
+      visibility: newVisibility,
+      config,
+    });
   };
 
   const handleUpdate = () => {
@@ -188,6 +222,17 @@ export default function TopicsPage() {
                             className="ml-2 h-4 w-4 shrink-0 text-emerald-500"
                             aria-label={t('visibility.publicAria')}
                           />
+                        )}
+                        {/* 圆桌标识 badge（v1.49.0）：紫色系与 visibility（琥珀/绿）、
+                            status/unread badge 区分，不抢视觉优先级 */}
+                        {topic.kind === 'roundtable' && (
+                          <Badge
+                            variant="outline"
+                            className="ml-2 shrink-0 gap-1 border-violet-500/40 bg-violet-500/10 text-violet-300"
+                          >
+                            <UsersRound className="h-3 w-3" />
+                            {t('kind.roundtable')}
+                          </Badge>
                         )}
                         {unreadCount > 0 && (
                           <Badge variant="destructive" className="ml-2 shrink-0">
@@ -304,6 +349,76 @@ export default function TopicsPage() {
               </label>
             </div>
           </div>
+          {/* 话题类型（v1.49.0 圆桌 web 创建入口）：radio 模式与 visibility 同规；
+              kind 创建后不可变（后端契约），选中圆桌时展开圆桌专属配置 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('form.kind')}</label>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="kind"
+                  value="normal"
+                  checked={newKind === 'normal'}
+                  onChange={() => setNewKind('normal')}
+                />
+                <MessageSquare className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm">{t('form.kindNormalDesc')}</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="kind"
+                  value="roundtable"
+                  checked={newKind === 'roundtable'}
+                  onChange={() => setNewKind('roundtable')}
+                />
+                <UsersRound className="h-4 w-4 text-violet-400" />
+                <span className="text-sm">{t('form.kindRoundtableDesc')}</span>
+              </label>
+            </div>
+          </div>
+          {newKind === 'roundtable' && (
+            <div className="space-y-4 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3">
+              <p className="text-xs text-muted-foreground">{t('form.kindImmutableHint')}</p>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">{t('form.wakePolicy')}</label>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="wakePolicy"
+                      value="mention"
+                      checked={newWakePolicy === 'mention'}
+                      onChange={() => setNewWakePolicy('mention')}
+                    />
+                    <span className="text-sm">{t('form.wakeMention')}</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="wakePolicy"
+                      value="broadcast"
+                      checked={newWakePolicy === 'broadcast'}
+                      onChange={() => setNewWakePolicy('broadcast')}
+                    />
+                    <span className="text-sm">{t('form.wakeBroadcast')}</span>
+                  </label>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">{t('form.maxRounds')}</label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  placeholder={t('form.maxRoundsPlaceholder')}
+                  value={newMaxRounds}
+                  onChange={(e) => setNewMaxRounds(e.target.value)}
+                />
+              </div>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => setCreateOpen(false)}>

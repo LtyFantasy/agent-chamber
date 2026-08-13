@@ -163,6 +163,7 @@ export class AgentController {
       description: agent.description,
       capabilities: agent.capabilities,
       createdAt: agent.createdAt,
+      lastActiveAt: agent.lastActiveAt,
       topicCount: agent.topicCount,
       messageCount: agent.messageCount,
       apiKeyPrefix: agent.apiKeyPrefix,

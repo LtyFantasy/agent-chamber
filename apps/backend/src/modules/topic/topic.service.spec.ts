@@ -1,7 +1,20 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository, ObjectLiteral, SelectQueryBuilder, InsertResult, In, DataSource, EntityManager } from 'typeorm';
-import { NotFoundException, BadRequestException, ForbiddenException, ConflictException } from '@nestjs/common';
+import {
+  Repository,
+  ObjectLiteral,
+  SelectQueryBuilder,
+  InsertResult,
+  In,
+  DataSource,
+  EntityManager,
+} from 'typeorm';
+import {
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  ConflictException,
+} from '@nestjs/common';
 import { TopicService } from './topic.service';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
@@ -12,7 +25,15 @@ import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Task } from '../../database/entities/task.entity';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
-import { TopicStatus, ActorType, MessageType, UserRole, ErrorCode, ParticipantStatus, Visibility } from '@agent-chamber/shared';
+import {
+  TopicStatus,
+  ActorType,
+  MessageType,
+  UserRole,
+  ErrorCode,
+  ParticipantStatus,
+  Visibility,
+} from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
@@ -182,14 +203,16 @@ describe('TopicService', () => {
     // ResourceValidator mock：exists 默认成功；existsMany 委托给真实 Agent repo.findBy
     mockResourceValidator = {
       exists: jest.fn().mockResolvedValue({ id: 'agent-1' } as Agent),
-      existsMany: jest.fn(async (repo: Repository<ObjectLiteral>, ids: string[], errorCode: ErrorCode) => {
-        if (ids.length === 0) return [];
-        const entities = await repo.findBy({ id: In(ids) } as any);
-        if (entities.length !== ids.length) {
-          throw new NotFoundException({ message: 'Some resources not found', code: errorCode });
-        }
-        return entities;
-      }),
+      existsMany: jest.fn(
+        async (repo: Repository<ObjectLiteral>, ids: string[], errorCode: ErrorCode) => {
+          if (ids.length === 0) return [];
+          const entities = await repo.findBy({ id: In(ids) } as any);
+          if (entities.length !== ids.length) {
+            throw new NotFoundException({ message: 'Some resources not found', code: errorCode });
+          }
+          return entities;
+        },
+      ),
     };
 
     // DataSource mock：transaction 默认透传回调
@@ -255,13 +278,13 @@ describe('TopicService', () => {
       const ids: string[] = criteria?.id?.value ?? [];
       return ids
         .filter((id) => id === 'user-1')
-        .map((id) => ({ id, displayName: 'Alice', avatarUrl: null } as User));
+        .map((id) => ({ id, displayName: 'Alice', avatarUrl: null }) as User);
     });
     mockAgentRepo.findBy.mockImplementation(async (criteria: any) => {
       const ids: string[] = criteria?.id?.value ?? [];
       return ids
         .filter((id) => id === 'agent-1')
-        .map((id) => ({ id, name: 'Bot-1', avatarUrl: null } as Agent));
+        .map((id) => ({ id, name: 'Bot-1', avatarUrl: null }) as Agent);
     });
   });
 
@@ -558,6 +581,88 @@ describe('TopicService', () => {
       });
     });
 
+    // ── kind / wakePolicy 装配（M2 阶段 1：设计 §5/§6） ──
+
+    it('create：kind=roundtable 且未显式 wakePolicy → 缺省 mention（设计 §6 默认）', async () => {
+      const dto = { title: 'Roundtable Topic', config: { kind: 'roundtable' as const } };
+      mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-rt' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant());
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+
+      await service.create('user-1', ActorType.HUMAN, dto);
+
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'roundtable', // kind 落实体列
+          settings: expect.objectContaining({ wakePolicy: 'mention' }),
+        }),
+      );
+    });
+
+    it('create：kind=roundtable 显式 wakePolicy=broadcast → 原样写入 settings', async () => {
+      const dto = {
+        title: 'Roundtable Topic',
+        config: { kind: 'roundtable' as const, wakePolicy: 'broadcast' as const },
+      };
+      mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-rt' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant());
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+
+      await service.create('user-1', ActorType.HUMAN, dto);
+
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'roundtable',
+          settings: expect.objectContaining({ wakePolicy: 'broadcast' }),
+        }),
+      );
+    });
+
+    it('create：无 config.kind → kind=normal 缺省，settings 不写 wakePolicy（普通桌零感知）', async () => {
+      const dto = { title: 'Normal Topic' };
+      mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-n' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant());
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+
+      await service.create('user-1', ActorType.HUMAN, dto);
+
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'normal',
+          settings: expect.not.objectContaining({ wakePolicy: expect.anything() }),
+        }),
+      );
+      // kind 是实体列，不允许混进 settings jsonb
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.not.objectContaining({
+          settings: expect.objectContaining({ kind: expect.anything() }),
+        }),
+      );
+    });
+
+    it('create：normal 桌显式 wakePolicy → 原样透传（配置原样存储语义，路由层不消费）', async () => {
+      const dto = {
+        title: 'Normal Topic',
+        config: { wakePolicy: 'broadcast' as const },
+      };
+      mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-n' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant());
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+
+      await service.create('user-1', ActorType.HUMAN, dto);
+
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'normal',
+          settings: expect.objectContaining({ wakePolicy: 'broadcast' }),
+        }),
+      );
+    });
+
     // ── Idempotency: clientRequestId ──
 
     it('should create topic normally when clientRequestId is not provided (zero overhead)', async () => {
@@ -581,7 +686,13 @@ describe('TopicService', () => {
       mockTopicRepo.save.mockResolvedValue(topic);
       mockParticipantRepo.create.mockReturnValue(createMockParticipant());
       mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
-      mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-1', actorId: 'user-1', clientRequestId: 'req-topic-001', entityType: 'topic', entityId: 'topic-idem-1' } as IdempotencyRecord);
+      mockIdempotencyRepo.save.mockResolvedValue({
+        id: 'rec-1',
+        actorId: 'user-1',
+        clientRequestId: 'req-topic-001',
+        entityType: 'topic',
+        entityId: 'topic-idem-1',
+      } as IdempotencyRecord);
 
       const result = await service.create('user-1', ActorType.HUMAN, dto);
 
@@ -638,9 +749,10 @@ describe('TopicService', () => {
       });
       mockDataSource.transaction.mockRejectedValueOnce(pgError);
 
-      await expect(service.create('user-1', ActorType.HUMAN, dto)).rejects.toThrow('other unique violation');
+      await expect(service.create('user-1', ActorType.HUMAN, dto)).rejects.toThrow(
+        'other unique violation',
+      );
     });
-
   });
 
   describe('update', () => {
@@ -726,6 +838,31 @@ describe('TopicService', () => {
       expect(mockParticipantRepo.remove).toHaveBeenCalledWith([
         expect.objectContaining({ participantId: 'agent-invited' }),
       ]);
+    });
+
+    it('update：config.kind 忽略（创建后不可变），config.wakePolicy 合并进 settings', async () => {
+      // kind 不可变语义：normal↔roundtable 互转在 M2 推迟清单，update 收到的 kind
+      // 一律丢弃——存量 seat 归属与会话层规则开关都依赖创建时的 kind
+      const topic = createMockTopic({ kind: 'roundtable' });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+
+      await service.update('topic-1', { config: { kind: 'normal', wakePolicy: 'broadcast' } });
+
+      expect(topic.kind).toBe('roundtable'); // entity kind 未被改写
+      expect(topic.settings).toMatchObject({ wakePolicy: 'broadcast' });
+      expect(topic.settings).not.toHaveProperty('kind'); // kind 不进 settings
+    });
+
+    it('update：仅改 wakePolicy（无 kind）→ settings 合并，kind 不动', async () => {
+      const topic = createMockTopic({ kind: 'roundtable' });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+
+      await service.update('topic-1', { config: { wakePolicy: 'mention' } });
+
+      expect(topic.kind).toBe('roundtable');
+      expect(topic.settings).toMatchObject({ wakePolicy: 'mention' });
     });
   });
 
@@ -978,6 +1115,39 @@ describe('TopicService', () => {
       expect(result.hasMore).toBe(false);
     });
 
+    it('should passthrough seatLabel on history messages (metadata.seatLabel single key only)', async () => {
+      // 圆桌座位发言：metadata.seatLabel 透传为 seatLabel，其余 metadata 键不透
+      // （隐私/体积，设计 docs/roundtable-design.md §6/§7；历史加载路径 = mapToMessageDtos）
+      const msgWithSeat = createMockMessage({
+        id: 'msg-1',
+        senderId: 'agent-1',
+        senderType: ActorType.AGENT,
+        metadata: { seatLabel: 'kimi-1', internalNote: 'must-not-leak' },
+      });
+      const msgWithoutSeat = createMockMessage({
+        id: 'msg-2',
+        senderId: 'agent-2',
+        senderType: ActorType.AGENT,
+        metadata: {},
+      });
+      const qbMock = createMockQueryBuilder([msgWithSeat, msgWithoutSeat], 2);
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Bot-1', avatarUrl: null } as Agent,
+        { id: 'agent-2', name: 'Bot-2', avatarUrl: null } as Agent,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+
+      // 默认 reverse 模式（DESC 取数后 reverse 为正序）：qb 按 DESC 返回
+      // [msg-1(带 seat), msg-2]，reverse 后 messages[1] 才是 msg-1
+      expect(result.messages[1]).toMatchObject({ seatLabel: 'kimi-1' });
+      expect(result.messages[1]).not.toHaveProperty('metadata');
+      expect(result.messages[0]).not.toHaveProperty('seatLabel');
+    });
+
     it('should handle empty results', async () => {
       const qbMock = createMockQueryBuilder([], 0);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
@@ -993,9 +1163,7 @@ describe('TopicService', () => {
 
     it('should apply after cursor filter', async () => {
       const afterId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-      mockMessageRepo.findOne.mockResolvedValue(
-        createMockMessage({ id: afterId }),
-      );
+      mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: afterId }));
 
       const msg2 = createMockMessage({ id: 'msg-2', content: 'After message' });
       const qbMock = createMockQueryBuilder([msg2], 1);
@@ -1048,7 +1216,11 @@ describe('TopicService', () => {
     });
 
     it('should ignore deprecated senderType query param and filter only by senderId', async () => {
-      const msg = createMockMessage({ id: 'msg-1', senderId: 'user-1', senderType: ActorType.HUMAN });
+      const msg = createMockMessage({
+        id: 'msg-1',
+        senderId: 'user-1',
+        senderType: ActorType.HUMAN,
+      });
       const qbMock = createMockQueryBuilder([msg], 1);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
         qbMock as unknown as SelectQueryBuilder<Message>,
@@ -1103,9 +1275,7 @@ describe('TopicService', () => {
 
     it('should apply before cursor filter', async () => {
       const beforeId = '55555555-5555-5555-5555-555555555555';
-      mockMessageRepo.findOne.mockResolvedValue(
-        createMockMessage({ id: beforeId }),
-      );
+      mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: beforeId }));
 
       const msg1 = createMockMessage({ id: 'msg-1', createdAt: new Date('2024-01-01T00:00:01Z') });
       const msg2 = createMockMessage({ id: 'msg-2', createdAt: new Date('2024-01-01T00:00:02Z') });
@@ -1184,9 +1354,7 @@ describe('TopicService', () => {
     it('should apply both after and since filters together', async () => {
       const sinceDate = new Date('2024-01-01T12:00:00Z');
       const afterId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-      mockMessageRepo.findOne.mockResolvedValue(
-        createMockMessage({ id: afterId }),
-      );
+      mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: afterId }));
 
       const msg1 = createMockMessage({
         id: 'msg-1',
@@ -1251,11 +1419,12 @@ describe('TopicService', () => {
 
     it('should include start message and messages after it', async () => {
       const startId = '22222222-2222-2222-2222-222222222222';
-      mockMessageRepo.findOne.mockResolvedValue(
-        createMockMessage({ id: startId }),
-      );
+      mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: startId }));
 
-      const startMsg = createMockMessage({ id: startId, createdAt: new Date('2024-01-01T00:00:02Z') });
+      const startMsg = createMockMessage({
+        id: startId,
+        createdAt: new Date('2024-01-01T00:00:02Z'),
+      });
       const afterMsg = createMockMessage({
         id: 'msg-3',
         createdAt: new Date('2024-01-01T00:00:03Z'),
@@ -1290,7 +1459,10 @@ describe('TopicService', () => {
 
     it('should return only start message when limit is 1', async () => {
       const startId = '22222222-2222-2222-2222-222222222222';
-      const startMsg = createMockMessage({ id: startId, createdAt: new Date('2024-01-01T00:00:02Z') });
+      const startMsg = createMockMessage({
+        id: startId,
+        createdAt: new Date('2024-01-01T00:00:02Z'),
+      });
       mockMessageRepo.findOne.mockResolvedValue(startMsg);
 
       const qbMock = createMockQueryBuilder([startMsg], 1);
@@ -1314,10 +1486,16 @@ describe('TopicService', () => {
       mockMessageRepo.findOne.mockResolvedValue(null);
 
       await expect(
-        service.getMessages('topic-1', { start: '22222222-2222-2222-2222-222222222222', limit: 20 }),
+        service.getMessages('topic-1', {
+          start: '22222222-2222-2222-2222-222222222222',
+          limit: 20,
+        }),
       ).rejects.toThrow(NotFoundException);
       await expect(
-        service.getMessages('topic-1', { start: '22222222-2222-2222-2222-222222222222', limit: 20 }),
+        service.getMessages('topic-1', {
+          start: '22222222-2222-2222-2222-222222222222',
+          limit: 20,
+        }),
       ).rejects.toMatchObject({ response: { code: ErrorCode.TOPIC_MESSAGE_NOT_FOUND } });
     });
 
@@ -1326,7 +1504,10 @@ describe('TopicService', () => {
       mockMessageRepo.findOne.mockResolvedValue(null);
 
       await expect(
-        service.getMessages('topic-1', { start: '33333333-3333-3333-3333-333333333333', limit: 20 }),
+        service.getMessages('topic-1', {
+          start: '33333333-3333-3333-3333-333333333333',
+          limit: 20,
+        }),
       ).rejects.toThrow(NotFoundException);
       expect(mockMessageRepo.findOne).toHaveBeenCalledWith({
         where: { id: '33333333-3333-3333-3333-333333333333', topicId: 'topic-1' },
@@ -1402,16 +1583,17 @@ describe('TopicService', () => {
     it('should return messages in closed interval [start, end]', async () => {
       const startId = '22222222-2222-2222-2222-222222222222';
       const endId = '33333333-3333-3333-3333-333333333333';
-      const startMsg = createMockMessage({ id: startId, createdAt: new Date('2024-01-01T00:00:02Z') });
+      const startMsg = createMockMessage({
+        id: startId,
+        createdAt: new Date('2024-01-01T00:00:02Z'),
+      });
       const endMsg = createMockMessage({ id: endId, createdAt: new Date('2024-01-01T00:00:04Z') });
       const middleMsg = createMockMessage({
         id: 'msg-3',
         createdAt: new Date('2024-01-01T00:00:03Z'),
       });
 
-      mockMessageRepo.findOne
-        .mockResolvedValueOnce(startMsg)
-        .mockResolvedValueOnce(endMsg);
+      mockMessageRepo.findOne.mockResolvedValueOnce(startMsg).mockResolvedValueOnce(endMsg);
 
       const qbMock = createMockQueryBuilder([startMsg, middleMsg, endMsg], 3);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
@@ -1490,8 +1672,12 @@ describe('TopicService', () => {
       const startId = '22222222-2222-2222-2222-222222222222';
       const endId = '33333333-3333-3333-3333-333333333333';
       mockMessageRepo.findOne
-        .mockResolvedValueOnce(createMockMessage({ id: startId, createdAt: new Date('2024-01-01T00:00:05Z') }))
-        .mockResolvedValueOnce(createMockMessage({ id: endId, createdAt: new Date('2024-01-01T00:00:02Z') }));
+        .mockResolvedValueOnce(
+          createMockMessage({ id: startId, createdAt: new Date('2024-01-01T00:00:05Z') }),
+        )
+        .mockResolvedValueOnce(
+          createMockMessage({ id: endId, createdAt: new Date('2024-01-01T00:00:02Z') }),
+        );
 
       await expect(
         service.getMessages('topic-1', { start: startId, end: endId, limit: 20 }),
@@ -1589,13 +1775,61 @@ describe('TopicService', () => {
       expect(mockTopicRepo.save).not.toHaveBeenCalled();
     });
 
+    it('should passthrough seatLabel from metadata (roundtable seat identity, single key only)', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+
+      const dto = { content: 'Seat report', metadata: { seatLabel: 'kimi-1' } };
+      const createdMessage = createMockMessage(dto);
+      const savedMessage = createMockMessage(dto);
+      mockMessageRepo.create.mockReturnValue(createdMessage);
+      mockMessageRepo.save.mockResolvedValue(savedMessage);
+      mockAgentRepo.findOne.mockResolvedValue({
+        id: 'user-1',
+        name: 'Agent One',
+        avatarUrl: null,
+      } as unknown as Agent);
+
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.AGENT, dto);
+
+      expect(result).toMatchObject({ seatLabel: 'kimi-1' });
+    });
+
+    it('should omit seatLabel when metadata lacks the key (no null serialization)', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+
+      const dto = { content: 'Plain message' };
+      const savedMessage = createMockMessage(dto);
+      mockMessageRepo.create.mockReturnValue(createMockMessage(dto));
+      mockMessageRepo.save.mockResolvedValue(savedMessage);
+      mockUserRepo.findOne.mockResolvedValue({
+        id: 'user-1',
+        displayName: 'Test User',
+        avatarUrl: null,
+      } as unknown as User);
+
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, dto);
+
+      // 字段缺省 = 响应对象字面缺键（条件展开），JSON 序列化不出 null
+      expect(result).not.toHaveProperty('seatLabel');
+    });
+
     it('should not update lastActiveAt when human sends a message', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
 
       const dto = { content: 'Hello from human' };
-      const createdMessage = createMockMessage({ content: dto.content, senderId: 'user-1', senderType: ActorType.HUMAN });
-      const savedMessage = createMockMessage({ content: dto.content, senderId: 'user-1', senderType: ActorType.HUMAN });
+      const createdMessage = createMockMessage({
+        content: dto.content,
+        senderId: 'user-1',
+        senderType: ActorType.HUMAN,
+      });
+      const savedMessage = createMockMessage({
+        content: dto.content,
+        senderId: 'user-1',
+        senderType: ActorType.HUMAN,
+      });
       mockMessageRepo.create.mockReturnValue(createdMessage);
       mockMessageRepo.save.mockResolvedValue(savedMessage);
       mockUserRepo.findOne.mockResolvedValue({
@@ -1664,7 +1898,13 @@ describe('TopicService', () => {
       mockMessageRepo.save.mockResolvedValue(savedMsg);
       mockUserRepo.findOne.mockResolvedValue({ displayName: 'Admin' } as User);
 
-      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Admin message' }, UserRole.ADMIN);
+      const result = await service.sendMessage(
+        'topic-1',
+        'user-1',
+        ActorType.HUMAN,
+        { content: 'Admin message' },
+        UserRole.ADMIN,
+      );
 
       expect(result).toEqual(expect.objectContaining({ id: 'msg-admin' }));
       // admin 放行：不触发 owner 代理查询（短路）
@@ -1685,7 +1925,9 @@ describe('TopicService', () => {
       mockMessageRepo.save.mockResolvedValue(savedMsg);
       mockUserRepo.findOne.mockResolvedValue({ displayName: 'Owner' } as User);
 
-      const result = await service.sendMessage('topic-1', 'owner-1', ActorType.HUMAN, { content: 'Owner message' });
+      const result = await service.sendMessage('topic-1', 'owner-1', ActorType.HUMAN, {
+        content: 'Owner message',
+      });
 
       expect(result).toEqual(expect.objectContaining({ id: 'msg-owner' }));
       expect(mockOwnerProxy.isOwnerProxy).toHaveBeenCalledWith('agent-1', {
@@ -1732,7 +1974,9 @@ describe('TopicService', () => {
       mockMessageRepo.save.mockResolvedValue(savedMsg);
       mockUserRepo.findOne.mockResolvedValue({ displayName: 'Member' } as User);
 
-      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Hi' });
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+        content: 'Hi',
+      });
 
       expect(result).toEqual(expect.objectContaining({ id: 'msg-participant' }));
       expect(mockOwnerProxy.isOwnerProxy).not.toHaveBeenCalled();
@@ -1811,10 +2055,19 @@ describe('TopicService', () => {
       const savedMsg = createMockMessage({ id: 'msg-idem-1', content: 'Hello' });
       mockMessageRepo.create.mockReturnValue(savedMsg);
       mockMessageRepo.save.mockResolvedValue(savedMsg);
-      mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-1', actorId: 'user-1', clientRequestId: 'req-msg-001', entityType: 'message', entityId: 'msg-idem-1' } as IdempotencyRecord);
+      mockIdempotencyRepo.save.mockResolvedValue({
+        id: 'rec-1',
+        actorId: 'user-1',
+        clientRequestId: 'req-msg-001',
+        entityType: 'message',
+        entityId: 'msg-idem-1',
+      } as IdempotencyRecord);
       mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
 
-      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Hello', clientRequestId: 'req-msg-001' });
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+        content: 'Hello',
+        clientRequestId: 'req-msg-001',
+      });
 
       // 事务被调用
       expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
@@ -1841,7 +2094,10 @@ describe('TopicService', () => {
       mockAgentRepo.findOne.mockResolvedValue({ name: 'Bot' } as Agent);
 
       // 传入未归一化的 SYSTEM：写库值必须与无 key 路径一致（归一化为 AGENT）
-      await service.sendMessage('topic-1', 'agent-1', ActorType.SYSTEM, { content: 'Hello', clientRequestId: 'req-msg-009' });
+      await service.sendMessage('topic-1', 'agent-1', ActorType.SYSTEM, {
+        content: 'Hello',
+        clientRequestId: 'req-msg-009',
+      });
 
       expect(mockMessageRepo.create).toHaveBeenCalledWith(
         expect.objectContaining({ senderType: ActorType.AGENT }),
@@ -1869,11 +2125,18 @@ describe('TopicService', () => {
       } as IdempotencyRecord);
 
       // findOne returns existing message
-      const existingMsg = createMockMessage({ id: 'msg-existing-1', content: 'Existing', senderId: 'user-1' });
+      const existingMsg = createMockMessage({
+        id: 'msg-existing-1',
+        content: 'Existing',
+        senderId: 'user-1',
+      });
       mockMessageRepo.findOne.mockResolvedValue(existingMsg);
       mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
 
-      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Hello', clientRequestId: 'req-msg-002' });
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+        content: 'Hello',
+        clientRequestId: 'req-msg-002',
+      });
 
       expect(result).toHaveProperty('idempotentReplay', true);
       expect(result.id).toBe('msg-existing-1');
@@ -1890,10 +2153,12 @@ describe('TopicService', () => {
       mockDataSource.transaction.mockRejectedValueOnce(pgError);
 
       await expect(
-        service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, { content: 'Hello', clientRequestId: 'req-msg-003' }),
+        service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'Hello',
+          clientRequestId: 'req-msg-003',
+        }),
       ).rejects.toThrow('other unique violation');
     });
-
   });
 
   describe('getUnread', () => {
@@ -2054,8 +2319,16 @@ describe('TopicService', () => {
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(null);
 
-      const msg1 = createMockMessage({ id: 'msg-1', senderId: 'user-1', senderType: ActorType.HUMAN });
-      const msg2 = createMockMessage({ id: 'msg-2', senderId: 'agent-1', senderType: ActorType.AGENT });
+      const msg1 = createMockMessage({
+        id: 'msg-1',
+        senderId: 'user-1',
+        senderType: ActorType.HUMAN,
+      });
+      const msg2 = createMockMessage({
+        id: 'msg-2',
+        senderId: 'agent-1',
+        senderType: ActorType.AGENT,
+      });
       const fetchQbMock = createMockQueryBuilder([msg1, msg2], 2);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
         fetchQbMock as unknown as SelectQueryBuilder<Message>,
@@ -2121,9 +2394,7 @@ describe('TopicService', () => {
       const participant = createMockParticipant({ lastReadMessageId: 'msg-5' });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(participant);
-      mockMessageRepo.findOne.mockResolvedValue(
-        createMockMessage({ id: 'msg-5' }),
-      );
+      mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: 'msg-5' }));
 
       const countQbMock = {
         where: jest.fn().mockReturnThis(),
@@ -2627,9 +2898,7 @@ describe('TopicService', () => {
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(null);
 
-      await expect(service.uninviteAgent('topic-1', 'agent-2')).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(service.uninviteAgent('topic-1', 'agent-2')).rejects.toThrow(NotFoundException);
       expect(mockParticipantRepo.remove).not.toHaveBeenCalled();
     });
 
@@ -2643,6 +2912,225 @@ describe('TopicService', () => {
       await expect(service.uninviteAgent('topic-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
       });
+    });
+  });
+
+  // ─── addEditor / removeEditor（v1.46 TOPIC-PERM：D5 边界语义） ───
+
+  describe('addEditor', () => {
+    it('无参与行 → 新建 role=editor + status=invited（invited editor 无需 join 即可编辑，D4）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      const newParticipant = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        status: ParticipantStatus.INVITED,
+      });
+      mockParticipantRepo.create.mockReturnValue(newParticipant);
+      mockParticipantRepo.save.mockResolvedValue(newParticipant);
+
+      const result = await service.addEditor('topic-1', 'agent-1');
+
+      expect(mockParticipantRepo.create).toHaveBeenCalledWith({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'editor',
+        status: ParticipantStatus.INVITED,
+      });
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(newParticipant);
+      expect(result).toEqual(topic);
+    });
+
+    it('member invited 行 → 置 role=editor，保留原 status（不隐式改状态，铁律 #18）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const member = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'member',
+        status: ParticipantStatus.INVITED,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(member);
+      mockParticipantRepo.save.mockResolvedValue(member);
+
+      await service.addEditor('topic-1', 'agent-1');
+
+      expect(member.role).toBe('editor');
+      expect(member.status).toBe(ParticipantStatus.INVITED); // status 不动
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(member);
+    });
+
+    it('member active 行 → 置 role=editor，保留 active', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const member = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'member',
+        status: ParticipantStatus.ACTIVE,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(member);
+      mockParticipantRepo.save.mockResolvedValue(member);
+
+      await service.addEditor('topic-1', 'agent-1');
+
+      expect(member.role).toBe('editor');
+      expect(member.status).toBe(ParticipantStatus.ACTIVE);
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(member);
+    });
+
+    it('已是 editor → 幂等成功（不重复 save 不抛冲突）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const editor = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'editor',
+        status: ParticipantStatus.ACTIVE,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(editor);
+
+      const result = await service.addEditor('topic-1', 'agent-1');
+
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+      expect(result).toEqual(topic);
+    });
+
+    it('status=left 行 → 409（需先重新 invite，不隐式复活历史行，D5）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(
+        createMockParticipant({
+          topicId: 'topic-1',
+          participantId: 'agent-1',
+          participantType: ActorType.AGENT,
+          role: 'member',
+          status: ParticipantStatus.LEFT,
+        }),
+      );
+
+      await expect(service.addEditor('topic-1', 'agent-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('目标是 moderator 行（creator 自己）→ 400（creator 不能被提升为 editor）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(
+        createMockParticipant({
+          topicId: 'topic-1',
+          participantId: 'user-1',
+          participantType: ActorType.HUMAN,
+          role: 'moderator',
+          status: ParticipantStatus.ACTIVE,
+        }),
+      );
+
+      await expect(service.addEditor('topic-1', 'user-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.VALIDATION_ERROR },
+      });
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('topic 不存在 → 404', async () => {
+      mockTopicRepo.findOne.mockResolvedValue(null);
+      await expect(service.addEditor('not-found', 'agent-1')).rejects.toThrow(NotFoundException);
+    });
+
+    it('agent 不存在 → 404 AGENT_NOT_FOUND', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockResourceValidator.exists.mockRejectedValue(
+        new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
+      );
+
+      await expect(service.addEditor('topic-1', 'agent-missing')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND },
+      });
+    });
+  });
+
+  describe('removeEditor', () => {
+    it('editor active → 降为 member，保留 status 不踢人（D5）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const editor = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'editor',
+        status: ParticipantStatus.ACTIVE,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(editor);
+      mockParticipantRepo.save.mockResolvedValue(editor);
+
+      const result = await service.removeEditor('topic-1', 'agent-1');
+
+      expect(editor.role).toBe('member');
+      expect(editor.status).toBe(ParticipantStatus.ACTIVE); // 不踢人
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(editor);
+      expect(result).toEqual(topic);
+    });
+
+    it('editor invited → 降为 member（仍是受邀者）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const editor = createMockParticipant({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        role: 'editor',
+        status: ParticipantStatus.INVITED,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(editor);
+      mockParticipantRepo.save.mockResolvedValue(editor);
+
+      await service.removeEditor('topic-1', 'agent-1');
+
+      expect(editor.role).toBe('member');
+      expect(editor.status).toBe(ParticipantStatus.INVITED);
+    });
+
+    it('非 editor 行（member）→ 404', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(
+        createMockParticipant({
+          topicId: 'topic-1',
+          participantId: 'agent-1',
+          participantType: ActorType.AGENT,
+          role: 'member',
+          status: ParticipantStatus.ACTIVE,
+        }),
+      );
+
+      await expect(service.removeEditor('topic-1', 'agent-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_IN_TOPIC },
+      });
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('无参与行 → 404', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.removeEditor('topic-1', 'agent-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_IN_TOPIC },
+      });
+    });
+
+    it('topic 不存在 → 404', async () => {
+      mockTopicRepo.findOne.mockResolvedValue(null);
+      await expect(service.removeEditor('not-found', 'agent-1')).rejects.toThrow(NotFoundException);
     });
   });
 
@@ -2696,10 +3184,12 @@ describe('TopicService', () => {
 
   describe('findOneWithParticipants', () => {
     /** Build a task QueryBuilder stub with chainable methods */
-    function createTaskQb(overrides: {
-      getMany?: any;
-      getCount?: number;
-    } = {}) {
+    function createTaskQb(
+      overrides: {
+        getMany?: any;
+        getCount?: number;
+      } = {},
+    ) {
       return {
         innerJoin: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
@@ -2729,9 +3219,7 @@ describe('TopicService', () => {
       mockTopicRepo.findOne.mockResolvedValue(topic);
 
       // Board mocks
-      const boards = [
-        { id: 'b1', name: 'Board 1', taskCount: 3 },
-      ];
+      const boards = [{ id: 'b1', name: 'Board 1', taskCount: 3 }];
       mockBoardRepo.find.mockResolvedValue(boards as Board[]);
       mockBoardRepo.count.mockResolvedValue(1);
 
@@ -2786,9 +3274,7 @@ describe('TopicService', () => {
       expect(result.taskCount).toBe(5);
       expect(result.openTaskCount).toBe(3);
       expect(result.doneTaskCount).toBe(2);
-      expect(result.boards).toEqual([
-        { id: 'b1', name: 'Board 1', taskCount: 3 },
-      ]);
+      expect(result.boards).toEqual([{ id: 'b1', name: 'Board 1', taskCount: 3 }]);
       expect(result.tasks).toEqual([
         { id: 't1', title: 'Task 1', status: 'todo', priority: 'p1' },
         { id: 't2', title: 'Task 2', status: 'done', priority: 'p2' },
@@ -2852,15 +3338,61 @@ describe('TopicService', () => {
       expect(result.invitedAgentIds).toEqual(['agent-1', 'agent-2']);
     });
 
+    it('should derive wakePolicy for roundtable topic with explicit broadcast setting', async () => {
+      // 显式值优先（与 roundtable.service resolveWakePolicy 同规）
+      const topic = createMockTopic({ kind: 'roundtable', settings: { wakePolicy: 'broadcast' } });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      expect(result.wakePolicy).toBe('broadcast');
+    });
+
+    it('should default roundtable wakePolicy to mention when settings lack explicit value', async () => {
+      const topic = createMockTopic({ kind: 'roundtable', settings: {} });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      expect(result.wakePolicy).toBe('mention');
+    });
+
+    it('should not output wakePolicy for normal topics', async () => {
+      // normal topic 零感知：即使 settings 里有 wakePolicy 也不输出（字段只服务圆桌 UI）
+      const topic = createMockTopic({ settings: { wakePolicy: 'broadcast' } });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      expect(result).not.toHaveProperty('wakePolicy');
+    });
+
     it('should throw NotFoundException when topic not found', async () => {
       mockTopicRepo.findOne.mockResolvedValue(null);
 
-      await expect(
-        service.findOneWithParticipants('not-found'),
-      ).rejects.toThrow(NotFoundException);
-      await expect(
-        service.findOneWithParticipants('not-found'),
-      ).rejects.toMatchObject({
+      await expect(service.findOneWithParticipants('not-found')).rejects.toThrow(NotFoundException);
+      await expect(service.findOneWithParticipants('not-found')).rejects.toMatchObject({
         response: { code: ErrorCode.TOPIC_NOT_FOUND },
       });
     });
@@ -2893,6 +3425,53 @@ describe('TopicService', () => {
       expect(result.participants).toHaveLength(1);
       expect(result.participants![0].participantId).toBe('user-1');
       expect(result.participants![0].status).toBe(ParticipantStatus.ACTIVE);
+    });
+
+    it('should filter out SYSTEM sentinel participants（公告通道哨兵不是成员，计数口径=过滤后数组）', async () => {
+      const topic = createMockTopic({
+        participants: [
+          createMockParticipant({
+            participantId: 'user-1',
+            status: ParticipantStatus.ACTIVE,
+          }),
+          // 哨兵 actor（sendSystemMessage 为私密桌自动 join，mockActorRepo 默认
+          // 非 user-/agent- 前缀归为 SYSTEM）：公告通道实现细节，不是话题成员
+          createMockParticipant({
+            participantId: '00000000-0000-0000-0000-000000000000',
+            status: ParticipantStatus.ACTIVE,
+          }),
+          createMockParticipant({
+            participantId: 'agent-1',
+            status: ParticipantStatus.ACTIVE,
+          }),
+        ],
+      });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      // 哨兵被过滤：仅真实成员进入返回数组（参与者面板计数口径 = 过滤后长度）
+      expect(result.participants).toHaveLength(2);
+      expect(result.participants!.map((p) => p.participantId)).toEqual(['user-1', 'agent-1']);
+      // 剩余成员类型映射正确（system 无漏网路径）
+      expect(result.participants![0]).toMatchObject({
+        participantId: 'user-1',
+        participantType: 'human',
+      });
+      expect(result.participants![1]).toMatchObject({
+        participantId: 'agent-1',
+        participantType: 'agent',
+      });
+      // 哨兵行保留在 DB（公告通道需要）：服务不写库，topic.participants 原样
+      expect(topic.participants).toHaveLength(3);
     });
   });
 

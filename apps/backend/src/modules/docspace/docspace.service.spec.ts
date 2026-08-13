@@ -12,14 +12,8 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
-import {
-  Visibility,
-  ErrorCode,
-  ActorType,
-  UserRole,
-  EventType,
-} from '@agent-chamber/shared';
-import { NotFoundException, ConflictException } from '@nestjs/common';
+import { Visibility, ErrorCode, ActorType, UserRole, EventType } from '@agent-chamber/shared';
+import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { EventService } from '../event/event.service';
@@ -112,9 +106,11 @@ describe('DocSpaceService', () => {
       // v1.42 批次 C2：updateRepoManifest 走原生 jsonb_set SQL（board updateMetrics 同款）
       query: jest.fn(),
       manager: {
-        transaction: jest.fn((fn: any) => fn({
-          createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
-        })),
+        transaction: jest.fn((fn: any) =>
+          fn({
+            createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+          }),
+        ),
       },
     } as unknown as jest.Mocked<Repository<DocSpace>>;
 
@@ -134,9 +130,11 @@ describe('DocSpaceService', () => {
       create: jest.fn((x: unknown) => x),
       createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
       manager: {
-        transaction: jest.fn((fn: any) => fn({
-          createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
-        })),
+        transaction: jest.fn((fn: any) =>
+          fn({
+            createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+          }),
+        ),
       },
     } as unknown as jest.Mocked<Repository<DocCategory>>;
 
@@ -363,12 +361,8 @@ describe('DocSpaceService', () => {
         andWhere: jest.fn().mockReturnThis(),
         getOne: jest.fn().mockResolvedValue(null),
       } as any);
-      spaceRepo.create.mockImplementation(
-        (input: DeepPartial<DocSpace>) => input as DocSpace,
-      );
-      spaceRepo.save.mockImplementation(
-        async (input: DeepPartial<DocSpace>) => input as DocSpace,
-      );
+      spaceRepo.create.mockImplementation((input: DeepPartial<DocSpace>) => input as DocSpace);
+      spaceRepo.save.mockImplementation(async (input: DeepPartial<DocSpace>) => input as DocSpace);
 
       const result = await service.create(mockActor, { name: '集成验证空间' });
       // 中文名 slugify 为空串 → 兜底 's-' + 8 位随机 hex，不得为空
@@ -382,7 +376,7 @@ describe('DocSpaceService', () => {
           topicId: 'topic-1',
           boardId: 'board-1',
         }),
-      ).rejects.toThrow(ConflictException);
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('validates board existence when boardId given', async () => {
@@ -402,7 +396,10 @@ describe('DocSpaceService', () => {
 
     it('throws AGENT_NOT_FOUND when invitedAgentIds invalid', async () => {
       resourceValidator.existsMany.mockRejectedValue(
-        new NotFoundException({ message: 'Some resources not found', code: ErrorCode.AGENT_NOT_FOUND }),
+        new NotFoundException({
+          message: 'Some resources not found',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
       await expect(
         service.create(mockActor, { name: 'Test', invitedAgentIds: ['agent-missing'] }),
@@ -445,7 +442,7 @@ describe('DocSpaceService', () => {
       spaceRepo.findOne.mockResolvedValue(makeSpace());
       await expect(
         service.update('space-1', { topicId: 'topic-1', boardId: 'board-1' }),
-      ).rejects.toThrow(ConflictException);
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('explicit null unbinds the bound side without touching task-doc links', async () => {
@@ -504,7 +501,9 @@ describe('DocSpaceService', () => {
 
     it('explicit null clears overviewFilter (字段出现即采用)', async () => {
       spaceRepo.findOne.mockResolvedValue(
-        makeSpace({ settings: { visibility: Visibility.OPEN, overviewFilter: { excludeTypes: ['memory'] } } }),
+        makeSpace({
+          settings: { visibility: Visibility.OPEN, overviewFilter: { excludeTypes: ['memory'] } },
+        }),
       );
 
       const saved = await service.update('space-1', { overviewFilter: null });
@@ -514,7 +513,9 @@ describe('DocSpaceService', () => {
 
     it('omitted overviewFilter preserves the old value', async () => {
       spaceRepo.findOne.mockResolvedValue(
-        makeSpace({ settings: { visibility: Visibility.OPEN, overviewFilter: { excludeTypes: ['memory'] } } }),
+        makeSpace({
+          settings: { visibility: Visibility.OPEN, overviewFilter: { excludeTypes: ['memory'] } },
+        }),
       );
 
       const saved = await service.update('space-1', { name: 'New Name' });
@@ -610,7 +611,11 @@ describe('DocSpaceService', () => {
     it('throws 409 if agent already a member', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      memberRepo.findOne.mockResolvedValue({ spaceId: 'space-1', actorId: 'agent-1', role: 'member' } as DocSpaceMember);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'member',
+      } as DocSpaceMember);
 
       await expect(service.inviteAgent('space-1', 'agent-1')).rejects.toThrow(ConflictException);
     });
@@ -620,7 +625,11 @@ describe('DocSpaceService', () => {
     it('removes member row', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      memberRepo.findOne.mockResolvedValue({ spaceId: 'space-1', actorId: 'agent-1', role: 'member' } as DocSpaceMember);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'member',
+      } as DocSpaceMember);
 
       await service.uninviteAgent('space-1', 'agent-1');
       expect(memberRepo.delete).toHaveBeenCalledWith({ spaceId: 'space-1', actorId: 'agent-1' });
@@ -629,7 +638,11 @@ describe('DocSpaceService', () => {
     it('throws if agent is editor (must remove editor first)', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      memberRepo.findOne.mockResolvedValue({ spaceId: 'space-1', actorId: 'agent-1', role: 'editor' } as DocSpaceMember);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'editor',
+      } as DocSpaceMember);
 
       await expect(service.uninviteAgent('space-1', 'agent-1')).rejects.toThrow(ConflictException);
     });
@@ -639,7 +652,11 @@ describe('DocSpaceService', () => {
     it('promotes member to editor', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      const memberRow = { spaceId: 'space-1', actorId: 'agent-1', role: 'member' } as DocSpaceMember;
+      const memberRow = {
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'member',
+      } as DocSpaceMember;
       memberRepo.findOne.mockResolvedValue(memberRow);
 
       await service.addEditor('space-1', 'agent-1');
@@ -650,7 +667,11 @@ describe('DocSpaceService', () => {
     it('prevents downgrade — existing editor stays editor', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      memberRepo.findOne.mockResolvedValue({ spaceId: 'space-1', actorId: 'agent-1', role: 'editor' } as DocSpaceMember);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'editor',
+      } as DocSpaceMember);
 
       await expect(service.addEditor('space-1', 'agent-1')).rejects.toThrow(ConflictException);
     });
@@ -671,7 +692,11 @@ describe('DocSpaceService', () => {
     it('demotes editor to member', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
-      const editorRow = { spaceId: 'space-1', actorId: 'agent-1', role: 'editor' } as DocSpaceMember;
+      const editorRow = {
+        spaceId: 'space-1',
+        actorId: 'agent-1',
+        role: 'editor',
+      } as DocSpaceMember;
       memberRepo.findOne.mockResolvedValue(editorRow);
 
       await service.removeEditor('space-1', 'agent-1');
@@ -685,6 +710,76 @@ describe('DocSpaceService', () => {
       memberRepo.findOne.mockResolvedValue(null);
 
       await expect(service.removeEditor('space-1', 'agent-1')).rejects.toThrow(ConflictException);
+    });
+  });
+
+  describe('transferCreator', () => {
+    const newAgentCreatorId = 'agent-9';
+
+    it('转让成功（agent 目标）：creatorId 更新 + 删除新 creator 的 member 行（干净交接）', async () => {
+      const space = makeSpace(); // creatorId = 'user-1'
+      spaceRepo.findOne.mockResolvedValue(space);
+      // actorRepo.findOne 命中（人/agent 统一 actors 表）
+      resourceValidator.exists.mockResolvedValue({ id: newAgentCreatorId, type: 'agent' } as Actor);
+
+      const result = await service.transferCreator('space-1', newAgentCreatorId);
+
+      // 双层校验第二层：目标存在性走 actors 表 + ACTOR_NOT_FOUND（铁律 #21/#22）
+      expect(resourceValidator.exists).toHaveBeenCalledWith(
+        actorRepo,
+        newAgentCreatorId,
+        ErrorCode.ACTOR_NOT_FOUND,
+      );
+      // 干净交接：既有 member 行被删除（幂等 delete，无行时 affected=0 非错误）
+      expect(memberRepo.delete).toHaveBeenCalledWith({
+        spaceId: 'space-1',
+        actorId: newAgentCreatorId,
+      });
+      expect(space.creatorId).toBe(newAgentCreatorId);
+      expect(result.creatorId).toBe(newAgentCreatorId);
+      expect(spaceRepo.save).toHaveBeenCalledWith(space);
+    });
+
+    it('转让成功（user 目标）：与 agent 目标同路径（actors 表统一，不区分类型）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      resourceValidator.exists.mockResolvedValue({ id: 'user-2', type: 'human' } as Actor);
+
+      const result = await service.transferCreator('space-1', 'user-2');
+
+      expect(result.creatorId).toBe('user-2');
+      expect(memberRepo.delete).toHaveBeenCalledWith({ spaceId: 'space-1', actorId: 'user-2' });
+    });
+
+    it('目标 actor 不存在 → 404 ACTOR_NOT_FOUND（resourceValidator 抛透传）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      resourceValidator.exists.mockRejectedValue(
+        new NotFoundException({ message: 'Resource not found', code: ErrorCode.ACTOR_NOT_FOUND }),
+      );
+
+      await expect(service.transferCreator('space-1', 'ghost-actor')).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.ACTOR_NOT_FOUND }),
+        }),
+      );
+      // 不落库、不删 member 行
+      expect(spaceRepo.save).not.toHaveBeenCalled();
+      expect(memberRepo.delete).not.toHaveBeenCalled();
+    });
+
+    it('目标已是当前 creator → 409 RESOURCE_CONFLICT（无操作请求，真实状态冲突）', async () => {
+      const space = makeSpace(); // creatorId = 'user-1'，目标 'user-1' 即自己
+      spaceRepo.findOne.mockResolvedValue(space);
+      resourceValidator.exists.mockResolvedValue({ id: 'user-1', type: 'human' } as Actor);
+
+      await expect(service.transferCreator('space-1', 'user-1')).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.RESOURCE_CONFLICT }),
+        }),
+      );
+      expect(space.creatorId).toBe('user-1');
+      expect(spaceRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -1214,7 +1309,9 @@ describe('DocSpaceService', () => {
     });
 
     it('appliedFilters 回显全部生效维度', async () => {
-      const docs = [makeOverviewDoc({ id: 'd1', path: 'docs/a.md', docType: 'guide', tags: ['prod'] })];
+      const docs = [
+        makeOverviewDoc({ id: 'd1', path: 'docs/a.md', docType: 'guide', tags: ['prod'] }),
+      ];
       mockOverview([], docs);
 
       const result = await service.getOverview('space-1', {
@@ -1494,7 +1591,10 @@ describe('DocSpaceService', () => {
         issues: [{ kind: 'heading', target: 'primary', value: '## 悬空的节' }],
         checkedAt: '2026-08-06T00:00:00.000Z',
       });
-      expect(result.routes![1].health).toEqual({ issues: [], checkedAt: '2026-08-06T00:00:00.000Z' });
+      expect(result.routes![1].health).toEqual({
+        issues: [],
+        checkedAt: '2026-08-06T00:00:00.000Z',
+      });
       expect(result.routes![2].health).toBeNull();
       // 有已检路由（r1/r2）→ totalBrokenRoutes 返回；只数 issues.length>0 的路由（r1），未检 r3 不计
       expect(result.totalBrokenRoutes).toBe(1);

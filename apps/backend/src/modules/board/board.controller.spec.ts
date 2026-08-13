@@ -519,25 +519,105 @@ describe('BoardController', () => {
       expect(service.update).toHaveBeenCalledWith('board-1', dto);
     });
 
-    it('should filter sensitive fields for non-creator (editor)', async () => {
+    // ─── D6（v1.46 TOPIC-PERM）：结构字段显式 403 替代 v1.37 静默剥离（用户拍板新契约）───
+
+    // 非 admin 的创建者（R4 语义：creator 判定必须用非 admin 身份验证，防 admin bypass 污染）
+    const creatorActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+    const editorActor = { id: 'editor-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+
+    it('editor PATCH topicId → 403，消息列出结构字段名（不再 200 装傻）', async () => {
       const board = { id: 'board-1', creatorId: 'other-user', creatorType: 'human' };
-      const result = { id: 'board-1', name: 'Updated' };
+      service.findById.mockResolvedValue(board);
+
+      await expect(
+        controller.update('board-1', { topicId: 'topic-2' }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('topicId'),
+          }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor name+topicId → 403 无部分应用（整体拒绝）', async () => {
+      const board = { id: 'board-1', creatorId: 'other-user', creatorType: 'human' };
+      service.findById.mockResolvedValue(board);
+
+      await expect(
+        controller.update('board-1', { name: 'Updated', topicId: 'topic-2' }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor topicId: null 显式值也算结构字段出现（`!== undefined` 探测 = 解绑语义）', async () => {
+      const board = { id: 'board-1', creatorId: 'other-user', creatorType: 'human' };
+      service.findById.mockResolvedValue(board);
+
+      await expect(
+        controller.update('board-1', { topicId: null as never }, editorActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({
+            code: ErrorCode.PERMISSION_DENIED,
+            message: expect.stringContaining('topicId'),
+          }),
+        }),
+      );
+      expect(service.update).not.toHaveBeenCalled();
+    });
+
+    it('editor 纯内容字段（name/description）→ service 收全 dto（透传，不再剥离）', async () => {
+      const board = { id: 'board-1', creatorId: 'other-user', creatorType: 'human' };
+      const result = { id: 'board-1', name: 'Updated', description: 'Desc' };
       service.findById.mockResolvedValue(board);
       service.update.mockResolvedValue(result);
 
-      const dto = {
-        name: 'Updated',
-        description: 'Desc',
-        topicId: 'topic-2',
-        visibility: Visibility.PRIVATE,
-        invitedAgentIds: ['agent-3'],
-      };
+      const dto = { name: 'Updated', description: 'Desc' };
+      expect(await controller.update('board-1', dto, editorActor)).toBe(result);
+      expect(service.update).toHaveBeenCalledWith('board-1', dto);
+    });
+
+    it('creator（非 admin）全字段可更新 → 透传持久化', async () => {
+      const board = { id: 'board-1', creatorId: 'user-1', creatorType: 'human' };
+      const result = { id: 'board-1', name: 'Updated', topicId: 'topic-2' };
+      service.findById.mockResolvedValue(board);
+      service.update.mockResolvedValue(result);
+
+      const dto = { name: 'Updated', topicId: 'topic-2' };
+      expect(await controller.update('board-1', dto, creatorActor)).toBe(result);
+      expect(service.update).toHaveBeenCalledWith('board-1', dto);
+    });
+
+    it('admin 结构字段可更新（全局 bypass，非 creator 也放行）', async () => {
+      const board = { id: 'board-1', creatorId: 'other-user', creatorType: 'human' };
+      const result = { id: 'board-1', topicId: 'topic-2' };
+      service.findById.mockResolvedValue(board);
+      service.update.mockResolvedValue(result);
+
+      const dto = { topicId: 'topic-2' };
       expect(await controller.update('board-1', dto, mockActor)).toBe(result);
-      expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
-      expect(service.update).toHaveBeenCalledWith('board-1', {
-        name: 'Updated',
-        description: 'Desc',
-      });
+      expect(service.update).toHaveBeenCalledWith('board-1', dto);
+    });
+
+    it('人类 owner 代理（非 admin 非直接 creator）结构字段可更新（v1.37 owner proxy）', async () => {
+      const board = { id: 'board-1', creatorId: 'agent-9', creatorType: 'agent' };
+      const result = { id: 'board-1', visibility: Visibility.PRIVATE };
+      service.findById.mockResolvedValue(board);
+      service.update.mockResolvedValue(result);
+      mockOwnerProxyService.isOwnerProxy.mockResolvedValue(true);
+
+      const ownerActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+      const dto = { visibility: Visibility.PRIVATE };
+      expect(await controller.update('board-1', dto, ownerActor)).toBe(result);
+      expect(mockOwnerProxyService.isOwnerProxy).toHaveBeenCalledWith('agent-9', ownerActor);
+      expect(service.update).toHaveBeenCalledWith('board-1', dto);
     });
   });
 
@@ -610,9 +690,9 @@ describe('BoardController', () => {
         }),
       );
 
-      await expect(
-        controller.updateMetrics('board-1', { metrics: {} }, mockActor),
-      ).rejects.toThrow(ForbiddenException);
+      await expect(controller.updateMetrics('board-1', { metrics: {} }, mockActor)).rejects.toThrow(
+        ForbiddenException,
+      );
       expect(service.updateMetrics).not.toHaveBeenCalled();
     });
 

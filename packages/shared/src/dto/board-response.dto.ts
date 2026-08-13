@@ -334,6 +334,28 @@ export interface BoardDigest {
    * 无 metrics 时 null。设计与 metrics 端点的唯一写口对齐：digest 永不写入。
    */
   metrics: Record<string, unknown> | null;
+  /**
+   * 圆桌平台级指标（v1.44.0-dev，M2 阶段 7，实时装配新段）。
+   *
+   * 平台级口径：topic/seat/message 均不隶属于 board——digest 虽按 board 调用，
+   * 本段统计的是**全平台**（设计文档 §12 r10）。永远输出该段：平台无圆桌时
+   * 全零（形状可预测，不返回 undefined）。
+   */
+  roundtable: {
+    /** 圆桌 topic 数（topics.kind='roundtable' 全平台计数） */
+    topicCount: number;
+    /** 座位数（roundtable_seats.status='active' 全平台计数） */
+    seatCount: number;
+    /** 日均轮次：近 7 天座位消息数（metadata.seatLabel 非空）÷ 7，保留两位小数 */
+    dailyRounds: number;
+    /**
+     * 沉默拦截率：Σseat.state.silentCount ÷ (ΣsilentCount + 座位消息全时段累计)。
+     * 分母 = 全时段座位消息总数（非 7 天窗口）；分母为 0 时为 0（防除零）。
+     */
+    silentRate: number;
+    /** 熔断触发总次数：Σseat.state.valveTripCount（圆桌安全阀跨过阈值次数） */
+    valveTripCount: number;
+  };
   /** 任一列表段（risks/nextUp/recentDone/recentlyUpdated/versions.history）被 limit 截断时为 true */
   truncated: boolean;
 }

@@ -1,9 +1,12 @@
 /**
  * read_doc 单元测试
  *
- * 覆盖：大纲模式（spaceName+path）、大纲模式（docId）、position→section、
- * headingPath→section（先取大纲匹配再读 section）、双通道校验（缺参数→isError）、
- * path 定位失败（文档不存在）、doc not found、紧凑 JSON、不收 sectionId。
+ * 覆盖：outline 模式（spaceName+path / docId 定位）精简 JSON 投影字段集合（砍掉
+ * spaceId/categoryId/source/sourceSha/createdBy/createdAt/mode）、full 模式原始
+ * markdown 纯文本、position/headingPath → section 原始 markdown（标题行重建：
+ * headingLevel>6 截断为 6 个 #、headingLevel=0 无标题行）、headingPath 未命中/多候选、
+ * 双通道校验（缺参数→isError）、path 定位失败、HTTP 失败、maxFullTokens 透传、
+ * 紧凑 JSON（outline 单行）、不收 sectionId。
  */
 
 import type { CustomToolContext } from '@agent-chamber/automcp';
@@ -36,7 +39,7 @@ describe('read_doc', () => {
     expect(schema.properties?.['sectionId']).toBeUndefined();
   });
 
-  it('大纲模式（spaceName+path 定位）', async () => {
+  it('大纲模式（spaceName+path 定位）→ 精简 JSON 字段集合', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -46,67 +49,195 @@ describe('read_doc', () => {
     });
     request.mockResolvedValueOnce({
       id: 'd1',
+      spaceId: 'sp-1',
+      categoryId: 'cat-1',
       path: 'docs/arch.md',
       title: 'Architecture',
+      summary: 'Architecture overview doc',
+      docType: 'architecture',
+      tags: ['arch', 'design'],
+      source: 'git:github.com/foo/bar',
+      sourceSha: 'abc123',
+      sectionCount: 2,
+      tokenEstimate: 5000,
+      createdBy: 'agent-1',
+      createdAt: '2026-07-01T00:00:00Z',
+      updatedAt: '2026-07-30T00:00:00Z',
       sections: [
         { position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 50 },
         { position: 1, headingPath: '§1 Intro', headingLevel: 1, tokenEstimate: 30 },
       ],
       linkHealth: { total: 2, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
+      mode: 'outline',
     });
 
-    const result = await readDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/arch.md' },
-      ctx(),
-    );
+    const result = await readDocTool.handler({ spaceName: 'My Docs', path: 'docs/arch.md' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
-    expect(body.id).toBe('d1');
+    // 投影后字段集合 = 白名单 11 字段（docId 取自后端响应 id）
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        'docId',
+        'path',
+        'title',
+        'summary',
+        'docType',
+        'tags',
+        'tokenEstimate',
+        'sectionCount',
+        'updatedAt',
+        'linkHealth',
+        'sections',
+      ].sort(),
+    );
+    expect(body.docId).toBe('d1');
     expect(body.sections).toBeDefined();
     expect(body.sections.length).toBe(2);
+    expect(body.sections[1]).toEqual({
+      position: 1,
+      headingPath: '§1 Intro',
+      headingLevel: 1,
+      tokenEstimate: 30,
+    });
     expect(body.linkHealth).toEqual({ total: 2, broken: [], checkedAt: '2026-07-30T00:00:00Z' });
+    // 被砍掉的低价值字段
+    expect(body.spaceId).toBeUndefined();
+    expect(body.categoryId).toBeUndefined();
+    expect(body.source).toBeUndefined();
+    expect(body.sourceSha).toBeUndefined();
+    expect(body.createdBy).toBeUndefined();
+    expect(body.createdAt).toBeUndefined();
+    expect(body.mode).toBeUndefined();
+    expect(body.content).toBeUndefined();
 
     // 验证调用链：list spaces → docs?path= → /docs/:id
     expect(request.mock.calls.length).toBe(3);
   });
 
-  it('大纲模式（docId 直接定位）', async () => {
+  it('大纲模式（docId 直接定位）→ 精简 JSON 字段集合', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       id: 'd1',
+      spaceId: 'sp-1',
       path: 'docs/x.md',
       title: 'X',
+      summary: 'X doc summary',
+      docType: 'guide',
+      tags: ['x'],
+      source: 'native',
+      sectionCount: 0,
+      tokenEstimate: 0,
+      createdBy: 'agent-1',
+      createdAt: '2026-07-01T00:00:00Z',
+      updatedAt: '2026-07-02T00:00:00Z',
       sections: [],
       linkHealth: { total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
+      mode: 'outline',
     });
 
-    const result = await readDocTool.handler(
-      { docId: 'd1' },
-      ctx(),
-    );
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
-    expect(body.id).toBe('d1');
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        'docId',
+        'path',
+        'title',
+        'summary',
+        'docType',
+        'tags',
+        'tokenEstimate',
+        'sectionCount',
+        'updatedAt',
+        'linkHealth',
+        'sections',
+      ].sort(),
+    );
+    expect(body.docId).toBe('d1');
+    expect(body.sections).toEqual([]);
     expect(body.linkHealth).toEqual({ total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' });
 
     // 单次调用（不调 list spaces）
     expect(request.mock.calls.length).toBe(1);
   });
 
-  it('position 定位 → section 正文', async () => {
+  it('大纲模式 linkHealth 为 null（旧数据未检查）→ 投影仍含 linkHealth 键', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'x.md',
+      title: 'X',
+      summary: 'X summary',
+      docType: 'note',
+      tags: [],
+      tokenEstimate: 100,
+      sectionCount: 0,
+      updatedAt: '2026-07-02T00:00:00Z',
+      sections: [],
+      linkHealth: null,
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toHaveProperty('linkHealth');
+    expect(body.linkHealth).toBeNull();
+  });
+
+  it('full 模式（小文档内联全文）→ 返回 content 原始 markdown 纯文本', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'docs/x.md',
+      title: 'X',
+      mode: 'full',
+      content: '# X\n\nInlined full content.',
+      sections: [{ position: 0, headingPath: 'X', headingLevel: 1, tokenEstimate: 50 }],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    // 不 JSON 包装、不加任何头部——text 就是 content 原值
+    expect(result.content[0].text).toBe('# X\n\nInlined full content.');
+  });
+
+  it('outline 模式（mode:outline 大文档）→ 精简 JSON 且无 content', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'docs/x.md',
+      title: 'X',
+      summary: 'X summary',
+      docType: 'guide',
+      tags: [],
+      tokenEstimate: 5000,
+      sectionCount: 1,
+      updatedAt: '2026-07-02T00:00:00Z',
+      mode: 'outline',
+      sections: [{ position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 5000 }],
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.docId).toBe('d1');
+    expect(body.sections).toHaveLength(1);
+    expect(body).not.toHaveProperty('content');
+    expect(body).not.toHaveProperty('mode');
+  });
+
+  it('position 定位 → 原始 markdown = 标题行 + 空行 + content，且不再多打 linkHealth 请求', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
     request.mockResolvedValueOnce({
       items: [{ id: 'd1' }],
-    });
-    // doc 元数据（linkHealth）
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      linkHealth: { total: 1, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
     });
     request.mockResolvedValueOnce({
       docId: 'd1',
@@ -124,17 +255,17 @@ describe('read_doc', () => {
     );
 
     expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.content).toBe('Section content here');
-    expect(body.position).toBe(1);
-    expect(body.linkHealth).toEqual({ total: 1, broken: [], checkedAt: '2026-07-30T00:00:00Z' });
+    // headingPath '§1 Intro' 末段 = '1 Intro'（数字是标题文本本身，不是分隔符）
+    expect(result.content[0].text).toBe('# 1 Intro\n\nSection content here');
 
-    // 调用链应包含 sections/:position + 前一步 doc 元数据 fetch
-    const sectionCall = request.mock.calls[3];
+    // 调用链仅 3 次：space 解析 + path 定位 + sections/:position
+    // （旧实现 position 直给时还多打一次 doc 元数据请求取 linkHealth——已砍）
+    expect(request).toHaveBeenCalledTimes(3);
+    const sectionCall = request.mock.calls[2];
     expect(sectionCall[1]).toContain('sections/1');
   });
 
-  it('headingPath 定位 → 先取大纲匹配 position 再读 section', async () => {
+  it('headingPath 定位 → 先取大纲匹配 position 再读 section，返回含标题行 markdown', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -142,14 +273,14 @@ describe('read_doc', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'd1' }],
     });
-    // 大纲
+    // 大纲（linkHealth 不再透传给 section 响应）
     request.mockResolvedValueOnce({
       id: 'd1',
       path: 'docs/x.md',
       sections: [
         { position: 0, headingPath: null, headingLevel: 0 },
         { position: 1, headingPath: '§1 Intro', headingLevel: 1 },
-        { position: 2, headingPath: '§2 Design', headingLevel: 1 },
+        { position: 2, headingPath: '§2 Design', headingLevel: 2 },
       ],
       linkHealth: { total: 3, broken: ['refs/old.md'], checkedAt: '2026-07-30T00:00:00Z' },
     });
@@ -159,7 +290,7 @@ describe('read_doc', () => {
       docPath: 'docs/x.md',
       position: 2,
       headingPath: '§2 Design',
-      headingLevel: 1,
+      headingLevel: 2,
       content: 'Design section content',
       tokenEstimate: 42,
     });
@@ -170,15 +301,48 @@ describe('read_doc', () => {
     );
 
     expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.content).toBe('Design section content');
-    expect(body.position).toBe(2);
-    expect(body.headingPath).toBe('§2 Design');
-    expect(body.linkHealth).toEqual({
-      total: 3,
-      broken: ['refs/old.md'],
-      checkedAt: '2026-07-30T00:00:00Z',
+    // headingPath '§2 Design' 末段 = '2 Design'（数字是标题文本本身，不是分隔符）
+    expect(result.content[0].text).toBe('## 2 Design\n\nDesign section content');
+
+    // 调用链：space 解析 + path 定位 + 大纲解析 + section 读取 = 4 次
+    expect(request).toHaveBeenCalledTimes(4);
+    expect(request.mock.calls[3][1]).toContain('sections/2');
+  });
+
+  it('headingLevel > 6 时标题行截断为 6 个 #', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      docId: 'd1',
+      docPath: 'docs/x.md',
+      position: 3,
+      headingPath: 'A § B § Deep',
+      headingLevel: 7,
+      content: 'Deep content',
+      tokenEstimate: 10,
     });
+
+    const result = await readDocTool.handler({ docId: 'd1', position: 3 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe('###### Deep\n\nDeep content');
+  });
+
+  it('headingLevel=0 无标题行 → 只返回 content', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      docId: 'd1',
+      docPath: 'docs/x.md',
+      position: 0,
+      headingPath: null,
+      headingLevel: 0,
+      content: 'Plain content.',
+      tokenEstimate: 10,
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1', position: 0 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe('Plain content.');
   });
 
   it('headingPath 在大纲中未匹配 → isError', async () => {
@@ -269,14 +433,9 @@ describe('read_doc', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'd1' }],
     });
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 404, message: 'Not found' }),
-    );
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 404, message: 'Not found' }));
 
-    const result = await readDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/x.md' },
-      ctx(),
-    );
+    const result = await readDocTool.handler({ spaceName: 'My Docs', path: 'docs/x.md' }, ctx());
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
@@ -291,14 +450,8 @@ describe('read_doc', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'd1' }],
     });
-    // doc 元数据（linkHealth）成功
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      linkHealth: { total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
-    });
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 500, message: 'DB error' }),
-    );
+    // section 读取失败（旧实现此处还有一步 doc 元数据 fetch——已砍）
+    request.mockRejectedValueOnce(new PlatformApiError({ status: 500, message: 'DB error' }));
 
     const result = await readDocTool.handler(
       { spaceName: 'My Docs', path: 'docs/x.md', position: 0 },
@@ -310,86 +463,19 @@ describe('read_doc', () => {
     expect(body.failedStep).toBe('read_doc_section');
   });
 
-  it('大纲模式 linkHealth 为 null（旧数据未检查）', async () => {
+  it('紧凑 JSON：outline 模式响应是单行 JSON', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       id: 'd1',
       path: 'x.md',
       title: 'X',
-      sections: [],
-      linkHealth: null,
-    });
-
-    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
-
-    expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.linkHealth).toBeNull();
-  });
-
-  it('section 模式（position）linkHealth 为 null', async () => {
-    const request = mockRequest();
-    request.mockResolvedValueOnce({
-      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
-    });
-    request.mockResolvedValueOnce({
-      items: [{ id: 'd1' }],
-    });
-    // doc 元数据 linkHealth 为 null
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      linkHealth: null,
-    });
-    request.mockResolvedValueOnce({
-      docId: 'd1',
-      docPath: 'docs/x.md',
-      position: 0,
-      headingPath: null,
-      headingLevel: 0,
-      content: 'Content',
-      tokenEstimate: 10,
-    });
-
-    const result = await readDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/x.md', position: 0 },
-      ctx(),
-    );
-
-    expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.content).toBe('Content');
-    expect(body.linkHealth).toBeNull();
-  });
-
-  it('section 模式（position）doc 元数据 fetch 失败 → isError', async () => {
-    const request = mockRequest();
-    request.mockResolvedValueOnce({
-      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
-    });
-    request.mockResolvedValueOnce({
-      items: [{ id: 'd1' }],
-    });
-    // doc 元数据 fetch 失败
-    request.mockRejectedValueOnce(
-      new PlatformApiError({ status: 404, message: 'Doc not found' }),
-    );
-
-    const result = await readDocTool.handler(
-      { spaceName: 'My Docs', path: 'docs/x.md', position: 0 },
-      ctx(),
-    );
-
-    expect(result.isError).toBe(true);
-    const body = JSON.parse(result.content[0].text);
-    expect(body.failedStep).toBe('read_doc_outline');
-  });
-
-  it('紧凑 JSON', async () => {
-    const request = mockRequest();
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      path: 'x.md',
-      title: 'X',
+      summary: 'X summary',
+      docType: 'note',
+      tags: [],
+      tokenEstimate: 100,
+      sectionCount: 0,
+      updatedAt: '2026-07-02T00:00:00Z',
+      mode: 'outline',
       sections: [],
       linkHealth: { total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
     });
@@ -397,51 +483,13 @@ describe('read_doc', () => {
     const result = await readDocTool.handler({ docId: 'd1' }, ctx());
 
     const text = result.content[0].text;
-    expect(text).not.toContain('\n  ');
+    expect(text).not.toContain('\n');
     expect(() => JSON.parse(text)).not.toThrow();
   });
 
-  // ─── 小文档内联全文（后端 mode/content 透传 + maxFullTokens）───
+  // ─── 小文档内联全文（后端 mode/content + maxFullTokens 透传）───
 
-  it('大纲模式后端返回 mode:full + content 时原样透传', async () => {
-    const request = mockRequest();
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      path: 'docs/x.md',
-      title: 'X',
-      mode: 'full',
-      content: '# X\n\nInlined full content.',
-      sections: [{ position: 0, headingPath: 'X', headingLevel: 1, tokenEstimate: 50 }],
-    });
-
-    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
-
-    expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.mode).toBe('full');
-    expect(body.content).toBe('# X\n\nInlined full content.');
-    expect(body.sections).toHaveLength(1);
-  });
-
-  it('大纲模式后端返回 mode:outline（大文档）原样透传且无 content', async () => {
-    const request = mockRequest();
-    request.mockResolvedValueOnce({
-      id: 'd1',
-      path: 'docs/x.md',
-      title: 'X',
-      mode: 'outline',
-      sections: [{ position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 5000 }],
-    });
-
-    const result = await readDocTool.handler({ docId: 'd1' }, ctx());
-
-    expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.mode).toBe('outline');
-    expect(body.content).toBeUndefined();
-  });
-
-  it('maxFullTokens 透传到后端 query（大纲模式）', async () => {
+  it('maxFullTokens 透传到后端 query；threshold 覆盖后 mode:full → 纯文本', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       id: 'd1',
@@ -455,8 +503,7 @@ describe('read_doc', () => {
     const result = await readDocTool.handler({ docId: 'd1', maxFullTokens: 5000 }, ctx());
 
     expect(result.isError).toBeFalsy();
-    const body = JSON.parse(result.content[0].text);
-    expect(body.mode).toBe('full');
+    expect(result.content[0].text).toBe('Inlined via threshold override.');
     // GET /docs/:id 必须带 params { maxFullTokens: 5000 }
     const outlineCall = request.mock.calls[0];
     expect(outlineCall[1]).toBe('/docs/d1');
@@ -479,7 +526,8 @@ describe('read_doc', () => {
     const outlineCall = request.mock.calls[0];
     expect(outlineCall[2]).toEqual({ params: { maxFullTokens: 0 } });
     const body = JSON.parse(result.content[0].text);
-    expect(body.mode).toBe('outline');
+    expect(body.sections).toHaveLength(1);
+    expect(body).not.toHaveProperty('content');
   });
 
   it('大纲模式未传 maxFullTokens 时不带 options（保持原调用形态）', async () => {

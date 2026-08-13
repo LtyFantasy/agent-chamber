@@ -15,6 +15,8 @@ import { Actor } from '../../database/entities/actor.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { Milestone } from '../../database/entities/milestone.entity';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
+import { Message } from '../../database/entities/message.entity';
 import { TaskModule } from '../task/task.module';
 import { EventModule } from '../event/event.module';
 
@@ -36,6 +38,10 @@ import { EventModule } from '../event/event.module';
       Doc,
       // v1.41 digest：milestones 段需查里程碑元数据 + 批量 stats（与 Doc 同款，无模块循环依赖）
       Milestone,
+      // v1.44.0-dev digest：roundtable 段实时装配（圆桌 topic/座位/座位消息，平台级口径；
+      // 与 Milestone 同款——实体注册仅依赖表，无模块循环依赖）
+      RoundtableSeat,
+      Message,
     ]),
     TaskModule,
     EventModule,

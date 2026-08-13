@@ -28,6 +28,7 @@ import { AuthService } from './auth.service';
 import { AdminBootstrapService } from './admin-bootstrap.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './jwt.strategy';
+import { ApiKeyAuthService } from '../../common/services/api-key-auth.service';
 import { User } from '../../database/entities/user.entity';
 import { RefreshToken } from '../../database/entities/refresh-token.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
@@ -49,8 +50,17 @@ import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
       inject: [ConfigService],
     }),
   ],
-  providers: [AuthService, AdminBootstrapService, JwtStrategy, ApiKeyGuard, JwtOrApiKeyGuard],
+  providers: [
+    AuthService,
+    AdminBootstrapService,
+    JwtStrategy,
+    ApiKeyGuard,
+    JwtOrApiKeyGuard,
+    // 认证逻辑单一事实来源：两个 HTTP guard 与 WS 握手（roundtable 模块，阶段 3）
+    // 三方共用；AuthModule 为 @Global()，子模块直接注入（M1 圆桌计划决策 4）
+    ApiKeyAuthService,
+  ],
   controllers: [AuthController],
-  exports: [AuthService, JwtModule, ApiKeyGuard, JwtOrApiKeyGuard],
+  exports: [AuthService, JwtModule, ApiKeyGuard, JwtOrApiKeyGuard, ApiKeyAuthService],
 })
 export class AuthModule {}

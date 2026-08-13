@@ -1,6 +1,7 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { DocEditor } from './doc-editor';
 import { Api } from '@/lib/api';
+import { confirm } from '@/lib/notify';
 
 /** docs.editor 命名空间的英语文案快照（同 en.json） */
 const messages: Record<string, string> = {
@@ -14,6 +15,7 @@ const messages: Record<string, string> = {
   titleAutoHint: 'Title is derived from the first # heading — no separate title field',
   save: 'Save',
   cancel: 'Cancel',
+  discardTitle: 'Discard changes',
   discardConfirm: 'You have unsaved changes. Discard them?',
   pathConflict: 'Path already exists, choose another',
   pathCheckFailed: 'Could not verify path uniqueness, please try again',
@@ -30,6 +32,12 @@ jest.mock('@/lib/api', () => ({
     },
   },
 }));
+
+// 全局 confirm mock（脏状态退出守卫用；resolve 值控制「放弃/留下」分支）
+jest.mock('@/lib/notify', () => ({
+  confirm: jest.fn(),
+}));
+const mockConfirm = confirm as jest.Mock;
 
 // DocPicker 依赖弹层/搜索链路，与本测试无关，stub 掉保持测试轻量
 jest.mock('@/components/docs/doc-picker', () => ({
@@ -79,7 +87,6 @@ describe('DocEditor 新建文档路径冲突预检', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
-
   it('精确校验命中已存在路径时拦截保存并提示', async () => {
     // existingPaths 本地列表未覆盖（模拟 >100 篇空间截断盲区），精确校验命中
     mockListDocs.mockResolvedValue({ items: [{ id: 'd1', path: 'guides/dup.md' }], total: 1 });
@@ -129,5 +136,79 @@ describe('DocEditor 新建文档路径冲突预检', () => {
       ).toBeInTheDocument();
     });
     expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe('DocEditor 脏状态退出守卫（全局 confirm 替换 window.confirm 批次）', () => {
+  beforeEach(() => {
+    mockConfirm.mockReset();
+    jest.clearAllMocks();
+  });
+
+  /** 渲染 edit 模式编辑器并让内容变脏（initialContent → 用户修改） */
+  function renderDirtyEditor() {
+    const onSave = jest.fn();
+    const onCancel = jest.fn();
+    render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        initialContent="original"
+        initialPath="docs/a.md"
+        existingPaths={[]}
+        saving={false}
+        onSave={onSave}
+        onCancel={onCancel}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('Write Markdown content here...'), {
+      target: { value: 'original edited' },
+    });
+    return { onSave, onCancel };
+  }
+
+  it('内容未修改（不脏）→ 取消直接退出，不弹确认', async () => {
+    const onCancel = jest.fn();
+    render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        initialContent="original"
+        initialPath="docs/a.md"
+        existingPaths={[]}
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={onCancel}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await act(async () => {});
+
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('脏状态 + confirm 取消 → 不退出（onCancel 不调）', async () => {
+    mockConfirm.mockResolvedValue(false);
+    const { onCancel } = renderDirtyEditor();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await act(async () => {}); // 结算 confirm Promise（异步确认无同步阻塞）
+
+    expect(mockConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ description: 'You have unsaved changes. Discard them?' }),
+    );
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it('脏状态 + confirm 确认 → 退出（onCancel 调用）', async () => {
+    mockConfirm.mockResolvedValue(true);
+    const { onCancel } = renderDirtyEditor();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await act(async () => {});
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
   });
 });

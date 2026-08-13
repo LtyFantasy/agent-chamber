@@ -24,6 +24,7 @@
  * =============================================================================
  */
 import { Injectable } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Brackets } from 'typeorm';
 import { UserRole } from '@agent-chamber/shared';
@@ -40,6 +41,7 @@ export class EventService {
     private eventRepo: Repository<Event>,
     private readonly sseService: SseService,
     private readonly accessQuery: AccessQueryService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   async poll(
@@ -122,6 +124,12 @@ export class EventService {
       cursor: saved.cursor,
       createdAt: saved.createdAt,
     });
+    // 事件总线挂点（M1 圆桌计划决策 2）：落库成功后同步派发，roundtable 注入触发器
+    // 用 @OnEvent('event.created') 订阅。⚠️ 实测（eventemitter2 v6.4.9 默认选项）：
+    // listener 抛错会同步冒泡出 emit() 且后续 listener 不再执行——因此 listener 必须
+    // 自吞异常（计划 §二.2 listener 铁规②），否则会污染 create() 热路径（本行刻意不包
+    // try/catch：热路径防炸依赖 listener 铁规，包了会静默吞掉编程错误）。
+    this.eventEmitter.emit('event.created', saved);
     return saved;
   }
 

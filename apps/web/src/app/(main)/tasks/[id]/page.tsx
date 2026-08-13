@@ -79,7 +79,7 @@ export default function TaskDetailPage() {
 
   if (isLoading) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
         <Loading size="lg" />
       </div>
     );
@@ -89,7 +89,7 @@ export default function TaskDetailPage() {
 
   if (!task) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] flex-col items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
         <Link href="/boards" className="mt-4 text-primary hover:underline">
           {t('backToBoards')}
@@ -102,7 +102,7 @@ export default function TaskDetailPage() {
   const priority = priorityMap[task.priority] || { label: task.priority, color: '' };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-8rem)]">
+    <div className="flex flex-col h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)]">
       {/* ── 返回头部（固定） ── */}
       <div className="shrink-0 flex items-start gap-4 mb-4">
         <Link href="/boards">

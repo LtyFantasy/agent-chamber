@@ -176,6 +176,120 @@ async function publicApiRequest<T>(
   return response.data.data;
 }
 
+/**
+ * 座位近况活动条目（M4b-1，落 seat.state.recentActivity——participant 全可读，
+ * 故服务端已 R5 摘要化：剥离 rawInput/locations 等敏感载荷、title 截断 + cwd 前缀剥离；
+ * 形状对齐 backend roundtable.service.ts RecentActivityItem，cap 10 环形）
+ */
+export interface RoundtableRecentActivityItem {
+  /** 活动发生时间（ISO 8601） */
+  at: string;
+  /** 活动类别：tool_call（工具调用）/ turn（一轮发言终结）/ permission（审批请求） */
+  kind: 'tool_call' | 'turn' | 'permission';
+  /** 摘要文本（工具标题或「回复 n 字/沉默」——服务端摘要语义，原文透传不翻译） */
+  summary: string;
+  /** 结果态（工具 status / stopReason / 'pending'，原文透传不翻译） */
+  result: string;
+}
+
+/**
+ * 座位实时相位（M4b-1，chamber 内存派生视图：不落库、不进 events 表，
+ * listSeats 响应时 overlay——形状对齐 backend roundtable.service.ts SeatPresence；
+ * 无 presence 字段 = 座位从未活动（服务端不加字段））
+ */
+export interface RoundtableSeatPresence {
+  /** 相位：thinking 思考中 / tool 工具调用中 / replying 回复中 / idle 空闲 / offline 离线 */
+  phase: 'thinking' | 'tool' | 'replying' | 'idle' | 'offline';
+  /** 相位变更时间（ISO 8601） */
+  at: string;
+  /** 工具标题（仅 phase='tool' 时存在；已摘要化，供 chip 展示） */
+  toolTitle?: string;
+}
+
+/**
+ * 圆桌座位（web 侧最小投影：补全候选只消费 label/status，审批卡片消费 id→label 映射；
+ * 完整实体在 backend database/entities/roundtable-seat.entity.ts，M3 管理 UI 再收口）
+ */
+export interface RoundtableSeatItem {
+  /** 座位 UUID（审批请求 seatId→label 映射键） */
+  id: string;
+  /** 座位展示名（seatLabel 身份模型，@ 补全候选） */
+  label: string;
+  /** 生命周期状态：active / paused / parked / offline（已移除座位不出现在列表） */
+  status: string;
+  /** 厂商（'kimi'，M4a 起扩展） */
+  vendor: string;
+  /**
+   * 认领 runner UUID（backend 实体字段原样透出；null = 未被任何 runner 认领）。
+   * 连接向导验收环的「座位被认领」直接信号（roundtable-design §8c）。
+   */
+  runnerId: string | null;
+  /** 主脑座位标记（M3 阶段 3，r13 座位管理 UI 展示用；backend listSeats 返回全实体） */
+  coordinator?: boolean;
+  /**
+   * 运行时状态（backend 实体 state jsonb 原样透出；M3 阶段 5 起含 modelInfo——
+   * 座位**实际在跑**的配置观测 model/thinking/mode（地面真相，非 config 创建声明），
+   * 字段全可选：不同 vendor 可能有缺；lastUsage 同款嵌套在 state 内）
+   */
+  state?: {
+    modelInfo?: { model?: string; thinking?: string; mode?: string };
+    /** M4b-1 近况时间线（cap 10 环形，服务端摘要化——participant 全可读） */
+    recentActivity?: RoundtableRecentActivityItem[];
+    /** 沉默轮计数（圆桌安全阀 r7，沉默拦截时 +1） */
+    silentCount?: number;
+    /** 最近一次 usage 通知（M1 顺手存，M3 预算熔断数据源）：used/size 为 token 计数 */
+    lastUsage?: { used: number; size: number; at: string };
+  };
+  /**
+   * M4b-1 实时相位（chamber 内存推导 overlay：随 listSeats 响应合并，
+   * 不落库；无条目 = 从未活动，后端不加字段）
+   */
+  presence?: RoundtableSeatPresence;
+  /**
+   * 静态配置（backend 实体 config jsonb 原样透出，shape 未冻结——宽松读取，只投影
+   * web 用到的字段）。bindActorId：座位绑定的 agent actor id（runner 用该 agent 的
+   * API Key 拨号时才会领到这些座位，roundtable-design §7）；参与者面板按它把座位
+   * chip 归组到对应 agent 行（roundtable-design §6 座位管理，M3 阶段 3 改版）。
+   */
+  config?: {
+    /** 绑定的 agent actor id（agent 创建者缺省绑自己；人类创建必须显式指定） */
+    bindActorId?: string;
+  };
+}
+
+/**
+ * 圆桌审批请求（web 侧投影，字段对齐 backend RoundtablePermissionRequest entity +
+ * api-definition.md §7a；tool/options 是 jsonb 原样透传——**形状未冻结**：
+ * tool = ToolBrief（宽松 `{ name?/title?/kind? }`），options 实测 ACP 形状
+ * `{ optionId, kind, name }`（kimi/codex 真机两侧均无 label；kind ∈
+ * allow_once/allow_always/reject 之类），裁决 optionId 按 optionId/id 双键匹配
+ * （后端同规，铁律 #20 契约即设计）
+ */
+export interface RoundtablePermissionRequestItem {
+  /** 审批请求行 id（裁决端点 Path 参数） */
+  id: string;
+  /** runner 侧请求 ID（ACP JSON-RPC id，仅展示/对账用） */
+  requestId: string;
+  /** 发起请求的座位 UUID（→ seats 数据映射 label） */
+  seatId: string;
+  /** 所属圆桌 topic UUID */
+  topicId: string;
+  /** 工具摘要（ToolBrief jsonb，形状未冻结，宽松读取） */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tool: Record<string, any>;
+  /** 审批选项（PermissionOption[] jsonb，形状未冻结；name 渲染按钮文案，label 为历史兼容回退） */
+  options: { optionId?: string; id?: string; kind?: string; label?: string; name?: string }[];
+  /** pending / approved / rejected / orphaned（orphaned = runner 断连作废） */
+  status: 'pending' | 'approved' | 'rejected' | 'orphaned';
+  /** 裁决选中的选项 id（pending/orphaned 时为 null） */
+  verdictOptionId: string | null;
+  /** 裁决者 actor id（仅人类裁决写入） */
+  resolvedBy: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+  updatedAt: string;
+}
+
 /** Skill 列表项 */
 export interface SkillListItem {
   name: string;
@@ -187,6 +301,29 @@ export interface SkillListItem {
 /** Skill 详情 */
 export interface SkillDetail extends SkillListItem {
   content: string;
+}
+
+/**
+ * 事件轮询项（GET /events/poll 返回的事件投影；字段对齐 backend Event entity——
+ * event.entity.ts，cursor 为微秒时间戳 bigint 字符串，单调递增，直接回传下一轮 poll）
+ */
+export interface EventItem {
+  id: string;
+  /** 事件类型（'new_message' / 'task_created' 等；全量枚举见 @agent-chamber/shared EventType） */
+  eventType: string;
+  /** 资源类型（如 'topic' / 'board' / 'task'） */
+  resourceType: string;
+  resourceId: string;
+  actorId: string | null;
+  topicId: string | null;
+  boardId: string | null;
+  /** 事件负载（jsonb 原样透出，形状按 eventType 解释、未冻结；new_message 含 messageId） */
+  payload: Record<string, unknown>;
+  /** 轮询游标：微秒时间戳 bigint 字符串，服务端保证单调递增，作为下一轮 poll 的 cursor */
+  cursor: string;
+  delivered: boolean;
+  deliveredAt: string | null;
+  createdAt: string;
 }
 
 // ──────────────────────────────────────────────
@@ -335,6 +472,136 @@ const topics = {
     apiRequest<unknown>('POST', `/topics/${id}/invite-user`, data),
   uninviteUser: (id: string, data: { userId: string }) =>
     apiRequest<unknown>('POST', `/topics/${id}/uninvite-user`, data),
+};
+
+/**
+ * 圆桌 runner（web 侧投影，v1.49.0 座位管理 runner 状态块数据源）：
+ * 后端 GET /roundtable/runners 的字段投影（不透 actorId，最小暴露面——
+ * 见 backend roundtable.service.ts listRunners）；排序已由后端完成
+ * （online 优先 + lastSeenAt 倒序），web 按序直接渲染
+ */
+export interface RoundtableRunnerItem {
+  /** runner UUID */
+  id: string;
+  /** runner 展示名（hello 上报的 runner-name） */
+  name: string;
+  /** 在线状态：online / offline（协议值不翻译，UI 用状态点颜色区分） */
+  status: string;
+  /** runner 软件版本（排障用，可空） */
+  version: string | null;
+  /** 支持的 vendor 列表（如 ["kimi","codex"]；建座 vendor 提示的数据源） */
+  vendors: string[];
+  /** 最近心跳/连接时间（ISO 8601，可空；web 渲染相对时间） */
+  lastSeenAt: string | null;
+}
+
+/**
+ * 建座位请求（POST /roundtable/seats，v1.49.0 web 建座 UI）：
+ * 字段契约对齐 backend CreateSeatDto（格式校验在 DTO，存在性/权限在 Service）。
+ * bindActorId：web（人类 JWT）创建时必须显式指定（DTO 缺省只兜 agent 创建者绑自己）。
+ */
+export interface CreateSeatRequest {
+  /** 所属圆桌 topic id */
+  topicId: string;
+  /** 座位展示名（seatLabel 身份模型，@ 补全候选） */
+  label: string;
+  /** 厂商（kimi / codex——协议值，SEAT_VENDORS） */
+  vendor: string;
+  /** 座位工作目录（runner 所在机器上的路径，agent 环境边界） */
+  cwd: string;
+  /** 权限模式：default / plan / auto / yolo（协议值不翻译） */
+  permissionMode: string;
+  /** 可选模型覆盖（ACP set_config_option） */
+  model?: string;
+  /** 绑定目标 agent actor id（runner 用该 agent 的 API Key 拨号时认领座位） */
+  bindActorId?: string;
+  /** 主脑座位标记 */
+  coordinator?: boolean;
+  /** 攒批窗口毫秒（0=直通；缺省后端兜底 30000，上限 300000） */
+  batchWindowMs?: number;
+}
+
+// ──────────────────────────────────────────────
+// Roundtable（圆桌座位，M1 控制面最小面）
+// ──────────────────────────────────────────────
+const roundtable = {
+  /**
+   * 列出圆桌 topic 的座位（需 topic 读权限；返回全量实体投影，
+   * 前端只消费 id/label/status——active 座位 label 是 @ 补全候选源；
+   * 已移除座位（status='removed'）由后端排除，不返回）
+   */
+  listSeats: (topicId: string) =>
+    apiRequest<RoundtableSeatItem[]>('GET', '/roundtable/seats', undefined, {
+      params: { topicId },
+    }),
+
+  /**
+   * 创建圆桌座位（v1.49.0 web 建座 UI；需 topic 写权限——后端 Service 层
+   * 存在性/权限判定，403/404 透传）。成功后调用方需 invalidate seats 查询。
+   */
+  createSeat: (data: CreateSeatRequest) =>
+    apiRequest<RoundtableSeatItem>('POST', '/roundtable/seats', data),
+
+  /**
+   * runner 列表（v1.49.0 座位管理 runner 状态块；任意认证 actor 可读，
+   * 字段投影不透 actorId；后端已排序 online 优先 + lastSeenAt 倒序）。
+   */
+  listRunners: () => apiRequest<RoundtableRunnerItem[]>('GET', '/roundtable/runners'),
+
+  /**
+   * 移除圆桌座位（M3 阶段 3，仅人类 topic 管理员/平台管理员；后端软删 +
+   * seat.revoke 下行 + topic 公告）。成功后调用方需 invalidate seats 查询。
+   */
+  deleteSeat: (seatId: string) =>
+    apiRequest<RoundtableSeatItem>('DELETE', `/roundtable/seats/${seatId}`),
+
+  /**
+   * 取消座位当前发言（M4b-1，仅治理身份 creator/admin/ownerProxy；busy 门控）：
+   * 后端立即返回 accepted（优雅取消结果异步，web 经 presence 轮询观察相位变化）；
+   * 空闲/离线座位 409 RESOURCE_CONFLICT（busy gate，防误杀健康会话）；
+   * 非治理身份 403；座位/topic 不存在 404。
+   */
+  cancelSeat: (seatId: string) =>
+    apiRequest<{ accepted: true; seatId: string }>('POST', `/roundtable/seats/${seatId}/cancel`),
+
+  /**
+   * 审批请求列表（M3 阶段 2 web 裁决 UI 数据源；topic 参与者可见，
+   * 按创建时间倒序分页）。status 过滤 pending/approved/rejected/orphaned，
+   * 缺省 = 全部。
+   */
+  listPermissionRequests: (
+    topicId: string,
+    params?: {
+      status?: 'pending' | 'approved' | 'rejected' | 'orphaned';
+      page?: number;
+      pageSize?: number;
+    },
+  ) =>
+    apiRequest<PaginatedResponse<RoundtablePermissionRequestItem>>(
+      'GET',
+      '/roundtable/permission-requests',
+      undefined,
+      { params: { topicId, ...params } },
+    ),
+
+  /**
+   * 当前用户（active 参与者口径）可见的 pending 审批总数——全局待办角标
+   * 数据源。响应为 `{ count }` 包装（非裸 number，见 controller）。
+   */
+  pendingPermissionRequestCount: () =>
+    apiRequest<{ count: number }>('GET', '/roundtable/permission-requests/pending-count'),
+
+  /**
+   * 裁决审批请求（仅人类 JWT + topic 参与者；agent 403）。optionId 必须 ∈
+   * 该请求 options 的 optionId/id。非 pending 409；非法 optionId 422。
+   * 成功后后端下行 seat.permission_verdict + 落 topic 系统公告。
+   */
+  verdictPermissionRequest: (id: string, optionId: string) =>
+    apiRequest<RoundtablePermissionRequestItem>(
+      'POST',
+      `/roundtable/permission-requests/${id}/verdict`,
+      { optionId },
+    ),
 };
 
 // ──────────────────────────────────────────────
@@ -496,6 +763,9 @@ const docs = {
     apiRequest<DocSpaceDetail>('POST', `/doc-spaces/${id}/add-editor`, { agentId }),
   removeEditor: (id: string, agentId: string) =>
     apiRequest<DocSpaceDetail>('POST', `/doc-spaces/${id}/remove-editor`, { agentId }),
+  // v1.45 DOCSPACE-PERM：creator 转让（creator-only；返回 enrich 后的 DocSpaceDetail）
+  transferCreator: (id: string, newCreatorId: string) =>
+    apiRequest<DocSpaceDetail>('POST', `/doc-spaces/${id}/transfer-creator`, { newCreatorId }),
 
   // ── 分类 ──
   createCategory: (spaceId: string, data: CreateDocCategoryInput) =>
@@ -600,6 +870,22 @@ const search = {
 };
 
 // ──────────────────────────────────────────────
+// Events（统一事件层轮询通道，web 实时刷新兜底）
+// ──────────────────────────────────────────────
+const events = {
+  /**
+   * 轮询事件流（GET /events/poll）。
+   * cursor 语义（后端契约）：只返回 cursor 之后的事件；'now' = 从当前时刻开始
+   * （跳过全部历史）。服务端按当前 actor 可访问资源过滤，返回 events + nextCursor，
+   * 下一轮把 nextCursor 原样透传。
+   */
+  poll: (cursor: string, limit = 100) =>
+    apiRequest<{ events: EventItem[]; nextCursor: string }>('GET', '/events/poll', undefined, {
+      params: { cursor, limit },
+    }),
+};
+
+// ──────────────────────────────────────────────
 // Webhook
 // ──────────────────────────────────────────────
 const webhooks = {
@@ -638,6 +924,23 @@ function getSkill(name: string, format?: 'raw'): Promise<SkillDetail | string> {
   return publicApiRequest<SkillDetail>('GET', `/skills/${name}`);
 }
 
+/** 获取子 Skill 详情（JSON 格式） */
+function getSubSkill(name: string, subpath: string): Promise<SkillDetail>;
+/** 获取子 Skill 原始 Markdown 内容（含 frontmatter） */
+function getSubSkill(name: string, subpath: string, format: 'raw'): Promise<string>;
+function getSubSkill(name: string, subpath: string, format?: 'raw'): Promise<SkillDetail | string> {
+  if (format === 'raw') {
+    // raw 格式直接返回 text/markdown，不走统一响应包装
+    return publicAxiosInstance
+      .get<string>(`/skills/${name}/${subpath}`, {
+        params: { format: 'raw' },
+        responseType: 'text',
+      })
+      .then((res) => res.data);
+  }
+  return publicApiRequest<SkillDetail>('GET', `/skills/${name}/${subpath}`);
+}
+
 const skills = {
   /** 获取公开 Skill 列表 */
   list: () => publicApiRequest<SkillListItem[]>('GET', '/skills'),
@@ -645,9 +948,11 @@ const skills = {
   /** 获取 Skill 详情（支持 JSON / raw Markdown） */
   get: getSkill,
 
-  /** 获取子 Skill（如 taskboard、topics） */
-  getSub: (name: string, subpath: string) =>
-    publicApiRequest<SkillDetail>('GET', `/skills/${name}/${subpath}`),
+  /** 获取子 Skill 列表（如 topics、taskboard、docs） */
+  getSubs: (name: string) => publicApiRequest<SkillListItem[]>('GET', `/skills/${name}/subs`),
+
+  /** 获取子 Skill（支持 JSON / raw Markdown） */
+  getSub: getSubSkill,
 };
 
 // ═══════════════════════════════════════════════
@@ -658,12 +963,14 @@ export const Api = {
   users,
   agents,
   topics,
+  roundtable,
   boards,
   tasks,
   docs,
   dashboard,
   avatars,
   search,
+  events,
   webhooks,
   monitoring,
   skills,

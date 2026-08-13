@@ -26,3 +26,6 @@ export { Doc } from './doc.entity';
 export { DocSection } from './doc-section.entity';
 export { TaskDocLink } from './task-doc-link.entity';
 export { DocRoute } from './doc-route.entity';
+export { RoundtableRunner } from './roundtable-runner.entity';
+export { RoundtableSeat } from './roundtable-seat.entity';
+export { RoundtablePermissionRequest } from './roundtable-permission-request.entity';

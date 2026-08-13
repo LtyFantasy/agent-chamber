@@ -12,6 +12,12 @@ COPY . .
 # 必须先编译 shared，backend 运行时通过 workspace symlink 依赖其 dist
 RUN pnpm --filter @agent-chamber/shared build
 RUN pnpm --filter @agent-chamber/backend build
+# 构建 runner standalone bundle（install-runner.sh / roundtable-runner.tar.gz）
+# 与宿主机 deploy.sh 复用同一脚本，保证两种部署方式的资产同源同版本。
+# ⚠️ docker build context 只含本目录（外层 oss-docs 不可见），脚本会 warn 跳过
+# integrations 拷贝——自部署栈的 /downloads/integrations/* 将 404，属已知边界
+# （本仓生产走宿主机 deploy.sh，oss-docs 四份指南正常进产物）。
+RUN bash scripts/build-runner-bundle.sh
 
 FROM node:22-alpine
 WORKDIR /app
@@ -22,5 +28,7 @@ COPY --from=builder /app/packages ./packages
 COPY --from=builder /app/apps/backend/dist ./apps/backend/dist
 COPY --from=builder /app/apps/backend/node_modules ./apps/backend/node_modules
 COPY --from=builder /app/apps/backend/package.json ./apps/backend/
+# runner bundle 资产（downloads controller DOWNLOADS_DIR 缺省 = WORKDIR/dist-assets）
+COPY --from=builder /app/dist-assets ./dist-assets
 EXPOSE 8743
 CMD ["node", "apps/backend/dist/apps/backend/src/main"]

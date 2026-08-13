@@ -8,7 +8,9 @@
     "postbuild": "node scripts/postbuild.js",
     "start": "next start",
     "lint": "eslint \"src/**/*.{ts,tsx}\" --fix --max-warnings 100",
-    "test": "jest",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx}\"",
+    "test": "pnpm format:check && jest",
     "test:watch": "jest --watch",
     "typecheck": "tsc --noEmit"
   },

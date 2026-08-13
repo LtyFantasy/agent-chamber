@@ -5,14 +5,19 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §6.11
  *   - 补充: docs/architecture.md §3.2.2 (Topic / Message), docs/spec.md §3.2 MessageType
+ *   - 圆桌: docs/roundtable-design.md §6/§7（seatLabel 单键透传 / wakePolicy effective 派生）
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   SYS-PARTICIPANT: findOneWithParticipants 把 system 哨兵（公告通道 sendSystemMessage 为
+ *         私密桌 join 的 actor）当成员返回——参与者面板出现 "Agent · member" 且计数虚高。
+ *         修复：resolveActorProfiles 后按 profile.type===SYSTEM 过滤，只动返回数组不动 DB 行
+ *         （哨兵 join 是公告通道需要）与 invitedAgentIds 派生。见 memory/2026-08-08.md。
  *   JOINED-AT: joined_at 用 @CreateDateColumn（NOT NULL + DB DEFAULT NOW()），invited 行插入即写邀请时间；
  *          sendMessage 的 TypeORM upsert DO UPDATE 每条消息把 joined_at 刷成消息时间且把 moderator 降级为 member。
  *          修复：joined_at 改可空 + 语义=最近一次激活时间（invited NULL/激活写入/re-join 刷新），DB 加
@@ -69,6 +74,7 @@ import {
   ErrorCode,
   EventType,
   ParticipantStatus,
+  TopicParticipantRole,
   UserRole,
 } from '@agent-chamber/shared';
 import type { TopicDetail } from '@agent-chamber/shared';
@@ -311,20 +317,29 @@ export class TopicService {
     const participantIds = activeParticipants.map((p) => p.participantId);
     const profileMap = await this.resolveActorProfiles(participantIds);
 
-    const participants = activeParticipants.map((p) => {
-      const profile = profileMap.get(p.participantId);
-      return {
-        participantId: p.participantId,
-        participantType:
-          profile?.type === ActorType.HUMAN ? ('human' as const) : ('agent' as const),
-        name: profile?.name || 'Unknown Actor',
-        avatarUrl: profile?.avatarUrl ?? null,
-        description: profile?.description ?? null,
-        role: p.role,
-        status: p.status as ParticipantStatus,
-        joinedAt: p.joinedAt,
-      };
-    });
+    // 过滤 system 哨兵参与者（公告通道实现细节，不是成员）：sendSystemMessage 为私密桌
+    // 自动 join 的 system 哨兵（SYSTEM_ACTOR_ID，roundtable.service 播种）不应出现在参与者
+    // 面板/计数里——RT-ROUTE 系列（失败回执/安全阀/审批公告）全部复用该通道，同源设计。
+    // 只过滤返回的 participants 数组：不动 DB 行（哨兵 join 是公告通道需要，保留）、
+    // 不动 invitedAgentIds 派生（其按 topic.participants 原样派生，与 participants 无关）。
+    const participants = activeParticipants
+      .filter((p) => profileMap.get(p.participantId)?.type !== ActorType.SYSTEM)
+      .map((p) => {
+        const profile = profileMap.get(p.participantId);
+        return {
+          participantId: p.participantId,
+          // 非 HUMAN 即 'agent'：SYSTEM 已在上方过滤，此分支不会有 system 漏网
+          // （resolveActorProfiles 对 actors 表缺失的行兜底归为 SYSTEM，同样被过滤）
+          participantType:
+            profile?.type === ActorType.HUMAN ? ('human' as const) : ('agent' as const),
+          name: profile?.name || 'Unknown Actor',
+          avatarUrl: profile?.avatarUrl ?? null,
+          description: profile?.description ?? null,
+          role: p.role,
+          status: p.status as ParticipantStatus,
+          joinedAt: p.joinedAt,
+        };
+      });
 
     // 从 participants 派生 invitedAgentIds（status='invited' 且类型为 agent 的行）
     const invitedAgentIds = (topic.participants || [])
@@ -361,9 +376,19 @@ export class TopicService {
       taskQb().andWhere('task.status = :done', { done: TaskStatus.DONE }).getCount(),
     ]);
 
+    // 圆桌唤醒策略 effective 值（仅 kind='roundtable' 时输出，normal topic 缺省）：
+    // settings.wakePolicy 显式值优先，缺省 → 'mention'。与 roundtable.service
+    // resolveWakePolicy 同规（真相源，其还处理 normal→broadcast 兜底，本字段只服务
+    // web 圆桌 UI 提示，故 normal 不输出）——设计 docs/roundtable-design.md §6。
+    const settings = topic.settings as Record<string, unknown> | null | undefined;
+    const wakePolicy = topic.kind === 'roundtable' ? settings?.wakePolicy : undefined;
+    const effectiveWakePolicy =
+      wakePolicy === 'mention' || wakePolicy === 'broadcast' ? wakePolicy : 'mention';
+
     return {
       ...topic,
       invitedAgentIds,
+      ...(topic.kind === 'roundtable' ? { wakePolicy: effectiveWakePolicy } : {}),
       participants,
       boardCount,
       taskCount,
@@ -394,12 +419,22 @@ export class TopicService {
 
     const { clientRequestId, ...createDto } = dto;
 
-    const settings = {
+    // kind 是实体列（不是 settings 键）：从 config 解构出来单独落列；
+    // 其余配置（含 wakePolicy）原样铺进 settings jsonb
+    const { kind: kindInput, ...restConfig } = createDto.config ?? {};
+    const kind = kindInput ?? 'normal';
+
+    const settings: Record<string, unknown> = {
       allow_agent_proposal: true,
       vote_threshold: 3,
       visibility,
-      ...createDto.config,
+      ...restConfig,
     };
+    // 圆桌唤醒策略缺省 'mention'（设计 docs/roundtable-design.md §6 默认：仅 @唤醒，
+    // 新桌默认省钱安全）；普通桌 wakePolicy 原样透传（零感知，无路由逻辑消费该值）
+    if (kind === 'roundtable' && settings.wakePolicy === undefined) {
+      settings.wakePolicy = 'mention';
+    }
 
     // ── 无幂等键：走原路径（零开销） ──
     if (!clientRequestId) {
@@ -410,6 +445,7 @@ export class TopicService {
         creatorId,
         creatorType,
         status: TopicStatus.ACTIVE,
+        kind,
         settings,
       });
       const savedTopic = (await this.topicRepo.save(topic)) as unknown as Topic;
@@ -420,7 +456,7 @@ export class TopicService {
         topicId: savedTopic.id,
         participantId: creatorId,
         participantType: creatorType,
-        role: 'moderator',
+        role: TopicParticipantRole.MODERATOR,
         status: ParticipantStatus.ACTIVE,
         joinedAt: new Date(),
       });
@@ -435,7 +471,7 @@ export class TopicService {
             this.participantRepo.create({
               topicId: savedTopic.id,
               participantId: agentId,
-              role: 'member',
+              role: TopicParticipantRole.MEMBER,
               status: ParticipantStatus.INVITED,
             }),
           );
@@ -458,6 +494,7 @@ export class TopicService {
           creatorId,
           creatorType,
           status: TopicStatus.ACTIVE,
+          kind,
           settings,
         });
         const saved: Topic = (await topicRepo.save(topic)) as unknown as Topic;
@@ -476,7 +513,7 @@ export class TopicService {
           topicId: saved.id,
           participantId: creatorId,
           participantType: creatorType,
-          role: 'moderator',
+          role: TopicParticipantRole.MODERATOR,
           status: ParticipantStatus.ACTIVE,
           joinedAt: new Date(),
         });
@@ -490,7 +527,7 @@ export class TopicService {
               participantRepo.create({
                 topicId: saved.id,
                 participantId: agentId,
-                role: 'member',
+                role: TopicParticipantRole.MEMBER,
                 status: ParticipantStatus.INVITED,
               }),
             );
@@ -569,7 +606,7 @@ export class TopicService {
           this.participantRepo.create({
             topicId: id,
             participantId: agentId,
-            role: 'member',
+            role: TopicParticipantRole.MEMBER,
             status: ParticipantStatus.INVITED,
           }),
         );
@@ -585,10 +622,15 @@ export class TopicService {
 
     // 处理 visibility / config 更新（合并到 settings，不再包含 invitedAgentIds）
     if (dto.visibility !== undefined || dto.config !== undefined) {
+      // kind 创建后不可变：update 收到的 kind 一律忽略（normal↔roundtable 互转在
+      // M2 推迟清单）——存量 seat 归属与会话层规则开关都依赖创建时的 kind，
+      // 中途突变会让 topic 生命周期语义漂移。wakePolicy 是运行时可调策略，原样合并。
+      const { kind: _ignoredKind, ...configRest } = dto.config ?? {};
+      void _ignoredKind;
       topic.settings = {
         ...topic.settings,
         ...(dto.visibility !== undefined && { visibility: dto.visibility }),
-        ...(dto.config || {}),
+        ...configRest,
       };
     }
 
@@ -636,7 +678,7 @@ export class TopicService {
         topicId,
         participantId,
         participantType,
-        role: 'member',
+        role: TopicParticipantRole.MEMBER,
         status: ParticipantStatus.ACTIVE,
         joinedAt: new Date(),
       });
@@ -1199,6 +1241,15 @@ export class TopicService {
       senderAvatar = agent?.avatarUrl || null;
     }
 
+    // 圆桌座位标签：仅透传 metadata.seatLabel 单键（座位子身份展示语义，
+    // 设计 docs/roundtable-design.md §6/§7），不透全量 metadata——隐私/体积。
+    // 无该键时字段缺省：条件展开让响应对象字面缺键，JSON 序列化不出 null。
+    const seatLabel = msg.metadata?.seatLabel;
+    // 圆桌主脑标记（M3 阶段 3，r13）：仅透传 metadata.seatCoordinator 单键
+    // （仅主脑座位落库时写入 true，缺省不写——载荷瘦，普通座位/人类/系统响应
+    // 字面缺键），web 消息流据此渲染主脑 badge（§3 from.coordinator 同源语义）
+    const seatCoordinator = msg.metadata?.seatCoordinator === true;
+
     return {
       id: msg.id,
       topicId: msg.topicId,
@@ -1206,6 +1257,8 @@ export class TopicService {
       senderType: actorType === ActorType.HUMAN ? 'human' : msg.senderType,
       senderName,
       senderAvatar,
+      ...(typeof seatLabel === 'string' && seatLabel ? { seatLabel } : {}),
+      ...(seatCoordinator ? { seatCoordinator: true } : {}),
       content: msg.content,
       replyTo: msg.replyToId,
       type: msg.type,
@@ -1334,6 +1387,12 @@ export class TopicService {
       const profile = senderProfileMap.get(msg.senderId);
       const senderType = profile?.type ?? ActorType.SYSTEM;
 
+      // 圆桌座位标签：仅透传 metadata.seatLabel 单键（与 buildMessageResponse 同规，
+      // 设计 docs/roundtable-design.md §6/§7）；无该键时响应对象缺键。
+      const seatLabel = msg.metadata?.seatLabel;
+      // 圆桌主脑标记（M3 阶段 3，r13）：与 buildMessageResponse 同规单键透传
+      const seatCoordinator = msg.metadata?.seatCoordinator === true;
+
       return {
         id: msg.id,
         topicId: msg.topicId,
@@ -1341,6 +1400,8 @@ export class TopicService {
         senderType: senderType === ActorType.HUMAN ? ('human' as const) : senderType,
         senderName: profile?.name || 'System',
         senderAvatar: profile?.avatarUrl ?? null,
+        ...(typeof seatLabel === 'string' && seatLabel ? { seatLabel } : {}),
+        ...(seatCoordinator ? { seatCoordinator: true } : {}),
         content: msg.content,
         replyTo: msg.replyToId,
         type: msg.type,
@@ -1428,7 +1489,7 @@ export class TopicService {
         topicId,
         participantId: actorId,
         participantType: actorType,
-        role: 'member',
+        role: TopicParticipantRole.MEMBER,
         status: ParticipantStatus.ACTIVE,
         lastReadMessageId: messageId,
         joinedAt: new Date(),
@@ -1508,7 +1569,7 @@ export class TopicService {
       const newTp = this.participantRepo.create({
         topicId: id,
         participantId: agentId,
-        role: 'member',
+        role: TopicParticipantRole.MEMBER,
         status: ParticipantStatus.INVITED,
       });
       await this.participantRepo.save(newTp);
@@ -1523,6 +1584,130 @@ export class TopicService {
       actorId: agentId,
       actorType: ActorType.AGENT,
       payload: { participantId: agentId },
+    });
+
+    return topic;
+  }
+
+  /**
+   * 原子操作：提升 Agent 为 Topic editor（v1.46 TOPIC-PERM，镜像 Board add-editor）
+   *
+   * 权限由 Controller 收口（creator/admin-only，D2 ensureCreatorOrAdmin）。
+   * 边界语义（D5）：
+   * - 行不存在 → 校验 agent 存在后新建 role=editor + status=invited 行（有意不写
+   *   joinedAt——受邀行语义：invited 为 NULL，激活时才写入）
+   * - 行存在（invited/active）→ 置 role=editor，保留原 status（不隐式改状态，铁律 #18）
+   * - 行 status=left → 409（需先重新 invite，不隐式复活历史行）
+   * - 目标是 moderator 行（creator 自己）→ 400（creator 不能被降级/提级为 editor）
+   * - editor 已提升 → 幂等成功（role 已是 editor 直接返回，不抛冲突）
+   *
+   * @param id - Topic ID
+   * @param agentId - Agent ID
+   * @returns 保存后的 Topic
+   * @throws NotFoundException - Topic 或 Agent 不存在
+   * @throws BadRequestException - 目标是 creator（moderator 行）
+   * @throws ConflictException - 行已 left（需先 invite）
+   */
+  async addEditor(id: string, agentId: string) {
+    const topic = await this.topicRepo.findOne({ where: { id } });
+    if (!topic)
+      throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
+
+    // 校验 Agent 真实存在，避免提升幽灵 Agent
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const tp = await this.participantRepo.findOne({
+      where: { topicId: id, participantId: agentId },
+    });
+
+    if (tp) {
+      if (tp.role === TopicParticipantRole.MODERATOR) {
+        throw new BadRequestException({
+          message: 'Topic creator cannot be promoted to editor',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
+      if (tp.status === ParticipantStatus.LEFT) {
+        throw new ConflictException({
+          message: 'Agent has left the topic, re-invite before promoting to editor',
+          code: ErrorCode.RESOURCE_CONFLICT,
+        });
+      }
+      if (tp.role !== TopicParticipantRole.EDITOR) {
+        // member → editor 升级（保留原 status：invited/active 均可，不隐式改状态）
+        tp.role = TopicParticipantRole.EDITOR;
+        await this.participantRepo.save(tp);
+      }
+    } else {
+      // 无行：新建 editor + invited 行（D4：invited 未 join 的 editor 可直接编辑，
+      // 与 hasTopicAccess 的 invited+active 语义一致，不强制先 join）
+      const newTp = this.participantRepo.create({
+        topicId: id,
+        participantId: agentId,
+        participantType: ActorType.AGENT,
+        role: TopicParticipantRole.EDITOR,
+        status: ParticipantStatus.INVITED,
+      });
+      await this.participantRepo.save(newTp);
+    }
+
+    // 触发事件（与 inviteAgent 同构：editor 提升视为加入事件）
+    await this.eventService.create({
+      eventType: EventType.AGENT_JOINED,
+      resourceType: 'topic',
+      resourceId: id,
+      topicId: id ?? undefined,
+      actorId: agentId,
+      actorType: ActorType.AGENT,
+      payload: { participantId: agentId, role: TopicParticipantRole.EDITOR },
+    });
+
+    return topic;
+  }
+
+  /**
+   * 原子操作：撤销 Agent 的 Topic editor 角色（v1.46 TOPIC-PERM，镜像 Board remove-editor）
+   *
+   * 权限由 Controller 收口（creator/admin-only，D2 ensureCreatorOrAdmin）。
+   * 语义（D5）：editor → 降为 member（保留 status，不踢人——invited 的 editor
+   * 降级后仍是受邀者，active 的 editor 降级后仍是活跃成员）；非 editor 行/不存在 → 404。
+   *
+   * @param id - Topic ID
+   * @param agentId - Agent ID
+   * @returns 保存后的 Topic
+   * @throws NotFoundException - Topic / Agent / editor 行不存在
+   */
+  async removeEditor(id: string, agentId: string) {
+    const topic = await this.topicRepo.findOne({ where: { id } });
+    if (!topic)
+      throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
+
+    // 校验 Agent 真实存在
+    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+
+    const tp = await this.participantRepo.findOne({
+      where: { topicId: id, participantId: agentId },
+    });
+    if (!tp || tp.role !== TopicParticipantRole.EDITOR) {
+      throw new NotFoundException({
+        message: 'Agent is not an editor in this topic',
+        code: ErrorCode.AGENT_NOT_IN_TOPIC,
+      });
+    }
+
+    // editor → member 降级（保留 status/joinedAt，不踢人）
+    tp.role = TopicParticipantRole.MEMBER;
+    await this.participantRepo.save(tp);
+
+    // 触发事件
+    await this.eventService.create({
+      eventType: EventType.AGENT_LEFT,
+      resourceType: 'topic',
+      resourceId: id,
+      topicId: id ?? undefined,
+      actorId: agentId,
+      actorType: ActorType.AGENT,
+      payload: { participantId: agentId, role: TopicParticipantRole.MEMBER },
     });
 
     return topic;

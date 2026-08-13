@@ -1,19 +1,38 @@
+/**
+ * =============================================================================
+ * AGENT-HOOK | 修改本文件前必读
+ * =============================================================================
+ * [设计文档]
+ *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
+ *
+ * [踩坑索引]
+ *
+ * [铁律关联] #9(代理层透传) #21(双层校验)
+ *
+ * [详细踩坑]（最多 5 条）
+ *   （暂无）
+ *
+ * [修改检查]
+ *   □ 已读 [设计文档] 确认修改符合设计意图
+ *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
+ *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * =============================================================================
+ */
 import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import * as crypto from 'crypto';
-import { ApiKey } from '../../database/entities/api-key.entity';
-import { Agent } from '../../database/entities/agent.entity';
-import { AgentStatus, ErrorCode } from '@agent-chamber/shared';
+import { ErrorCode } from '@agent-chamber/shared';
+import { ApiKeyAuthService } from '../services/api-key-auth.service';
 
+/**
+ * 纯 API Key 认证 guard（X-API-Key header）。
+ *
+ * M1 圆桌计划决策 4：认证逻辑已抽至 ApiKeyAuthService（本 guard 与 JwtOrApiKeyGuard、
+ * 后续 WS 握手三方共用），本 guard 只保留职责：① 缺 key 报错（专属于本 guard 的
+ * 严格语义——缺失即 401 且 code=INVALID_API_KEY）；② 调 service 并把 AgentPayload
+ * 挂到 request.agent。行为与抽取前逐行等价。
+ */
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
-  constructor(
-    @InjectRepository(ApiKey)
-    private apiKeyRepo: Repository<ApiKey>,
-    @InjectRepository(Agent)
-    private agentRepo: Repository<Agent>,
-  ) {}
+  constructor(private readonly apiKeyAuth: ApiKeyAuthService) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest();
@@ -26,67 +45,7 @@ export class ApiKeyGuard implements CanActivate {
       });
     }
 
-    const keyHash = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
-
-    const apiKey = await this.apiKeyRepo.findOne({
-      where: { keyHash },
-      relations: ['agent'],
-    });
-
-    if (!apiKey) {
-      throw new UnauthorizedException({
-        message: 'Invalid API Key',
-        code: ErrorCode.INVALID_API_KEY,
-      });
-    }
-
-    if (apiKey.revokedAt || apiKey.deletedAt) {
-      throw new UnauthorizedException({
-        message: 'API Key has been revoked',
-        code: ErrorCode.INVALID_API_KEY,
-      });
-    }
-
-    if (apiKey.expiresAt && apiKey.expiresAt < new Date()) {
-      throw new UnauthorizedException({
-        message: 'API Key has expired',
-        code: ErrorCode.TOKEN_EXPIRED,
-      });
-    }
-
-    const agent = await this.agentRepo.findOne({
-      where: { id: apiKey.agentId },
-      relations: { actor: true },
-    });
-
-    if (!agent || agent.actor?.deletedAt) {
-      throw new UnauthorizedException({
-        message: 'Agent not found',
-        code: ErrorCode.AGENT_NOT_FOUND,
-      });
-    }
-
-    if (agent.actor?.status !== AgentStatus.ACTIVE) {
-      throw new UnauthorizedException({
-        message: 'Agent is not active',
-        code: ErrorCode.AGENT_DISABLED,
-      });
-    }
-
-    // Update last used
-    apiKey.lastUsedAt = new Date();
-    await this.apiKeyRepo.save(apiKey);
-
-    // Update agent lastActiveAt asynchronously (non-blocking)
-    agent.lastActiveAt = new Date();
-    this.agentRepo.save(agent).catch(() => {});
-
-    request.agent = {
-      id: agent.id,
-      name: agent.name,
-      ownerId: agent.ownerId,
-      permissions: apiKey.permissions,
-    };
+    request.agent = await this.apiKeyAuth.authenticate(apiKeyHeader);
 
     return true;
   }

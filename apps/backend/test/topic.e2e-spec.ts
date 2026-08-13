@@ -13,7 +13,11 @@ describe('TopicController (e2e)', () => {
     ({ app, mockRepos } = await createTestingApp());
 
     const jwtService = app.get(JwtService);
-    authToken = jwtService.sign({ sub: '00000000-0000-4000-8000-000000000005', email: 'test@example.com', role: 'observer' });
+    authToken = jwtService.sign({
+      sub: '00000000-0000-4000-8000-000000000005',
+      email: 'test@example.com',
+      role: 'observer',
+    });
 
     // Support JwtStrategy validation for every request (Actor unified model)
     mockRepos.User.findOne.mockResolvedValue({
@@ -65,7 +69,10 @@ describe('TopicController (e2e)', () => {
 
   it('POST /topics - success', async () => {
     mockRepos.Topic.create.mockReturnValue({ title: 'Test Topic' });
-    mockRepos.Topic.save.mockResolvedValue({ id: '00000000-0000-4000-8000-000000000001', title: 'Test Topic' });
+    mockRepos.Topic.save.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000001',
+      title: 'Test Topic',
+    });
     mockRepos.TopicParticipant.create.mockReturnValue({});
     mockRepos.TopicParticipant.save.mockResolvedValue({});
 
@@ -83,7 +90,6 @@ describe('TopicController (e2e)', () => {
 
   it('GET /topics/:id - success', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
-
       id: '00000000-0000-4000-8000-000000000001',
       title: 'Test Topic',
       creatorId: '00000000-0000-4000-8000-000000000005',
@@ -117,7 +123,6 @@ describe('TopicController (e2e)', () => {
 
   it('PATCH /topics/:id - success', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
-
       id: '00000000-0000-4000-8000-000000000001',
       title: 'Old Title',
       creatorId: '00000000-0000-4000-8000-000000000005',
@@ -144,7 +149,6 @@ describe('TopicController (e2e)', () => {
 
   it('DELETE /topics/:id - success', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
-
       id: '00000000-0000-4000-8000-000000000001',
       title: 'Test Topic',
       creatorId: '00000000-0000-4000-8000-000000000005',
@@ -203,7 +207,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -256,7 +265,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -264,13 +278,18 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findBy.mockResolvedValue([]);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&limit=1')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&limit=1',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data.messages).toHaveLength(1);
-        expect(res.body.data.messages[0]).toHaveProperty('id', '00000000-0000-4000-8000-000000000010');
+        expect(res.body.data.messages[0]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000010',
+        );
       });
   });
 
@@ -314,7 +333,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -322,14 +346,22 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findBy.mockResolvedValue([]);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&limit=2')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&limit=2',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data.messages).toHaveLength(2);
-        expect(res.body.data.messages[0]).toHaveProperty('id', '00000000-0000-4000-8000-000000000010');
-        expect(res.body.data.messages[1]).toHaveProperty('id', '00000000-0000-4000-8000-000000000011');
+        expect(res.body.data.messages[0]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000010',
+        );
+        expect(res.body.data.messages[1]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000011',
+        );
       });
   });
 
@@ -344,7 +376,9 @@ describe('TopicController (e2e)', () => {
     });
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&after=00000000-0000-4000-8000-000000000011')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&after=00000000-0000-4000-8000-000000000011',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(400)
       .expect((res: any) => {
@@ -364,7 +398,9 @@ describe('TopicController (e2e)', () => {
     mockRepos.Message.findOne.mockResolvedValue(null);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-4000-8000-000000000099&limit=1')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-4000-8000-000000000099&limit=1',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(404)
       .expect((res: any) => {
@@ -403,7 +439,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -411,13 +452,18 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findBy.mockResolvedValue([]);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&limit=1')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&limit=1',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data.messages).toHaveLength(1);
-        expect(res.body.data.messages[0]).toHaveProperty('id', '00000000-0000-4000-8000-000000000020');
+        expect(res.body.data.messages[0]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000020',
+        );
       });
   });
 
@@ -461,7 +507,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -469,14 +520,22 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findBy.mockResolvedValue([]);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&limit=2')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&limit=2',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data.messages).toHaveLength(2);
-        expect(res.body.data.messages[0]).toHaveProperty('id', '00000000-0000-4000-8000-000000000019');
-        expect(res.body.data.messages[1]).toHaveProperty('id', '00000000-0000-4000-8000-000000000020');
+        expect(res.body.data.messages[0]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000019',
+        );
+        expect(res.body.data.messages[1]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000020',
+        );
       });
   });
 
@@ -529,7 +588,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -537,14 +601,22 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findBy.mockResolvedValue([]);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&end=00000000-0000-0000-0000-000000000020&limit=10')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?start=00000000-0000-0000-0000-000000000010&end=00000000-0000-0000-0000-000000000020&limit=10',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data.messages).toHaveLength(3);
-        expect(res.body.data.messages[0]).toHaveProperty('id', '00000000-0000-4000-8000-000000000010');
-        expect(res.body.data.messages[2]).toHaveProperty('id', '00000000-0000-4000-8000-000000000020');
+        expect(res.body.data.messages[0]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000010',
+        );
+        expect(res.body.data.messages[2]).toHaveProperty(
+          'id',
+          '00000000-0000-4000-8000-000000000020',
+        );
       });
   });
 
@@ -560,7 +632,9 @@ describe('TopicController (e2e)', () => {
     mockRepos.Message.findOne.mockResolvedValue(null);
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-4000-8000-000000000099&limit=1')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-4000-8000-000000000099&limit=1',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(404)
       .expect((res: any) => {
@@ -579,7 +653,9 @@ describe('TopicController (e2e)', () => {
     });
 
     return request(app.getHttpServer())
-      .get('/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&before=00000000-0000-4000-8000-000000000019')
+      .get(
+        '/topics/00000000-0000-4000-8000-000000000001/messages?end=00000000-0000-0000-0000-000000000020&before=00000000-0000-4000-8000-000000000019',
+      )
       .set('Authorization', `Bearer ${authToken}`)
       .expect(400)
       .expect((res: any) => {
@@ -589,7 +665,6 @@ describe('TopicController (e2e)', () => {
 
   it('POST /topics/:id/messages - success', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
-
       id: '00000000-0000-4000-8000-000000000001',
       title: 'Test Topic',
       creatorId: '00000000-0000-4000-8000-000000000005',
@@ -621,7 +696,6 @@ describe('TopicController (e2e)', () => {
 
   it('POST /topics/:id/messages - failure when topic is closed (400)', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
-
       id: '00000000-0000-4000-8000-000000000001',
       title: 'Test Topic',
       creatorId: '00000000-0000-4000-8000-000000000005',
@@ -688,7 +762,12 @@ describe('TopicController (e2e)', () => {
     });
 
     mockRepos.Actor.find.mockResolvedValue([
-      { id: '00000000-0000-4000-8000-000000000005', type: 'human', displayName: 'Test User', avatarUrl: null },
+      {
+        id: '00000000-0000-4000-8000-000000000005',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
@@ -901,6 +980,152 @@ describe('TopicController (e2e)', () => {
       .expect(404)
       .expect((res: any) => {
         expect(res.body.code).toBe(ErrorCode.TOPIC_NOT_FOUND);
+      });
+  });
+
+  // ==================== v1.46 TOPIC-PERM：editor 参与方 + 结构端点收口 ====================
+
+  const otherCreatorTopic = () => ({
+    id: '00000000-0000-4000-8000-000000000001',
+    title: 'Shared Topic',
+    creatorId: '00000000-0000-4000-8000-000000000009', // 非当前用户
+    creatorType: 'human',
+    settings: { visibility: 'private' },
+    status: 'active',
+  });
+
+  it('PATCH /topics/:id - editor 参与方（role=editor, status=active）改 description → 200 回读生效（D4）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue(otherCreatorTopic());
+    // TopicPolicy.write 自查 participant 行：editor + active → 放行（invited/active 语义）
+    mockRepos.TopicParticipant.findOne.mockResolvedValue({
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      role: 'editor',
+      status: 'active',
+    });
+    mockRepos.Topic.save.mockResolvedValue({
+      ...otherCreatorTopic(),
+      description: 'Edited by editor',
+    });
+
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ description: 'Edited by editor' })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('description', 'Edited by editor');
+      });
+  });
+
+  it('PATCH /topics/:id - editor 含结构字段 visibility → 整体 403，消息列出字段名（D3）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue(otherCreatorTopic());
+    mockRepos.TopicParticipant.findOne.mockResolvedValue({
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      role: 'editor',
+      status: 'active',
+    });
+    // 结构字段路径走 isCreatorOf → owner 代理查询（非 owner → false）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ visibility: 'open' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+        expect(res.body.message).toContain('visibility');
+      });
+  });
+
+  it('PATCH /topics/:id - member（非 editor）改 description → 403（write 未放宽给 member）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue(otherCreatorTopic());
+    mockRepos.TopicParticipant.findOne.mockResolvedValue({
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      role: 'member',
+      status: 'active',
+    });
+    // member 非 creator 级 → policy write 拒绝（不触发 ownerProxy；agent 非候选，兜底 mock）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ description: 'Hijack attempt' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+      });
+  });
+
+  it('POST /topics/:id/close - editor → 403（结构端点收口 D2，editor 不能状态流转）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue(otherCreatorTopic());
+    mockRepos.TopicParticipant.findOne.mockResolvedValue({
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      role: 'editor',
+      status: 'active',
+    });
+    // 结构端点走 ensureCreatorOrAdmin → owner 代理查询（非 owner → false）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .post('/topics/00000000-0000-4000-8000-000000000001/close')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+      });
+  });
+
+  it('POST /topics/:id/add-editor - creator 提升 agent → 200（editor 行落库 invited）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue({
+      ...otherCreatorTopic(),
+      creatorId: '00000000-0000-4000-8000-000000000005', // 当前用户即 creator
+    });
+    // resourceValidator.exists 校验 agent 存在性（走 findOne）
+    mockRepos.Agent.findOne = jest
+      .fn()
+      .mockResolvedValue({ id: '00000000-0000-4000-8000-000000000003', name: 'Bot-3' });
+    // 无参与行 → 新建 editor+invited 行（inviteAgent 同款 mock 路径）
+    mockRepos.TopicParticipant.findOne.mockResolvedValue(null);
+    mockRepos.TopicParticipant.create.mockReturnValue({});
+    mockRepos.TopicParticipant.save.mockResolvedValue({});
+    mockRepos.Topic.save.mockResolvedValue(otherCreatorTopic());
+
+    return request(app.getHttpServer())
+      .post('/topics/00000000-0000-4000-8000-000000000001/add-editor')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ agentId: '00000000-0000-4000-8000-000000000003' })
+      .expect(201)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('id');
+      });
+  });
+
+  it('POST /topics/:id/add-editor - editor（非 creator）→ 403（成员管理 creator-only）', async () => {
+    mockRepos.Topic.findOne.mockResolvedValue(otherCreatorTopic());
+    mockRepos.TopicParticipant.findOne.mockResolvedValue({
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      role: 'editor',
+      status: 'active',
+    });
+    // 成员管理走 ensureCreatorOrAdmin → owner 代理查询（非 owner → false）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .post('/topics/00000000-0000-4000-8000-000000000001/add-editor')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ agentId: '00000000-0000-4000-8000-000000000003' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
       });
   });
 });

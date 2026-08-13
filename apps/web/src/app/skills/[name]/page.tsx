@@ -50,6 +50,23 @@ export default function SkillDetailPage() {
     enabled: !!name,
   });
 
+  /** 子 Skill 列表（如 topics、taskboard、docs）；null = 尚未加载完成 */
+  const { data: subs } = useQuery({
+    queryKey: ['skills', 'subs', name],
+    queryFn: () => Api.skills.getSubs(name),
+    enabled: !!name,
+  });
+
+  /** 当前选中的子 Skill 路径；null = 展示主 Skill 内容 */
+  const [selectedSub, setSelectedSub] = useState<string | null>(null);
+
+  /** 选中子 Skill 的详情内容 */
+  const { data: subDetail, isLoading: subLoading } = useQuery({
+    queryKey: ['skills', 'sub', name, selectedSub],
+    queryFn: () => Api.skills.getSub(name, selectedSub as string),
+    enabled: !!name && !!selectedSub,
+  });
+
   /** 一键安装命令，基于当前页面域名动态生成 */
   const installCommand = useMemo(() => {
     if (typeof window === 'undefined' || !name) return '';
@@ -77,6 +94,24 @@ export default function SkillDetailPage() {
     if (!skill) return;
     try {
       const rawContent = await Api.skills.get(name, 'raw');
+      const blob = new Blob([rawContent], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'SKILL.md';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('下载失败:', err);
+    }
+  };
+
+  /** 下载子 Skill 的 SKILL.md 文件（含 frontmatter，与仓库原文件一致） */
+  const handleSubDownload = async (subpath: string) => {
+    try {
+      const rawContent = await Api.skills.getSub(name, subpath, 'raw');
       const blob = new Blob([rawContent], { type: 'text/markdown' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -131,7 +166,7 @@ export default function SkillDetailPage() {
                 </div>
                 <CardDescription>{skill.description}</CardDescription>
                 <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <Badge variant="secondary">v{skill.version}</Badge>
+                  {skill.version && <Badge variant="secondary">v{skill.version}</Badge>}
                   <span className="text-xs text-muted-foreground">
                     {t('updated', { time: formatRelativeTime(skill.updatedAt) })}
                   </span>
@@ -165,12 +200,61 @@ export default function SkillDetailPage() {
             </div>
           </CardHeader>
 
+          {/* 子 Skill 导航条：主 Skill + 各子 Skill 标签，点击切换内容区 */}
+          {subs && subs.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 border-b px-6 pb-4">
+              <span className="text-xs font-medium text-muted-foreground">{t('subSkills')}</span>
+              <Button
+                variant={selectedSub === null ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setSelectedSub(null)}
+              >
+                {skill.name}
+              </Button>
+              {subs.map((sub) => (
+                <Button
+                  key={sub.name}
+                  variant={selectedSub === sub.name ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setSelectedSub(sub.name)}
+                >
+                  {sub.name}
+                  {sub.version && <span className="ml-1.5 text-xs opacity-70">v{sub.version}</span>}
+                </Button>
+              ))}
+            </div>
+          )}
+
           <CardContent>
-            {/* Markdown 预览：固定最大高度，支持滚动 */}
+            {/* Markdown 预览：固定最大高度，支持滚动；选中子 Skill 时渲染子内容 */}
             <div className="max-h-[60vh] overflow-y-auto rounded-md border bg-card p-4 sm:p-6">
-              <article className="prose prose-sm dark:prose-invert max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{skill.content}</ReactMarkdown>
-              </article>
+              {selectedSub ? (
+                subLoading || !subDetail ? (
+                  <div className="flex justify-center py-8">
+                    <Loading size="sm" />
+                  </div>
+                ) : (
+                  <>
+                    <article className="prose prose-sm dark:prose-invert max-w-none">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{subDetail.content}</ReactMarkdown>
+                    </article>
+                    <div className="mt-4 flex justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleSubDownload(selectedSub)}
+                      >
+                        <Download className="mr-1.5 h-4 w-4" />
+                        {t('subDownload')}
+                      </Button>
+                    </div>
+                  </>
+                )
+              ) : (
+                <article className="prose prose-sm dark:prose-invert max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{skill.content}</ReactMarkdown>
+                </article>
+              )}
             </div>
           </CardContent>
 

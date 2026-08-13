@@ -151,7 +151,7 @@ export default function AgentKeysPage() {
 
   if (isLoading) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
         <Loading size="lg" />
       </div>
     );
@@ -159,7 +159,7 @@ export default function AgentKeysPage() {
 
   if (error) {
     return (
-      <div className="flex h-[calc(100vh-8rem)] flex-col items-center justify-center">
+      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('loadError')}</h2>
         <p className="text-muted-foreground mt-2">{error}</p>
         <Link href="/agents" className="mt-4 text-primary hover:underline">

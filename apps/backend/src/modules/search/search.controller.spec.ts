@@ -42,6 +42,7 @@ describe('SearchController', () => {
           hasPrev: false,
         },
         tasks: null,
+        docs: null,
       };
       service.search.mockResolvedValue(result);
 
@@ -60,7 +61,7 @@ describe('SearchController', () => {
     });
 
     it('should default type to all when omitted', async () => {
-      service.search.mockResolvedValue({ messages: null, tasks: null });
+      service.search.mockResolvedValue({ messages: null, tasks: null, docs: null });
 
       const dto: SearchQueryDto = {
         q: 'test',

@@ -157,6 +157,19 @@ export enum BoardMemberRole {
   MEMBER = 'member',
 }
 
+/**
+ * 话题参与者角色（v1.46 TOPIC-PERM 新增 editor，对齐 Board/DocSpace）
+ * - moderator: 创建者行标记（topic_participants 中 creator 的 role，历史约定）
+ * - editor: 可编辑话题内容字段（title/description）；结构字段/状态流转/成员管理仍 creator-only
+ * - member: 普通参与者（只读 + 发言）
+ * role 列是裸 varchar(30)，新增枚举值无需 migration
+ */
+export enum TopicParticipantRole {
+  MODERATOR = 'moderator',
+  EDITOR = 'editor',
+  MEMBER = 'member',
+}
+
 export enum ErrorCode {
   // HTTP 基础映射
   SUCCESS = 200,
@@ -177,6 +190,8 @@ export enum ErrorCode {
   TOKEN_EXPIRED = 1007,
   TOKEN_INVALID = 1008,
   PERMISSION_DENIED = 1009,
+  /** 404 — 目标 actor（人/agent 统一 actors 行）不存在：DocSpace creator 转让等按 actor 寻址的操作 */
+  ACTOR_NOT_FOUND = 1010,
 
   // Topic (2000-2099)
   TOPIC_NOT_FOUND = 2000,
@@ -244,4 +259,12 @@ export enum ErrorCode {
   DOC_ROUTE_INVALID_CODE_ENTRY = 10007,
   /** 404 — doc_routes 目标路由不存在 */
   DOC_ROUTE_NOT_FOUND = 10008,
+
+  // Roundtable (11000-11099)
+  /** 404 — 审批请求不存在（裁决/查询目标缺失） */
+  ROUNDTABLE_PERMISSION_REQUEST_NOT_FOUND = 11000,
+  /** 404 — 圆桌座位不存在（座位移除等操作目标缺失） */
+  ROUNDTABLE_SEAT_NOT_FOUND = 11001,
+  /** 409 — 同一 topic 下该 actor 已有 active 座位（r17 唯一约束：一 agent 一 topic 一 active 座位；removed 软删豁免可重建） */
+  ROUNDTABLE_SEAT_BIND_ACTOR_CONFLICT = 11002,
 }

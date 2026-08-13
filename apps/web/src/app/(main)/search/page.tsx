@@ -12,8 +12,15 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
 import { EmptyState } from '@/components/ui/empty-state';
 import { formatRelativeTime } from '@/lib/utils';
-import { Search, MessageSquare, ClipboardList, User } from 'lucide-react';
-import type { MessageSearchResult, TaskSearchResult, SearchType, PaginatedResponse } from '@/types';
+import { Search, MessageSquare, ClipboardList, FileText, User } from 'lucide-react';
+import Link from 'next/link';
+import type {
+  MessageSearchResult,
+  TaskSearchResult,
+  SearchType,
+  PaginatedResponse,
+  DocSearchHitWithSpace,
+} from '@/types';
 
 const taskStatusMap: Record<
   string,
@@ -63,12 +70,14 @@ function renderHighlight(highlight: string | null): JSX.Element | string {
 type SearchResults = {
   messages: PaginatedResponse<MessageSearchResult> | null;
   tasks: PaginatedResponse<TaskSearchResult> | null;
+  docs: DocSearchHitWithSpace[] | null;
 };
 
 const TAB_TO_TYPE: Record<string, SearchType> = {
   all: 'all',
   messages: 'messages',
   tasks: 'tasks',
+  docs: 'docs',
 };
 
 export default function SearchPage() {
@@ -82,7 +91,11 @@ export default function SearchPage() {
 
   const [query, setQuery] = useState(urlQ);
   const [activeTab, setActiveTab] = useState(urlType === 'all' ? 'all' : urlType);
-  const [results, setResults] = useState<SearchResults>({ messages: null, tasks: null });
+  const [results, setResults] = useState<SearchResults>({
+    messages: null,
+    tasks: null,
+    docs: null,
+  });
   const [isLoading, setIsLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(!!urlQ);
 
@@ -108,7 +121,7 @@ export default function SearchPage() {
   const performSearch = useCallback(
     async (q: string, type: SearchType, page: number, append: boolean) => {
       if (!q.trim()) {
-        setResults({ messages: null, tasks: null });
+        setResults({ messages: null, tasks: null, docs: null });
         setHasSearched(false);
         return;
       }
@@ -125,7 +138,7 @@ export default function SearchPage() {
         });
 
         if (append) {
-          // 追加模式：合并已有数据和新数据
+          // 追加模式：合并已有数据和新数据（docs 无分页加载更多，保持旧值）
           setResults((prev) => ({
             messages:
               data.messages && prev.messages
@@ -141,6 +154,7 @@ export default function SearchPage() {
                     items: [...prev.tasks.items, ...data.tasks.items],
                   }
                 : (data.tasks ?? prev.tasks),
+            docs: data.docs ?? prev.docs,
           }));
         } else {
           setResults(data);
@@ -148,7 +162,7 @@ export default function SearchPage() {
       } catch (error) {
         console.error('搜索失败:', error);
         if (!append) {
-          setResults({ messages: null, tasks: null });
+          setResults({ messages: null, tasks: null, docs: null });
         }
       } finally {
         setIsLoading(false);
@@ -161,7 +175,7 @@ export default function SearchPage() {
   useEffect(() => {
     if (!query.trim()) {
       setHasSearched(false);
-      setResults({ messages: null, tasks: null });
+      setResults({ messages: null, tasks: null, docs: null });
       return;
     }
 
@@ -185,7 +199,12 @@ export default function SearchPage() {
     // 如果切换到单类型 tab 且没有数据，自动搜索
     const type = TAB_TO_TYPE[tab];
     if (type !== 'all') {
-      const hasData = type === 'messages' ? !!results.messages : !!results.tasks;
+      const hasData =
+        type === 'messages'
+          ? !!results.messages
+          : type === 'tasks'
+            ? !!results.tasks
+            : !!results.docs;
       if (!hasData && query.trim()) {
         void performSearch(query, type, 1, false);
       }
@@ -216,7 +235,8 @@ export default function SearchPage() {
 
   const messageCount = results.messages?.items.length ?? 0;
   const taskCount = results.tasks?.items.length ?? 0;
-  const totalCount = messageCount + taskCount;
+  const docCount = results.docs?.length ?? 0;
+  const totalCount = messageCount + taskCount + docCount;
 
   const renderLoadingSkeleton = () => (
     <div className="space-y-4">
@@ -313,6 +333,40 @@ export default function SearchPage() {
     );
   };
 
+  const renderDocCard = (doc: DocSearchHitWithSpace) => (
+    <Link
+      // 同一文档可能多个 section 命中（position 区分），key 必须组合，否则 React 重复 key 警告
+      key={`${doc.docId}-${doc.position}`}
+      href={`/docs/${doc.spaceId}?doc=${doc.docId}`}
+      className="block"
+      title={t('openDoc', { title: doc.docTitle })}
+    >
+      <Card className="transition-shadow hover:border-primary/40 hover:shadow-glow-sm">
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10">
+                <FileText className="h-4 w-4 text-primary" />
+              </div>
+              <div className="min-w-0">
+                <CardTitle className="truncate text-base">{doc.docTitle}</CardTitle>
+                {doc.headingPath && (
+                  <p className="truncate text-xs text-muted-foreground">{doc.headingPath}</p>
+                )}
+              </div>
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground">{doc.docPath}</span>
+          </div>
+        </CardHeader>
+        {doc.snippet && (
+          <CardContent>
+            <p className="line-clamp-3 text-sm text-muted-foreground">{doc.snippet}</p>
+          </CardContent>
+        )}
+      </Card>
+    </Link>
+  );
+
   const renderLoadMoreButton = (type: 'messages' | 'tasks') => {
     const data = type === 'messages' ? results.messages : results.tasks;
     if (!data || !data.hasNext) return null;
@@ -366,6 +420,9 @@ export default function SearchPage() {
               {t('tab.tasks')}{' '}
               {results.tasks && results.tasks.total > 0 && `(${results.tasks.total})`}
             </TabsTrigger>
+            <TabsTrigger value="docs">
+              {t('tab.docs')} {docCount > 0 && `(${docCount})`}
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="all">
@@ -399,6 +456,16 @@ export default function SearchPage() {
                     {renderLoadMoreButton('tasks')}
                   </div>
                 )}
+                {docCount > 0 && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h2 className="text-lg font-semibold">
+                        {t('sectionDocs', { count: docCount })}
+                      </h2>
+                    </div>
+                    <div className="space-y-3">{results.docs!.map(renderDocCard)}</div>
+                  </div>
+                )}
               </div>
             )}
           </TabsContent>
@@ -426,6 +493,16 @@ export default function SearchPage() {
                 {results.tasks!.items.map(renderTaskCard)}
                 {renderLoadMoreButton('tasks')}
               </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="docs">
+            {isLoading && !results.docs ? (
+              renderLoadingSkeleton()
+            ) : docCount === 0 ? (
+              <EmptyState title={t('noDocs')} description={t('noDocsDesc', { query })} />
+            ) : (
+              <div className="space-y-3">{results.docs!.map(renderDocCard)}</div>
             )}
           </TabsContent>
         </Tabs>

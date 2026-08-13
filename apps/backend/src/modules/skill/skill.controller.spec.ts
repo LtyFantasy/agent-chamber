@@ -33,7 +33,9 @@ describe('SkillController', () => {
     findAll: jest.fn(),
     findOne: jest.fn(),
     findSubSkill: jest.fn(),
+    findSubSkills: jest.fn(),
     getRaw: jest.fn(),
+    getSubRaw: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -158,8 +160,31 @@ describe('SkillController', () => {
     });
   });
 
+  describe('findSubSkills', () => {
+    it('should call service.findSubSkills and return result', async () => {
+      const result: SkillListItemDto[] = [
+        {
+          name: 'taskboard',
+          description: 'Task board skill.',
+          version: '1.1.0',
+          updatedAt: '2026-06-10',
+        },
+      ];
+      service.findSubSkills.mockResolvedValue(result);
+
+      expect(await controller.findSubSkills('agent-chamber')).toBe(result);
+      expect(service.findSubSkills).toHaveBeenCalledWith('agent-chamber');
+    });
+
+    it('should propagate NotFoundException from service', async () => {
+      service.findSubSkills.mockRejectedValue(new NotFoundException('Skill not found'));
+
+      await expect(controller.findSubSkills('missing-skill')).rejects.toThrow(NotFoundException);
+    });
+  });
+
   describe('findSubSkill', () => {
-    it('should call service.findSubSkill and return result', async () => {
+    it('should return JSON detail when format is not raw', async () => {
       const detail: SkillDetailDto = {
         name: 'taskboard',
         description: 'Task board skill.',
@@ -169,16 +194,71 @@ describe('SkillController', () => {
       };
       service.findSubSkill.mockResolvedValue(detail);
 
-      expect(await controller.findSubSkill('agent-chamber', 'taskboard')).toBe(detail);
+      const res = {
+        setHeader: jest.fn(),
+        send: jest.fn(),
+        json: jest.fn(),
+      } as unknown as Response;
+      const req = { requestId: 'req-123' } as unknown as Request;
+
+      await controller.findSubSkill(
+        'agent-chamber',
+        'taskboard',
+        undefined as unknown as string,
+        res,
+        req,
+      );
+
       expect(service.findSubSkill).toHaveBeenCalledWith('agent-chamber', 'taskboard');
+      expect(service.getSubRaw).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith({
+        code: 200,
+        message: 'success',
+        data: detail,
+        timestamp: expect.any(String),
+        requestId: 'req-123',
+      });
+    });
+
+    it('should return raw markdown when format=raw', async () => {
+      const rawContent = '# Raw Taskboard\n';
+      service.getSubRaw.mockResolvedValue(rawContent);
+
+      const res = {
+        setHeader: jest.fn(),
+        send: jest.fn(),
+        json: jest.fn(),
+      } as unknown as Response;
+      const req = { requestId: 'req-123' } as unknown as Request;
+
+      await controller.findSubSkill('agent-chamber', 'taskboard', 'raw', res, req);
+
+      expect(service.getSubRaw).toHaveBeenCalledWith('agent-chamber', 'taskboard');
+      expect(service.findSubSkill).not.toHaveBeenCalled();
+      expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'text/markdown; charset=utf-8');
+      expect(res.send).toHaveBeenCalledWith(rawContent);
+      expect(res.json).not.toHaveBeenCalled();
     });
 
     it('should propagate NotFoundException from service', async () => {
       service.findSubSkill.mockRejectedValue(new NotFoundException('Skill not found'));
 
-      await expect(controller.findSubSkill('agent-chamber', 'missing')).rejects.toThrow(
-        NotFoundException,
-      );
+      const res = {
+        setHeader: jest.fn(),
+        send: jest.fn(),
+        json: jest.fn(),
+      } as unknown as Response;
+      const req = { requestId: 'req-123' } as unknown as Request;
+
+      await expect(
+        controller.findSubSkill(
+          'agent-chamber',
+          'missing',
+          undefined as unknown as string,
+          res,
+          req,
+        ),
+      ).rejects.toThrow(NotFoundException);
     });
   });
 });

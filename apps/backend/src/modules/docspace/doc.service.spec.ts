@@ -1,17 +1,13 @@
 import { Repository, SelectQueryBuilder } from 'typeorm';
 import { DocService } from './doc.service';
+import { chunkMarkdown } from './markdown-chunker';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
 import { AuditLog } from '../../database/entities/audit-log.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Board } from '../../database/entities/board.entity';
-import {
-  ErrorCode,
-  AuditAction,
-  ActorType,
-  EventType,
-} from '@agent-chamber/shared';
+import { ErrorCode, AuditAction, ActorType, EventType } from '@agent-chamber/shared';
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { EventService } from '../event/event.service';
 import { RouteHealthService } from './route-health.service';
@@ -404,12 +400,12 @@ describe('DocService', () => {
       const catQb = createMockQueryBuilder([], 0);
       (categoryRepo.createQueryBuilder as jest.Mock).mockReturnValue(catQb);
 
-      categoryRepo.create.mockReturnValue(makeCategory({ name: 'Architecture', slug: 'architecture' }));
+      categoryRepo.create.mockReturnValue(
+        makeCategory({ name: 'Architecture', slug: 'architecture' }),
+      );
       categoryRepo.save.mockResolvedValue(makeCategory({ id: 'cat-new', name: 'Architecture' }));
 
-      mockTransaction.mockResolvedValue(
-        makeDoc({ id: 'doc-new', categoryId: 'cat-new' }),
-      );
+      mockTransaction.mockResolvedValue(makeDoc({ id: 'doc-new', categoryId: 'cat-new' }));
 
       const result = await service.upsert('space-1', {
         ...dto,
@@ -502,9 +498,7 @@ describe('DocService', () => {
       const qb = createMockQueryBuilder([], 0);
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
 
-      mockTransaction.mockResolvedValue(
-        makeDoc({ id: 'doc-new', path: 'docs/test.md' }),
-      );
+      mockTransaction.mockResolvedValue(makeDoc({ id: 'doc-new', path: 'docs/test.md' }));
 
       const actor = { id: 'user-1', type: ActorType.HUMAN, role: 'admin' } as any;
       await service.upsert('space-1', dto, actor);
@@ -689,9 +683,21 @@ describe('DocService', () => {
       ]);
 
       expect(result.results).toHaveLength(3);
-      expect(result.results[0]).toMatchObject({ path: 'docs/new.md', status: 'created', id: 'doc-new' });
-      expect(result.results[1]).toMatchObject({ path: 'docs/updated.md', status: 'updated', id: 'doc-updated' });
-      expect(result.results[2]).toMatchObject({ path: 'docs/same.md', status: 'unchanged', id: 'doc-same' });
+      expect(result.results[0]).toMatchObject({
+        path: 'docs/new.md',
+        status: 'created',
+        id: 'doc-new',
+      });
+      expect(result.results[1]).toMatchObject({
+        path: 'docs/updated.md',
+        status: 'updated',
+        id: 'doc-updated',
+      });
+      expect(result.results[2]).toMatchObject({
+        path: 'docs/same.md',
+        status: 'unchanged',
+        id: 'doc-same',
+      });
       expect(result.summary).toEqual({ total: 3, created: 1, updated: 1, unchanged: 1, failed: 0 });
     });
 
@@ -729,7 +735,11 @@ describe('DocService', () => {
           code: 10003,
         },
       });
-      expect(result.results[1]).toMatchObject({ path: 'docs/ok.md', status: 'created', id: 'doc-ok' });
+      expect(result.results[1]).toMatchObject({
+        path: 'docs/ok.md',
+        status: 'created',
+        id: 'doc-ok',
+      });
       expect(result.summary).toEqual({ total: 2, created: 1, updated: 0, unchanged: 0, failed: 1 });
     });
 
@@ -837,6 +847,7 @@ describe('DocService', () => {
       expect(result.sections![0]).toMatchObject({
         position: 0,
         headingPath: 'Intro',
+        heading: 'Intro',
         headingLevel: 1,
         tokenEstimate: 50,
       });
@@ -846,6 +857,42 @@ describe('DocService', () => {
       expect((result as any).content).toBeUndefined();
       // outline 分支零额外开销：仅一次 section 查询
       expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('derives local heading as last headingPath segment (display field)', async () => {
+      // 多级 headingPath → heading 取末段；headingPath=null（headingLevel 0 文首段）→ heading 为 null；
+      // headingPath 本身保留全链作寻址地址（语义不变）
+      const doc = makeDoc({ tokenEstimate: 5000 });
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sectionQb = createMockQueryBuilder(
+        [
+          makeSection({
+            position: 0,
+            headingPath: 'AAA § BBB § CCC',
+            headingLevel: 3,
+            tokenEstimate: 10,
+          }),
+          makeSection({ position: 1, headingPath: null, headingLevel: 0, tokenEstimate: 20 }),
+          makeSection({
+            position: 2,
+            headingPath: '末段带空格 ',
+            headingLevel: 2,
+            tokenEstimate: 30,
+          }),
+        ],
+        3,
+      );
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
+
+      const result = await service.findOne('doc-1');
+      expect(result.sections![0].heading).toBe('CCC');
+      expect(result.sections![1].heading).toBeNull();
+      expect(result.sections![2].heading).toBe('末段带空格');
+      // headingPath 寻址契约不变
+      expect(result.sections![0].headingPath).toBe('AAA § BBB § CCC');
+      expect(result.sections![1].headingPath).toBeNull();
     });
 
     it('exposes sourceSha in detail (via toSummary, DocDetail extends DocSummary)', async () => {
@@ -872,7 +919,14 @@ describe('DocService', () => {
       );
       // full 分支：全量 sections（含 content）
       const fullQb = createMockQueryBuilder(
-        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, content: 'Lead body.' })],
+        [
+          makeSection({
+            position: 0,
+            headingPath: 'Test Doc',
+            headingLevel: 1,
+            content: 'Lead body.',
+          }),
+        ],
         1,
       );
       (sectionRepo.createQueryBuilder as jest.Mock)
@@ -894,7 +948,14 @@ describe('DocService', () => {
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
 
       const outlineQb = createMockQueryBuilder(
-        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 2000 })],
+        [
+          makeSection({
+            position: 0,
+            headingPath: 'Test Doc',
+            headingLevel: 1,
+            tokenEstimate: 2000,
+          }),
+        ],
         1,
       );
       const fullQb = createMockQueryBuilder(
@@ -916,7 +977,14 @@ describe('DocService', () => {
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
 
       const sectionQb = createMockQueryBuilder(
-        [makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, tokenEstimate: 2001 })],
+        [
+          makeSection({
+            position: 0,
+            headingPath: 'Test Doc',
+            headingLevel: 1,
+            tokenEstimate: 2001,
+          }),
+        ],
         1,
       );
       (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(sectionQb);
@@ -972,7 +1040,14 @@ describe('DocService', () => {
         1,
       );
       const fullQb = createMockQueryBuilder(
-        [makeSection({ position: 0, headingPath: 'Intro', headingLevel: 1, content: 'Big but inlined.' })],
+        [
+          makeSection({
+            position: 0,
+            headingPath: 'Intro',
+            headingLevel: 1,
+            content: 'Big but inlined.',
+          }),
+        ],
         1,
       );
       (sectionRepo.createQueryBuilder as jest.Mock)
@@ -996,7 +1071,12 @@ describe('DocService', () => {
 
       // headingPath 末段作为标题文本；level 决定 # 个数，验证 web 全文通道还原层级
       const sections = [
-        makeSection({ position: 0, headingPath: 'Intro', headingLevel: 1, content: 'First section.' }),
+        makeSection({
+          position: 0,
+          headingPath: 'Intro',
+          headingLevel: 1,
+          content: 'First section.',
+        }),
         makeSection({
           position: 1,
           headingPath: 'Intro § Detail',
@@ -1020,8 +1100,18 @@ describe('DocService', () => {
 
       const sections = [
         // position 0 的 H1 末段与 doc.title 同名 → 不重复插标题行
-        makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, content: 'Lead body.' }),
-        makeSection({ position: 1, headingPath: 'Test Doc § Sub', headingLevel: 2, content: 'Sub body.' }),
+        makeSection({
+          position: 0,
+          headingPath: 'Test Doc',
+          headingLevel: 1,
+          content: 'Lead body.',
+        }),
+        makeSection({
+          position: 1,
+          headingPath: 'Test Doc § Sub',
+          headingLevel: 2,
+          content: 'Sub body.',
+        }),
       ];
       const secQb = createMockQueryBuilder(sections, 2);
       (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
@@ -1038,8 +1128,18 @@ describe('DocService', () => {
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
 
       const sections = [
-        makeSection({ position: 0, headingPath: 'Test Doc', headingLevel: 1, content: 'Lead body.' }),
-        makeSection({ position: 1, headingPath: 'Test Doc § Sub', headingLevel: 2, content: 'Sub body.' }),
+        makeSection({
+          position: 0,
+          headingPath: 'Test Doc',
+          headingLevel: 1,
+          content: 'Lead body.',
+        }),
+        makeSection({
+          position: 1,
+          headingPath: 'Test Doc § Sub',
+          headingLevel: 2,
+          content: 'Sub body.',
+        }),
       ];
       const secQb = createMockQueryBuilder(sections, 2);
       (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
@@ -1064,6 +1164,197 @@ describe('DocService', () => {
 
       const result = await service.getContent('doc-1');
       expect(result.content).toBe('Body text.');
+    });
+
+    it('restores empty heading sections as bare heading lines (no dangling blank lines)', async () => {
+      // 空 content section（空正文标题，chunker 保真产出）→ 标题行独占一段，
+      // 不追加 "\n\n"，join 后恰好一个空行分隔，不得出现 "\n\n\n"
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sections = [
+        makeSection({ position: 0, headingPath: '分组', headingLevel: 2, content: '' }),
+        makeSection({ position: 1, headingPath: '子节', headingLevel: 2, content: '正文' }),
+      ];
+      const secQb = createMockQueryBuilder(sections, 2);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const result = await service.getContent('doc-1', true);
+      expect(result.content).toBe('## 分组\n\n## 子节\n\n正文');
+      expect(result.content).not.toContain('\n\n\n');
+    });
+
+    it('round-trips idempotently: empty heading sections survive read + rewrite cycles', async () => {
+      // 核心验收（任务 e6eaf06d）：含空 H2 分组标题的文档，chunk → reconstructContent
+      // （full=true，编辑器回写口径）→ 再 chunk，两次 (headingPath, headingLevel, content)
+      // 序列必须完全一致——空标题不再在「全文读 + upsert 回写」往返中渐进丢失
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const source = [
+        '# 标题',
+        '',
+        '引言正文',
+        '',
+        '## 空分组一',
+        '',
+        '## 空分组二',
+        '',
+        '### 有内容子节',
+        '子节正文',
+        '',
+        '## 结尾空分组',
+        '',
+      ].join('\n');
+
+      const chunks = chunkMarkdown(source, doc.title);
+      // 期望分块：1 个 H1（引言）+ 3 个空标题（空分组一/空分组二/结尾空分组）+ 1 个 H3 子节
+      const emptyPaths = chunks.filter((c) => c.content === '');
+      expect(emptyPaths).toHaveLength(3);
+
+      // chunks 字段与 doc_sections 行一一对应（见 upsert 的 sections 映射），直接当 sections 喂回
+      const sections = chunks.map((c) =>
+        makeSection({
+          position: c.position,
+          headingPath: c.headingPath,
+          headingLevel: c.headingLevel,
+          content: c.content,
+          tokenEstimate: c.tokenEstimate,
+        }),
+      );
+      const secQb = createMockQueryBuilder(sections, sections.length);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const { content: reconstructed } = await service.getContent('doc-1', true);
+      // 重建文不含多余空行，空标题行完整保留
+      expect(reconstructed).not.toContain('\n\n\n');
+      expect(reconstructed).toContain('## 空分组一');
+      expect(reconstructed).toContain('## 空分组二');
+      expect(reconstructed).toContain('## 结尾空分组');
+
+      // 重建文再切分 → 与首次切分序列完全一致（幂等，不再渐进退化）
+      const chunks2 = chunkMarkdown(reconstructed, doc.title);
+      expect(chunks2).toHaveLength(chunks.length);
+      expect(chunks2.map((c) => [c.headingPath, c.headingLevel, c.content])).toEqual(
+        chunks.map((c) => [c.headingPath, c.headingLevel, c.content]),
+      );
+    });
+
+    it('run-dedup: merges paragraph-split sibling chunks into a single heading line', async () => {
+      // 任务 e6eaf06d 第二张脸：chunker step 4 段落切分产生的兄弟 chunk 共用同一
+      // (headingPath, headingLevel)——重建时若逐个插标题行，同一标题会重复 N 次；
+      // run-dedup 只插回一次标题行，两段正文都在且顺序正确
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sections = [
+        makeSection({ position: 0, headingPath: 'A § X', headingLevel: 2, content: 'Para one.' }),
+        makeSection({ position: 1, headingPath: 'A § X', headingLevel: 2, content: 'Para two.' }),
+      ];
+      const secQb = createMockQueryBuilder(sections, 2);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const result = await service.getContent('doc-1', true);
+      expect(result.content).toBe('## X\n\nPara one.\n\nPara two.');
+      expect(result.content).not.toContain('\n\n\n');
+    });
+
+    it('run-dedup: same heading level with different parent chains keeps both heading lines', async () => {
+      // headingLevel 相同但 headingPath 不同（父链 A/B 不同，如 `A § X` 与 `B § X`）
+      // → 不是段落切分兄弟，两个标题行都必须保留
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sections = [
+        makeSection({ position: 0, headingPath: 'A § X', headingLevel: 2, content: 'A body.' }),
+        makeSection({ position: 1, headingPath: 'B § X', headingLevel: 2, content: 'B body.' }),
+      ];
+      const secQb = createMockQueryBuilder(sections, 2);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const result = await service.getContent('doc-1', true);
+      expect(result.content).toBe('## X\n\nA body.\n\n## X\n\nB body.');
+    });
+
+    it('run-dedup: empty heading section followed by same-path content chunk renders heading once', async () => {
+      // 病态存储形态（chunker 不会自然产出，历史数据/手工构造可能）：空标题 section 后跟
+      // 同 (headingPath, headingLevel) 的正文 section → 标题只出现一次——
+      // 验证 run-dedup 与空标题分支（只渲染标题行）的交互
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const sections = [
+        makeSection({ position: 0, headingPath: '分组', headingLevel: 2, content: '' }),
+        makeSection({ position: 1, headingPath: '分组', headingLevel: 2, content: '正文' }),
+      ];
+      const secQb = createMockQueryBuilder(sections, 2);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const result = await service.getContent('doc-1', true);
+      expect(result.content).toBe('## 分组\n\n正文');
+      expect(result.content.match(/## 分组/g)).toHaveLength(1);
+      expect(result.content).not.toContain('\n\n\n');
+    });
+
+    it('run-dedup round-trips idempotently: >4000-char section renders each heading exactly once', async () => {
+      // 核心验收（任务 e6eaf06d 第二张脸）：巨型章节（>4000 字符触发 chunker step 4 段落切分，
+      // 30 个子 chunk 共用同一 headingPath）+ 空 H2 分组标题的文档：
+      // ① chunk → reconstructContent(full=true) 重建后每个标题只出现 1 次（不再重复 N 次）；
+      // ② 重建文再 chunk → (headingPath, headingLevel, content) 序列与首次完全相等
+      //    （「全文读 + upsert 回写」往返幂等，不再每轮固化重复标题）。
+      // 构造约定：段落单行、无内嵌空行、无首尾空白、段落间恰一个空行——保证 trim 后与原文
+      // 一致，首次往返即可幂等。
+      const doc = makeDoc();
+      const docQb = createMockQueryBuilder([doc], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+
+      const bigParas = Array.from({ length: 30 }, (_, i) => `段落${i + 1}：${'甲'.repeat(140)}`);
+      const sourceLines = ['# 标题', '', '引言正文', '', '## 空分组', '', '## 巨章'];
+      for (const p of bigParas) sourceLines.push(p, '');
+      sourceLines.push('## 结尾空分组', '');
+      const source = sourceLines.join('\n');
+
+      const chunks1 = chunkMarkdown(source, doc.title);
+      // 期望分块：1 个 H1 引言 + 1 个空 H2 分组 + 30 个巨章段落 chunk + 1 个空 H2 结尾 = 33
+      expect(chunks1).toHaveLength(33);
+      expect(chunks1.filter((c) => c.headingPath === '标题 § 巨章')).toHaveLength(30);
+
+      const sections = chunks1.map((c) =>
+        makeSection({
+          position: c.position,
+          headingPath: c.headingPath,
+          headingLevel: c.headingLevel,
+          content: c.content,
+          tokenEstimate: c.tokenEstimate,
+        }),
+      );
+      const secQb = createMockQueryBuilder(sections, sections.length);
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
+
+      const { content: reconstructed } = await service.getContent('doc-1', true);
+
+      // 每个标题只出现 1 次：4 个不同标题，巨章 30 个兄弟 chunk 只插回一次标题行
+      const headingLines = reconstructed.match(/^#{1,6} .+$/gm) ?? [];
+      expect(headingLines).toEqual(['# 标题', '## 空分组', '## 巨章', '## 结尾空分组']);
+      // 30 段正文都在且顺序正确，无多余空行
+      for (let i = 1; i <= 30; i++) {
+        expect(reconstructed).toContain(`段落${i}：`);
+      }
+      expect(reconstructed.indexOf('段落1：')).toBeLessThan(reconstructed.indexOf('段落2：'));
+      expect(reconstructed.indexOf('段落29：')).toBeLessThan(reconstructed.indexOf('段落30：'));
+      expect(reconstructed).not.toContain('\n\n\n');
+
+      // 重建文再切分 → 与首次切分序列完全一致（往返幂等）
+      const chunks2 = chunkMarkdown(reconstructed, doc.title);
+      expect(chunks2).toHaveLength(chunks1.length);
+      expect(chunks2.map((c) => [c.headingPath, c.headingLevel, c.content])).toEqual(
+        chunks1.map((c) => [c.headingPath, c.headingLevel, c.content]),
+      );
     });
   });
 
@@ -1123,9 +1414,7 @@ describe('DocService', () => {
       const secQb = createMockQueryBuilder([], 0);
       (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(secQb);
 
-      await expect(
-        service.getSection('doc-1', undefined, 'NoSuch'),
-      ).rejects.toMatchObject({
+      await expect(service.getSection('doc-1', undefined, 'NoSuch')).rejects.toMatchObject({
         response: { code: ErrorCode.DOC_NOT_FOUND },
       });
     });
@@ -1185,7 +1474,12 @@ describe('DocService', () => {
     });
 
     it('emits DOC_DELETED on soft-delete', async () => {
-      const doc = makeDoc({ source: 'native', spaceId: 'space-1', path: 'docs/test.md', title: 'Test Doc' });
+      const doc = makeDoc({
+        source: 'native',
+        spaceId: 'space-1',
+        path: 'docs/test.md',
+        title: 'Test Doc',
+      });
       const qb = createMockQueryBuilder([doc], 1);
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
 
@@ -1357,16 +1651,13 @@ describe('DocService', () => {
 
       await service.upsert('space-1', {
         path: 'docs/test.md',
-        content:
-          'See [doc](/docs/space-1?doc=00000000-0000-0000-0000-000000000000)',
+        content: 'See [doc](/docs/space-1?doc=00000000-0000-0000-0000-000000000000)',
       });
 
       expect(savedDoc).not.toBeNull();
       const lh = (savedDoc as any).linkHealth as Record<string, unknown>;
       expect(lh.total).toBe(1);
-      expect(lh.broken).toEqual([
-        '/docs/space-1?doc=00000000-0000-0000-0000-000000000000',
-      ]);
+      expect(lh.broken).toEqual(['/docs/space-1?doc=00000000-0000-0000-0000-000000000000']);
     });
 
     it('skips unchanged content entirely when link_health already present', async () => {

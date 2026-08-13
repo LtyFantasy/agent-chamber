@@ -6,13 +6,21 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.3 (W2 空间/分类/成员 API)
 
- * [踩坑索引] (无历史踩坑，新建文件) OWNER-PROXY(六处creator硬校验)
+ * [踩坑索引] OWNER-PROXY(creator硬校验+owner代理) DOCSPACE-PERM(update字段级分权+creator转让)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #21(双层校验) #22(findOne必须判空)
  *
- *   OWNER-PROXY: v1.37 六处 isCreator 硬校验（update/remove/invite/uninvite/add-editor/
- *       remove-editor）扩展 owner 代理判定（isCreatorOf），人类 owner 对其 agent 创建的
+ *   OWNER-PROXY: v1.37 creator 硬校验（delete/invite/uninvite/add-editor/remove-editor/
+ *       transfer-creator）扩展 owner 代理判定（isCreatorOf），人类 owner 对其 agent 创建的
  *       space 视同 creator 全通。
+ *   DOCSPACE-PERM: v1.45 update() 不再是纯 creator-only——字段级分权：内容字段
+ *       （name/description/overviewFilter）走 policy write（editor 可），结构字段
+ *       （visibility/topicId/boardId）creator-only。结构字段存在性判断必须 `!== undefined`
+ *       （显式 null = 解绑语义也算出现），403 消息列出具体字段名（R1）。
+ *       新端点 POST :id/transfer-creator（creator-only，干净交接，见 service 注释）。
+ *   VALIDATION-400: 互斥参数同传（topicId+boardId）是请求格式错误，必须 400
+ *       VALIDATION_ERROR——历史上本文件误用 403 Forbidden + RESOURCE_CONFLICT
+ *       （2026-08-09 修复 edad7a9）。403 只留给真实权限拒绝。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -33,6 +41,8 @@ import {
   UseGuards,
   ParseUUIDPipe,
   ForbiddenException,
+  BadRequestException,
+  HttpCode,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { DocSpaceService } from './docspace.service';
@@ -50,6 +60,7 @@ import {
   UninviteDocSpaceAgentDto,
   AddDocSpaceEditorDto,
   RemoveDocSpaceEditorDto,
+  TransferCreatorDto,
   DocOverviewQueryDto,
   RepoManifestDto,
 } from './dto';
@@ -96,9 +107,9 @@ export class DocSpaceController {
     // Mutual exclusivity check (validation layer only catches both via class-validator;
     // service also guards, but controller-level check gives nicer error for edge case)
     if (dto.topicId && dto.boardId) {
-      throw new ForbiddenException({
+      throw new BadRequestException({
         message: 'topicId and boardId are mutually exclusive',
-        code: ErrorCode.RESOURCE_CONFLICT,
+        code: ErrorCode.VALIDATION_ERROR,
       });
     }
 
@@ -161,25 +172,51 @@ export class DocSpaceController {
   @Patch(':id')
   @ApiOperation({
     summary: 'Update DocSpace',
-    description: 'Update DocSpace by ID. Only the creator can update.',
+    description:
+      'Update DocSpace by ID. Field-level permission split (v1.45 DOCSPACE-PERM): ' +
+      'content fields (name/description/overviewFilter) require write access ' +
+      '(creator, editor, owner-proxy, or admin); structural fields ' +
+      '(visibility/topicId/boardId) require creator (or admin). ' +
+      'An editor request containing any structural field is rejected as a whole (403) ' +
+      '— no partial application.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'DocSpace updated successfully' })
+  @ApiResponse({
+    status: 403,
+    description: 'Structural fields require creator permission (PERMISSION_DENIED)',
+  })
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateDocSpaceDto,
     @CurrentActor() actor: UnifiedActor,
   ) {
     const space = await this.docSpaceService.findById(id);
-
-    // Only creator (or admin) can update
-    const isCreator = await this.isCreatorOf(space, actor);
     const isAdmin = actor?.role === UserRole.ADMIN;
-    if (!isCreator && !isAdmin) {
-      throw new ForbiddenException({
-        message: 'Only the space creator can update',
-        code: ErrorCode.PERMISSION_DENIED,
-      });
+
+    // 字段级分权（D1）：内容字段（name/description/overviewFilter）走 policy write——
+    // permService.ensureCan 全覆盖 creator/editor/owner-proxy/admin，不自造 isCreatorOrEditor
+    // 判断（实现收敛）；结构字段（visibility/topicId/boardId）creator-only。
+    // ⚠️ 结构字段存在性必须 `!== undefined`（显式 null 也算「出现」= 解绑语义）——
+    // truthy 判断会漏掉 { visibility: null } 解绑请求，让 editor 绕过结构字段检查。
+    const hasStructural =
+      dto.visibility !== undefined || dto.topicId !== undefined || dto.boardId !== undefined;
+    if (hasStructural) {
+      const isCreator = await this.isCreatorOf(space, actor);
+      if (!isCreator && !isAdmin) {
+        // R1：403 消息列出实际出现的结构字段名（editor 请求含任一结构字段 → 整体 403，不做部分应用），
+        // agent 消费者可据消息自修正
+        const presentStructural: string[] = [];
+        if (dto.visibility !== undefined) presentStructural.push('visibility');
+        if (dto.topicId !== undefined) presentStructural.push('topicId');
+        if (dto.boardId !== undefined) presentStructural.push('boardId');
+        throw new ForbiddenException({
+          message: `Structural fields require creator permission: ${presentStructural.join(', ')}`,
+          code: ErrorCode.PERMISSION_DENIED,
+        });
+      }
+    } else {
+      await this.permService.ensureCan(space, actor, 'write');
     }
 
     // If boardId is being set, validate board access
@@ -204,7 +241,10 @@ export class DocSpaceController {
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Repo manifest stored successfully' })
-  @ApiResponse({ status: 400, description: 'Validation failed (files limit / absolute path / `..` segment)' })
+  @ApiResponse({
+    status: 400,
+    description: 'Validation failed (files limit / absolute path / `..` segment)',
+  })
   async updateRepoManifest(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: RepoManifestDto,
@@ -340,6 +380,49 @@ export class DocSpaceController {
       });
     }
     return this.docSpaceService.removeEditor(id, dto.agentId);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post(':id/transfer-creator')
+  // 转让修改既有资源（非新建），语义上 200 而非 POST 默认 201（与 ApiResponse 对齐）
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Transfer DocSpace creator',
+    description:
+      'Transfer the creator role to another actor (human or agent, unified actors table). ' +
+      'Creator-only (owner-proxy included). Clean handover: the old creator does not ' +
+      'automatically receive any role (loses access to PRIVATE spaces); any existing ' +
+      'member row of the new creator is removed (creator identity overrides membership). ' +
+      'No event/audit is emitted (consistent with invite/add-editor).',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Creator transferred successfully' })
+  @ApiResponse({
+    status: 403,
+    description: 'Only the space creator can transfer (PERMISSION_DENIED)',
+  })
+  @ApiResponse({ status: 404, description: 'Target actor not found (ACTOR_NOT_FOUND)' })
+  @ApiResponse({ status: 409, description: 'Target is already the creator (RESOURCE_CONFLICT)' })
+  async transferCreator(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: TransferCreatorDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(id);
+
+    // Creator-only 闸门（owner-proxy 含内，照抄 inviteAgent 模式）
+    const isCreator = await this.isCreatorOf(space, actor);
+    const isAdmin = actor?.role === UserRole.ADMIN;
+    if (!isCreator && !isAdmin) {
+      throw new ForbiddenException({
+        message: 'Only space creator can transfer the creator role',
+        code: ErrorCode.PERMISSION_DENIED,
+      });
+    }
+
+    const updated = await this.docSpaceService.transferCreator(id, dto.newCreatorId);
+    // 返回 enrich 后的 space（与 findOne 同款响应形状，前端 invalidate 后可直读）
+    return this.docSpaceService.enrich(updated);
   }
 
   // ─── Categories ─────────────────────────────────────────────

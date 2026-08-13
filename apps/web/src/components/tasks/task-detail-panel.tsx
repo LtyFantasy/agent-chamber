@@ -21,7 +21,7 @@
 
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
@@ -51,6 +51,7 @@ import {
 import type { Milestone as MilestoneType, TaskDependencyItem, Comment, Activity } from '@/types';
 import { DocPicker } from '@/components/docs/doc-picker';
 import { TaskPicker, type TaskPick } from '@/components/tasks/task-picker';
+import { confirm } from '@/lib/notify';
 
 /** 组件 Props */
 export interface TaskDetailPanelProps {
@@ -89,6 +90,9 @@ export function TaskDetailPanel({
   const router = useRouter();
   const t = useTranslations('tasks');
   const tGlobal = useTranslations();
+  // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
+  // 不防则连点排队两个确认框——确认两次 = 重复删除任务）
+  const deleteConfirmPendingRef = useRef(false);
 
   /** 当前激活的 Tab */
   const [activeTab, setActiveTab] = useState('detail');
@@ -897,9 +901,21 @@ export function TaskDetailPanel({
             variant="outline"
             size="sm"
             className="text-destructive hover:text-destructive"
-            onClick={() => {
-              if (confirm(t('delete.confirm'))) {
+            onClick={async () => {
+              if (deleteConfirmPendingRef.current || deleteMutation.isPending) return;
+              deleteConfirmPendingRef.current = true;
+              try {
+                const ok = await confirm({
+                  title: t('deleteTitle'),
+                  description: t('delete.confirm'),
+                  confirmText: tGlobal('common.confirm'),
+                  cancelText: tGlobal('common.cancel'),
+                  confirmVariant: 'danger',
+                });
+                if (!ok) return;
                 deleteMutation.mutate();
+              } finally {
+                deleteConfirmPendingRef.current = false;
               }
             }}
             isLoading={deleteMutation.isPending}

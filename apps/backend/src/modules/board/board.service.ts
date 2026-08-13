@@ -80,6 +80,8 @@ import { EventService } from '../event/event.service';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { Milestone } from '../../database/entities/milestone.entity';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
+import { Message } from '../../database/entities/message.entity';
 import { QueryTaskDto } from '../task/dto';
 import {
   CreateBoardDto,
@@ -123,6 +125,12 @@ export class BoardService {
     // v1.41 digest：里程碑元数据 + 批量 stats（无模块循环依赖——实体注册仅依赖表）
     @InjectRepository(Milestone)
     private milestoneRepo: Repository<Milestone>,
+    // v1.44.0-dev digest：roundtable 段实时装配（圆桌 topic/座位/座位消息，平台级口径；
+    // 实体注册仅依赖表，无模块循环依赖——对齐 milestoneRepo 惯例）
+    @InjectRepository(RoundtableSeat)
+    private seatRepo: Repository<RoundtableSeat>,
+    @InjectRepository(Message)
+    private messageRepo: Repository<Message>,
   ) {}
 
   /**
@@ -520,6 +528,10 @@ export class BoardService {
    *   （versionLimit=0 对齐既有惯例：显式要求空段不参与截断判定）
    * - metrics：board.settings.metrics 透传（report-metrics.mjs 上报的测试基线/MCP
    *   工具数等机器事实），无则 null
+   * - roundtable（v1.44.0-dev，M2 阶段 7）：圆桌平台级指标首版——圆桌 topic 数、
+   *   active 座位数、近 7 天日均轮次、沉默拦截率、熔断次数；**平台级口径**：
+   *   topic/seat/message 均不隶属于 board，digest 按 board 调用但本段统计全平台；
+   *   永远输出该段（无圆桌时全零，形状可预测）。五值口径见装配处注释
    * - docs：按 boardId 找绑定空间（无则 docs: null）+ 该空间未删除文档 updatedAt desc；
    *   **权限语义（契约层决定）**：board 可读即蕴含空间元数据可读（不含正文）
    * - truncated：任一列表段"实际存在但被 limit 截断"为 true；limit=0（调用方显式
@@ -569,9 +581,7 @@ export class BoardService {
 
     // ── taskCount / completedTaskCount：复用 enrich 口径（board 详情为准） ──
     const { total: taskCount, completed: completedTaskCount } =
-      listIds.length > 0
-        ? await this.countTasksByBoard(boardId)
-        : { total: 0, completed: 0 };
+      listIds.length > 0 ? await this.countTasksByBoard(boardId) : { total: 0, completed: 0 };
 
     // ── open 任务全量（priorityDistribution 需全量；nextUp 是它的前缀切片） ──
     // Priority 枚举序 p0→p1→p2→p3，ORDER BY priority ASC = p0（最高优先级）在前
@@ -775,8 +785,55 @@ export class BoardService {
     // metrics：settings.metrics 透传不加工（report-metrics.mjs 上报的机器事实；无则 null）
     const metrics = (board.settings?.metrics as Record<string, unknown> | undefined) ?? null;
 
+    // ── roundtable：圆桌平台级指标（v1.44.0-dev，M2 阶段 7，实时装配新段） ──
+    // 平台级口径：topic/seat/message 均不隶属于 board，digest 按 board 调用但本段
+    // 统计全平台（设计文档 §12 r10）。永远输出该段——平台无圆桌时全零，形状可预测
+    // （不返回 undefined，消费端无需判空）。座位消息判定 = messages.metadata->>'seatLabel'
+    // 非空（阶段 3/6 确立的座位身份标记）；TypeORM 软删自动过滤（DeleteDateColumn 令
+    // count()/getCount() 隐式加 deleted_at IS NULL）。
+    // topicCount：topics.kind='roundtable' 全平台计数（kind 创建后不可变，阶段 1）
+    const roundtableTopicCount = await this.topicRepo.count({
+      where: { kind: 'roundtable' },
+    });
+    // seatCount：active 状态座位数（status 枚举 active/paused/parked/offline，默认 active）
+    const roundtableSeatCount = await this.seatRepo.count({
+      where: { status: 'active' },
+    });
+    // 座位 state 计数求和用 JS 内存累加（座位量小，禁止 jsonb 聚合 SQL——stage 7 口径
+    // 拍板）；state 为 jsonb 默认 '{}'，阶段 4 落计数前的历史座位缺键，?? 0 兜底
+    const allSeats = await this.seatRepo.find();
+    let silentCountSum = 0;
+    let valveTripCountSum = 0;
+    for (const seat of allSeats) {
+      silentCountSum += (seat.state?.silentCount as number | undefined) ?? 0;
+      valveTripCountSum += (seat.state?.valveTripCount as number | undefined) ?? 0;
+    }
+    // 座位消息全时段累计（silentRate 分母——**全时段**，非 7 天窗口；严禁用
+    // roundsWithoutHuman 当分母，它会复位清零，阶段 5 已知坑 RT-VALVE 系）
+    const seatMessageTotal = await this.messageRepo
+      .createQueryBuilder('m')
+      .where("m.metadata ->> 'seatLabel' IS NOT NULL")
+      .andWhere("m.metadata ->> 'seatLabel' <> ''")
+      .getCount();
+    // 近 7 天窗口（含当下往前 7×24h；dailyRounds 分子，口径注释见 shared 类型）
+    const seatMessage7dCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const seatMessages7d = await this.messageRepo
+      .createQueryBuilder('m')
+      .where("m.metadata ->> 'seatLabel' IS NOT NULL")
+      .andWhere("m.metadata ->> 'seatLabel' <> ''")
+      .andWhere('m.createdAt >= :cutoff', { cutoff: seatMessage7dCutoff })
+      .getCount();
+    // dailyRounds 保留两位小数（除法合理精度）；silentRate 分母 0 → 0（防除零）
+    const dailyRounds = Math.round((seatMessages7d / 7) * 100) / 100;
+    const silentRateDenominator = silentCountSum + seatMessageTotal;
+    const silentRate = silentRateDenominator > 0 ? silentCountSum / silentRateDenominator : 0;
+
     const truncated =
-      risksTruncated || nextUpTruncated || recentDoneTruncated || docsTruncated || versionsTruncated;
+      risksTruncated ||
+      nextUpTruncated ||
+      recentDoneTruncated ||
+      docsTruncated ||
+      versionsTruncated;
 
     // 最终投影：剔除内部 assigneeId，统一填充 assigneeName
     const projectRisk = (r: DigestRiskRow): BoardDigestRisk => {
@@ -808,6 +865,13 @@ export class BoardService {
         total: versionsTotal,
       },
       metrics,
+      roundtable: {
+        topicCount: roundtableTopicCount,
+        seatCount: roundtableSeatCount,
+        dailyRounds,
+        silentRate,
+        valveTripCount: valveTripCountSum,
+      },
       priorityDistribution: { open: priorityDistribution },
       risks: risks.map(projectRisk),
       nextUp: nextUp.map(projectOpen),

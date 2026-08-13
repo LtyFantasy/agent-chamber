@@ -22,6 +22,7 @@
  */
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { APP_FILTER, APP_INTERCEPTOR, APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
@@ -57,6 +58,8 @@ import { AuditModule } from './modules/audit/audit.module';
 import { SearchModule } from './modules/search/search.module';
 import { WebhookModule } from './modules/webhook/webhook.module';
 import { MonitoringModule } from './modules/monitoring/monitoring.module';
+import { RoundtableModule } from './modules/roundtable/roundtable.module';
+import { DownloadsModule } from './modules/downloads/downloads.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -65,6 +68,10 @@ import { HealthModule } from './health/health.module';
       isGlobal: true,
       load: [databaseConfig, jwtConfig, appConfig],
     }),
+    // 事件总线（M1 圆桌计划决策 2）：@nestjs/event-emitter forRoot() 默认 global: true，
+    // 注册一次全模块可注入 EventEmitter2。EventService.create() 末尾 emit('event.created')，
+    // 12 个事件写入方零改动；roundtable 模块用 @OnEvent('event.created') 订阅。
+    EventEmitterModule.forRoot(),
     TypeOrmModule.forRoot({
       type: 'postgres',
       host: process.env.DB_HOST || 'localhost',
@@ -109,6 +116,12 @@ import { HealthModule } from './health/health.module';
     SearchModule,
     WebhookModule,
     MonitoringModule,
+    // 圆桌模式（M1 计划阶段 3）：WS 控制面（/ws/runner）+ runner 注册表 + 座位管理
+    // REST + 注入管线（@OnEvent('event.created') 触发，见 roundtable.service.ts）
+    RoundtableModule,
+    // 下载分发（M1「最后一公里」P2）：公开提供 install-runner.sh / runner bundle / 对接指南，
+    // 供 curl | bash 一键安装链路使用；无 DB 依赖、全 @Public()
+    DownloadsModule,
     HealthModule,
   ],
   providers: [

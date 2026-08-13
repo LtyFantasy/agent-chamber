@@ -25,6 +25,7 @@
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
+      "@agent-chamber/roundtable-protocol": ["../../packages/roundtable-protocol/src/index.ts"],
       "@agent-chamber/shared": ["../../packages/shared/src/index.ts"]
     }
   },

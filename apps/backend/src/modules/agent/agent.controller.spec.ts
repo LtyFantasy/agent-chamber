@@ -88,6 +88,42 @@ describe('AgentController', () => {
       ).rejects.toThrow('Permission denied');
     });
 
+    it('should keep lastActiveAt/createdAt in admin list response (regression: pickPublicAgentFields whitelist)', async () => {
+      const result = {
+        items: [
+          {
+            id: 'agent-1',
+            name: 'Hument GPT',
+            status: 'active',
+            createdAt: '2026-08-09T00:00:00.000Z',
+            updatedAt: '2026-08-09T00:00:00.000Z',
+            lastActiveAt: '2026-08-10T04:05:21.000Z',
+            topicCount: 0,
+            messageCount: 0,
+            apiKeyPrefix: 'ask_xxxx',
+            webhookUrl: 'https://example.com/hook', // 敏感字段应被剥离
+            systemPrompt: 'secret',
+          },
+        ],
+        total: 1,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      };
+      service.findAll.mockResolvedValue(result);
+
+      const res = await controller.findAll({}, { headers: {} }, mockActor);
+
+      const item = res.items[0] as Record<string, unknown>;
+      expect(item.lastActiveAt).toBe('2026-08-10T04:05:21.000Z');
+      expect(item.createdAt).toBe('2026-08-09T00:00:00.000Z');
+      // 敏感字段仍被白名单剥离
+      expect(item.webhookUrl).toBeUndefined();
+      expect(item.systemPrompt).toBeUndefined();
+    });
+
     it('should return only own agents for non-admin user', async () => {
       const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
       const result = {

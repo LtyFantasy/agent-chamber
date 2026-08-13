@@ -237,8 +237,14 @@ export interface DocDetail extends DocSummary {
 export interface DocSectionOutline {
   /** 篇内顺序（对外定位锚点，position 跨更新稳定） */
   position: number;
-  /** 层级标题路径 */
+  /** 层级标题路径（全祖先链，如 "AAA § BBB § CCC"） */
   headingPath?: string | null;
+  /**
+   * 本地标题（headingPath 末段，如 "CCC"，展示用；增量字段，向后兼容）。
+   * headingPath 为 null（headingLevel 0 文首无标题段）时为 null；
+   * headingPath 保留作寻址地址（headingPath= 精确定位、重名消歧），语义不变。
+   */
+  heading?: string | null;
   /** 标题层级 0-6 */
   headingLevel: number;
   /** Token 估算（本 section） */

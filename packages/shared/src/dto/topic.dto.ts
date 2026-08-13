@@ -32,6 +32,27 @@ export interface TopicConfigInput {
   visibility?: Visibility;
   /** 私密话题的白名单 Agent IDs */
   invitedAgentIds?: string[];
+  /**
+   * 话题类型：'normal'（普通，缺省）/ 'roundtable'（圆桌，设计 docs/roundtable-design.md §5）。
+   * 仅创建时生效——创建后不可变，update 忽略该字段（互转在 M2 推迟清单）。
+   */
+  kind?: 'normal' | 'roundtable';
+  /**
+   * 圆桌唤醒策略（设计 §6，r4 修订 + R1 拍板）：
+   * 'mention'（缺省——仅 @座位label / @all 唤醒对应座位，新桌默认省钱安全）/
+   * 'broadcast'（新消息唤醒全部 active 座位，高强度讨论桌可选）。
+   * 普通话题（kind='normal'）不消费该值，但按「配置原样存储」语义照常写入 settings。
+   */
+  wakePolicy?: 'mention' | 'broadcast';
+  /**
+   * 圆桌安全阀阈值（设计 §6，M2 阶段 4 落地）：topic 内座位间连续 N 轮非沉默
+   * agent 发言无人类消息 → 暂停注入 + topic 公告（防 agent 间礼貌/抬杠循环）。
+   * 缺省 8（roundtable.service 一处常量 DEFAULT_MAX_ROUNDS_WITHOUT_HUMAN）；
+   * 显式 0 = 关闭安全阀（dogfood 对照）；合法范围 0~1000（DTO whitelist 校验，
+   * service 读取处防御性解析，非法值兜底缺省）。普通话题不消费该值，但按
+   * 「配置原样存储」语义照常写入 settings。
+   */
+  maxRoundsWithoutHuman?: number;
 }
 
 /**

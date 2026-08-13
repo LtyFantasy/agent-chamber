@@ -155,6 +155,7 @@ export type {
   DocSectionContent,
   DocFullContent,
   DocSearchHit,
+  DocSearchHitWithSpace,
   DocSpaceOverview,
   DocCategoryOverview,
   TaskDocLinkItem,

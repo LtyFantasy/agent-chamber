@@ -16,7 +16,7 @@ export class SearchController {
   @ApiOperation({
     summary: 'Full-text search',
     description:
-      'Full-text search across messages and tasks using PostgreSQL tsvector + GIN index, with keyword highlighting support.',
+      'Full-text search across messages, tasks and docs using PostgreSQL tsvector + GIN index, with keyword highlighting support. Docs results are non-paginated (fixed limit 20).',
   })
   @ApiQuery({
     name: 'q',
@@ -27,7 +27,7 @@ export class SearchController {
   @ApiQuery({
     name: 'type',
     required: false,
-    description: 'Search scope: all / messages / tasks, defaults to all',
+    description: 'Search scope: all / messages / tasks / docs, defaults to all',
     type: String,
   })
   @ApiQuery({

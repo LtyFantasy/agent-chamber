@@ -17,3 +17,4 @@ export { DocDetailQueryDto } from './doc-detail-query.dto';
 export { CreateDocRouteDto } from './create-doc-route.dto';
 export { UpdateDocRouteDto } from './update-doc-route.dto';
 export { RepoManifestDto, RepoManifestFileConstraint } from './repo-manifest.dto';
+export { TransferCreatorDto } from './transfer-creator.dto';
