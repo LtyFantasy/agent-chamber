@@ -104,7 +104,7 @@ import type { Logger } from '../logger';
  * 本包版本（hello/initialize 上报；与 cli.ts VERSION 单一常量同源，R5——
  * clientInfo.version 上报的是 runner 版本，不按 profile 各报各的；与 package.json 保持一致）
  */
-export const DRIVER_VERSION = '0.3.1';
+export const DRIVER_VERSION = '0.4.0';
 
 /** ACP initialize 的 clientInfo.name（chamber 侧日志识别 runner 来源） */
 const CLIENT_NAME = 'agent-chamber-roundtable-runner';
@@ -124,11 +124,13 @@ export interface AcpVendorProfile {
   /** 厂商名（日志前缀/错误文案；如 'kimi'/'codex'） */
   vendorName: string;
   /**
-   * 构造 ACP 子进程 spawn 命令（每次拉起时调用）。
+   * 构造 ACP 子进程 spawn 命令（每次拉起时调用，带座位配置——opencode 需要按
+   * 座位 permissionMode 注入 OPENCODE_CONFIG_CONTENT 权限钉死，见 opencode-acp.ts；
+   * 不需要座位上下文的厂商（kimi/codex）可忽略该参数）。
    * 可抛错——抛错即 start/inject 失败，错误信息直接成为座位 offline 的 detail
    * （如 codex 探测不到 CLI：R3 不静默兜底）。
    */
-  spawnCommand(): { bin: string; args: string[]; env: NodeJS.ProcessEnv };
+  spawnCommand(config: SeatConfig): { bin: string; args: string[]; env: NodeJS.ProcessEnv };
   /**
    * 平台权限档位 → set_config_option 钉死序列（档案 #5 泄漏防护的厂商映射）。
    * kimi：单条 mode=permissionMode；codex：mode（read-only/agent/agent-full-access）
@@ -509,7 +511,7 @@ export class AcpDriver implements SeatDriver {
 
   /** spawn acp 子进程（命令与 env 由 profile 决定）并挂接 stdout 分帧 / stderr 透传 / exit 清理 */
   private launch(config: SeatConfig): AcpSession {
-    const { bin, args, env } = this.profile.spawnCommand();
+    const { bin, args, env } = this.profile.spawnCommand(config);
     const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'], env });
     const session: AcpSession = {
       config,

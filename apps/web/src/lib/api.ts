@@ -217,7 +217,7 @@ export interface RoundtableSeatItem {
   label: string;
   /** 生命周期状态：active / paused / parked / offline（已移除座位不出现在列表） */
   status: string;
-  /** 厂商（'kimi'，M4a 起扩展） */
+  /** 厂商（'kimi'，M4a 起扩展至 codex/opencode/claude-code） */
   vendor: string;
   /**
    * 认领 runner UUID（backend 实体字段原样透出；null = 未被任何 runner 认领）。
@@ -489,7 +489,7 @@ export interface RoundtableRunnerItem {
   status: string;
   /** runner 软件版本（排障用，可空） */
   version: string | null;
-  /** 支持的 vendor 列表（如 ["kimi","codex"]；建座 vendor 提示的数据源） */
+  /** 支持的厂商列表（如 ["kimi","codex","opencode","claude-code"]；建座 vendor 提示的数据源） */
   vendors: string[];
   /** 最近心跳/连接时间（ISO 8601，可空；web 渲染相对时间） */
   lastSeenAt: string | null;
@@ -505,7 +505,7 @@ export interface CreateSeatRequest {
   topicId: string;
   /** 座位展示名（seatLabel 身份模型，@ 补全候选） */
   label: string;
-  /** 厂商（kimi / codex——协议值，SEAT_VENDORS） */
+  /** 厂商（kimi / codex / opencode / claude-code——协议值，SEAT_VENDORS） */
   vendor: string;
   /** 座位工作目录（runner 所在机器上的路径，agent 环境边界） */
   cwd: string;

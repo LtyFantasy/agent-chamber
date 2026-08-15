@@ -86,7 +86,7 @@ export interface RunnerWsClientOptions {
   version: string;
   /** 状态存储（hello 对账游标 + 未确认队列 + lastReceivedSeq 去重） */
   state: StateStore;
-  /** 支持的厂商列表（默认协议包 SEAT_VENDORS = ['kimi','codex']；chamber 按 vendor ∈ hello.vendors 绑定座位） */
+  /** 支持的厂商列表（默认协议包 SEAT_VENDORS = ['kimi','codex','opencode','claude-code']；chamber 按 vendor ∈ hello.vendors 绑定座位） */
   vendors?: SeatVendor[];
   /** 下行信封分发（校验通过后；runner-core 处理座位业务） */
   onDownlink: (envelope: Envelope) => void;
@@ -238,7 +238,7 @@ export class RunnerWsClient {
     }
     const payload = {
       version: this.options.version,
-      // M4a：双厂商上报（kimi + codex；chamber 按 vendor ∈ hello.vendors 绑定座位）
+      // M4a 起：厂商数组上报（kimi/codex/opencode/claude-code；chamber 按 vendor ∈ hello.vendors 绑定座位）
       vendors: this.options.vendors ?? [...SEAT_VENDORS],
       seats,
       // 可选 name（hello payload 契约 v1 未冻结该键，chamber updateHelloInfo 宽松读取）

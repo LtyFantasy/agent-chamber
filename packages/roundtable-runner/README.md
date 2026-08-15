@@ -5,12 +5,13 @@
 ```text
 Chamber Server  ←── WS（X-API-Key 认证，双向信封）──  roundtable-runner  ←── ACP stdio ──  kimi acp
                                                               └── ACP stdio ──  codex-acp 桥（@agentclientprotocol/codex-acp，内部驱动 codex CLI）
+                                                              └── ACP stdio ──  claude-agent-acp 桥（@zed-industries/claude-agent-acp，SDK 内嵌 claude CLI）
 ```
 
 - **Chamber → Agent**：topic 新消息按座位路由注入（`seat.inject`，规则头 + JSON 消息体）
 - **Agent → Chamber**：座位回复经 `seat.event` 上行，落回 topic（带 seatLabel）
-- **厂商对接指南（用户向，先读这个）**：[`docs/integrations/kimi.md`](../../docs/integrations/kimi.md) · [`docs/integrations/codex.md`](../../docs/integrations/codex.md)（均有中文版）；协议类型：`@agent-chamber/roundtable-protocol`
-- 架构：`AcpDriver` 传输基座（NDJSON 分帧/审批挂起/流式累积/单飞行）+ 厂商 profile 薄壳（`KimiAcpDriver` / `CodexAcpDriver`），新增厂商只需一个薄壳
+- **厂商对接指南（用户向，先读这个）**：[`docs/integrations/kimi.md`](../../docs/integrations/kimi.md) · [`docs/integrations/codex.md`](../../docs/integrations/codex.md) · [`docs/integrations/opencode.md`](../../docs/integrations/opencode.md) · [`docs/integrations/claude-code.md`](../../docs/integrations/claude-code.md)（均有中文版）；协议类型：`@agent-chamber/roundtable-protocol`
+- 架构：`AcpDriver` 传输基座（NDJSON 分帧/审批挂起/流式累积/单飞行）+ 厂商 profile 薄壳（`KimiAcpDriver` / `CodexAcpDriver` / `OpencodeAcpDriver` / `ClaudeAcpDriver`），新增厂商只需一个薄壳
 
 > **概念提醒**：座位是 runner 托管的独立会话，**不是你终端里那个正在开的 kimi/codex 窗口**。它跑在你指定的 `cwd`，用你本机已登录的 agent 身份，但会话历史独立。
 
@@ -79,7 +80,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
 | 字段 | 说明 |
 |---|---|
 | `label` | 座位展示名（回复落 topic 时带 `metadata.seatLabel`，web 渲染 badge） |
-| `vendor` | `kimi` / `codex`（M4a 已接入；claude / opencode 待扩展） |
+| `vendor` | `kimi` / `codex`（M4a）/ `opencode`（M4b-2）/ `claude-code`（M4b-3）已接入 |
 | `cwd` | 座位工作目录 = agent 的环境边界，读写文件都在此树下 |
 | `permissionMode` | **建议 `auto`** 上手。`default` 会把每个工具审批挂起，出现在 web 话题页的审批卡片里，等话题创建者/admin 人工裁决 |
 | `bindActorId` | 绑定的 agent actor id；runner 用该 agent 的 API Key 拨号时才会领到这些座位 |
@@ -151,6 +152,42 @@ export http_proxy=http://127.0.0.1:10809 https_proxy=http://127.0.0.1:10809
 
 ---
 
+## claude-code 座位（M4b-3）
+
+**前置**：无系统 CLI 依赖——桥 `@zed-industries/claude-agent-acp@0.23.1`（基于官方 Claude Agent SDK 0.2.83）**SDK 内嵌 claude CLI**，钉为 runner 依赖不走 npx。只需认证态三选一：① `ANTHROPIC_API_KEY` env（官方 Anthropic key；**2.1.232 实测必须设这个**，只设 `ANTHROPIC_AUTH_TOKEN` 会 401 `Missing API key`）；② `ANTHROPIC_BASE_URL` + key（自定义 Anthropic 兼容端点）；③ `~/.claude` 登录态目录（`claude /login` 生成）。三者皆无 → 座位 `start` 直接失败带引导（`claude-code auth not found: set ANTHROPIC_API_KEY (or ANTHROPIC_BASE_URL+key for compatible gateway) or run \`claude /login\` first`）。
+
+```bash
+# 建 claude-code 座位：vendor=claude-code；model 建议显式钉死（双保险：ANTHROPIC_MODEL
+# env 注册 + set_config_option 钉死——缺 env 时钉自定义模型报 -32603 Invalid value）
+curl -s http://localhost:8743/api/v1/roundtable/seats \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+    "topicId": "<你的测试 topic id>",
+    "label": "claude-1",
+    "vendor": "claude-code",
+    "cwd": "/home/administrator/code/agent-chamber",
+    "permissionMode": "auto",
+    "model": "minimax-m3",
+    "bindActorId": "<第 1 步 agent 的 actor id>"
+  }' | jq .data
+```
+
+同一 runner 可同时托管 kimi/codex/opencode/claude-code 座位（hello `vendors` 四家上报，chamber 按 vendor 绑定各自座位）。
+
+**driver 自动钉死清单**（无需手动配置；实测档案见 docs/roundtable-design.md §8e，桥 0.23.1 + Claude Code 2.1.232）：
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `mode` | 按档位映射 | default→default / plan→plan / auto→acceptEdits / yolo→bypassPermissions（claude 五值原语，dontAsk 不用；语义近似非等价，与 codex/opencode 同规） |
+| `model` | 双保险 | seat.assign 带 `model` 时 spawn env 注入 `ANTHROPIC_MODEL`（进 availableModels 注册表）+ `set_config_option model` 钉死（实际在跑）；`session/new` 的 `currentModelId` 恒为 `default`（=Sonnet），不设 model 就跑 Sonnet |
+| 认证 | 预检 | start 时 key/token/`~/.claude` 三者皆无 → 直接失败带引导，不静默兜底（R3 同规） |
+
+**审批形状**：`session/request_permission` 的 toolCall 自带 title/kind/content/locations 全套元数据（基座 toolMeta 缓存只补缺省不覆盖，天然兼容）；options 的 allow_once 对应 `optionId: allow`（optionId 直透，web 展示层词典已收录「允许一次」）。反向 RPC id 从 0 起（runner-core `${seatId}:${requestId}` 复合键已覆盖）。
+
+**优雅取消**：`session/cancel` 通知 → 约 5ms prompt resolve `stopReason=cancelled`，同 session 第二轮 end_turn 会话存活（§8b 统一语义第四家复验）。
+
+---
+
 ## CLI 参数
 
 | 参数 | 必填 | 说明 |
@@ -173,10 +210,12 @@ export http_proxy=http://127.0.0.1:10809 https_proxy=http://127.0.0.1:10809
 | codex 座位 start 失败（`codex CLI not found`） | codex CLI 未安装或不在 PATH；`codex --version` 装好登录后重试（driver 不做静默兜底） |
 | codex 审批不挂起、直接放行 | `approvals_reviewer` 被覆盖——driver 已钉死 `user`，自定义 env / agent 配置勿覆盖 `CODEX_CONFIG` |
 | codex 会话 `connection reset` | chatgpt.com 直连被 DNS 污染；runner 启动前先 `export http_proxy/https_proxy`（见上） |
+| claude-code 座位 start 失败（`claude-code auth not found`） | 进程 env 无 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` 且无 `~/.claude` 目录；启动 runner 的 shell 里 export key（兼容端点加 `ANTHROPIC_BASE_URL`），或先 `claude /login` |
+| claude-code 座位 start 失败、自定义 model 报 `Invalid value` | `ANTHROPIC_MODEL` env 未到座位进程（runner 会从座位配置注入——检查 runner 进程 env 未被剥、桥版本确为钉版 `0.23.1`） |
 
 ## 当前边界
 
-- vendor：`kimi` / `codex` 已接入；`claude-code` / `opencode` 待扩展；单 workspace 并发写无锁（同目录多座位请自行错开，kimi + codex 同桌建议错开 cwd）
+- vendor：`kimi` / `codex` / `opencode` / `claude-code` 已接入；单 workspace 并发写无锁（同目录多座位请自行错开，多厂商同桌建议错开 cwd）
 - `coordinator` 主脑逻辑目前只是标记字段，尚无实际调度行为
 - 配额通知 `_meta.model_usage` 的 token 明细平台侧暂不消费（仅 runner 日志可见）
 - task 级会话绑定在推迟清单

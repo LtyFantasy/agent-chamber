@@ -47,12 +47,21 @@ import { RunnerConnectGuide } from './runner-connect-guide';
  * 座位厂商（协议值不翻译，与 backend SEAT_VENDORS 同规；新增厂商时同步此处 +
  * i18n 说明文案）。形状：value = 协议值，descKey = 一句语义说明的 i18n 键。
  */
-const VENDOR_OPTIONS = [{ value: 'kimi' }, { value: 'codex' }] as const;
+const VENDOR_OPTIONS = [
+  { value: 'kimi' },
+  { value: 'codex' },
+  { value: 'opencode' },
+  { value: 'claude-code' },
+] as const;
 
 /**
  * 权限模式四档（协议值不翻译；语义说明走 i18n）。映射关系（runner 侧）：
  * codex = default→read-only / plan→read-only+plan 协作 / auto→agent /
- * yolo→agent-full-access；kimi 同档语义。'auto' 是 dogfood 推荐档（默认选中）。
+ * yolo→agent-full-access；kimi 同档语义；opencode = default/plan→build/plan +
+ * 权限 ask 钉死，auto/yolo→build + 权限全放行（opencode 无 auto/yolo 原语，
+ * 语义近似，见 opencode-acp.ts O1/O2）；claude-code = default→default /
+ * plan→plan / auto→acceptEdits / yolo→bypassPermissions（claude 五值原语，
+ * dontAsk 不用，语义近似，见 claude-acp.ts C2）。'auto' 是 dogfood 推荐档（默认选中）。
  */
 const PERMISSION_MODE_OPTIONS = [
   { value: 'default', descKey: 'pmDefaultDesc' },

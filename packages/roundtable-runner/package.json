@@ -1,6 +1,6 @@
 {
   "name": "@agent-chamber/roundtable-runner",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "圆桌模式 runner：SeatDriver 接口 + AcpDriver 传输基座（kimi/codex ACP stdio）+ WebSocket 控制面拨号 + JSON 状态持久化",
   "main": "dist/index.js",
@@ -16,6 +16,7 @@
   "dependencies": {
     "@agentclientprotocol/codex-acp": "1.1.14",
     "@agent-chamber/roundtable-protocol": "workspace:*",
+    "@zed-industries/claude-agent-acp": "0.23.1",
     "commander": "^12.0.0",
     "ws": "^8.21.2"
   },

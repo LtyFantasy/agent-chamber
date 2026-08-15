@@ -11,13 +11,16 @@
 # 用法:
 #   ./scripts/install-runner.sh                      # repo 模式：构建 + 生成 start-runner.sh
 #   ./scripts/install-runner.sh --vendor codex       # 只做 codex 侧预检
+#   ./scripts/install-runner.sh --vendor opencode    # 只做 opencode 侧预检
+#   ./scripts/install-runner.sh --vendor claude-code # 只做 claude-code 侧预检（认证 env/登录态）
 #   ./scripts/install-runner.sh --dry-run            # 只打印动作不执行
 #   curl -fsSL <platform>/api/v1/downloads/install-runner.sh | bash -s -- \
 #     --platform-url https://platform.example.com --api-key <KEY> --start   # standalone
 #
 # 行为（两种模式公共）:
-#   1. 按 --vendor 预检 kimi/codex CLI（codex 侧检测 chatgpt.com 连通性，
-#      不通则打印代理设置指引——国内 DNS 污染是第一大坑）
+#   1. 按 --vendor 预检 kimi/codex/opencode CLI（codex 侧检测 chatgpt.com 连通性，
+#      不通则打印代理设置指引——国内 DNS 污染是第一大坑）与 claude-code 认证态
+#      （ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env 或 ~/.claude 登录态目录）
 #   2. 生成 start-runner.sh（含 platform-url / api-key / runner-name / state-dir）
 #   3. state-dir 默认派生 ~/.roundtable-runner-<runner-name>（R3：消灭共享状态
 #      目录假死事故的默认路径；显式 --state-dir 仍优先，两种模式统一）
@@ -32,7 +35,8 @@
 #
 # 不做：不装 systemd/pm2、不创建 agent/座位（需要人类 JWT，属于平台侧操作）。
 #
-# 前置要求：node（>=18；repo 模式还需 pnpm），kimi 和/或 codex CLI 已登录
+# 前置要求：node（>=18；repo 模式还需 pnpm），kimi / codex / opencode CLI 至少一个
+# 已登录，或 claude-code 已配置 ANTHROPIC_API_KEY（兼容端点 + ANTHROPIC_BASE_URL）
 # =============================================================================
 set -euo pipefail
 
@@ -42,7 +46,7 @@ PLATFORM_URL="${PLATFORM_URL:-http://localhost:8743}" # chamber 后端地址，�
 API_KEY="${API_KEY:-}"                                # 座位 agent 的 API Key（可留空，之后手填 start-runner.sh）
 RUNNER_NAME="${RUNNER_NAME:-roundtable-runner}"       # runner 名称（hello 上报，web 展示）
 STATE_DIR="${STATE_DIR:-}"                            # 状态目录（空 → 下方按 R3 派生）
-VENDOR="${VENDOR:-both}"                              # kimi | codex | both（预检范围）
+VENDOR="${VENDOR:-all}"                               # kimi | codex | opencode | claude-code | all（预检范围；both 为 all 的兼容别名）
 DRY_RUN="${DRY_RUN:-0}"                               # 1 = 只打印动作不执行
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/share/agent-chamber/runner}"  # standalone 解压目录
 START="${START:-0}"                                   # 1 = 生成 start-runner.sh 后立即启动（仅 standalone）
@@ -80,7 +84,8 @@ Options:
                             (optional; edit start-runner.sh later if omitted)
   -n, --runner-name <name>  runner name (default: roundtable-runner)
       --state-dir <dir>     runner state dir (default: ~/.roundtable-runner-<runner-name>)
-      --vendor <v>          preflight scope: kimi | codex | both (default: both)
+      --vendor <v>          preflight scope: kimi | codex | opencode | claude-code | all
+                            (default: all; "both" kept as a legacy alias of "all")
       --install-dir <dir>   standalone install dir
                             (default: ~/.local/share/agent-chamber/runner)
       --start               standalone only: start the runner immediately (setsid)
@@ -88,7 +93,7 @@ Options:
   -h, --help                show this help message and exit
 
 Next steps after this script: create an agent + seat, then ./start-runner.sh
-See docs/integrations/kimi.md and docs/integrations/codex.md.
+See docs/integrations/kimi.md, codex.md, opencode.md and claude-code.md.
 EOF
 }
 
@@ -128,8 +133,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$VENDOR" in
-  kimi|codex|both) ;;
-  *) fail "--vendor 只能是 kimi | codex | both，收到: $VENDOR" ;;
+  kimi|codex|opencode|claude-code|all) ;;
+  both) VENDOR=all ;;  # 兼容别名：both（kimi+codex 时代默认值）→ all
+  *) fail "--vendor 只能是 kimi | codex | opencode | claude-code | all，收到: $VENDOR" ;;
 esac
 
 # ---------- state-dir 默认派生（R3，两种模式统一） ----------
@@ -147,22 +153,22 @@ else
 fi
 
 # ---------- CLI 预检（按 vendor 范围，两种模式共用） ----------
-# 缺 CLI 只警告（不影响另一厂商座位）；两个都缺才失败
+# 缺 CLI 只警告（不影响其他厂商座位）；全部缺才失败
 preflight_clis() {
   CLI_MISSING=0
-  if [[ "$VENDOR" == "kimi" || "$VENDOR" == "both" ]]; then
+  if [[ "$VENDOR" == "kimi" || "$VENDOR" == "all" ]]; then
     if command -v kimi >/dev/null 2>&1; then
       info "kimi CLI: $(kimi --version 2>/dev/null || echo 'found')"
     else
-      warn "未找到 kimi CLI（kimi 座位将无法启动）。安装登录后重试；只做 codex 座位可用 --vendor codex 跳过本检查"
+      warn "未找到 kimi CLI（kimi 座位将无法启动）。安装登录后重试；只做其他厂商座位可用 --vendor <厂商> 跳过本检查"
       CLI_MISSING=1
     fi
   fi
-  if [[ "$VENDOR" == "codex" || "$VENDOR" == "both" ]]; then
+  if [[ "$VENDOR" == "codex" || "$VENDOR" == "all" ]]; then
     if command -v codex >/dev/null 2>&1; then
       info "codex CLI: $(codex --version 2>/dev/null || echo 'found')"
     else
-      warn "未找到 codex CLI（codex 座位将无法启动）。安装登录后重试；只做 kimi 座位可用 --vendor kimi 跳过本检查"
+      warn "未找到 codex CLI（codex 座位将无法启动）。安装登录后重试；只做其他厂商座位可用 --vendor <厂商> 跳过本检查"
       CLI_MISSING=1
     fi
     # chatgpt.com 连通性检测：国内 DNS 污染是 codex 座位的第一大坑，提前显性化
@@ -174,9 +180,36 @@ preflight_clis() {
       fi
     fi
   fi
-  if [[ "$CLI_MISSING" == "1" && "$VENDOR" == "both" ]]; then
-    command -v kimi >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || \
-      fail "kimi 与 codex CLI 都未找到——至少安装并登录其中一个（详见 docs/integrations/ 下对应指南）"
+  if [[ "$VENDOR" == "opencode" || "$VENDOR" == "all" ]]; then
+    if command -v opencode >/dev/null 2>&1; then
+      info "opencode CLI: $(opencode --version 2>/dev/null || echo 'found')"
+    else
+      warn "未找到 opencode CLI（opencode 座位将无法启动）。安装（https://opencode.ai）并 opencode auth login 后重试；只做其他厂商座位可用 --vendor <厂商> 跳过本检查"
+      CLI_MISSING=1
+    fi
+  fi
+  if [[ "$VENDOR" == "claude-code" || "$VENDOR" == "all" ]]; then
+    # claude-code 座位无系统 CLI 依赖（SDK 内嵌 claude CLI），认证态 = env key 或
+    # ~/.claude 登录态目录（driver C3 预检同判据）；缺认证只 warn 不 fail（不参与
+    # CLI_MISSING 判定——claude 无 CLI 二进制可探测），用户可稍后 export 或先
+    # `claude /login`，与 kimi 缺 CLI 同级 warn 语义
+    if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" && ! -d "$HOME/.claude" ]]; then
+      warn "未检测到 claude-code 认证（ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env 与 ~/.claude 登录态目录均无）——claude-code 座位将无法启动："
+      warn "  export ANTHROPIC_API_KEY=<key>（兼容端点另加 export ANTHROPIC_BASE_URL=<url>），或运行 claude /login"
+      warn "  无需安装系统 claude 二进制（桥 SDK 内嵌）；详见 claude-code.md 集成指南"
+    else
+      if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        info "claude-code 认证: ANTHROPIC_API_KEY env"
+      elif [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+        info "claude-code 认证: ANTHROPIC_AUTH_TOKEN env"
+      else
+        info "claude-code 认证: ~/.claude 登录态目录"
+      fi
+    fi
+  fi
+  if [[ "$CLI_MISSING" == "1" && "$VENDOR" == "all" ]]; then
+    command -v kimi >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || command -v opencode >/dev/null 2>&1 || \
+      fail "kimi、codex 与 opencode CLI 都未找到——至少安装并登录其中一个（详见 docs/integrations/ 下对应指南）"
   fi
 }
 
@@ -201,8 +234,8 @@ if [[ "$MISSING_TOOLCHAIN" == "1" ]]; then
 [install-runner] runner 需要宿主机安装 node（>=18）与 pnpm：
   - node: https://nodejs.org/ （或 nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash）
   - pnpm: corepack enable && corepack prepare pnpm@latest --activate（或 npm i -g pnpm）
-为什么不能用 docker 里的 node？runner 要驱动你本机已登录的 kimi/codex CLI（含登录态），
-必须在宿主机直接运行。
+为什么不能用 docker 里的 node？runner 要驱动你本机已登录的 kimi/codex/opencode CLI
+（含登录态）或 claude-code 的 ANTHROPIC_* env 认证，必须在宿主机直接运行。
 EOF
   exit 1
 fi
@@ -250,7 +283,7 @@ echo -e "${GREEN}  runner 安装完成（repo 模式）${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════${NC}"
 info "下一步："
 info "  1. 创建 agent 拿 API Key、创建圆桌话题与座位（座位要绑定该 agent）"
-info "     指南: docs/integrations/kimi.md · docs/integrations/codex.md"
+info "     指南: docs/integrations/kimi.md · codex.md · opencode.md · claude-code.md"
 info "  2. $([ -z "$API_KEY" ] && echo "把 API Key 填入 $START_SCRIPT 后，" || echo "")运行: $START_SCRIPT"
 info "提示：多个 runner 必须各自独立 --state-dir（默认已按 runner-name 派生，无需手动指定）"
 
@@ -368,7 +401,7 @@ echo -e "${GREEN}  runner 安装完成（standalone 模式）${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════${NC}"
 info "下一步："
 info "  1. 创建 agent 拿 API Key、创建圆桌话题与座位（座位要绑定该 agent）"
-info "     指南: $PLATFORM_URL/api/v1/downloads/integrations/kimi.md · codex.md"
+info "     指南: $PLATFORM_URL/api/v1/downloads/integrations/kimi.md · codex.md · opencode.md · claude-code.md"
 info "  2. $([ -z "$API_KEY" ] && echo "把 API Key 填入 $START_SCRIPT 后，" || echo "")运行: $START_SCRIPT"
 info "提示：多个 runner 必须各自独立 --state-dir（默认已按 runner-name 派生，无需手动指定）"
 info "提示：升级 runner 时重跑本脚本即可（--install-dir 保持一致）"

@@ -6,6 +6,8 @@
  * - AcpDriver 传输基座（厂商差异收口 AcpVendorProfile；M4a 由 kimi-acp.ts 提取）
  * - KimiAcpDriver（ACP stdio 驱动 kimi，行为档案 8 条落地 §8）
  * - CodexAcpDriver（ACP stdio 驱动 codex-acp 桥，quirk 薄壳 §8）
+ * - OpencodeAcpDriver（ACP stdio 直连 `opencode acp`，profile 薄壳 §8；M4b-2）
+ * - ClaudeAcpDriver（ACP stdio 驱动 claude-agent-acp 桥，profile 薄壳 §8e；M4b-3）
  * - RunnerWsClient（控制面 WS 拨号：退避重连/心跳/幂等去重/未确认队列重放，§4）
  * - StateStore（JSON 状态持久化：会话映射/对账游标/未确认队列，原子写+损坏恢复）
  * - RunnerCore（编排：座位生命周期 + 下行分发 + prompt 装配）
@@ -18,6 +20,10 @@ export { KimiAcpDriver } from './drivers/kimi-acp';
 export type { KimiAcpDriverOptions } from './drivers/kimi-acp';
 export { CodexAcpDriver } from './drivers/codex-acp';
 export type { CodexAcpDriverOptions } from './drivers/codex-acp';
+export { OpencodeAcpDriver } from './drivers/opencode-acp';
+export type { OpencodeAcpDriverOptions } from './drivers/opencode-acp';
+export { ClaudeAcpDriver } from './drivers/claude-acp';
+export type { ClaudeAcpDriverOptions } from './drivers/claude-acp';
 export { RunnerWsClient, nextBackoff } from './ws-client';
 export type { RunnerWsClientOptions } from './ws-client';
 export { StateStore } from './state-store';

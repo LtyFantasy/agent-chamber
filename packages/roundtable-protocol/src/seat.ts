@@ -7,15 +7,15 @@
  * 全部字段出处：docs/roundtable-design.md §3（契约①：SeatDriver 接口，r4）。
  */
 
-/** 已知座位厂商集合。已接入 'kimi' | 'codex'（M4a）；后续 'claude-code' | 'opencode' 按序扩展（docs/roundtable-design.md §3） */
-export const SEAT_VENDORS = ['kimi', 'codex'] as const;
+/** 已知座位厂商集合。已接入 'kimi' | 'codex'（M4a）| 'opencode'（M4b-2）| 'claude-code'（M4b-3）；后续按序扩展（docs/roundtable-design.md §3） */
+export const SEAT_VENDORS = ['kimi', 'codex', 'opencode', 'claude-code'] as const;
 
 /**
  * 座位厂商标识
- * 已接入 'kimi' | 'codex'；类型层仍保留 `(string & {})` 联合承接后续
- * 'claude-code' | 'opencode' —— 接入新厂商无需改本协议包。
+ * 已接入 'kimi' | 'codex' | 'opencode' | 'claude-code'；类型层仍保留 `(string & {})` 联合
+ * 承接后续厂商 —— 接入新厂商无需改本协议包。
  */
-export type SeatVendor = 'kimi' | 'codex' | (string & {});
+export type SeatVendor = 'kimi' | 'codex' | 'opencode' | 'claude-code' | (string & {});
 
 /** 权限模式枚举值（docs/roundtable-design.md §3 原文：'default' | 'plan' | 'auto' | 'yolo'） */
 export const PERMISSION_MODES = ['default', 'plan', 'auto', 'yolo'] as const;
@@ -42,7 +42,7 @@ export interface SeatConfig {
   seatId: string;
   /** 座位展示名（身份模型见 docs/roundtable-design.md §6） */
   label: string;
-  /** 厂商标识（'kimi'/'codex' 已接入，M4a 起扩展） */
+  /** 厂商标识（'kimi'/'codex'/'opencode'/'claude-code' 已接入，M4 起扩展） */
   vendor: SeatVendor;
   /** 座位工作目录（agent 的环境边界） */
   cwd: string;

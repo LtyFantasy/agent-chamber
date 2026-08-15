@@ -10,7 +10,9 @@
 #   dist-assets/integrations/*.md          对接指南四份（kimi/codex × EN/zh-CN）
 #
 # 流程：构建 protocol/runner → pnpm deploy --prod 到临时 staging（workspace 依赖
-# 内联成独立副本）→ 改写 staging package.json 的 workspace:* 为实际版本
+# 内联成独立副本）→ 逃逸符号链接替换为实体拷贝（deploy --legacy 的 workspace 依赖
+# 是指回主仓的相对符号链接，见步骤 2.5 注释）→ 改写 staging package.json 的
+# workspace:* 为实际版本
 # （standalone 安装自检失败时 npm install --omit=dev 重建依赖，npm 不认 workspace:
 # 协议，必须实版本号）→ node dist/cli.js --help 自检 → tar.gz → 拷贝配套资产。
 #
@@ -65,6 +67,25 @@ if [ "$PNPM_MAJOR" -ge 10 ]; then
 else
   pnpm --filter @agent-chamber/roundtable-runner deploy --prod "$STAGING"
 fi
+
+# ---------- 2.5 外逃逸符号链接内联为实体拷贝 ----------
+# pnpm deploy --legacy 对 workspace 依赖生成「逃逸符号链接」：node_modules/
+# @agent-chamber/roundtable-protocol 是相对符号链接，解析后指回主仓包目录。
+# staging 自检（步骤 4）在本机恰好能解析 → 假阳性；用户机器解包后必然
+# MODULE_NOT_FOUND（2026-08-14 M4b-3 从零冒烟实测捕获，现行 bundle 全中招）。
+# 修法：把解析结果落在 staging 之外的符号链接替换为实体拷贝（protocol 零依赖，
+# 直接 cp -r 即可；.pnpm 内部相对链接保持原样不动）。
+while IFS= read -r link; do
+  target="$(readlink -f "$link")"
+  case "$target" in
+    "$STAGING"/*) ;;  # staging 内部链接（.pnpm 布局）自包含，保持原样
+    *)
+      info "内联逃逸符号链接: ${link#"$STAGING"/} → $target"
+      rm "$link"
+      cp -r "$target" "$link"
+      ;;
+  esac
+done < <(find "$STAGING/node_modules" -type l)
 
 # ---------- 3. 改写 workspace:* 为实际版本 ----------
 # staging/package.json 中 @agent-chamber/roundtable-protocol 仍写作 workspace:*；

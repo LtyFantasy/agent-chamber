@@ -80,7 +80,7 @@ export class DownloadsController {
   }
 
   /**
-   * 获取对接指南（kimi/codex 各 EN + zh-CN）。
+   * 获取对接指南（kimi/codex/opencode/claude-code 各 EN + zh-CN）。
    *
    * @param file 指南文件名，仅白名单内可访问（见 DownloadsService.DOWNLOAD_WHITELIST）
    */
@@ -91,7 +91,7 @@ export class DownloadsController {
     summary: 'Download integration guide markdown',
     description:
       'Public download of roundtable runner integration guides. ' +
-      'Whitelisted files: kimi.md / kimi.zh-CN.md / codex.md / codex.zh-CN.md.',
+      'Whitelisted files: kimi.md / codex.md / opencode.md / claude-code.md (plus each .zh-CN.md).',
   })
   @ApiProduces('text/markdown')
   @ApiParam({ name: 'file', description: 'Guide filename (whitelist enforced)', example: 'kimi.md' })

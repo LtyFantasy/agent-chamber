@@ -71,6 +71,7 @@ const OPTION_I18N_KEYS: Record<string, PermissionOptionI18nKey> = {
   allow_once: 'permissionRequest.option.approveOnce', // codex
   allow_always: 'permissionRequest.option.approveAlways',
   reject_once: 'permissionRequest.option.reject',
+  allow: 'permissionRequest.option.approveOnce', // claude-code：allow_once kind 对应 optionId=allow（optionId 直透，见 claude-acp.ts §8e）
 };
 
 interface PermissionRequestCardProps {

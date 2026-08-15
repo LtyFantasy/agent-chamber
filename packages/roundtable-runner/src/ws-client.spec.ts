@@ -142,7 +142,7 @@ describe('RunnerWsClient 连接与心跳', () => {
     expect(hello.seq).toBe(0);
     expect(hello.seatId).toBeUndefined();
     expect(hello.payload.version).toBe('1.2.3');
-    expect(hello.payload.vendors).toEqual(['kimi', 'codex']);
+    expect(hello.payload.vendors).toEqual(['kimi', 'codex', 'opencode', 'claude-code']);
     expect(hello.payload.name).toBe('test-runner');
     expect(hello.payload.seats).toEqual({ 'seat-a': { lastSentSeq: 1, lastReceivedSeq: 1 } });
     await client.stop();
