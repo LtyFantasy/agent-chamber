@@ -7,7 +7,7 @@
 #   dist-assets/roundtable-runner.tar.gz   runner + prod node_modules（vendored，
 #                                         用户机器只需 node，无需 pnpm/git/外网）
 #   dist-assets/install-runner.sh          一键安装脚本（与 tar.gz 同版本）
-#   dist-assets/integrations/*.md          对接指南四份（kimi/codex × EN/zh-CN）
+#   dist-assets/integrations/*.md          对接指南八份（kimi/codex/opencode/claude-code × EN/zh-CN）
 #
 # 流程：构建 protocol/runner → pnpm deploy --prod 到临时 staging（workspace 依赖
 # 内联成独立副本）→ 逃逸符号链接替换为实体拷贝（deploy --legacy 的 workspace 依赖
@@ -18,8 +18,9 @@
 #
 # 路径关系（脚本位于 <内层 repo 根>/scripts/）：
 #   - <repo 根>            = $(dirname $0)/..（pnpm-workspace 所在，本脚本的执行环境）
-#   - oss-docs（外层）      = $REPO_ROOT/../oss-docs（docs/integrations/ 是唯一事实来源）
-#   - docker 构建无外层目录 → INTEGRATIONS_SRC 可覆盖；缺省探测失败则 warn 跳过
+#   - oss-docs（外层）      = $REPO_ROOT/../oss-docs（主仓布局：docs/integrations/ 唯一事实来源）
+#   - chamber 快照仓布局    = $REPO_ROOT/docs/integrations（oss-export 导出，docker 构建走这里）
+#   - 两级探测均失败 → INTEGRATIONS_SRC 可覆盖；缺省探测失败则 warn 跳过
 #
 # 用法:
 #   ./scripts/build-runner-bundle.sh
@@ -32,10 +33,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 与 backend DownloadsService 同款 env 契约：DOWNLOADS_DIR 覆盖，缺省 repo 根 dist-assets/
 OUT_DIR="${DOWNLOADS_DIR:-$REPO_ROOT/dist-assets}"
-# 外层 oss-docs 探测（本机仓库存在；docker 构建环境不存在则留空）
+# 指南源探测（两级，按优先级）：
+#   1. 主仓布局：$REPO_ROOT/../oss-docs/docs/integrations（外层 oss-docs，唯一事实来源）
+#   2. chamber 布局：$REPO_ROOT/docs/integrations（oss-export 已将指南导出进快照仓，
+#      chamber docker 构建无外层 oss-docs，此前静默跳过导致 downloads 指南端点 404）
+# 两级都失败则留空，步骤 6 warn 跳过（可用 INTEGRATIONS_SRC 显式覆盖）
 INTEGRATIONS_SRC="${INTEGRATIONS_SRC:-}"
 if [[ -z "$INTEGRATIONS_SRC" ]]; then
   INTEGRATIONS_SRC="$(cd "$REPO_ROOT/../oss-docs/docs/integrations" 2>/dev/null && pwd || true)"
+fi
+if [[ -z "$INTEGRATIONS_SRC" ]]; then
+  INTEGRATIONS_SRC="$(cd "$REPO_ROOT/docs/integrations" 2>/dev/null && pwd || true)"
 fi
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -126,8 +134,8 @@ if [[ -n "$INTEGRATIONS_SRC" && -d "$INTEGRATIONS_SRC" ]]; then
   cp "$INTEGRATIONS_SRC"/*.md "$OUT_DIR/integrations/"
   info "integrations 已拷贝: $INTEGRATIONS_SRC → $OUT_DIR/integrations/ ($(ls "$OUT_DIR/integrations" | wc -l) 份)"
 else
-  warn "未找到 oss-docs/docs/integrations（docker 构建环境无外层目录？），integrations 已跳过"
-  warn "  本机可传 INTEGRATIONS_SRC=<外层 oss-docs/docs/integrations 绝对路径> 重跑"
+  warn "未找到对接指南源（已探测 ../oss-docs/docs/integrations 与 docs/integrations），integrations 已跳过"
+  warn "  可传 INTEGRATIONS_SRC=<指南目录绝对路径> 重跑"
 fi
 
 # ---------- 7. 体积打印 + 超限警告 ----------
