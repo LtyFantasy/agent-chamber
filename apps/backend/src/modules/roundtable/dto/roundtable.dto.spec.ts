@@ -74,7 +74,7 @@ describe('CreateSeatDto', () => {
     expect(errors.some((e) => e.property === 'coordinator')).toBe(true);
   });
 
-  // ── batchWindowMs 校验矩阵（设计 §6：0=直通 / 缺省 30000 / 上限 300000） ──
+  // ── batchWindowMs 校验矩阵（设计 §6：0=直通 / 缺省 5000 / 上限 300000） ──
 
   it('batchWindowMs 合法值通过（0=直通、30000、300000 上限）', async () => {
     for (const batchWindowMs of [0, 30000, 300000]) {
@@ -84,7 +84,7 @@ describe('CreateSeatDto', () => {
     }
   });
 
-  it('batchWindowMs 缺省不报错（可选项，service 侧落缺省 30000）', async () => {
+  it('batchWindowMs 缺省不报错（可选项，service 侧落缺省 5000）', async () => {
     const dto = plainToInstance(CreateSeatDto, validInput);
     expect(await validate(dto)).toHaveLength(0);
   });

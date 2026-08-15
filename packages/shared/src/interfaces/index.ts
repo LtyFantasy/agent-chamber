@@ -54,3 +54,21 @@ export interface TokenResponse {
   tokenType: string;
   expiresIn: number;
 }
+
+/**
+ * 存活探针（GET /api/v1/health）响应
+ * @warning 该端点 @SkipTransform 裸返回（无 ApiResponse 包装），
+ *          前端不得走 apiRequest 的 data 解包，需直接取响应体
+ */
+export interface HealthStatus {
+  /** 进程存活状态（恒 'ok'——探针能应答即活着） */
+  status: 'ok';
+  /** 应答时间（ISO 8601） */
+  timestamp: string;
+  /** 进程运行秒数 */
+  uptime: number;
+  /** 平台版本（monorepo 根 package.json version；解析失败为 'unknown'） */
+  version?: string;
+  /** git short SHA（无 .git 环境且未注入 GIT_SHA 时省略该字段） */
+  commit?: string;
+}

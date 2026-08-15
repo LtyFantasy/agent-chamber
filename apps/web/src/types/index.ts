@@ -50,6 +50,8 @@ export interface UpdateUserRequest {
 
 // 分页响应（已从 shared 包统一）
 export type { PaginatedResponse } from '@agent-chamber/shared';
+// 存活探针响应（@SkipTransform 裸响应，无 data 包装）
+export type { HealthStatus } from '@agent-chamber/shared';
 export { UserRole } from '@agent-chamber/shared';
 
 // 枚举类型

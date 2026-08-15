@@ -73,6 +73,19 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
   });
   const pendingCount = pendingCountData?.count ?? 0;
 
+  /**
+   * 平台版本角标（logo 正下方）：后端 /health 实时读取
+   * （version = monorepo 根 package.json，commit = git short SHA）。
+   * 公共端点无需登录；失败静默不渲染——观测性增强不得影响导航可用性。
+   */
+  const { data: health } = useQuery({
+    queryKey: ['system', 'health'],
+    queryFn: () => Api.monitoring.getHealth(),
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+    retry: false,
+  });
+
   const navItems = allNavItems.filter((item) => {
     if ('adminOnly' in item && item.adminOnly && !isAdmin) return false;
     return true;
@@ -109,6 +122,21 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
               <X className="h-5 w-5" />
             </button>
           </div>
+          {/* 版本角标：logo 正下方等宽小字（v1.52.0-dev · 0e80e65），
+              数据源 = 后端 /health，部署后自动跟随，无硬编码 */}
+          {health?.version && (
+            <div className="px-6 pt-1.5" data-testid="sidebar-version">
+              <span
+                className="font-mono text-[10px] tracking-wide text-muted-foreground/60 select-none"
+                title={
+                  health.commit ? `v${health.version} · ${health.commit}` : `v${health.version}`
+                }
+              >
+                v{health.version}
+                {health.commit ? ` · ${health.commit}` : ''}
+              </span>
+            </div>
+          )}
           <nav className="flex-1 space-y-1 p-4">
             {navItems.map((item) => {
               const isExternal = 'external' in item && item.external;

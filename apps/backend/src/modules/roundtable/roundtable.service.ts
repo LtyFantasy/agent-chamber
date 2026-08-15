@@ -126,10 +126,12 @@ const RECENT_ACTIVITY_CAP = 10;
 const RECENT_ACTIVITY_TITLE_CAP = 80;
 
 /**
- * 攒批窗口缺省值（毫秒；设计 docs/roundtable-design.md §6：座位维度时间窗默认 30s，
+ * 攒批窗口缺省值（毫秒；设计 docs/roundtable-design.md §6：座位维度时间窗默认 5s，
  * 一处常量可调）。0 = 直通（M1 行为，dogfood 桌可关攒批对照）——阶段 2 消费。
+ * 取值 rationale（2026-08-15 用户拍板）：窗口只为攒住「连续碎消息」突发，5s 足够；
+ * 30s 对「空闲座位 + 单条消息」是纯等待延迟，busy 排队场景则相对 turn 时长无感。
  */
-export const DEFAULT_BATCH_WINDOW_MS = 30000;
+export const DEFAULT_BATCH_WINDOW_MS = 5000;
 
 /** busy 排队超限回执阈值（决策 #6）：per-seat flight.queue.length > 20 落「排队积压」回执 */
 const QUEUE_RECEIPT_THRESHOLD = 20;
@@ -460,7 +462,7 @@ export class RoundtableService {
       permissionMode: dto.permissionMode,
       cwd: dto.cwd,
       bindActorId,
-      // 攒批窗口：缺省 30s（设计 §6，DEFAULT_BATCH_WINDOW_MS 一处常量）；0 = 直通（M1 行为）
+      // 攒批窗口：缺省 5s（设计 §6，DEFAULT_BATCH_WINDOW_MS 一处常量）；0 = 直通（M1 行为）
       batchWindowMs: dto.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS,
     };
     if (dto.model) config.model = dto.model;

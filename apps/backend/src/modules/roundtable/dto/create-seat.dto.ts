@@ -79,7 +79,7 @@ export class CreateSeatDto {
   coordinator?: boolean;
 
   /**
-   * 攒批窗口（毫秒，设计 §6：座位维度时间窗，缺省 30s 一处常量可调）：
+   * 攒批窗口（毫秒，设计 §6：座位维度时间窗，缺省 5s 一处常量可调）：
    * 0 = 直通（M1 行为，消息立即注入，dogfood 对照用）；>0 = 窗口内到达的消息
    * 合并为一次注入。上限 300000（5 分钟）防误配长窗导致消息滞留不可见。
    * 落 seat.config jsonb（entity 注释预留键名 batchWindowMs，阶段 2 消费）。
@@ -89,8 +89,8 @@ export class CreateSeatDto {
   @Min(0)
   @Max(300000)
   @ApiPropertyOptional({
-    description: '攒批窗口毫秒（0=直通；缺省 30000，设计 §6 默认 30s）',
-    example: 30000,
+    description: '攒批窗口毫秒（0=直通；缺省 5000，设计 §6 默认 5s）',
+    example: 5000,
   })
   batchWindowMs?: number;
 }

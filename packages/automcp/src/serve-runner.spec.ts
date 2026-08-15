@@ -369,4 +369,35 @@ describe('runServe', () => {
       ).rejects.toThrow(/must have a "handler" function/);
     });
   });
+
+  describe('body 大小上限（MCP-BODY-1 回归）', () => {
+    it('应接受超过 express 默认 100kb 的 JSON body（不被 413 拒绝）', async () => {
+      const result = await runServe(
+        makeOptions(path.join(fixturesDir, 'openapi3-minimal.json')),
+      );
+
+      // 构造约 200KB 的 JSON-RPC 请求体——超过 express.json() 默认 100kb，
+      // 低于显式放宽的 10mb；大字段挂在 params 上保持 JSON-RPC 结构合法
+      const padding = 'x'.repeat(200 * 1024);
+      const res = await axios.post(
+        `${result.url}/mcp`,
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+          params: { padding },
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 10_000,
+          // 本测试只关心 body-parser 是否放行（非 413），MCP 层对 padding 的处理不在范围
+          validateStatus: () => true,
+        },
+      );
+
+      expect(res.status).not.toBe(413);
+
+      await result.stop();
+    });
+  });
 });

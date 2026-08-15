@@ -34,6 +34,7 @@ import {
   ListTree,
 } from 'lucide-react';
 import { Api } from '@/lib/api';
+import { dedupeOutlineSections } from '@/lib/outline-sections';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { formatDate } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth.store';
@@ -716,7 +717,9 @@ export default function DocSpaceDetailPage() {
           <p className="text-xs text-muted-foreground">{t('doc.noOutline')}</p>
         ) : (
           <nav className="space-y-0.5">
-            {doc.sections.map((section) => (
+            {/* 超长 section 的续 chunk 共用同一 headingPath/headingLevel，渲染前折叠
+                （bug 1a6b57d0），否则同一标题在大纲重复 N 条 */}
+            {dedupeOutlineSections(doc.sections).map((section) => (
               <button
                 key={section.position}
                 onClick={() => scrollToHeading(contentRef.current, section.headingPath)}

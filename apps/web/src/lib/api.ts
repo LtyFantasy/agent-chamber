@@ -43,6 +43,7 @@ import type {
   CreateUserRequest,
   UpdateUserRequest,
   AuditLog,
+  HealthStatus,
   UnreadSummary,
   SearchResult,
   SearchQuery,
@@ -904,6 +905,12 @@ const monitoring = {
       'GET',
       '/system/api-logs/export',
     ),
+  /**
+   * 存活探针（含平台版本 version + git commit，供 sidebar 版本角标）。
+   * 注意：/health 是 @SkipTransform 裸响应（无 {data} 包装），
+   * 不能走 apiRequest 解包，直接取响应体。
+   */
+  getHealth: () => publicAxiosInstance.get<HealthStatus>('/health').then((r) => r.data),
 };
 
 // ──────────────────────────────────────────────

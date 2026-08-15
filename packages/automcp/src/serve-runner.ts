@@ -7,12 +7,14 @@
  *   - 补充: .kimi/plan-mcp-phase2.md §2 (custom tools 扩展点)
  *   - 补充: .kimi/plans/miss-martian-polaris-superboy.md §运行模式
  *
- * [踩坑索引] -
+ * [踩坑索引] MCP-BODY-1(express.json 默认 100kb 卡死大文档 upsert, 须显式 limit)
  *
  * [铁律关联] #7(编译优先) #11(注释强制)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
+ *   MCP-BODY-1: 2026-08-15 实锤（backlog f4fe0a59）——裸 express.json() 默认 100kb，
+ *   113KB 文档 upsert_doc 经 MCP 通道 413；backend main.ts 是 5mb，两侧必须对齐语义。
+ *   修复 = 显式 { limit: '10mb' }（本文件 serve 入口唯一 json body 解析点）。
  *
  * [修改检查]（固定模板，不逐文件定制）
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -78,7 +80,10 @@ export async function runServe(options: ServeOptions): Promise<ServeResult> {
 
   // ─── 4. 创建依赖 ───
   const app = express();
-  app.use(express.json());
+  // body 上限显式放宽到 10mb（2026-08-15 用户拍板）：express.json() 默认 100kb，
+  // 大文档 upsert_doc（如 113KB 的 roundtable-design.md r29）经 MCP 通道被 413
+  // PayloadTooLargeError 拒绝（backlog f4fe0a59 实锤）；对齐 backend main.ts 的 5mb 语义并留余量
+  app.use(express.json({ limit: '10mb' }));
 
   const auth = buildAuthConfig(options);
   const proxy = new HttpProxy(options.baseUrl, auth);

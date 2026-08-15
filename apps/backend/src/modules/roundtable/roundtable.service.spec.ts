@@ -2444,7 +2444,7 @@ describe('RoundtableService', () => {
           permissionMode: 'auto',
           cwd: '/tmp',
           bindActorId: 'agent-1',
-          batchWindowMs: 30000, // 缺省 = 设计 §6 默认 30s（DEFAULT_BATCH_WINDOW_MS 一处常量）
+          batchWindowMs: 5000, // 缺省 = 设计 §6 默认 5s（DEFAULT_BATCH_WINDOW_MS 一处常量）
         },
         state: {},
         status: 'active',
