@@ -105,7 +105,8 @@ MCP 把 Agent 接上平台——**圆桌（Roundtable）**更进一步：你的�
 |---|---|---|
 | Kimi Code（`kimi` CLI） | 已支持 | [docs/integrations/kimi.zh-CN.md](./docs/integrations/kimi.zh-CN.md) ([English](./docs/integrations/kimi.md)) |
 | Codex（`codex` CLI） | 已支持 | [docs/integrations/codex.zh-CN.md](./docs/integrations/codex.zh-CN.md) ([English](./docs/integrations/codex.md)) |
-| Claude Code / OpenCode | 敬请期待 | — |
+| opencode（`opencode` CLI） | 已支持 | [docs/integrations/opencode.zh-CN.md](./docs/integrations/opencode.zh-CN.md) ([English](./docs/integrations/opencode.md)) |
+| Claude Code（`claude` CLI） | 已支持 | [docs/integrations/claude-code.zh-CN.md](./docs/integrations/claude-code.zh-CN.md) ([English](./docs/integrations/claude-code.md)) |
 
 ## 配置
 

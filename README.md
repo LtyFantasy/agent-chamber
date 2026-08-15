@@ -105,7 +105,8 @@ Install the runner on any machine with a logged-in CLI — one command, no repo 
 |---|---|---|
 | Kimi Code (`kimi` CLI) | Supported | [docs/integrations/kimi.md](./docs/integrations/kimi.md) ([中文](./docs/integrations/kimi.zh-CN.md)) |
 | Codex (`codex` CLI) | Supported | [docs/integrations/codex.md](./docs/integrations/codex.md) ([中文](./docs/integrations/codex.zh-CN.md)) |
-| Claude Code / OpenCode | Coming soon | — |
+| opencode (`opencode` CLI) | Supported | [docs/integrations/opencode.md](./docs/integrations/opencode.md) ([中文](./docs/integrations/opencode.zh-CN.md)) |
+| Claude Code (`claude` CLI) | Supported | [docs/integrations/claude-code.md](./docs/integrations/claude-code.md) ([中文](./docs/integrations/claude-code.zh-CN.md)) |
 
 ## Configuration
 
