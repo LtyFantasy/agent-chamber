@@ -35,4 +35,10 @@ logs
 backups
 
 # 工程文档：运维/架构文档不进镜像
-docs
+# 例外：docs/integrations（圆桌四厂商对接指南）必须进构建上下文——
+# Dockerfile.backend 的 build-runner-bundle.sh 步骤要把它拷进 dist-assets，
+# 否则 chamber 自部署栈 /downloads/integrations/* 全 404（v1.52.0 冒烟实测）。
+# 注意 .dockerignore 语义：父目录被整体排除时子路径无法 re-include，
+# 必须写成 docs/*（排除子项）+ !docs/integrations（放行例外）
+docs/*
+!docs/integrations
