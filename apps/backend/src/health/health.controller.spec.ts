@@ -65,5 +65,30 @@ describe('HealthController', () => {
         expect(commit).toMatch(/^[0-9a-f]{7,40}$/);
       }
     });
+
+    it('chamber 品牌名（oss-rebrand 后）同样能解析 version（v1.57.3 冒烟 unknown 坑回归）', () => {
+      // 搭临时目录模拟 chamber 快照仓布局：cwd=apps/backend（子包名不匹配），
+      // 向上命中 name=agent-chamber 的根 package.json（fs.readFileSync 在本测试
+      // 环境不可 redefine，改用真实文件 + process.chdir 驱动 findRepoRoot 上溯）
+      const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'chamber-health-'));
+      fs.mkdirSync(path.join(tmp, 'apps', 'backend'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, 'apps', 'backend', 'package.json'),
+        JSON.stringify({ name: '@agent-chamber/backend', version: '1.0.0' }),
+      );
+      fs.writeFileSync(
+        path.join(tmp, 'package.json'),
+        JSON.stringify({ name: 'agent-chamber', version: '9.9.9-test' }),
+      );
+      const originalCwd = process.cwd();
+      try {
+        process.chdir(path.join(tmp, 'apps', 'backend'));
+        const controller = new HealthController(mockDataSource);
+        expect(controller.check().version).toBe('9.9.9-test');
+      } finally {
+        process.chdir(originalCwd);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
   });
 });

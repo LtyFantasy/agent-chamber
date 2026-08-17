@@ -45,10 +45,12 @@ interface VersionInfo {
 
 /**
  * 从 startDir 向上最多 4 级查找 monorepo 根目录
- *（判定依据：package.json 的 name === 'agent-chamber'）。
+ *（判定依据：package.json 的 name 为主仓名或 chamber 品牌名）。
  *
  * 兼容两种进程 cwd：生产/部署 = 仓库根（node apps/backend/dist/... 从根启动），
  * pnpm --filter 开发/测试 = apps/backend（向上两级命中根）。
+ * chamber 快照仓经 oss-rebrand 改包名为 agent-chamber，docker 自部署链的
+ * /health version 解析必须同时认两个品牌名（v1.57.3 冒烟实测 'unknown' 坑）。
  */
 function findRepoRoot(startDir: string): string | null {
   let dir = startDir;
@@ -57,7 +59,7 @@ function findRepoRoot(startDir: string): string | null {
       const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as {
         name?: string;
       };
-      if (pkg.name === 'agent-chamber') return dir;
+      if (pkg.name === 'agent-chamber' || pkg.name === 'agent-chamber') return dir;
     } catch {
       /* 本级无 package.json 或不可解析，继续向上 */
     }
