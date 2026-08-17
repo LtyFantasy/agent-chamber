@@ -1,4 +1,5 @@
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { createElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import DocSpaceDetailPage from './page';
 import { Api } from '@/lib/api';
@@ -47,14 +48,15 @@ jest.mock('@/lib/api', () => ({
   Api: {
     docs: {
       getSpace: jest.fn(),
-      listDocs: jest.fn(),
+      listAllDocs: jest.fn(),
       search: jest.fn(),
       getDoc: jest.fn(),
       getDocContent: jest.fn(),
     },
-    // v1.37 owner 代理：页面新增我的 agent 列表查询（非 admin 只返回自己拥有的 agents）
+    // v1.37 owner 代理：页面新增我的 agent 列表查询（非 admin 只返回自己拥有的 agents）；
+    // listAll 返回数组（循环翻页拉全），非分页响应
     agents: {
-      list: jest.fn().mockResolvedValue({ items: [], total: 0 }),
+      listAll: jest.fn().mockResolvedValue([]),
     },
   },
 }));
@@ -70,7 +72,23 @@ jest.mock('@/components/docs/batch-upload-dialog', () => ({
 // react-markdown / remark-gfm 为纯 ESM，Jest 不转换 node_modules，stub 之
 jest.mock('react-markdown', () => ({
   __esModule: true,
-  default: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  default: ({ children }: { children: React.ReactNode }) => (
+    <div>
+      {String(children)
+        .split('\n')
+        .map((line, index) => {
+          const match = /^(#{1,6})\s+(.+)$/.exec(line);
+          if (match) {
+            return createElement(
+              `h${match[1].length}`,
+              { key: index },
+              match[2].replace(/`([^`]*)`/g, '$1'),
+            );
+          }
+          return <span key={index}>{line}</span>;
+        })}
+    </div>
+  ),
 }));
 jest.mock('remark-gfm', () => ({
   __esModule: true,
@@ -79,7 +97,7 @@ jest.mock('remark-gfm', () => ({
 
 const mockApi = Api.docs as unknown as {
   getSpace: jest.Mock;
-  listDocs: jest.Mock;
+  listAllDocs: jest.Mock;
   search: jest.Mock;
   getDoc: jest.Mock;
   getDocContent: jest.Mock;
@@ -114,11 +132,39 @@ function renderPage() {
   );
 }
 
+describe('DocSpaceDetailPage headingPath 导航', () => {
+  it('scrolls to inline-code headings after normalizing markdown backticks', async () => {
+    const specialHeading = '2.1 TTK 目标区间（以 `numeric-equations.md` §3.2 为准）';
+    mockApi.getSpace.mockResolvedValue(spaceFixture);
+    mockApi.listAllDocs.mockResolvedValue([]);
+    mockApi.search.mockResolvedValue([]);
+    mockApi.getDoc.mockResolvedValue({
+      ...docFixture,
+      sections: [{ position: 0, headingPath: specialHeading, headingLevel: 3 }],
+    });
+    mockApi.getDocContent.mockResolvedValue({
+      content: `### ${specialHeading}\n\n正文。`,
+      title: docFixture.title,
+    });
+    const scrollSpy = jest.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollSpy,
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: specialHeading }));
+
+    expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+});
+
 describe('DocSpaceDetailPage 内容查询错误分支', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockApi.getSpace.mockResolvedValue(spaceFixture);
-    mockApi.listDocs.mockResolvedValue({ items: [], total: 0 });
+    mockApi.listAllDocs.mockResolvedValue([]);
     mockApi.search.mockResolvedValue([]);
     mockApi.getDoc.mockResolvedValue(docFixture);
   });
@@ -165,7 +211,7 @@ describe('DocSpaceDetailPage 搜索防抖（B1）', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockApi.getSpace.mockResolvedValue(spaceFixture);
-    mockApi.listDocs.mockResolvedValue({ items: [], total: 0 });
+    mockApi.listAllDocs.mockResolvedValue([]);
     mockApi.search.mockResolvedValue([]);
     mockApi.getDoc.mockResolvedValue(docFixture);
     mockApi.getDocContent.mockResolvedValue({ content: '# Doc T\nbody', title: 'Doc T' });

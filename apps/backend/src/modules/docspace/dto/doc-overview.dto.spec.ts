@@ -213,4 +213,35 @@ describe('DocOverviewQueryDto', () => {
       },
     );
   });
+
+  describe('slim transform（v1.56，对齐 includeRoutes 惯例）', () => {
+    it("parses 'true' as true (slim 投影)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { slim: 'true' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.slim).toBe(true);
+    });
+
+    it("parses 'false' as false (全字段)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { slim: 'false' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.slim).toBe(false);
+    });
+
+    it('omitted → undefined (service 视为 false 全字段，向后兼容)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, {});
+      expect(dto.slim).toBeUndefined();
+    });
+
+    // 同 includeRoutes：格式错误直接 400，不静默当作 false
+    it.each(['1', '0', 'yes', 'TRUE', 'False', '', 'on'])(
+      "rejects '%s' (→ 400，格式错误不透传)",
+      async (value) => {
+        const dto = plainToInstance(DocOverviewQueryDto, { slim: value });
+        const errors = await validate(dto);
+        expect(errors.some((e) => e.property === 'slim')).toBe(true);
+      },
+    );
+  });
 });

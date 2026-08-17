@@ -57,6 +57,8 @@ describe('validatePayload: seat.event（契约① SeatEvent 透传）', () => {
     { name: 'seat_info 全字段', event: { type: 'seat_info', seatId: 's', model: 'kimi-k2', thinking: 'high', mode: 'auto' } },
     { name: 'seat_info 仅 seatId', event: { type: 'seat_info', seatId: 's' } },
     { name: 'seat_info 部分字段', event: { type: 'seat_info', seatId: 's', mode: 'yolo' } },
+    // 1.54.0（Board 3c3d9577）：轻量在场信号，只带相位不带内容
+    { name: 'activity thinking', event: { type: 'activity', seatId: 's', activity: 'thinking' } },
   ];
 
   it.each(eventCases.map((c) => [c.name, c.event] as [string, unknown]))('正例：%s', (_name, event) => {
@@ -80,6 +82,8 @@ describe('validatePayload: seat.event（契约① SeatEvent 透传）', () => {
     ['seat_info.mode 非字符串', { type: 'seat_info', seatId: 's', mode: {} }],
     ['status 非法值', { type: 'status', seatId: 's', status: 'sleeping' }],
     ['status.detail 非字符串', { type: 'status', seatId: 's', status: 'online', detail: 1 }],
+    ['activity 非法取值', { type: 'activity', seatId: 's', activity: 'typing' }],
+    ['activity 缺 activity 字段', { type: 'activity', seatId: 's' }],
   ];
   it.each(badCases as [string, unknown][])('反例：%s', (_name, event) => {
     expect(validatePayload('seat.event', event).ok).toBe(false);

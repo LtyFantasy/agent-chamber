@@ -23,6 +23,9 @@ describe('DocController', () => {
     findOne: jest.fn(),
     getContent: jest.fn(),
     getSection: jest.fn(),
+    getSections: jest.fn(),
+    getSectionByHeadingQuery: jest.fn(),
+    patchSection: jest.fn(),
     upsert: jest.fn(),
     remove: jest.fn(),
   };
@@ -200,7 +203,9 @@ describe('DocController', () => {
       };
       docService.getSection.mockResolvedValue(section);
 
-      expect(await controller.getSection('doc-1', 0, undefined, mockActor)).toBe(section);
+      expect(
+        await controller.getSection('doc-1', 0, undefined, undefined, undefined, mockActor),
+      ).toBe(section);
     });
 
     it('passes headingPath query param to service', async () => {
@@ -218,8 +223,284 @@ describe('DocController', () => {
       };
       docService.getSection.mockResolvedValue(section);
 
-      await controller.getSection('doc-1', 0, 'Setup', mockActor);
+      await controller.getSection('doc-1', 0, 'Setup', undefined, undefined, mockActor);
       expect(docService.getSection).toHaveBeenCalledWith('doc-1', 0, 'Setup');
+    });
+
+    it('position takes priority over headingPath', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.getSection.mockResolvedValue({});
+
+      // position + headingPath 同传 → getSection（position 优先，与既有契约一致）
+      await controller.getSection('doc-1', 2, 'Setup', undefined, undefined, mockActor);
+      expect(docService.getSection).toHaveBeenCalledWith('doc-1', 2, 'Setup');
+      expect(docService.getSectionByHeadingQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── getSection v1.55：positions[] 批量通道 ──────────────────
+
+  describe('getSection positions[] batch channel', () => {
+    it('positions= batch → calls service.getSections and returns batch result', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const batch = {
+        docId: 'doc-1',
+        docPath: 'test.md',
+        sections: [
+          {
+            position: 1,
+            headingPath: 'Setup',
+            headingLevel: 2,
+            content: 'Steps',
+            tokenEstimate: 20,
+          },
+        ],
+        missing: [9],
+      };
+      docService.getSections.mockResolvedValue(batch);
+
+      expect(
+        await controller.getSection('doc-1', undefined, undefined, '1,3,5', undefined, mockActor),
+      ).toBe(batch);
+      // 权限边界与单节一致：doc → space 解析 + read 校验
+      expect(docService.findById).toHaveBeenCalledWith('doc-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      // 逗号分隔字符串解析为 number[]（空白容差）
+      expect(docService.getSections).toHaveBeenCalledWith('doc-1', [1, 3, 5]);
+    });
+
+    it('rejects batch mixed with single-section locators (400 VALIDATION_ERROR)', async () => {
+      await expect(
+        controller.getSection('doc-1', 0, undefined, '1,3', undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      // 格式层快速失败：不发起 doc 解析/权限/批量读取
+      expect(docService.findById).not.toHaveBeenCalled();
+      expect(docService.getSections).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed positions (non-integer / negative / empty / oversized) with 400', async () => {
+      // 非整数
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, '1,a', undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      // 负数
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, '-1', undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      // 空串
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, '', undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      // 超过 MAX_BATCH_POSITIONS(100)
+      const tooMany = Array.from({ length: 101 }, (_, i) => i).join(',');
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, tooMany, undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      // 全部格式错误都在 findById 之前拦截（层 1 先于层 2）
+      expect(docService.findById).not.toHaveBeenCalled();
+      expect(docService.getSections).not.toHaveBeenCalled();
+    });
+
+    it('still enforces read permission for well-formed batch requests', async () => {
+      docService.findById.mockResolvedValue({ id: 'doc-1', spaceId: 'space-1' });
+      docSpaceService.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, '1', undefined, nonAdminActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(docService.getSections).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── getSection v1.55：headingQuery 模糊通道 ─────────────────
+
+  describe('getSection headingQuery fuzzy channel', () => {
+    it('headingQuery alone → calls service.getSectionByHeadingQuery', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const section = {
+        docId: 'doc-1',
+        docPath: 'test.md',
+        position: 2,
+        headingPath: '2 Design',
+        headingLevel: 2,
+        content: 'Design',
+        tokenEstimate: 10,
+      };
+      docService.getSectionByHeadingQuery.mockResolvedValue(section);
+
+      expect(
+        await controller.getSection('doc-1', undefined, undefined, undefined, 'Design', mockActor),
+      ).toBe(section);
+      expect(docService.getSectionByHeadingQuery).toHaveBeenCalledWith('doc-1', 'Design');
+      expect(docService.getSection).not.toHaveBeenCalled();
+    });
+
+    it('position + headingQuery → getSection wins (priority contract)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.getSection.mockResolvedValue({});
+
+      await controller.getSection('doc-1', 3, undefined, undefined, 'Design', mockActor);
+      expect(docService.getSection).toHaveBeenCalledWith('doc-1', 3, undefined);
+      expect(docService.getSectionByHeadingQuery).not.toHaveBeenCalled();
+    });
+
+    it('headingPath + headingQuery → headingPath wins (priority contract)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.getSection.mockResolvedValue({});
+
+      await controller.getSection('doc-1', undefined, 'Setup', undefined, 'Design', mockActor);
+      expect(docService.getSection).toHaveBeenCalledWith('doc-1', undefined, 'Setup');
+      expect(docService.getSectionByHeadingQuery).not.toHaveBeenCalled();
+    });
+
+    it('rejects empty/whitespace headingQuery with 400 (substring match on empty string is meaningless)', async () => {
+      docService.findById.mockResolvedValue({ id: 'doc-1', spaceId: 'space-1' });
+      docSpaceService.findById.mockResolvedValue(space);
+
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, undefined, '', mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      await expect(
+        controller.getSection('doc-1', undefined, undefined, undefined, '   ', mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      expect(docService.getSectionByHeadingQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── patchSection（section 级写，v1.55 T3）──────────────────
+
+  describe('patchSection', () => {
+    it('delegates to service after ensuring write permission (source defaults to native)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = { id: 'doc-1', path: 'test.md', sectionCount: 2, tokenEstimate: 60 };
+      docService.patchSection.mockResolvedValue(result);
+
+      expect(
+        await controller.patchSection('doc-1', 1, { content: '## A\n\nnew' }, undefined, mockActor),
+      ).toBe(result);
+
+      // 权限边界：先 doc → space 解析，再 write 校验（铁律 #21 权限在 Controller 层）
+      expect(docService.findById).toHaveBeenCalledWith('doc-1');
+      expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
+      // source 缺省 native（与 upsert 契约一致）；expectedSectionHash 缺省 → undefined 透传
+      expect(docService.patchSection).toHaveBeenCalledWith(
+        'doc-1',
+        1,
+        '## A\n\nnew',
+        'native',
+        mockActor,
+        undefined,
+      );
+    });
+
+    it('passes the ?source= query param through to the service', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.patchSection.mockResolvedValue({
+        id: 'doc-1',
+        path: 'test.md',
+        sectionCount: 1,
+        tokenEstimate: 10,
+      });
+
+      await controller.patchSection('doc-1', 0, { content: 'x' }, 'git:my-repo', mockActor);
+      expect(docService.patchSection).toHaveBeenCalledWith(
+        'doc-1',
+        0,
+        'x',
+        'git:my-repo',
+        mockActor,
+        undefined,
+      );
+    });
+
+    it('passes body.expectedSectionHash through to the service (fail-closed precondition)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.patchSection.mockResolvedValue({
+        id: 'doc-1',
+        path: 'test.md',
+        sectionCount: 1,
+        tokenEstimate: 10,
+      });
+
+      await controller.patchSection(
+        'doc-1',
+        0,
+        { content: 'x', expectedSectionHash: 'hash-abc' },
+        undefined,
+        mockActor,
+      );
+      expect(docService.patchSection).toHaveBeenCalledWith(
+        'doc-1',
+        0,
+        'x',
+        'native',
+        mockActor,
+        'hash-abc',
+      );
+    });
+
+    it('rejects negative position with 400 VALIDATION_ERROR before any service call (format layer)', async () => {
+      await expect(
+        controller.patchSection('doc-1', -1, { content: 'x' }, undefined, mockActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      expect(docService.findById).not.toHaveBeenCalled();
+      expect(docService.patchSection).not.toHaveBeenCalled();
     });
   });
 

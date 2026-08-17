@@ -24,6 +24,7 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   UseGuards,
   ParseUUIDPipe,
   HttpCode,
@@ -36,7 +37,7 @@ import { RouteHealthService } from './route-health.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
-import { CreateDocRouteDto, UpdateDocRouteDto } from './dto';
+import { CreateDocRouteDto, UpdateDocRouteDto, QueryDocRouteDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
 /**
@@ -63,18 +64,33 @@ export class DocRouteController {
   @ApiOperation({
     summary: 'List intent routes of a DocSpace',
     description:
-      'Return all intent routes (doc_routes) of the space, sorted by sortOrder ASC then createdAt ASC. ' +
-      'Requires read access to the space.',
+      'List intent routes (doc_routes) of the space, sorted by sortOrder ASC then createdAt ASC. ' +
+      'Requires read access to the space. ' +
+      'Response shape depends on pagination params (v1.55): omitting page/pageSize returns the legacy ' +
+      'full-array shape (capped at 1000 rows as runaway guard); passing page or pageSize switches to ' +
+      'the standard paginated envelope {items,total,page,pageSize,totalPages,hasNext,hasPrev} ' +
+      '(page default 1, pageSize default 20, max 100). ' +
+      'Filters apply to both modes: q = ILIKE fuzzy match on intent, category = exact match.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Routes returned successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid pagination params (e.g. pageSize > 100)' })
   async findAll(
     @Param('id', ParseUUIDPipe) spaceId: string,
+    @Query() query: QueryDocRouteDto,
     @CurrentActor() actor: UnifiedActor,
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
-    return this.routeService.findAll(spaceId);
+
+    const filters = { q: query.q, category: query.category };
+    // 分页模式触发条件：显式传 page 或 pageSize 任一项（DTO 已校验整数边界）；
+    // 缺省页码/页大小对齐 docs 列表惯例（page=1、pageSize=20）
+    if (query.page !== undefined || query.pageSize !== undefined) {
+      return this.routeService.findPaged(spaceId, filters, query.page ?? 1, query.pageSize ?? 20);
+    }
+    // 传统全量模式：返回 DocRoute[] 数组（向后兼容 v1.42 契约）
+    return this.routeService.findAll(spaceId, filters);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

@@ -1,6 +1,6 @@
 {
   "name": "agent-chamber",
-  "version": "1.52.0-dev",
+  "version": "1.57.3-dev",
   "private": true,
   "description": "AI Agent Chamber协作平台 — 去中心化的Agent协作通信中间件",
   "scripts": {

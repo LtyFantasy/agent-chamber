@@ -14,6 +14,7 @@ describe('MonitoringController', () => {
   const mockService = {
     getApiLogs: jest.fn(),
     exportApiLogs: jest.fn(),
+    getOverview: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -68,6 +69,16 @@ describe('MonitoringController', () => {
 
       expect(await controller.exportApiLogs({})).toBe(result);
       expect(service.exportApiLogs).toHaveBeenCalledWith({});
+    });
+  });
+
+  describe('getOverview', () => {
+    it('should call service.getOverview and return result', async () => {
+      const result = { generatedAt: new Date().toISOString() };
+      service.getOverview.mockResolvedValue(result);
+
+      expect(await controller.getOverview()).toBe(result);
+      expect(service.getOverview).toHaveBeenCalledWith();
     });
   });
 

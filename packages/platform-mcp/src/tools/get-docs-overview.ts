@@ -106,9 +106,17 @@ export const getDocsOverviewTool: CustomTool = {
       'Truncated flag is passed through when token cap is exceeded. ' +
       'Response includes spaceDescription (space legend) in full by default; legend tokens are reported ' +
       'separately as legendTokenEstimate and do not consume the maxTokens budget (pass includeDescription=false to omit). ' +
+      'Intent routes (doc_routes) are embedded by default but capped at the first 50 in curation order — ' +
+      'routesTruncated/routesTotal mark the overflow; pass includeRoutes=false to omit the section entirely, ' +
+      'or use list_doc_routes for paginated full access. ' +
       'Default is the full map; filtering (v1.38): excludeType=memory filters diary-type noise out, ' +
       'type=guide,reference shows only curated docs, applySpaceDefaults=false ignores space-level default filters. ' +
-      'The response echoes effective filters as appliedFilters.',
+      'The response echoes effective filters as appliedFilters. ' +
+      'LARGE SPACES (v1.56): if the response is truncated or oversized, start with maxTokens=5000–8000, ' +
+      'verify filters took effect via the appliedFilters echo (e.g. excludeType=memory), and pass slim=true ' +
+      'to shrink each doc entry to {path,title,summary,docType,tokenEstimate} — combined they keep the ' +
+      'response well under typical MCP limits; embedded routes are always navigation-projected ' +
+      '(full route fields via list_doc_routes).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -156,11 +164,25 @@ export const getDocsOverviewTool: CustomTool = {
             'Optional: include the space description (legend) in the response. Default true; ' +
             'pass false to omit spaceDescription/legendTokenEstimate.',
         },
+        includeRoutes: {
+          type: 'boolean',
+          description:
+            'Optional: include the intent routes (doc_routes) in the response. Default true ' +
+            '(embedded routes are capped at the first 50 in curation order; routesTruncated/routesTotal ' +
+            'mark the overflow — use list_doc_routes for the full set); pass false to omit the routes section.',
+        },
         applySpaceDefaults: {
           type: 'boolean',
           description:
             'Optional: apply space-level default filters (settings.overviewFilter). Default true; ' +
             'pass false to ignore space defaults (escape hatch for "I want everything this time").',
+        },
+        slim: {
+          type: 'boolean',
+          description:
+            'Optional: slim projection for large spaces (v1.56). Default false (full doc fields, ' +
+            'backward compatible); pass true to project each doc entry to {path,title,summary,docType,' +
+            'tokenEstimate} — category grouping is preserved. Embedded routes are always navigation-projected.',
         },
       },
       required: ['spaceName'],
@@ -240,6 +262,8 @@ export const getDocsOverviewTool: CustomTool = {
       'maxTokens',
       'applySpaceDefaults',
       'includeDescription',
+      'includeRoutes',
+      'slim',
     ] as const;
     const params: Record<string, unknown> = {};
     for (const key of filterKeys) {

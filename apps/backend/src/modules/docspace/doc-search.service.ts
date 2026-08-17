@@ -27,7 +27,7 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
-import type { DocSearchHit } from '@agent-chamber/shared';
+import type { DocSearchHit, DocSearchSort } from '@agent-chamber/shared';
 
 /**
  * 双路打分权重常量
@@ -101,6 +101,8 @@ interface SearchRow {
   doc_id: string;
   doc_path: string;
   doc_title: string;
+  /** 文档创建时间（v1.55 时间序排序 + 时间窗过滤的 ORDER BY/WHERE 载体） */
+  doc_created_at: string;
   section_position: number;
   heading_path: string | null;
   section_content: string;
@@ -162,11 +164,27 @@ export class DocSearchService {
    *   - ts_headline when ts_rank > 0
    *   - Fallback: matched substring ±150 chars, ≤300 chars total
    *
-   * Sorting: score DESC, position ASC（boost 后 Node 侧重排，对齐既有 SQL ORDER BY 语义）。
-   * 可解释性：命中携带 boosts（route/taskLinks）透出加权来源；无 boost 省略该键。
+   * Sorting（v1.55 sort 接管语义）:
+   *   - sort='relevance'（缺省，现有行为不变）：SQL ORDER BY score DESC, position ASC；
+   *     boost 融合在 Node 侧应用并重排（页内重排——翻页时 boost 只重排当前页，
+   *     不跨页搬移命中，与「boost 只重排、不引入新结果」边界一致）。
+   *   - sort='createdAt_desc'/'createdAt_asc'：时间序**接管 ORDER BY**（docs.created_at
+   *     + section_position ASC 平局兜底），双评分仅保留 SCORE_FLOOR 噪音过滤——
+   *     boost 融合**仅适用相关度排序**，时间序下完全跳过（不查询、不应用、不透出
+   *     boosts，score 保留 SQL 原始合成分）。理由：时间序的业务意图是「按时间穷尽
+   *     遍历」（如读最近 N 天日记），策展/任务链接加权会破坏时间连续性且无意义。
+   *
+   * Time window（v1.55 createdAfter/createdBefore）: 过滤 docs.created_at，
+   * 双侧**含边界**（>= / <=）——「最近 7 天」按 now-7d 取 createdAfter 时边界文档不丢。
+   *
+   * Pagination（v1.55 offset）: SQL OFFSET，与 limit 配对穷尽翻页；缺省 0。
+   *
+   * 可解释性：命中携带 boosts（route/taskLinks）透出加权来源；无 boost 省略该键
+   * （时间序下恒省略）。
    *
    * @param accessibleSpaceIds - Whitelist from AccessQueryService (null = admin, all spaces)
-   * @param query - Search parameters (q, type, tag, category, limit)
+   * @param query - Search parameters (q, type, tag, category, limit, offset, sort,
+   *   createdAfter, createdBefore)
    * @returns Ranked search hits
    */
   async search(
@@ -177,10 +195,28 @@ export class DocSearchService {
       tag?: string;
       category?: string;
       limit?: number;
+      offset?: number;
+      sort?: DocSearchSort;
+      createdAfter?: string;
+      createdBefore?: string;
     },
   ): Promise<DocSearchHit[]> {
-    const { q, type, tag, category, limit = DEFAULT_LIMIT } = query;
+    const {
+      q,
+      type,
+      tag,
+      category,
+      limit = DEFAULT_LIMIT,
+      offset = 0,
+      sort = 'relevance',
+      createdAfter,
+      createdBefore,
+    } = query;
     const effectiveLimit = Math.min(Math.max(limit, 1), MAX_LIMIT);
+    // offset 防御性下钳 0（controller/DTO 层已拦格式，此处兜底 Service 直调）
+    const effectiveOffset = Math.max(offset, 0);
+    // 时间序接管 ORDER BY：boost 融合仅适用相关度排序（见方法注释）
+    const sortByTime = sort === 'createdAt_desc' || sort === 'createdAt_asc';
 
     // Empty whitelist short-circuit (non-admin with zero accessible spaces)
     if (accessibleSpaceIds !== null && accessibleSpaceIds.length === 0) {
@@ -189,7 +225,7 @@ export class DocSearchService {
 
     // Dual-scoring subquery: per-section ts_rank + trgm(content) + trgm(headingPath),
     // wrapped so the composite score can be filtered (floor) and ordered as a column.
-    const rows = await this.sectionRepo.manager
+    const mainQb = this.sectionRepo.manager
       .createQueryBuilder()
       .select('sub.*')
       .addSelect(
@@ -201,6 +237,7 @@ export class DocSearchService {
           .select('d.id', 'doc_id')
           .addSelect('d.path', 'doc_path')
           .addSelect('d.title', 'doc_title')
+          .addSelect('d.created_at', 'doc_created_at')
           .addSelect('s.position', 'section_position')
           .addSelect('s.heading_path', 'heading_path')
           .addSelect('s.content', 'section_content')
@@ -231,6 +268,14 @@ export class DocSearchService {
         if (category) {
           sqb.andWhere('dc.slug = :catSlug', { catSlug: category });
         }
+        // 时间窗过滤（v1.55）：双侧含边界（>= / <=）——参数为 ISO 8601 字符串，
+        // PG timestamptz 列与 ISO 文本比较安全（DTO @IsISO8601 已拦格式，层 1）
+        if (createdAfter) {
+          sqb.andWhere('d.created_at >= :createdAfter', { createdAfter });
+        }
+        if (createdBefore) {
+          sqb.andWhere('d.created_at <= :createdBefore', { createdBefore });
+        }
 
         return sqb;
       }, 'sub')
@@ -238,10 +283,19 @@ export class DocSearchService {
         `(sub.ts_rank_score * ${RANK_WEIGHTS.TS_RANK} + sub.trgm_content_score * ${RANK_WEIGHTS.TRGM_CONTENT} + sub.trgm_heading_score * ${RANK_WEIGHTS.TRGM_HEADING}) > :scoreFloor`,
         { scoreFloor: SCORE_FLOOR },
       )
-      .orderBy('score', 'DESC')
+      // 排序接管（v1.55 sort）：时间序按 docs.created_at（section_position ASC 平局兜底）；
+      // 相关度（缺省）保持既有 score DESC, position ASC——boost 重排语义见方法注释
+      .orderBy(
+        sortByTime ? 'sub.doc_created_at' : 'score',
+        sortByTime ? (sort === 'createdAt_desc' ? 'DESC' : 'ASC') : 'DESC',
+      )
       .addOrderBy('sub.section_position', 'ASC')
-      .limit(effectiveLimit)
-      .getRawMany<SearchRow & { score: number }>();
+      .limit(effectiveLimit);
+    // 翻页（v1.55 offset）：仅在 >0 时附加，保持缺省查询计划与既有行为一致
+    if (effectiveOffset > 0) {
+      mainQb.offset(effectiveOffset);
+    }
+    const rows = await mainQb.getRawMany<SearchRow & { score: number }>();
 
     // ── 三路融合 boost（plan §4-C3）────────────────────────────────
     // 边界（plan §4 明文）：boost 在 SQL SCORE_FLOOR 过滤之后执行——只重排、不引入新结果
@@ -249,6 +303,13 @@ export class DocSearchService {
     // 无命中直接短路，跳过两路 boost 查询。
     if (rows.length === 0) {
       return [];
+    }
+
+    // ── 时间序分支（v1.55）：ORDER BY 已由 SQL 按 created_at 接管，boost 融合
+    //    仅适用相关度排序——时间序下跳过两路 boost 查询与 Node 侧重排，SQL 顺序
+    //    即最终顺序（score 保留原始合成分，不透出 boosts）。
+    if (sortByTime) {
+      return Promise.all(rows.map((row) => this.buildHit(row, q)));
     }
 
     // ① 策展路由命中：命中路由的 primaryDocId ×1.5 / secondaryDocId ×1.2
@@ -261,21 +322,7 @@ export class DocSearchService {
     // Build hits
     const hits: DocSearchHit[] = [];
     for (const row of rows) {
-      const hasTsMatch = Number(row.ts_rank_score) > 0;
-      const snippet = hasTsMatch
-        ? await this.buildTsHeadlineSnippet(row.doc_id, row.section_position, q)
-        : this.buildTrgmSnippet(row.section_content, q);
-
-      const hit: DocSearchHit = {
-        docId: row.doc_id,
-        docPath: row.doc_path,
-        docTitle: row.doc_title,
-        position: Number(row.section_position),
-        headingPath: row.heading_path ?? null,
-        snippet: snippet.text,
-        contentTruncated: snippet.truncated,
-        score: Number(row.score),
-      };
+      const hit = await this.buildHit(row, q);
 
       // ③ 应用两路乘数并透出 boosts（可解释性：调用方知道结果为何排前）
       // 无任何 boost 的命中分数不变、boosts 键省略（taskLinks=0 视为无 boost——GROUP BY
@@ -308,6 +355,33 @@ export class DocSearchService {
     hits.sort((a, b) => b.score - a.score || a.position - b.position);
 
     return hits;
+  }
+
+  /**
+   * 由单条 SQL 行构建命中项（snippet 生成 + 字段投影，不含 boost）
+   *
+   * 相关度排序与时间序排序共用的命中构建管线：ts_rank > 0 走 ts_headline
+   * （额外一次 SQL），否则 trgm 子串窗口。boost 乘数仅由相关度分支在此结果上叠加。
+   *
+   * @param row - 双评分子查询原始行（含合成分 score）
+   * @param q - 检索词（ts_headline / trgm snippet 共用）
+   */
+  private async buildHit(row: SearchRow & { score: number }, q: string): Promise<DocSearchHit> {
+    const hasTsMatch = Number(row.ts_rank_score) > 0;
+    const snippet = hasTsMatch
+      ? await this.buildTsHeadlineSnippet(row.doc_id, row.section_position, q)
+      : this.buildTrgmSnippet(row.section_content, q);
+
+    return {
+      docId: row.doc_id,
+      docPath: row.doc_path,
+      docTitle: row.doc_title,
+      position: Number(row.section_position),
+      headingPath: row.heading_path ?? null,
+      snippet: snippet.text,
+      contentTruncated: snippet.truncated,
+      score: Number(row.score),
+    };
   }
 
   /**

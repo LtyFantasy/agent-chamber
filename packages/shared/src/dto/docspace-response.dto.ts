@@ -141,6 +141,27 @@ export interface DocSummary {
 }
 
 /**
+ * 文档摘要 slim 投影（v1.56，overview?slim=true 专用）
+ *
+ * 只保留地图导航字段：{path, title, summary, docType, tokenEstimate}——
+ * 摘要是地图条目的 token 大头，slim 场景（大空间冷启动）下其余元数据
+ * （id/spaceId/tags/source/sourceSha/断链计数/时间戳/创建者）一律省略，
+ * 需要明细走 read_doc / list_docs 全字段通道。
+ */
+export interface DocSummarySlim {
+  /** 文档路径 */
+  path: string;
+  /** 文档标题 */
+  title: string;
+  /** 摘要（≤500 字符） */
+  summary?: string | null;
+  /** 文档类型 */
+  docType?: string | null;
+  /** Token 估算总量 */
+  tokenEstimate?: number;
+}
+
+/**
  * 文档详情（含元数据 + section 大纲，不含正文）
  * MCP read_doc（无定位参数）返回此结构。
  */
@@ -181,15 +202,19 @@ export interface RouteHealthIssue {
  * 三触发点异步重检）。
  * 语义：空 issues = 健康；NULL = 尚未检查（对齐 LinkHealth「无数据 ≠ 零断链」）。
  *
- * codeEntryStatus（C2，codeEntry 非空时出现）：'ok' = 精确命中或目录前缀命中 repoManifest.files；
- * 'broken' = 有 manifest 且不命中（issues 同时含 kind:'codeEntry'）；'unchecked' = 空间无
- * repoManifest（不算 broken——「从未上报清单」≠「代码入口失配」）。codeEntry 为空时省略该键。
+ * codeEntryStatus（C2 + T5 扩展，codeEntry 非空时出现）：'ok' = 精确命中或目录前缀命中
+ * repoManifest.files；'broken' = 有 manifest 且不命中（issues 同时含 kind:'codeEntry'）；
+ * 'unchecked' = 空间无 repoManifest（不算 broken——「从未上报清单」≠「代码入口失配」）；
+ * 'exempt' = codeEntryType 为 'pattern'（glob 泛化写法），豁免精确存在性校验，不算 broken
+ * （codeEntryNote 附豁免原因）。codeEntry 为空时省略该键。
  */
 export interface RouteHealth {
   /** issue 列表，空数组 = 健康 */
   issues: RouteHealthIssue[];
-  /** codeEntry 级联校验状态（C2；仅 codeEntry 非空时携带，详见类型注释） */
-  codeEntryStatus?: 'ok' | 'broken' | 'unchecked';
+  /** codeEntry 级联校验状态（C2/T5；仅 codeEntry 非空时携带，详见类型注释） */
+  codeEntryStatus?: 'ok' | 'broken' | 'unchecked' | 'exempt';
+  /** 豁免说明（T5；仅 codeEntryStatus='exempt' 时携带）：pattern 型路由不参与精确存在性校验的原因 */
+  codeEntryNote?: string;
   /** 检查时间戳 ISO 8601 */
   checkedAt: string;
 }
@@ -265,10 +290,70 @@ export interface DocSectionContent {
   headingPath?: string | null;
   /** 标题层级 */
   headingLevel: number;
+  /** 是否为长 section 的续 chunk；老服务端缺字段时为 undefined */
+  isContinuation?: boolean;
   /** Section 正文 */
   content: string;
   /** Token 估算 */
   tokenEstimate?: number;
+  /**
+   * 派生锚点哈希（sha256(headingPath + '\n' + headingLevel + '\n' + content) hex，
+   * 纯派生不落库）。写前提校验用：patch 时携带 expectedSectionHash 比对，
+   * 防止 stale position 在 re-chunk 漂移后写错块（fail-closed）。
+   */
+  sectionHash?: string;
+  /**
+   * 保真渲染片段（renderSectionPart skipDuplicateTitle=false 口径：标题行插回 + run-dedup）。
+   * 是该节在 full=true 全文中的字节级子串——可直接作 patch_doc oldString 来源 /
+   * section 模式 content 参照。
+   */
+  markdown?: string;
+}
+
+/**
+ * 批量读取的单个 section 项（GET /docs/:id/sections?positions= 响应元素）
+ *
+ * 与 DocSectionContent 同口径的 section 正文，但不重复携带文档级字段
+ * （docId/docPath 提升到批量结果信封 DocBatchSectionsResult 上，响应最小化）。
+ */
+export interface DocSectionItem {
+  /** 篇内顺序（0-based，与 outline/单节读同口径） */
+  position: number;
+  /** 层级标题路径 */
+  headingPath?: string | null;
+  /** 标题层级 */
+  headingLevel: number;
+  /** 是否为长 section 的续 chunk；老服务端缺字段时为 undefined */
+  isContinuation?: boolean;
+  /** Section 正文（不含标题行，chunker 契约） */
+  content: string;
+  /** Token 估算 */
+  tokenEstimate?: number;
+  /** 派生锚点哈希（与 DocSectionContent.sectionHash 同口径，写前提校验用） */
+  sectionHash?: string;
+  /**
+   * 保真渲染片段（renderSectionPart skipDuplicateTitle=false 口径：标题行插回 + run-dedup）。
+   * 是该节在 full=true 全文中的字节级子串——可直接作 patch_doc oldString 来源 /
+   * section 模式 content 参照。
+   */
+  markdown?: string;
+}
+
+/**
+ * 批量 section 读取结果（GET /docs/:id/sections?positions=1,3,5，v1.55）
+ *
+ * 部分失败友好：越界/不存在的 position 不整体报错，单独列入 missing；
+ * 重复 position 去重（每个 position 至多返回一次）。sections 按 position ASC。
+ */
+export interface DocBatchSectionsResult {
+  /** 文档 ID */
+  docId: string;
+  /** 文档路径 */
+  docPath: string;
+  /** 命中的 section 列表（position ASC） */
+  sections: DocSectionItem[];
+  /** 越界/不存在的 position 列表（请求去重后、升序） */
+  missing: number[];
 }
 
 /**
@@ -286,6 +371,23 @@ export interface DocFullContent {
 }
 
 // ─── Search ──────────────────────────────────────────────
+
+/**
+ * 文档搜索排序模式（v1.55 search_docs 翻页/时间序）
+ *
+ * - relevance（缺省）：双评分 + boost 融合排序（现有行为不变）；
+ * - createdAt_desc / createdAt_asc：按 docs.created_at 时间序**接管 ORDER BY**——
+ *   boost 融合仅适用相关度排序，时间序下不计算、不应用、不透出 boosts，
+ *   score 保留 SQL 原始合成分（语义详见 DocSearchService.search 注释）。
+ */
+export type DocSearchSort = 'relevance' | 'createdAt_desc' | 'createdAt_asc';
+
+/** DocSearchSort 合法值清单（DTO @IsIn 校验与 swagger enum 共用，单一事实来源） */
+export const DOC_SEARCH_SORT_VALUES: readonly DocSearchSort[] = [
+  'relevance',
+  'createdAt_desc',
+  'createdAt_asc',
+];
 
 /**
  * 文档搜索命中项
@@ -351,6 +453,20 @@ export interface DocSpaceOverviewAppliedFilters {
 }
 
 /**
+ * doc_routes.codeEntryType 取值冻结（T5，类型前置铁律 #25）
+ *
+ * - 'exact'（缺省，存量/缺省行为）：codeEntry 是仓库内精确文件或目录路径，
+ *   recheck 时做 repoManifest.files 精确/目录前缀存在性校验；
+ * - 'pattern'：codeEntry 是 glob 型泛化写法（如 `apps/web/app/**` + `/page.tsx`），
+ *   对人类有指引价值但无法精确校验，recheck 时豁免存在性校验（health 标记
+ *   codeEntryStatus:'exempt'，绝不报 broken、不参与 broken 统计）。
+ */
+export const DOC_ROUTE_CODE_ENTRY_TYPES = ['exact', 'pattern'] as const;
+
+/** codeEntryType 取值联合（'exact' | 'pattern'） */
+export type DocRouteCodeEntryType = (typeof DOC_ROUTE_CODE_ENTRY_TYPES)[number];
+
+/**
  * 意图路由（doc_routes，v1.42 批次 B5）
  *
  * INDEX.md 功能-文档映射表的结构化形态：intent（"我要…"）→ primaryDoc+headingPath（先看）→
@@ -376,6 +492,11 @@ export interface DocRoute {
   /** 代码入口（仓库内相对路径；null = 无） */
   codeEntry?: string | null;
   /**
+   * codeEntry 类型（T5）：'exact'（缺省）= 精确路径，recheck 参与存在性校验；
+   * 'pattern' = glob 泛化写法，recheck 豁免（不报 broken）。随 codeEntry 语义配套填写。
+   */
+  codeEntryType: DocRouteCodeEntryType;
+  /**
    * 路由健康巡检结果（v1.42 批次 C1，异步重检写入）：
    * 空 issues = 健康；NULL = 尚未检查。C1 只产出 kind:'heading' 的 issue。
    */
@@ -391,9 +512,33 @@ export interface DocRoute {
 }
 
 /**
- * DocSpace 概览（紧凑地图）
- * 结构化展示所有分类及其下文档的摘要信息。
+ * 意图路由导航投影（v1.56，overview 内嵌段专用）
+ *
+ * 只保留「导航够用」的字段：intent（我要…）→ category（分组）→
+ * primaryDocId+primaryHeadingPath（先看哪篇的哪个节）→ codeEntry（代码入口）
+ * + health.codeEntryStatus（codeEntry 可用性指示）。
+ * health 语义：null = 未检；{codeEntryStatus} = 已检（仅 codeEntry 非空时携带 status，
+ * 无 status 时序列化为 {}，与 null 的「未检」区分）；issues/checkedAt/codeEntryNote
+ * 等明细一律省略——全字段走 GET /doc-spaces/:id/routes 或 list_doc_routes 通道
+ * （overview 只做导航门面，v1.55 起 routes 段本就截断策展序前 50 条）。
  */
+export interface DocRouteNav {
+  /** 用户意图描述（"我要…"） */
+  intent: string;
+  /** 路由分组（可空） */
+  category?: string | null;
+  /** 主文档 ID（路由第一步跳转） */
+  primaryDocId: string;
+  /** 主文档定位锚点（doc_sections.heading_path 精确匹配；null = 文档级） */
+  primaryHeadingPath?: string | null;
+  /** 代码入口（仓库内相对路径；null = 无） */
+  codeEntry?: string | null;
+  /**
+   * 导航级健康指示：只保留 codeEntryStatus（对齐 RouteHealth 定义）；
+   * 未检（health NULL）→ null；已检但 codeEntry 为空（无 status）→ {}
+   */
+  health?: Pick<RouteHealth, 'codeEntryStatus'> | null;
+}
 export interface DocSpaceOverview {
   /** 空间 ID */
   spaceId: string;
@@ -404,12 +549,26 @@ export interface DocSpaceOverview {
   /** 空间图例 token 估算（v1.41）：单列记账，不参与 maxTokens 文档条目预算竞争 */
   legendTokenEstimate?: number;
   /**
-   * 意图路由列表（v1.42 B5）：全量返回（按 sortOrder+createdAt ASC），与图例同待遇——
-   * 不占 maxTokens 文档条目预算；includeRoutes=false 时缺省
+   * 意图路由导航投影列表（v1.42 B5 内嵌，v1.56 起恒为导航投影）：按 sortOrder+createdAt ASC 排序，
+   * 与图例同待遇——不占 maxTokens 文档条目预算；includeRoutes=false 时缺省。
+   * 每条只含导航字段（intent/category/primaryDocId/primaryHeadingPath/codeEntry/health.codeEntryStatus）——
+   * 全字段走 GET /doc-spaces/:id/routes（分页）或 list_doc_routes 工具。
+   * 防爆截断（v1.55）：最多内嵌前 OVERVIEW_ROUTES_LIMIT（=50）条策展序最前的路由；
+   * 超出时 routesTruncated=true 且 routesTotal 给出全量条数。
    */
-  routes?: DocRoute[];
-  /** 意图路由 token 估算（v1.42 B5）：estimateTokens 对序列化 routes 单列记账，计入 totalTokenEstimate */
+  routes?: DocRouteNav[];
+  /** 意图路由 token 估算（v1.42 B5）：estimateTokens 对序列化 routes（截断后）单列记账，计入 totalTokenEstimate */
   routesTokenEstimate?: number;
+  /**
+   * routes 段是否被截断（v1.55）：空间路由总数 > OVERVIEW_ROUTES_LIMIT（=50）时为 true，
+   * 此时 routes 只含策展序前 50 条；includeRoutes=false 时缺省
+   */
+  routesTruncated?: boolean;
+  /**
+   * 空间路由全量条数（v1.55）：不受截断影响（routesTotal 恒为全量计数），
+   * 供调用方判断是否需要走分页端点拉全；includeRoutes=false 时缺省
+   */
+  routesTotal?: number;
   /** 分类树 */
   categories: DocCategoryOverview[];
   /** 未分类文档 */
@@ -428,7 +587,7 @@ export interface DocSpaceOverview {
   totalBrokenRoutes?: number;
   /** 总 token 估算（图例 + 文档条目 + 意图路由合计，仅信息回显） */
   totalTokenEstimate?: number;
-  /** 是否因 token 上限截断（仅文档条目截断，图例/意图路由始终全量） */
+  /** 是否因 token 上限截断（仅文档条目截断，图例始终全量；意图路由截断见 routesTruncated） */
   truncated?: boolean;
   /** 实际生效的过滤条件回显（未传任何过滤且无空间默认时缺省） */
   appliedFilters?: DocSpaceOverviewAppliedFilters;
@@ -440,6 +599,32 @@ export interface DocSpaceOverview {
 export interface DocCategoryOverview extends DocCategoryDto {
   /** 本分类下的文档摘要列表 */
   docs: DocSummary[];
+}
+
+/**
+ * slim 模式下的分类视图（v1.56，overview?slim=true）
+ *
+ * 与 DocCategoryOverview 同构，仅 docs 元素换为 DocSummarySlim——
+ * category 归属/分组结构不动（slim 只裁文档条目字段，不改变地图形状）。
+ */
+export interface DocCategoryOverviewSlim extends Omit<DocCategoryOverview, 'docs'> {
+  /** 本分类下的文档 slim 摘要列表（{path,title,summary,docType,tokenEstimate}） */
+  docs: DocSummarySlim[];
+}
+
+/**
+ * DocSpace 概览 slim 变体（v1.56，overview?slim=true）
+ *
+ * 与 DocSpaceOverview 同构，仅 categories/uncategorized 的文档条目换为
+ * DocSummarySlim（routes 段两种模式同为 DocRouteNav 导航投影）。
+ * 语义：slim=true 时返回本形状；缺省/false 返回 DocSpaceOverview（向后兼容）。
+ */
+export interface DocSpaceOverviewSlim
+  extends Omit<DocSpaceOverview, 'categories' | 'uncategorized'> {
+  /** 分类树（docs 为 slim 条目） */
+  categories: DocCategoryOverviewSlim[];
+  /** 未分类文档（slim 条目） */
+  uncategorized: DocSummarySlim[];
 }
 
 // ─── Task-Doc Link ───────────────────────────────────────
@@ -480,6 +665,11 @@ export interface UpsertDocResult {
    * undefined = unchanged 分支不设置此字段）。
    */
   created?: boolean;
+  /**
+   * 写后内容哈希（sha256 hex）。链式写免重读：下次写携带 expectedContentHash
+   * 做乐观锁前提校验（409 DOC_CONTENT_CONFLICT = 期间被他人改动）。
+   */
+  contentHash?: string;
 }
 
 // ─── Batch Upsert ──────────────────────────────────────────

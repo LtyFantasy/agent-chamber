@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { DocSpaceController } from './docspace.controller';
 import { DocSpaceService } from './docspace.service';
+import { DocBundleService } from './doc-bundle.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { BoardService } from '../board/board.service';
@@ -13,6 +14,7 @@ describe('DocSpaceController', () => {
   let service: typeof mockService;
   let permService: typeof mockPermService;
   let boardService: typeof mockBoardService;
+  let bundleService: typeof mockBundleService;
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
@@ -47,6 +49,12 @@ describe('DocSpaceController', () => {
     findById: jest.fn(),
   };
 
+  // v1.55 T6：空间级全量导出/回导（export/import-bundle 端点）
+  const mockBundleService = {
+    exportBundle: jest.fn(),
+    importBundle: jest.fn(),
+  };
+
   beforeEach(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [DocSpaceController],
@@ -58,6 +66,7 @@ describe('DocSpaceController', () => {
           provide: OwnerProxyService,
           useValue: { isOwnerProxy: jest.fn().mockResolvedValue(false) },
         },
+        { provide: DocBundleService, useValue: mockBundleService },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -70,6 +79,9 @@ describe('DocSpaceController', () => {
       PermissionService,
     ) as unknown as typeof permService;
     boardService = moduleRef.get<BoardService>(BoardService) as unknown as typeof boardService;
+    bundleService = moduleRef.get<DocBundleService>(
+      DocBundleService,
+    ) as unknown as typeof bundleService;
   });
 
   afterEach(() => jest.resetAllMocks());
@@ -559,6 +571,70 @@ describe('DocSpaceController', () => {
       expect(await controller.getOverview('space-1', {}, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
       expect(service.getOverview).toHaveBeenCalledWith('space-1', {});
+    });
+  });
+
+  // ─── 空间级全量导出 / 回导（任务 T6）────────────────────────
+
+  describe('exportBundle', () => {
+    it('ensures read permission（与 overview 一致）then returns bundle', async () => {
+      const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
+      const bundle = {
+        formatVersion: 1,
+        exportedAt: '2026-08-16T00:00:00.000Z',
+        space: { name: 'Test', description: null, visibility: Visibility.OPEN, settings: {} },
+        categories: [],
+        routes: [],
+        docs: [],
+      };
+      service.findById.mockResolvedValue(space);
+      bundleService.exportBundle.mockResolvedValue(bundle);
+
+      expect(await controller.exportBundle('space-1', mockActor)).toBe(bundle);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(bundleService.exportBundle).toHaveBeenCalledWith('space-1');
+    });
+  });
+
+  describe('importBundle', () => {
+    const bundle = {
+      formatVersion: 1,
+      exportedAt: '2026-08-16T00:00:00.000Z',
+      space: { name: 'Test', description: null, visibility: Visibility.OPEN, settings: {} },
+      categories: [],
+      routes: [],
+      docs: [],
+    };
+
+    it('ensures write permission then imports bundle（overwriteSpaceMeta 缺省 false）', async () => {
+      const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
+      const result = {
+        formatVersion: 1,
+        importedAt: '2026-08-16T00:00:00.000Z',
+        docs: {
+          results: [],
+          summary: { total: 0, created: 0, updated: 0, unchanged: 0, failed: 0 },
+        },
+        categories: { results: [], summary: { total: 0, created: 0, updated: 0, failed: 0 } },
+        routes: { results: [], summary: { total: 0, created: 0, updated: 0, failed: 0 } },
+        spaceMeta: { applied: false, status: 'skipped' },
+      };
+      service.findById.mockResolvedValue(space);
+      bundleService.importBundle.mockResolvedValue(result);
+
+      expect(await controller.importBundle('space-1', bundle as never, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
+      expect(bundleService.importBundle).toHaveBeenCalledWith('space-1', bundle, mockActor, false);
+    });
+
+    it('overwriteSpaceMeta=true 显式透传', async () => {
+      const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
+      service.findById.mockResolvedValue(space);
+      bundleService.importBundle.mockResolvedValue({});
+
+      await controller.importBundle('space-1', bundle as never, mockActor, true);
+
+      expect(bundleService.importBundle).toHaveBeenCalledWith('space-1', bundle, mockActor, true);
     });
   });
 });

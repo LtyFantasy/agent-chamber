@@ -354,4 +354,82 @@ describe('RouteHealthService', () => {
       expect(r2.health!.codeEntryStatus).toBe('ok');
     });
   });
+
+  // ─── T5 codeEntryType='pattern' 豁免（glob 泛化写法不报 broken） ───
+
+  describe('recheckSpace pattern codeEntry exemption (T5)', () => {
+    /** 便捷：空间挂 repoManifest + 单路由 + heading 全命中（排除 heading 噪音） */
+    function setup(manifest: Record<string, unknown> | null, route: DocRoute) {
+      spaceRepo.findOne.mockResolvedValue(manifest ? makeSpace(manifest) : null);
+      routeRepo.find.mockResolvedValue([route]);
+      docService.sectionExistsByHeadingPath.mockResolvedValue(true);
+    }
+
+    it('pattern 型 + 文件不存在的 glob → codeEntryStatus:exempt + codeEntryNote，不产 issue 不算 broken', async () => {
+      const route = makeRoute({
+        codeEntry: 'apps/web/app/**' + '/page.tsx',
+        codeEntryType: 'pattern',
+      });
+      setup(
+        { repoManifest: { sha: 'abc', files: ['apps/web/app/page.tsx'], reportedAt: 'x' } },
+        route,
+      );
+
+      const result = await service.recheckSpace('space-1');
+
+      expect(route.health).toEqual({
+        issues: [],
+        codeEntryStatus: 'exempt',
+        codeEntryNote: expect.any(String),
+        checkedAt: expect.any(String),
+      });
+      expect(result).toEqual({ rechecked: 1, broken: 0 });
+    });
+
+    it('pattern 豁免只作用于 codeEntry：heading 悬空仍正常报 broken（issues 照常装配）', async () => {
+      const route = makeRoute({
+        codeEntry: 'apps/web/app/**' + '/page.tsx',
+        codeEntryType: 'pattern',
+      });
+      setup({ repoManifest: { sha: 'abc', files: [], reportedAt: 'x' } }, route);
+      // heading 未命中（pattern 不豁免 heading 校验）
+      docService.sectionExistsByHeadingPath.mockResolvedValue(false);
+
+      const result = await service.recheckSpace('space-1');
+
+      expect(route.health!.issues).toEqual([
+        { kind: 'heading', target: 'primary', value: '## 3. 架构总览' },
+      ]);
+      expect(route.health!.codeEntryStatus).toBe('exempt');
+      expect(result).toEqual({ rechecked: 1, broken: 1 });
+    });
+
+    it('pattern 型豁免不依赖 manifest（无 manifest 同样 exempt 而非 unchecked）', async () => {
+      const route = makeRoute({
+        codeEntry: 'apps/web/app/**' + '/page.tsx',
+        codeEntryType: 'pattern',
+      });
+      setup({}, route);
+
+      await service.recheckSpace('space-1');
+
+      expect(route.health!.codeEntryStatus).toBe('exempt');
+      expect(route.health!.issues).toEqual([]);
+      expect(route.health!.codeEntryNote).toEqual(expect.any(String));
+    });
+
+    it('exact 缺省行为不变：codeEntryType 缺省（undefined，存量行迁移后为 exact）→ 仍走 C2 精确校验', async () => {
+      // makeRoute 不传 codeEntryType → undefined；recheck 按 exact 分支处理（与存量行一致）
+      const route = makeRoute({ codeEntry: 'apps/gone.ts' });
+      setup({ repoManifest: { sha: 'abc', files: ['apps/keep.ts'], reportedAt: 'x' } }, route);
+
+      const result = await service.recheckSpace('space-1');
+
+      expect(route.health!.codeEntryStatus).toBe('broken');
+      expect(route.health!.issues).toEqual([
+        { kind: 'codeEntry', target: 'codeEntry', value: 'apps/gone.ts' },
+      ]);
+      expect(result.broken).toBe(1);
+    });
+  });
 });

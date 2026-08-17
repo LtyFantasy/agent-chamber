@@ -7,15 +7,35 @@
  *   - 补充: plan §4.3 (文档读/文档写), plan §4.4 (chunking), plan §1.1-13 (sectionId 不稳定契约)
  *
  * [踩坑索引]
+ *   - headingPath-separator-v1.57.2：headingPath 结构分隔符必须是带空格的 ` § `；标题正文中的
+ *     `§3.2` 不能按裸字符拆分，末段标题统一走 shared extractLastHeadingSegment()。
+ *   - patch_doc MATCH 模式字节一致性（2026-08-17，Hument 同类事故在 match 面）：工具描述
+ *     「read_doc 返回文本与 match 匹配面相同」曾经失实——full 丢首标题 / section 幻影标题
+ *     （续 chunk 无标题行）/ 空正文尾部 \n\n 三处字节不一致，复制的 oldString 必 0 命中。
+ *     修复：findOne full 分支改 skipDuplicateTitle=false（与 match 面/getContent(full=true)
+ *     逐字节同形）；getSection/getSections/getSectionByHeadingQuery 新增 markdown 字段
+ *     （renderSectionPart 口径的字节级子串）供 MCP 读侧直用。改渲染规则先跑 docspace 测试
  *   - 任务 e6eaf06d 第二张脸：chunker step 4 段落切分产生的兄弟 chunk 共用同一 headingPath，
  *     重建时若逐个插标题行，同一标题会重复 N 次（生产实证 12~180 次），且「全文读 + upsert
- *     回写」每轮固化重复标题，文档越往返越臃肿；reconstructContent 已实现 run-dedup
- *     （相邻 section 同 (headingPath, headingLevel) 只插回一次标题）——修改该逻辑前先跑
- *     docspace 测试验证往返幂等（长文 round-trip 用例）
+ *     回写」每轮固化重复标题，文档越往返越臃肿；v1.57.3 起 renderSectionPart 仅依据
+ *     chunker 持久化的 isContinuation 事实去重，不能再用相邻 headingPath/headingLevel 猜测，
+ *     否则合法同名 sibling 标题会被吞掉。修改该逻辑前先跑 docspace 测试验证往返幂等
+ *     （长文 round-trip 用例 + docspace-patch.e2e-spec.ts 真实 PG 集成）
+ *   - rundedup-continuation-v1.57.3：相邻同路径 section 可能是真实同名标题；chunker 直写
+ *     isContinuation=true，renderer 只据事实去重，老服务端缺字段时保留标题、不静默吞正文。
  *   - 互斥查询参数（path= 与 q=）同传是请求格式错误：400 VALIDATION_ERROR，禁止用
  *     RESOURCE_CONFLICT（2026-08-09 修复 edad7a9，原误挂 RESOURCE_CONFLICT）
+ *   - Hument 事故（topic msg 6dbc4da3）：patch_doc stale position 在 re-chunk 漂移后
+ *     静默写错块（fail-open）→ fail-closed 改造（2026-08-16）：读通道派生 sectionHash
+ *     （存储三元组 sha256，**非渲染片段**——渲染依赖 isContinuation 事实，禁止改口径）、
+ *     patchSection expectedSectionHash / upsert expectedContentHash 前提校验
+ *     （事务内 FOR UPDATE 锁行复核，TOCTOU 加固）、新增 patchByMatch match 模式写
+ *     （操作面 = full=true 全文；0 命中 404 / 多命中 409+matchCount / 唯一命中替换）
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
+ *
+ * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   rundedup-continuation-v1.57.3: 相邻同 headingPath/headingLevel 可能是真实同名 sibling，旧启发式会吞标题。renderer 改为只依据 chunker 持久化的 isContinuation 去重。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -40,12 +60,19 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Board } from '../../database/entities/board.entity';
-import { ErrorCode, AuditAction, EventType, HEADING_PATH_SEPARATOR } from '@agent-chamber/shared';
+import {
+  ErrorCode,
+  AuditAction,
+  EventType,
+  extractLastHeadingSegment,
+} from '@agent-chamber/shared';
 import type {
   DocSummary,
   DocDetail,
   DocSectionOutline,
   DocSectionContent,
+  DocSectionItem,
+  DocBatchSectionsResult,
   DocFullContent,
   UpsertDocResult,
   PaginatedResponse,
@@ -150,6 +177,28 @@ export class DocService {
     return createHash('sha256').update(content).digest('hex');
   }
 
+  /**
+   * 派生 section 锚点哈希（写前提校验用，fail-closed 改造的读侧契约）。
+   *
+   * 纯派生不落库：DocSection 的存储三元组仍是哈希输入，读时算给调用方抄、
+   * 写时（patchSection expectedSectionHash）重算比对；isContinuation 不参与哈希。
+   *
+   * ⚠️ 输入 = **存储三元组**（headingPath/headingLevel/content），不是渲染片段
+   * （架构评审钉死）：渲染片段包含标题恢复规则，若用渲染文本算 hash，修改渲染策略
+   * 会导致同一 section 的锚点变化——错误耦合。
+   * 禁止把本方法「优化」成渲染文本口径。headingPath 为 null（headingLevel 0 文首段）
+   * 时按空串参与，保证确定性。
+   */
+  private computeSectionHash(section: {
+    headingPath: string | null;
+    headingLevel: number;
+    content: string;
+  }): string {
+    return createHash('sha256')
+      .update(`${section.headingPath ?? ''}\n${section.headingLevel}\n${section.content}`)
+      .digest('hex');
+  }
+
   /** Extract first paragraph (≤ maxLen) from text for auto-summary. */
   private extractFirstParagraph(text: string, maxLen = 500): string {
     const firstPara = text.split('\n\n')[0]?.trim() || text.slice(0, maxLen);
@@ -238,6 +287,11 @@ export class DocService {
    * - category by name resolution (auto-create if not found)
    * - summary defaults to first section's first paragraph (≤500 chars)
    * - source isolation: existing doc with non-matching source → 409
+   * - expectedContentHash（可选乐观锁，v1.57 fail-closed 改造）：携带时校验现存
+   *   doc 的 contentHash——doc 不存在或 hash 不符 → 409 DOC_CONTENT_CONFLICT；
+   *   hash 相符且内容未变 → unchanged 正常返回（不算冲突）。校验在**事务内**
+   *   FOR UPDATE 锁行后复核（TOCTOU 加固，见事务内注释）；事务外同款检查只是
+   *   快速失败路径。
    * - 23505 concurrent catch → re-query existing doc (idempotency)
    */
   async upsert(
@@ -252,6 +306,7 @@ export class DocService {
       tags?: string[];
       source?: string;
       sourceSha?: string;
+      expectedContentHash?: string;
     },
     actor?: UnifiedActor,
   ): Promise<UpsertDocResult> {
@@ -272,6 +327,22 @@ export class DocService {
         throw new ConflictException({
           message: `Document source '${existing.source}' does not match request source '${source}'`,
           code: ErrorCode.DOC_SOURCE_MISMATCH,
+        });
+      }
+
+      // expectedContentHash 乐观锁——事务外快速失败路径（fail-closed 改造）：
+      // 此刻 hash 已不符则直接 409，不必进事务；权威校验在事务内 FOR UPDATE 后复核
+      // （防「事务外校验通过 → 并发写入 → 事务内覆盖」的 TOCTOU 窗口）。
+      if (
+        dto.expectedContentHash !== undefined &&
+        existing.contentHash !== dto.expectedContentHash
+      ) {
+        throw new ConflictException({
+          message:
+            `expectedContentHash mismatch: document was modified since the caller's read ` +
+            `(expected ${dto.expectedContentHash}, current ${existing.contentHash}); re-read the document and retry`,
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { currentContentHash: existing.contentHash },
         });
       }
 
@@ -318,8 +389,19 @@ export class DocService {
           sectionCount: existing.sectionCount,
           tokenEstimate: existing.tokenEstimate,
           unchanged: true,
+          contentHash: existing.contentHash ?? undefined,
         };
       }
+    } else if (dto.expectedContentHash !== undefined) {
+      // 乐观锁语义：对不存在的文档无法断言前提（调用方持有的 hash 无所指）→ 409，
+      // 不得静默降级为新建（那会把「我以为在改旧文档」变成「意外创建新文档」）
+      throw new ConflictException({
+        message:
+          `expectedContentHash provided but document does not exist at path '${dto.path}'; ` +
+          `re-read the document and retry`,
+        code: ErrorCode.DOC_CONTENT_CONFLICT,
+        data: { currentContentHash: null },
+      });
     }
 
     // Track whether this is a create (for created flag in result)
@@ -363,27 +445,56 @@ export class DocService {
         let doc: Doc;
 
         if (existing) {
+          let target = existing;
+
+          // TOCTOU 加固（fail-closed 改造，架构评审拍板）：expectedContentHash 携带时，
+          // 事务内对 doc 行 SELECT ... FOR UPDATE 锁行后重读比对——事务外的 existing
+          // 查询与事务写入之间有并发窗口，两个并发写可双双通过事务外校验再互相覆盖
+          // （乐观锁失效，Hument 事故的多 agent 变体）。锁行后复核，不符即抛 409 回滚。
+          // 仅在携带前提校验时加锁：缺省调用保持现状行为（行锁本就会在 UPDATE 时获取，
+          // 这里只是提前到写前并附加重读比对），不改变无前提请求的执行路径。
+          if (dto.expectedContentHash !== undefined) {
+            const locked = await docRepo
+              .createQueryBuilder('d')
+              .setLock('pessimistic_write')
+              .where('d.id = :id', { id: existing.id })
+              .andWhere('d.deleted_at IS NULL')
+              .getOne();
+
+            if (!locked || locked.contentHash !== dto.expectedContentHash) {
+              throw new ConflictException({
+                message:
+                  `expectedContentHash mismatch (in-transaction recheck): document was modified ` +
+                  `concurrently (expected ${dto.expectedContentHash}, current ${locked?.contentHash ?? '<deleted>'}); ` +
+                  `re-read the document and retry`,
+                code: ErrorCode.DOC_CONTENT_CONFLICT,
+                data: { currentContentHash: locked?.contentHash ?? null },
+              });
+            }
+            target = locked;
+          }
+
           // Delete old sections (CASCADE handles FK, but we delete explicitly for clarity)
           await sectionRepo
             .createQueryBuilder()
             .delete()
-            .where('doc_id = :docId', { docId: existing.id })
+            .where('doc_id = :docId', { docId: target.id })
             .execute();
 
           // Update metadata
-          existing.title = autoTitle;
-          existing.summary = summary;
-          existing.docType = dto.docType ?? existing.docType;
-          existing.tags = dto.tags ?? existing.tags;
-          existing.categoryId = categoryId ?? existing.categoryId;
-          existing.contentHash = computedHash;
+          target.title = autoTitle;
+          target.summary = summary;
+          target.docType = dto.docType ?? target.docType;
+          target.tags = dto.tags ?? target.tags;
+          target.categoryId = categoryId ?? target.categoryId;
+          target.contentHash = computedHash;
           // 内容变更时刷新 last-verified sha（sync 携带则覆盖；native 编辑不带 sha 保留旧值——
           // 旧 sha 将显 stale，正是消费端 doc.sourceSha vs 空间 maxSha 新鲜度比较的用途）
-          existing.sourceSha = dto.sourceSha ?? existing.sourceSha;
-          existing.sectionCount = chunks.length;
-          existing.tokenEstimate = totalTokens;
-          existing.linkHealth = linkHealth as unknown as Record<string, unknown>;
-          doc = await docRepo.save(existing);
+          target.sourceSha = dto.sourceSha ?? target.sourceSha;
+          target.sectionCount = chunks.length;
+          target.tokenEstimate = totalTokens;
+          target.linkHealth = linkHealth as unknown as Record<string, unknown>;
+          doc = await docRepo.save(target);
         } else {
           // Create new
           doc = docRepo.create({
@@ -413,6 +524,7 @@ export class DocService {
               position: c.position,
               headingPath: c.headingPath,
               headingLevel: c.headingLevel,
+              isContinuation: c.isContinuation,
               content: c.content,
               tokenEstimate: c.tokenEstimate,
             }),
@@ -486,6 +598,7 @@ export class DocService {
         sectionCount: result.sectionCount,
         tokenEstimate: result.tokenEstimate,
         created: isCreate,
+        contentHash: result.contentHash ?? undefined,
       };
     } catch (err: unknown) {
       const pgErr = err as { code?: string; constraint?: string };
@@ -510,6 +623,7 @@ export class DocService {
           sectionCount: winner.sectionCount,
           tokenEstimate: winner.tokenEstimate,
           created: false,
+          contentHash: winner.contentHash ?? undefined,
         };
       }
       throw err;
@@ -582,8 +696,10 @@ export class DocService {
   }
 
   /**
-   * List documents in a space. Supports filters: category, tag, type, q (full-text), path (exact).
-   * path= and q= are mutually exclusive.
+   * List documents in a space. Supports filters: category, tag, type, q (full-text),
+   * path (exact), pathPrefix (prefix match, v1.55).
+   * path= and q= are mutually exclusive; path= and pathPrefix= are mutually exclusive
+   * (both target the path column and exact match subsumes prefix).
    */
   async findAll(
     spaceId: string,
@@ -593,16 +709,25 @@ export class DocService {
       type?: string;
       q?: string;
       path?: string;
+      pathPrefix?: string;
       page?: number;
       pageSize?: number;
     },
   ): Promise<PaginatedResponse<DocSummary>> {
-    const { category, tag, type, q, path, page = 1, pageSize = 20 } = query;
+    const { category, tag, type, q, path, pathPrefix, page = 1, pageSize = 20 } = query;
 
     // path= and q= are mutually exclusive
     if (path && q) {
       throw new BadRequestException({
         message: 'path= and q= are mutually exclusive',
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+
+    // path= 与 pathPrefix= 互斥（同打 path 列；精确匹配语义包含前缀匹配，同传无意义）
+    if (path && pathPrefix) {
+      throw new BadRequestException({
+        message: 'path= and pathPrefix= are mutually exclusive',
         code: ErrorCode.VALIDATION_ERROR,
       });
     }
@@ -618,6 +743,13 @@ export class DocService {
     // Exact path match
     if (path) {
       qb.andWhere('d.path = :exactPath', { exactPath: path });
+    }
+
+    // Path prefix match（v1.55）：LIKE 通配符转义保证字面前缀语义——
+    // 用户输入中的 \ % _ 逐字符转义（ESCAPE '\'），不会被当作 LIKE 元字符解释
+    if (pathPrefix) {
+      const escaped = pathPrefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+      qb.andWhere("d.path LIKE :pathPrefix ESCAPE '\\'", { pathPrefix: `${escaped}%` });
     }
 
     // Full-text search (ILIKE on title + path)
@@ -669,6 +801,11 @@ export class DocService {
    * 第二次全量查询 sections 并重建全文，返回 mode:'full' + content；否则 mode:'outline'。
    * tokenEstimate=0（存量未估算文档）守卫不触发全文，避免任意大文档误内联。
    *
+   * full 模式 content = **与 match 写面 / full=true 通道逐字节同形的保真全文**
+   * （skipDuplicateTitle=false：首 H1 与 title 同名也保留标题行）——read_doc full 输出
+   * 可直接作 patch_doc MATCH 模式 oldString 来源（字节一致性保证）；首标题去重只剩
+   * web 渲染侧（getContent full=false）使用。
+   *
    * @param maxFullTokens 覆盖阈值（≥0；0 = 强制 outline；非法值由 controller 双层校验拦截，不达此层）
    */
   async findOne(id: string, maxFullTokens?: number): Promise<DocDetail> {
@@ -690,9 +827,7 @@ export class DocService {
       // heading 派生：headingPath 末段 = 本地标题（展示用；与 reconstructContent 的
       // lastSegment 同款派生）。headingPath 为 null（headingLevel 0 文首无标题段）→ null；
       // headingPath 本身保留作寻址地址，语义不变。
-      heading: s.headingPath
-        ? (s.headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '')
-        : null,
+      heading: s.headingPath ? extractLastHeadingSegment(s.headingPath) : null,
       headingLevel: s.headingLevel,
       tokenEstimate: s.tokenEstimate,
     }));
@@ -714,7 +849,9 @@ export class DocService {
       doc.tokenEstimate <= threshold
     ) {
       // full 分支独立第二次查询（全量 sections 含 content 大字段）——outline 分支零额外开销。
-      // 复用 reconstructContent 渲染去重语义（skipDuplicateTitle=true，与 web /content 默认一致）。
+      // 复用 reconstructContent 保真渲染（skipDuplicateTitle=false：与 match 写面
+      // patchByMatch 操作面 / getContent(full=true) 通道逐字节同形——read_doc full 输出
+      // 可直接作 patch_doc oldString 来源）。首标题去重只剩 web 渲染侧（getContent full=false）。
       const fullSections = await this.sectionRepo
         .createQueryBuilder('s')
         .where('s.docId = :docId', { docId: id })
@@ -722,7 +859,7 @@ export class DocService {
         .getMany();
 
       result.mode = 'full';
-      result.content = this.reconstructContent(doc, fullSections, true);
+      result.content = this.reconstructContent(doc, fullSections, false);
     } else {
       result.mode = 'outline';
     }
@@ -770,12 +907,9 @@ export class DocService {
    * join 后与相邻段之间恰好一个空行，保证「全文读 + upsert 回写」往返幂等
    * （否则空 H2 分组标题会在重建中被吞掉，见 markdown-chunker AGENT-HOOK e6eaf06d）。
    *
-   * run-dedup：chunker step 4 对 >4000 字符的 section 按段落二次切分，子 chunk 共用同一
-   * headingPath/headingLevel 且相邻——重建时逐个插回标题行会把同一标题重复 N 次（生产实证
-   * 同标题重复 12~180 次），每轮「全文读 + upsert 回写」还会把重复标题固化进下一轮存储。
-   * 因此相邻 section 的 (headingPath, headingLevel) 相同 = 同一切分段，仅首个插标题行、
-   * 后续兄弟只接正文。已知取舍：原文「同父同名且相邻」的病态重复标题会被合并
-   * （极罕见，且本身就是坏文档）。
+   * run-dedup：chunker step 4 对 >4000 字符的 section 按段落二次切分，并将续 chunk
+   * 持久化为 isContinuation=true；重建时续 chunk 只接正文，真实同名 sibling（isContinuation=false）
+   * 仍插回标题行，避免旧的相邻 headingPath/headingLevel 启发式误吞合法标题。
    *
    * @param skipDuplicateTitle 渲染侧去重：position 0 的 H1 若与 doc.title 同名则不重复
    *   插标题行（web 渲染层已用 header 元数据卡展示 title）；链接巡检等语义消费方应传
@@ -783,39 +917,56 @@ export class DocService {
    */
   private reconstructContent(
     doc: Doc,
-    sections: { content: string; headingLevel: number; headingPath: string | null }[],
+    sections: {
+      content: string;
+      headingLevel: number;
+      headingPath: string | null;
+      isContinuation?: boolean;
+    }[],
     skipDuplicateTitle: boolean,
   ): string {
     const parts = sections
-      .map((s, idx) => {
-        if (s.headingLevel > 0 && s.headingPath) {
-          // run-dedup：与前一 section 同 (headingPath, headingLevel) 视为段落切分兄弟 chunk
-          // （chunker step 4 共用同一 headingPath 的产物），只由首个插标题行，后续只接正文。
-          // 与 idx===0 的 skipDuplicateTitle 去重独立生效：idx 0 被去重后，idx 1 若同
-          // headingPath 也不插标题（正确，本就是同一切分段）。
-          const prev = idx > 0 ? sections[idx - 1] : null;
-          const isSiblingParagraphChunk =
-            prev !== null &&
-            prev.headingPath === s.headingPath &&
-            prev.headingLevel === s.headingLevel;
-          if (!isSiblingParagraphChunk) {
-            const lastSegment = s.headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '';
-            const isDuplicateTitle = skipDuplicateTitle && idx === 0 && lastSegment === doc.title;
-            if (lastSegment && !isDuplicateTitle) {
-              const prefix = '#'.repeat(Math.min(s.headingLevel, 6));
-              // 空 content section 只插标题行（不追加 "\n\n"），避免 join 后产生多余空行
-              return s.content
-                ? `${prefix} ${lastSegment}\n\n${s.content}`
-                : `${prefix} ${lastSegment}`;
-            }
-          }
-        }
-        return s.content;
-      })
+      .map((s, idx) => this.renderSectionPart(s, idx, doc.title, skipDuplicateTitle))
       // 过滤被去重吞掉（isDuplicateTitle）或 level-0 且内容为空的 section 产生的空串，
       // 防止 join 拼接出多余空行；正常 section 的 content 非空，不受影响
       .filter((part) => part !== '');
     return parts.join('\n\n');
+  }
+
+  /**
+   * 渲染单个 section 为 markdown 片段（标题行插回的最小复用单元）。
+   *
+   * reconstructContent（全文重建）与 patchSection（section 级写的整篇拼接）共用本方法，
+   * 保证「标题行如何插回」只有一份实现——修改渲染规则两侧自动同步。
+   * run-dedup / 首标题去重 / 空 content 只插标题行的完整语义见 reconstructContent 方法注释。
+   *
+   * @param s 当前 section（content 不含标题行，chunker 契约）；isContinuation=true 时不插标题
+   * @param idx section 在有序列表中的下标（skipDuplicateTitle 仅作用于 idx 0）
+   * @param docTitle 文档标题（首标题去重比对用）
+   * @param skipDuplicateTitle 渲染侧首标题去重开关（全文读渲染 true；回写保真语义 false）
+   * @returns 该 section 的渲染片段（可能为空串：被去重吞掉或 level-0 空内容）
+   */
+  private renderSectionPart(
+    s: {
+      content: string;
+      headingLevel: number;
+      headingPath: string | null;
+      isContinuation?: boolean;
+    },
+    idx: number,
+    docTitle: string,
+    skipDuplicateTitle: boolean,
+  ): string {
+    if (s.headingLevel > 0 && s.headingPath && !s.isContinuation) {
+      const lastSegment = extractLastHeadingSegment(s.headingPath);
+      const isDuplicateTitle = skipDuplicateTitle && idx === 0 && lastSegment === docTitle;
+      if (lastSegment && !isDuplicateTitle) {
+        const prefix = '#'.repeat(Math.min(s.headingLevel, 6));
+        // 空 content section 只插标题行（不追加 "\n\n"），避免 join 后产生多余空行
+        return s.content ? `${prefix} ${lastSegment}\n\n${s.content}` : `${prefix} ${lastSegment}`;
+      }
+    }
+    return s.content;
   }
 
   /**
@@ -844,6 +995,9 @@ export class DocService {
    * - position (from URL param) takes priority if both provided
    * - sectionId is NOT accepted (unstable contract, see plan §1.1-13)
    * - 404 DOC_NOT_FOUND if doc or section not found
+   * - 返回值带 markdown：保真渲染片段（renderSectionPart skipDuplicateTitle=false 口径：
+   *   标题行插回 + run-dedup + 空正文只插标题行）——该节在 full=true 全文中的**字节级子串**，
+   *   可直接作 patch_doc MATCH 模式 oldString / section 模式 content 参照面
    */
   async getSection(
     docId: string,
@@ -884,9 +1038,341 @@ export class DocService {
       position: section.position,
       headingPath: section.headingPath,
       headingLevel: section.headingLevel,
+      isContinuation: section.isContinuation,
       content: section.content,
       tokenEstimate: section.tokenEstimate,
+      sectionHash: this.computeSectionHash(section),
+      // 保真渲染片段（与全文重建同款渲染规则，idx 仅 skipDuplicateTitle=true 有意义，此处恒 false）
+      markdown: this.renderSectionPart(section, section.position, doc.title, false),
     };
+  }
+
+  /**
+   * 批量读取多个 section（v1.55，与单节 getSection 同口径的 position 语义）。
+   *
+   * 场景：outline 后一次拿多个目标节，N 节一次往返（原 N 次）。
+   *
+   * **部分失败友好契约**（批量场景核心决策）：
+   * - 越界/不存在的 position **不整体报错**，单独列入 `missing`——批量请求里一个
+   *   陈旧 position（文档结构漂移）不应让其余节的读取一起失败；
+   * - 重复 position 去重（每个 position 至多返回一次）；
+   * - 结果 sections 按 position ASC（与 outline 顺序一致，便于调用方顺序消费）。
+   *
+   * 格式层错误（非整数/负数/超限/混用单节定位参数）在 Controller 层 400 拦截
+   * （铁律 #21 层 1），本方法只做业务存在性判定（层 2）。
+   *
+   * @param docId 目标文档 ID（不存在/软删 → 404 DOC_NOT_FOUND，findById）
+   * @param positions 0-based position 列表（与 outline/getSection 同口径）
+   * @returns {docId, docPath, sections（命中节，position ASC）, missing（去重升序）}
+   *   sections 每项带 markdown：保真渲染片段（与 getSection.markdown 同口径——该节在
+   *   full=true 全文中的**字节级子串**，oldString / section 模式 content 参照面；
+   *   run-dedup 由每个 section 的 isContinuation 持久化事实决定，不依赖请求上下文）
+   */
+  async getSections(docId: string, positions: number[]): Promise<DocBatchSectionsResult> {
+    const doc = await this.findById(docId);
+
+    // 全量 section（position ASC）一次拉齐，Node 侧按 position 命中——
+    // 批量场景逐 position 发 SQL 会 N+1，全量单查 + Map 命中最优（文档 section
+    // 规模有限，chunker 切分下无超大 section 表）
+    const sections = await this.sectionRepo
+      .createQueryBuilder('s')
+      .where('s.doc_id = :docId', { docId })
+      .orderBy('s.position', 'ASC')
+      .getMany();
+    const byPosition = new Map(sections.map((s) => [s.position, s]));
+    // 去重（Set 保序后升序重排——响应契约：position ASC）
+    const uniquePositions = [...new Set(positions)].sort((a, b) => a - b);
+
+    const found: DocSectionItem[] = [];
+    const missing: number[] = [];
+    for (const p of uniquePositions) {
+      const section = byPosition.get(p);
+      if (section) {
+        found.push({
+          position: section.position,
+          headingPath: section.headingPath,
+          headingLevel: section.headingLevel,
+          isContinuation: section.isContinuation,
+          content: section.content,
+          tokenEstimate: section.tokenEstimate,
+          sectionHash: this.computeSectionHash(section),
+          // 保真渲染片段（与全文重建同款渲染规则）
+          markdown: this.renderSectionPart(section, section.position, doc.title, false),
+        });
+      } else {
+        missing.push(p);
+      }
+    }
+
+    return { docId: doc.id, docPath: doc.path, sections: found, missing };
+  }
+
+  /**
+   * headingQuery 模糊定位单节（v1.55）：对 outline headingPath 做大小写不敏感子串匹配。
+   *
+   * 场景：Agent 凭 route/记忆里不完整的 heading 片段定位节，免去「先 outline 抄精确
+   * headingPath 再读节」的往返。
+   *
+   * **命中语义**（本方法拍板）：
+   * - 唯一命中 → 返回该节（与 getSection 同形 DocSectionContent）；
+   * - 多命中 → 409 RESOURCE_CONFLICT + data.candidates [{position, headingPath}]——
+   *   绝不静默挑选（同名子标题在不同章节下可重复，静默选错节比报错更危险），
+   *   候选透出 position 供调用方改用精确定位；
+   * - 零命中 → 404 DOC_NOT_FOUND（与 getSection 锚点缺失语义一致），message 提示
+   *   走 GET /docs/:id 拿 outline 核对 headingPath。
+   *
+   * 匹配实现：ILIKE '%<escaped>%'——LIKE 通配符（\ % _）逐字符转义保证字面子串语义
+   * （findAll pathPrefix 同款先例）；NULL headingPath（headingLevel 0 文首段）不命中。
+   *
+   * @param docId 目标文档 ID（不存在/软删 → 404，findById）
+   * @param headingQuery 非空子串（空串/全空白由 Controller 层拦在模糊通道之外）
+   * 唯一命中返回值带 markdown（与 getSection 同口径：renderSectionPart skipDuplicateTitle=false
+   * 保真渲染片段 = 该节在 full=true 全文中的**字节级子串**，oldString / section content 参照面）
+   */
+  async getSectionByHeadingQuery(docId: string, headingQuery: string): Promise<DocSectionContent> {
+    const doc = await this.findById(docId);
+
+    // LIKE 元字符转义（ESCAPE '\'）：用户输入中的 \ % _ 按字面量匹配
+    const escaped = headingQuery.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    const matches = await this.sectionRepo
+      .createQueryBuilder('s')
+      .where('s.doc_id = :docId', { docId })
+      .andWhere("s.heading_path ILIKE :pattern ESCAPE '\\'", { pattern: `%${escaped}%` })
+      .orderBy('s.position', 'ASC')
+      .getMany();
+
+    if (matches.length === 0) {
+      throw new NotFoundException({
+        message: `No section headingPath contains "${headingQuery}"; fetch the outline via GET /docs/:id to check available headingPaths`,
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    }
+
+    if (matches.length > 1) {
+      // 多命中歧义：409 + 候选列表（candidates 经 AllExceptionsFilter 的 data 槽透传）
+      throw new ConflictException({
+        message: `headingQuery "${headingQuery}" matches ${matches.length} sections; retry with an exact position or headingPath`,
+        code: ErrorCode.RESOURCE_CONFLICT,
+        data: {
+          candidates: matches.map((m) => ({ position: m.position, headingPath: m.headingPath })),
+        },
+      });
+    }
+
+    const section = matches[0];
+    return {
+      docId: doc.id,
+      docPath: doc.path,
+      position: section.position,
+      headingPath: section.headingPath,
+      headingLevel: section.headingLevel,
+      isContinuation: section.isContinuation,
+      content: section.content,
+      tokenEstimate: section.tokenEstimate,
+      sectionHash: this.computeSectionHash(section),
+      // 保真渲染片段（与全文重建同款渲染规则）
+      markdown: this.renderSectionPart(section, section.position, doc.title, false),
+    };
+  }
+
+  /**
+   * Section 级写：替换指定 position 的整节（v1.55，与 getSection 读侧对称）。
+   *
+   * **content 契约（含标题行，勿传裸正文）**：替换范围覆盖该 section 的**整节**——
+   * 标题行 + 正文（chunker 把标题存进 headingPath/headingLevel，section.content 不含
+   * 标题行；本方法替换的是该节在全文中的完整渲染片段）。因此 content 必须是与
+   * read_doc section 模式 / GET /docs/:id/content?full=true 同形的渲染结果：
+   * `## 标题\n\n正文...`。想保留原标题就在 content 里带上原标题行；传空串 = 删除该节。
+   *
+   * **管线复用**：替换后把整篇（其余 section 按 renderSectionPart 保真渲染 + 目标节
+   * 换成新 content）交给 this.upsert 重跑 chunk/重建管线——sections 重建、outline /
+   * position / contentHash / tokenEstimate / linkHealth 全部一致刷新，审计 / DOC_UPDATED
+   * 事件 / route health 异步重检 / source 隔离 / unchanged 短路全部继承 upsert 语义，
+   * 不新写第二套重建逻辑。title/summary 透传现存值，避免整篇回写冲掉策展元数据。
+   *
+   * **并发与 position 漂移**：本操作语义 = 文档粒度的 read-modify-write。fail-closed
+   * 改造后，写路径携带内部乐观锁（expectedContentHash = 读取时的 doc.contentHash，
+   * 在 upsert 事务内 FOR UPDATE 锁行复核）——读取→写入之间文档被并发改动 → 409
+   * DOC_CONTENT_CONFLICT 而非静默覆盖；expectedSectionHash 携带时再叠加目标节锚点
+   * 比对（事务外快速失败 + 文档级事务内复核兜底）。patch 改变文档结构（新 content
+   * 引入/删除标题）后，其余节的 position 会漂移，调用方持有的旧 position/outline
+   * 需重新 GET /docs/:id 刷新后再用。
+   *
+   * **错误语义**：文档不存在 → 404 DOC_NOT_FOUND（findById）；position 未落在实际
+   * section 范围内 → 404 DOC_NOT_FOUND（与 getSection 的锚点缺失语义一致；负数等格式
+   * 错误在 Controller 层 400 VALIDATION_ERROR 拦截，铁律 #21）；expectedSectionHash
+   * 与目标节当前 hash 不符 → 409 DOC_CONTENT_CONFLICT（data.sectionCount 提示重拉
+   * outline）；source 与文档 source 不符 → 409 DOC_SOURCE_MISMATCH（upsert 隔离检查
+   * 继承）；读写在并发窗口内被抢改 → 409 DOC_CONTENT_CONFLICT（事务内复核）。
+   *
+   * @param docId 目标文档 ID
+   * @param position 目标 section 的 0-based position（与 getSection/outline 同口径）
+   * @param content 替换该整节的新渲染片段（含标题行；空串 = 删除该节）
+   * @param source 请求方 source 标识（native 缺省；非 native 文档须携带匹配 source）
+   * @param actor 操作者（审计用）
+   * @param expectedSectionHash 可选前提校验：调用方读取时抄下的目标节 sectionHash
+   *   （getSection/getSections 返回值），不符 → 409 fail-closed，防止 stale position
+   *   在 re-chunk 漂移后写错块（Hument 事故 6dbc4da3）
+   * @returns upsert 结果 {id, path, sectionCount, tokenEstimate, unchanged?, contentHash}
+   */
+  async patchSection(
+    docId: string,
+    position: number,
+    content: string,
+    source: string,
+    actor?: UnifiedActor,
+    expectedSectionHash?: string,
+  ): Promise<UpsertDocResult> {
+    const doc = await this.findById(docId);
+
+    // 全量 section（position ASC）：拼接整篇与越界判断都需要有序全量。
+    // 与 getContent 同款查询（doc_id + position ASC），走实体 hydration。
+    const sections = await this.sectionRepo
+      .createQueryBuilder('s')
+      .where('s.doc_id = :docId', { docId: docId })
+      .orderBy('s.position', 'ASC')
+      .getMany();
+
+    // 越界判断（铁律 #21 层 2 业务存在性）：position 必须命中实际存在的 section。
+    // 负数由 Controller 层格式校验先行拦截，此处 <0 判断是对 Service 直调的防御兜底。
+    if (!Number.isInteger(position) || position < 0 || position >= sections.length) {
+      throw new NotFoundException({
+        message: `Section position ${position} out of range (document has ${sections.length} sections, valid range 0-${Math.max(sections.length - 1, 0)})`,
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    }
+
+    // expectedSectionHash 前提校验（fail-closed，事务外快速失败路径）：目标节锚点哈希
+    // 与调用方读取时抄下的值不符 = 节已漂移/被改（stale position 写错块的事故形态），
+    // 409 + data.sectionCount 提示重拉 outline。权威并发兜底 = 下方 upsert 携带的
+    // expectedContentHash 事务内复核（sections 只由 upsert 重建管线写入，doc.contentHash
+    // 不变 ⟺ sections 未重建，文档级哈希比对即可覆盖节级并发漂移）。
+    if (expectedSectionHash !== undefined) {
+      const currentHash = this.computeSectionHash(sections[position]);
+      if (currentHash !== expectedSectionHash) {
+        throw new ConflictException({
+          message:
+            `expectedSectionHash mismatch for position ${position}: the section changed since ` +
+            `the caller's read (stale position/anchor); re-fetch the outline and retry ` +
+            `(current sectionCount=${sections.length})`,
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { sectionCount: sections.length },
+        });
+      }
+    }
+
+    // 逐节渲染（skipDuplicateTitle=false：与 web full=true 通道一致的完整保真语义，
+    // 保证拼回的整篇可安全回写不丢首标题），把目标节片段替换为新 content 后拼回整篇。
+    // 注意替换发生在 filter 前的原始 parts 上（下标与 section position 一一对应）。
+    const rawParts = sections.map((s, idx) => this.renderSectionPart(s, idx, doc.title, false));
+    rawParts[position] = content;
+    const fullContent = rawParts.filter((part) => part !== '').join('\n\n');
+
+    // 复用 upsert 重建管线（title/summary 透传现存值；source 透传供隔离检查）。
+    // expectedContentHash = 本次读取时的 doc.contentHash → TOCTOU 加固：读取 sections
+    // 与 upsert 事务写入之间的并发改动在事务内 FOR UPDATE 复核时 409 回滚（fail-closed），
+    // 不再静默互相覆盖。unchanged 幂等短路不受影响（hash 相符且内容未变 → 正常早退）。
+    return this.upsert(
+      doc.spaceId,
+      {
+        path: doc.path,
+        content: fullContent,
+        title: doc.title,
+        summary: doc.summary ?? undefined,
+        source,
+        // 内部乐观锁（TOCTOU 加固）：doc.contentHash 为 null 的远古文档无哈希可比对，
+        // 退化为无前提（无法加固的既有数据形态，不阻塞写）
+        expectedContentHash: doc.contentHash ?? undefined,
+      },
+      actor,
+    );
+  }
+
+  /**
+   * Match 模式文档写：全文精确串替换（fail-closed 改造新增，与 patchSection 并列的
+   * 第二种写模式——patch_doc 工具的 match 通道 / PATCH /docs/:id/content 端点）。
+   *
+   * **操作面钉死 = full=true 保真全文**（架构评审）：与 getContent(id, full=true)
+   * 同款全文（renderSectionPart + skipDuplicateTitle=false + '\n\n' join）——
+   * 与读侧 full=true 通道逐字节同形。web 渲染默认版（full=false）会去掉与 title
+   * 同名的首标题行，调用方拿错通道构造 oldString 会零命中。
+   *
+   * **命中语义（fail-closed，绝不静默）**：
+   * - 0 命中 → 404 DOC_NOT_FOUND（提示先读全文核对 oldString）；
+   * - >1 命中 → 409 RESOURCE_CONFLICT + data.matchCount（提示扩大 oldString 上下文
+   *   后重试——与 headingQuery 多命中「绝不静默挑选」同款哲学）；
+   * - 恰好 1 命中 → 替换后复用 upsert 重建管线。
+   *
+   * **TOCTOU 加固**：与 patchSection 同款——upsert 携带 expectedContentHash =
+   * 读取时的 doc.contentHash，事务内 FOR UPDATE 锁行复核；「计数时 1 处、写入时
+   * 已变」的并发窗口在事务内被文档级哈希比对 409 回滚（内容不变 ⟹ 计数不变，
+   * 哈希复核蕴含计数复核，无需独立闭包）。
+   *
+   * @param docId 目标文档 ID（不存在/软删 → 404 DOC_NOT_FOUND，findById）
+   * @param oldString 待替换的精确子串（空串在 DTO 层 400 拦截；此处不重复校验）
+   * @param newString 替换内容（可为空串 = 删除该片段；函数式 replacer 防 $ 模式被解释）
+   * @param source 请求方 source 标识（native 缺省；非 native 文档须携带匹配 source）
+   * @param actor 操作者（审计用）
+   * @returns upsert 结果 {id, path, sectionCount, tokenEstimate, unchanged?, contentHash}
+   */
+  async patchByMatch(
+    docId: string,
+    oldString: string,
+    newString: string,
+    source: string,
+    actor?: UnifiedActor,
+  ): Promise<UpsertDocResult> {
+    const doc = await this.findById(docId);
+
+    // 操作面 = getContent(id, full=true) 同款全文（见方法 doc 注释「操作面钉死」）
+    const sections = await this.sectionRepo
+      .createQueryBuilder('s')
+      .where('s.doc_id = :docId', { docId: doc.id })
+      .orderBy('s.position', 'ASC')
+      .getMany();
+    const fullContent = this.reconstructContent(doc, sections, false);
+
+    // 精确子串计数（split 段数 - 1 = 命中次数）
+    const matchCount = fullContent.split(oldString).length - 1;
+
+    if (matchCount === 0) {
+      throw new NotFoundException({
+        message:
+          `oldString not found in the document's full content (0 matches); ` +
+          `re-read the full content (GET /docs/:id/content?full=true or read_doc) and retry`,
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    }
+
+    if (matchCount > 1) {
+      // 多命中歧义：409 + matchCount（绝不静默替换某一处——与 headingQuery 多命中同款契约）
+      throw new ConflictException({
+        message:
+          `oldString matches ${matchCount} locations in the document; ` +
+          `expand oldString with more surrounding context to make it unique and retry`,
+        code: ErrorCode.RESOURCE_CONFLICT,
+        data: { matchCount },
+      });
+    }
+
+    // 唯一命中：函数式 replacer（newString 中的 $&/$1 等模式按字面量处理，不被解释）
+    const newContent = fullContent.replace(oldString, () => newString);
+
+    // 复用 upsert 重建管线 + 内部乐观锁（见方法 doc 注释「TOCTOU 加固」）
+    return this.upsert(
+      doc.spaceId,
+      {
+        path: doc.path,
+        content: newContent,
+        title: doc.title,
+        summary: doc.summary ?? undefined,
+        source,
+        // 内部乐观锁（TOCTOU 加固）：doc.contentHash 为 null 的远古文档无哈希可比对，
+        // 退化为无前提（无法加固的既有数据形态，不阻塞写）
+        expectedContentHash: doc.contentHash ?? undefined,
+      },
+      actor,
+    );
   }
 
   /**
@@ -993,7 +1479,7 @@ export class DocService {
       // matches the upsert-time original-content semantics.
       const sections = await this.sectionRepo
         .createQueryBuilder('s')
-        .select(['s.content', 's.headingLevel', 's.headingPath'])
+        .select(['s.content', 's.headingLevel', 's.headingPath', 's.isContinuation'])
         .where('s.doc_id = :docId', { docId: doc.id })
         .orderBy('s.position', 'ASC')
         .getMany();

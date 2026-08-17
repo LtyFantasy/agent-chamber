@@ -215,6 +215,14 @@ interface AcpSession {
    * 会话级内存态：重启/resume 后为空 → 优雅降级为现状（缺省不补），非回归
    */
   toolMeta: Map<string, { title?: unknown; kind?: unknown }>;
+  /**
+   * thinking activity 边沿抑制标志（1.54.0，Board 3c3d9577）：
+   * true = 当前已处于 thinking 相位（turn 开始 chamber 由 status busy 推导，或本段
+   * 思考已上报过），thought chunk 不再重复上行；message_chunk 到达时重置为 false
+   * （相位转 replying，重新武装）——仅「输出中 → 再思考」边沿上行一次 activity
+   * 事件，防逐 chunk 高频放大（thought chunk 与 message_chunk 同频）。
+   */
+  thinkingNotified: boolean;
 }
 
 /** AcpDriver 构造选项 */
@@ -313,6 +321,10 @@ export class AcpDriver implements SeatDriver {
     }
     session.busy = true;
     session.streamedText = '';
+    // turn 开始 = thinking 相位（chamber 由下方 status busy 推导）——置 true 抑制
+    // 本 turn 首批 thought chunk 的冗余 activity 上行；首个 message_chunk 到达后
+    // 重新武装（见 handleNotification）
+    session.thinkingNotified = true;
     // 新一轮 turn：复位优雅取消标志 + 清残留超时句柄（上一轮 cancel 已终结；
     // R2：cancel 后 agent 自然 end_turn 时兜底超时器必须已清，不得误杀）
     session.cancelling = false;
@@ -529,6 +541,7 @@ export class AcpDriver implements SeatDriver {
       dead: false,
       configSnapshot: {},
       toolMeta: new Map(),
+      thinkingNotified: true,
     };
     child.stderr?.on('data', (d: Buffer) => {
       // agent 诊断日志透传（不污染协议观察；acp-poc 同款模式）
@@ -695,9 +708,25 @@ export class AcpDriver implements SeatDriver {
           if (content?.type === 'text' && typeof content.text === 'string') {
             // 流式增量：累积全文（沉默判定用）+ 事件上行
             session.streamedText += content.text;
+            // 相位转 replying：重新武装 thinking 边沿（后续 thought chunk 到达时
+            // 上行一次 activity，实现「输出中 → 再思考」presence 翻转）
+            session.thinkingNotified = false;
             this.emit({ type: 'message_chunk', seatId: session.config.seatId, text: content.text });
             return;
           }
+        } else if (kind === 'agent_thought_chunk') {
+          // 思考内容按 §8b 屏蔽不上 topic；但 chunk 到达本身是 liveness 信号——
+          // 边沿触发上行一次轻量 activity（只带类型不带内容），chamber 据此举
+          // presence 回 thinking。非边沿（连续思考/turn 首批）仅记日志。
+          if (!session.thinkingNotified) {
+            session.thinkingNotified = true;
+            this.emit({ type: 'activity', seatId: session.config.seatId, activity: 'thinking' });
+          } else {
+            this.logger.debug(
+              'session/update kind=agent_thought_chunk (suppressed, already thinking)',
+            );
+          }
+          return;
         } else if (kind === 'tool_call' || kind === 'tool_response') {
           // 工具调用可观测（M2 过程折叠视图数据源；字段未冻结，宽松透传——RT-PERM-2：
           // 工具元数据（toolCallId/title/kind/status/locations/rawInput）挂在 update
@@ -725,7 +754,7 @@ export class AcpDriver implements SeatDriver {
           });
           return;
         }
-        // 其他 update（agent_thought_chunk 等）：M1 只记日志
+        // 其余未识别 update：只记日志（agent_thought_chunk 已有专属分支，见上）
         this.logger.debug(`session/update kind=${kind} (ignored)`);
         return;
       }

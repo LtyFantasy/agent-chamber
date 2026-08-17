@@ -83,4 +83,18 @@ export class UpsertDocDto {
   // docs.source_sha 列为 varchar(64)，超长必须在 DTO 层 400，禁止透传 PG 22001 → 500（铁律 21）
   @MaxLength(64)
   sourceSha?: string;
+
+  @ApiPropertyOptional({
+    description:
+      '可选乐观锁前提（fail-closed 改造）：调用方读取/上次写入时拿到的 contentHash ' +
+      '（upsert 响应携 contentHash，链式写免重读）。文档不存在或当前 hash 不符 → ' +
+      '409 DOC_CONTENT_CONFLICT（事务内 FOR UPDATE 复核）；hash 相符且内容未变 → ' +
+      'unchanged 正常返回（不算冲突）。缺省 = 现状行为（无前提校验）。',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  // sha256 hex 定长 64；超长 = 格式错误，DTO 层 400（铁律 21）
+  @MaxLength(64)
+  expectedContentHash?: string;
 }

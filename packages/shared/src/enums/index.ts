@@ -259,6 +259,8 @@ export enum ErrorCode {
   DOC_ROUTE_INVALID_CODE_ENTRY = 10007,
   /** 404 — doc_routes 目标路由不存在 */
   DOC_ROUTE_NOT_FOUND = 10008,
+  /** 409 — 文档写前提校验失败（stale expectedContentHash / expectedSectionHash，调用方须重读后重试） */
+  DOC_CONTENT_CONFLICT = 10009,
 
   // Roundtable (11000-11099)
   /** 404 — 审批请求不存在（裁决/查询目标缺失） */

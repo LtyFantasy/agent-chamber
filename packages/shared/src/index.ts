@@ -19,3 +19,4 @@ export * from './dto/dashboard-response.dto';
 export * from './dto/audit-response.dto';
 export * from './dto/docspace.dto';
 export * from './dto/docspace-response.dto';
+export * from './dto/system-overview.dto';

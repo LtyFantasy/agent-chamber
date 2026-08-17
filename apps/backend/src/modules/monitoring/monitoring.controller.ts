@@ -38,6 +38,19 @@ import { ApiLogQueryDto } from './dto/api-log-query.dto';
 export class MonitoringController {
   constructor(private readonly monitoringService: MonitoringService) {}
 
+  @Get('overview')
+  @ApiOperation({
+    summary: 'System overview',
+    description:
+      'Read-only operational overview aggregated from existing tables (runners / seats / events / webhooks); no instrumentation; admin only',
+  })
+  @ApiResponse({ status: 200, description: 'System overview (SystemOverview DTO)' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Insufficient permissions; admin role required' })
+  async getOverview() {
+    return this.monitoringService.getOverview();
+  }
+
   @Get('api-logs')
   @ApiOperation({
     summary: 'List API call logs',

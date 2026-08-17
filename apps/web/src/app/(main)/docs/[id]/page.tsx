@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslations } from 'next-intl';
-import { Visibility } from '@agent-chamber/shared';
+import { Visibility, extractLastHeadingSegment } from '@agent-chamber/shared';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Link from 'next/link';
@@ -95,14 +95,24 @@ function DocTreeItem({
   );
 }
 
-/** 滚动到正文内指定标题（按标题文本匹配，headingPath 取 § 分隔的末段） */
+/**
+ * 去除标题中的行内代码记号，匹配 React Markdown 的 textContent。
+ *
+ * React Markdown 渲染后 textContent 不包含反引号，但 headingPath 保留原始 Markdown。
+ */
+function normalizeHeadingText(text: string): string {
+  return text.replace(/`([^`]*)`/g, '$1').trim();
+}
+
+/** 滚动到正文内指定标题（headingPath 末段由 shared helper 提取） */
 function scrollToHeading(container: HTMLElement | null, headingPath: string | null | undefined) {
   if (!container || !headingPath) return;
-  const lastSegment = headingPath.split('§').pop()?.trim();
+  const lastSegment = extractLastHeadingSegment(headingPath);
   if (!lastSegment) return;
+  const normalizedLastSegment = normalizeHeadingText(lastSegment);
   const headings = container.querySelectorAll('h1, h2, h3, h4, h5, h6');
   for (const el of Array.from(headings)) {
-    if (el.textContent?.trim() === lastSegment) {
+    if (normalizeHeadingText(el.textContent ?? '') === normalizedLastSegment) {
       el.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
@@ -179,9 +189,9 @@ export default function DocSpaceDetailPage() {
   /** 文档列表（左栏分类树；搜索态不用它） */
   const { data: docsData } = useQuery({
     queryKey: ['docs', 'docs', spaceId, typeFilter, tagFilter],
+    // listAllDocs 循环翻页拉全：单页 pageSize:100 在 >100 篇文档的空间静默丢尾部（对齐 agents.listAll 评审 M-e）
     queryFn: () =>
-      Api.docs.listDocs(spaceId, {
-        pageSize: 100,
+      Api.docs.listAllDocs(spaceId, {
         type: typeFilter || undefined,
         tag: tagFilter || undefined,
       }),
@@ -191,7 +201,7 @@ export default function DocSpaceDetailPage() {
   /** 过滤候选专用全量列表（不带 type/tag——否则选中过滤后下拉只剩被筛文档的标签，反直觉） */
   const { data: facetDocsData } = useQuery({
     queryKey: ['docs', 'doc-facets', spaceId],
-    queryFn: () => Api.docs.listDocs(spaceId, { pageSize: 100 }),
+    queryFn: () => Api.docs.listAllDocs(spaceId),
     enabled: !!spaceId,
   });
 
@@ -252,8 +262,8 @@ export default function DocSpaceDetailPage() {
   const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
 
   // ── 派生数据 ────────────────────────────────────
-  /** useMemo 包裹避免 ?? [] 每次渲染产生新数组、污染下游 memo 依赖 */
-  const docs = useMemo<DocSummary[]>(() => docsData?.items ?? [], [docsData]);
+  /** useMemo 包裹避免 ?? [] 每次渲染产生新数组、污染下游 memo 依赖（listAllDocs 直接返回数组） */
+  const docs = useMemo<DocSummary[]>(() => docsData ?? [], [docsData]);
   const categories = space?.categories ?? [];
   const members = space?.members ?? [];
 
@@ -273,8 +283,8 @@ export default function DocSpaceDetailPage() {
   const isOwnerLike =
     !!user && (user.role === 'admin' || isCreatorOrOwner(space?.creatorId, user.id, myAgentIds));
 
-  /** type / tag 候选（从「未过滤」全量列表聚合，开放字符串无硬编码枚举） */
-  const facetDocs = useMemo<DocSummary[]>(() => facetDocsData?.items ?? [], [facetDocsData]);
+  /** type / tag 候选（从「未过滤」全量列表聚合，开放字符串无硬编码枚举；listAllDocs 直接返回数组） */
+  const facetDocs = useMemo<DocSummary[]>(() => facetDocsData ?? [], [facetDocsData]);
   const typeOptions = useMemo(
     () =>
       Array.from(new Set(facetDocs.map((d) => d.docType).filter((v): v is string => !!v))).sort(),
@@ -292,7 +302,8 @@ export default function DocSpaceDetailPage() {
    * - 相对 .md path → resolveDocPath 命中后 SPA 跳 /docs/<spaceId>?doc=<id>；未命中按断链样式渲染（琥珀虚线，呼应右栏 linkHealth 警告）
    * - 纯 #锚点 / 非 .md 相对路径 → 默认渲染不干预
    * 解析映射用「未过滤」的 facetDocs，避免左栏 type/tag 过滤激活时误判断链。
-   * 注意 v1 列表上限 pageSize=100：超过 100 篇的空间可能误判为断链（与 linkHealth 后端全量集合的差异，暂接受）。
+   * facetDocs 经 listAllDocs 循环翻页拉全（对齐 agents.listAll 评审 M-e）：>100 篇的空间
+   * 不再截断，断链判定与后端 linkHealth 全量集合对齐。
    * 跨文档 #锚点不做滚动定位：markdown 锚点 slug 与 headingPath 文本匹配规则不同构，落地不可靠。
    */
   const docPathToId = useMemo(() => new Map(facetDocs.map((d) => [d.path, d.id])), [facetDocs]);
@@ -728,7 +739,9 @@ export default function DocSpaceDetailPage() {
                 title={section.headingPath ?? undefined}
               >
                 {/* 目录只显示末段标题（面包屑全路径留在 tooltip），否则每项都被父级标题刷屏 */}
-                {section.headingPath?.split('§').pop()?.trim() || t('doc.noOutline')}
+                {section.headingPath
+                  ? extractLastHeadingSegment(section.headingPath) || t('doc.noOutline')
+                  : t('doc.noOutline')}
               </button>
             ))}
           </nav>

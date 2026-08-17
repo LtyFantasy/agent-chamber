@@ -53,22 +53,34 @@ import type {
   DocSpaceMemberDto,
   DocCategoryDto,
   DocSummary,
+  DocSummarySlim,
   DocSpaceOverview,
+  DocSpaceOverviewSlim,
   DocCategoryOverview,
+  DocCategoryOverviewSlim,
+  DocRouteNav,
   DocSpaceOverviewFilter,
   DocSpaceOverviewAppliedFilters,
-  DocRoute as DocRouteDto,
   RepoManifest,
   PaginatedResponse,
 } from '@agent-chamber/shared';
 import { DocOverviewQueryDto } from './dto';
-import { toDocRouteDto } from './doc-route.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 
 /** Overview token cap (~20000, v1.41 图例化升格). When exceeded, docs are truncated and `truncated: true` is set. */
 const OVERVIEW_TOKEN_CAP = 20000;
+
+/**
+ * Overview routes 段内嵌条数上限（v1.55 防爆，任务 T2）。
+ *
+ * 背景：最重租户已达 191 条路由 × 400~600 字符 ≈ 80~110KB，曾把 overview 整体
+ * ~100K 响应顶到截断，冷启动 Agent 看不到尾部路由组。routes 按 sortOrder ASC
+ * 策展序排列，前 50 条即最高优先级路由；尾部全量获取走分页端点
+ * GET /doc-spaces/:id/routes 或 list_doc_routes 工具（overview 只做导航门面）。
+ */
+const OVERVIEW_ROUTES_LIMIT = 50;
 
 /**
  * CJK 感知 token 估算（与 markdown-chunker 公式一致）：CJK 字符逐字计 1 token，
@@ -104,10 +116,74 @@ function brokenCountOf(doc: Doc): number | undefined {
  * 无 health（NULL = 尚未检查）或 issues 非数组（脏数据防御，对齐 B4 jsonb 防御惯例）
  * → undefined（省略该键）。语义区分：1 = 该路由有 issue（issues.length>0），
  * 0 = 已检查且健康，undefined = 未检查——与 brokenCountOf 的「无数据 ≠ 零问题」同款。
+ * T5：pattern 型（codeEntryType='pattern'）豁免路由的 health 为
+ * { issues: [], codeEntryStatus:'exempt', ... }——issues 为空 → 计 0，天然不参与
+ * totalBrokenRoutes（豁免语义由 route-health 单测 + e2e 集成覆盖）。
  */
 function brokenRouteCountOf(route: DocRoute): number | undefined {
   const issues = (route.health as { issues?: unknown } | null)?.issues;
   return Array.isArray(issues) ? (issues.length > 0 ? 1 : 0) : undefined;
+}
+
+/**
+ * Overview 文档条目投影（v1.56 slim）：
+ * - slim=true → 只保留地图导航字段 {path,title,summary,docType,tokenEstimate}
+ *   （大空间瘦身，摘要是条目 token 大头；其余元数据走 read_doc/list_docs 全字段通道）
+ * - slim=false（缺省）→ 全字段 DocSummary（向后兼容，行为不变）
+ * category 分组结构由调用方保持，本函数只管条目形状。
+ */
+function toOverviewDocItem(doc: Doc, slim: boolean): DocSummary | DocSummarySlim {
+  if (slim) {
+    return {
+      path: doc.path,
+      title: doc.title,
+      summary: doc.summary,
+      docType: doc.docType,
+      tokenEstimate: doc.tokenEstimate,
+    };
+  }
+  return {
+    id: doc.id,
+    spaceId: doc.spaceId,
+    categoryId: doc.categoryId,
+    path: doc.path,
+    title: doc.title,
+    summary: doc.summary,
+    docType: doc.docType,
+    tags: doc.tags,
+    source: doc.source,
+    sourceSha: doc.sourceSha,
+    brokenLinkCount: brokenCountOf(doc),
+    sectionCount: doc.sectionCount,
+    tokenEstimate: doc.tokenEstimate,
+    createdBy: doc.createdBy,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+}
+
+/**
+ * Overview 内嵌路由导航投影（v1.56）：每条只保留「导航够用」的字段
+ * {intent,category,primaryDocId,primaryHeadingPath,codeEntry,health.codeEntryStatus}，
+ * 其余（id/sortOrder/secondary 字段/codeEntryType/health 明细/时间戳）一律省略——
+ * 全字段走 GET /doc-spaces/:id/routes 或 list_doc_routes 工具（overview 只做导航门面）。
+ * 这是默认行为（slim 与否同为导航投影，需求方认可的取舍：导航语义无需 secondary/
+ * 管理字段，且 routes 段本就截断前 50 条）。
+ * health 语义：null = 未检（原样保留）；已检 → 只透 codeEntryStatus（codeEntry 可用性
+ * 指示，无 status 时序列化为 {}——与 null 的「未检」区分）；issues/checkedAt/note 省略。
+ */
+function toDocRouteNav(route: DocRoute): DocRouteNav {
+  return {
+    intent: route.intent,
+    category: route.category,
+    primaryDocId: route.primaryDocId,
+    primaryHeadingPath: route.primaryHeadingPath,
+    codeEntry: route.codeEntry,
+    health:
+      route.health === null || route.health === undefined
+        ? null
+        : { codeEntryStatus: route.health.codeEntryStatus },
+  };
 }
 
 /**
@@ -1086,17 +1162,30 @@ export class DocSpaceService {
    * （markdown 空间图例，始终全量不截断）；legendTokenEstimate 单列图例 token，
    * 不参与 maxTokens 文档条目预算竞争；totalTokenEstimate = 图例 + 文档条目合计（仅信息回显）。
    *
-   * v1.42 B5 意图路由内嵌：includeRoutes 缺省 true 时返回空间全量 doc_routes（按
+   * v1.42 B5 意图路由内嵌：includeRoutes 缺省 true 时内嵌 doc_routes（按
    * sortOrder+createdAt ASC），与图例同待遇——不占 maxTokens 文档条目预算；
    * routesTokenEstimate 用 estimateTokens 对序列化 routes 单列记账并计入 totalTokenEstimate；
-   * truncated 语义不变（只管文档条目）。显式 includeRoutes=false 时省略 routes/routesTokenEstimate。
+   * truncated 语义不变（只管文档条目）。显式 includeRoutes=false 时省略 routes 相关全部字段。
+   *
+   * v1.55 routes 段防爆：内嵌最多前 OVERVIEW_ROUTES_LIMIT（=50）条策展序路由，
+   * routesTruncated/routesTotal 透出截断状态与全量条数；totalBrokenRoutes 仍按全量统计。
+   *
+   * v1.56 slim 瘦身：slim=true 时每条 doc 只返回导航字段
+   * {path,title,summary,docType,tokenEstimate}（category 分组结构不变，返回
+   * DocSpaceOverviewSlim 形状）；routes 内嵌段恒为导航投影（toDocRouteNav，默认行为
+   * 变更，全字段走 list_doc_routes）。缺省 slim=false 全字段不变（向后兼容）。
    */
-  async getOverview(spaceId: string, query?: DocOverviewQueryDto): Promise<DocSpaceOverview> {
+  async getOverview(
+    spaceId: string,
+    query?: DocOverviewQueryDto,
+  ): Promise<DocSpaceOverview | DocSpaceOverviewSlim> {
     const space = await this.findById(spaceId);
 
     const filters = resolveOverviewFilters(space, query);
     const { types, excludeTypes, categories, excludeCategories, tag, pathPrefix } = filters;
     const maxTokens = filters.maxTokens;
+    // slim 投影（v1.56）：显式 'true' 才生效，缺省/‘false’ = 全字段（向后兼容）
+    const slim = query?.slim === true;
     // 缺省内嵌图例（v1.41）：显式 false 才省略（对齐 applySpaceDefaults 的"缺省 true"语义）
     const includeDescription = query?.includeDescription !== false;
     // 缺省内嵌意图路由（v1.42 B5）：显式 false 才省略（与 includeDescription 同惯例）
@@ -1161,7 +1250,7 @@ export class DocSpaceService {
     let totalTokenEstimate = 0;
     let truncated = false;
 
-    const categoryOverviews: DocCategoryOverview[] = [];
+    const categoryOverviews: (DocCategoryOverview | DocCategoryOverviewSlim)[] = [];
 
     // 分类输出：白名单命中分类保留（未命中整体省略）；黑名单命中分类整体隐藏（含其文档）。
     // 两维度对称——include 保留命中分类，exclude 剔除命中分类
@@ -1169,31 +1258,15 @@ export class DocSpaceService {
       if (whiteCategoryIds && !whiteCategoryIds.has(cat.id)) continue;
       if (blackCategoryIds && blackCategoryIds.has(cat.id)) continue;
       const catDocs = docMap.get(cat.id) || [];
-      const docItems: DocSummary[] = [];
+      // 条目形状随 slim 参数（slim=true → DocSummarySlim，缺省 → DocSummary 全字段）
+      const docItems: (DocSummary | DocSummarySlim)[] = [];
       for (const doc of catDocs) {
         if (totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
           truncated = true;
           break;
         }
         totalTokenEstimate += overviewEntryTokens(doc);
-        docItems.push({
-          id: doc.id,
-          spaceId: doc.spaceId,
-          categoryId: doc.categoryId,
-          path: doc.path,
-          title: doc.title,
-          summary: doc.summary,
-          docType: doc.docType,
-          tags: doc.tags,
-          source: doc.source,
-          sourceSha: doc.sourceSha,
-          brokenLinkCount: brokenCountOf(doc),
-          sectionCount: doc.sectionCount,
-          tokenEstimate: doc.tokenEstimate,
-          createdBy: doc.createdBy,
-          createdAt: doc.createdAt,
-          updatedAt: doc.updatedAt,
-        });
+        docItems.push(toOverviewDocItem(doc, slim));
       }
       if (truncated) break;
 
@@ -1211,7 +1284,7 @@ export class DocSpaceService {
     }
 
     // Uncategorized docs（传 category 白名单时省略该段——未分类文档不属于任何被选分类）
-    const uncategorized: DocSummary[] = [];
+    const uncategorized: (DocSummary | DocSummarySlim)[] = [];
     if (!categories) {
       const uncategorizedDocs = docMap.get(null) || [];
       for (const doc of uncategorizedDocs) {
@@ -1220,24 +1293,7 @@ export class DocSpaceService {
           break;
         }
         totalTokenEstimate += overviewEntryTokens(doc);
-        uncategorized.push({
-          id: doc.id,
-          spaceId: doc.spaceId,
-          categoryId: doc.categoryId,
-          path: doc.path,
-          title: doc.title,
-          summary: doc.summary,
-          docType: doc.docType,
-          tags: doc.tags,
-          source: doc.source,
-          sourceSha: doc.sourceSha,
-          brokenLinkCount: brokenCountOf(doc),
-          sectionCount: doc.sectionCount,
-          tokenEstimate: doc.tokenEstimate,
-          createdBy: doc.createdBy,
-          createdAt: doc.createdAt,
-          updatedAt: doc.updatedAt,
-        });
+        uncategorized.push(toOverviewDocItem(doc, slim));
       }
     }
 
@@ -1259,21 +1315,33 @@ export class DocSpaceService {
     const legendTokenEstimate =
       includeDescription && space.description ? estimateTokens(space.description) : undefined;
 
-    // 意图路由（v1.42 B5）：includeRoutes 缺省 true → 空间全量返回（同一 find，与图例同待遇，
+    // 意图路由（v1.42 B5）：includeRoutes 缺省 true → 内嵌返回（同一 find，与图例同待遇，
     // 不占 maxTokens 文档条目预算）；routesTokenEstimate 对序列化 routes 单列记账并计入 totalTokenEstimate。
-    let routes: DocRouteDto[] | undefined;
+    // v1.55 防爆截断：最多内嵌策展序前 OVERVIEW_ROUTES_LIMIT（=50）条，routesTruncated/routesTotal
+    // 标记透出全量规模，把"是否拉全"的选择权交给调用方（全量走分页端点/list_doc_routes 工具）。
+    // v1.56 导航投影：每条裁到 toDocRouteNav 字段集（默认行为，slim 与否一致）——
+    // 全字段获取走 list_doc_routes，overview 只做导航门面。
+    let routes: DocRouteNav[] | undefined;
     let routesTokenEstimate: number | undefined;
+    let routesTruncated: boolean | undefined;
+    let routesTotal: number | undefined;
     // 路由健康汇总（v1.42 批次 C1）：与 totalBrokenLinks 同款装配模式——有任一路由已检
     // （health 非 NULL 且 issues 为数组）时返回"broken 路由数"（issues.length>0 的计数和，
     // 0 也返回），全部未检则省略。includeRoutes=false 时同步省略（无 routes 可统计）。
+    // 统计口径为空间全量路由（不受展示层截断影响——健康是空间级指标）。
     let totalBrokenRoutes: number | undefined;
     if (includeRoutes) {
       const routeRows = await this.routeRepo.find({
         where: { spaceId },
         order: { sortOrder: 'ASC', createdAt: 'ASC' },
       });
-      routes = routeRows.map(toDocRouteDto);
-      // 序列化 routes 的 token 估算（CJK 感知同款公式）；空集合成本为 0——
+      routesTotal = routeRows.length;
+      routesTruncated = routeRows.length > OVERVIEW_ROUTES_LIMIT;
+      // 截断只影响内嵌展示：取策展序（sortOrder ASC → createdAt ASC）前 N 条
+      const visibleRows = routesTruncated ? routeRows.slice(0, OVERVIEW_ROUTES_LIMIT) : routeRows;
+      routes = visibleRows.map(toDocRouteNav);
+      // 序列化 routes 的 token 估算（CJK 感知同款公式，按截断后实际返回内容记账——
+      // 语义 = 本响应消耗的 token）；空集合成本为 0——
       // 保持 v1.41 既有契约"空 overview totalTokenEstimate=0"不变（'[]' 的 1 token 属实现噪声）。
       routesTokenEstimate = routes.length > 0 ? estimateTokens(JSON.stringify(routes)) : 0;
 
@@ -1295,7 +1363,9 @@ export class DocSpaceService {
       ...(legendTokenEstimate !== undefined
         ? { spaceDescription: space.description, legendTokenEstimate }
         : {}),
-      ...(routes !== undefined ? { routes, routesTokenEstimate } : {}),
+      ...(routes !== undefined
+        ? { routes, routesTokenEstimate, routesTruncated, routesTotal }
+        : {}),
       ...(totalBrokenRoutes !== undefined ? { totalBrokenRoutes } : {}),
       categories: categoryOverviews,
       uncategorized,
@@ -1308,6 +1378,8 @@ export class DocSpaceService {
       ...(Object.keys(filters.appliedFilters).length > 0
         ? { appliedFilters: filters.appliedFilters }
         : {}),
-    };
+      // 条目形状由 slim 参数决定且同一响应内一致（categories/uncategorized 同为 slim 或同为全字段），
+      // 内部以联合类型装配避免双分支重复代码，此处收窄到联合返回类型
+    } as DocSpaceOverview | DocSpaceOverviewSlim;
   }
 }

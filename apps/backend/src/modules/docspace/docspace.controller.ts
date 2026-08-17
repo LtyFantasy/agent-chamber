@@ -40,12 +40,14 @@ import {
   Query,
   UseGuards,
   ParseUUIDPipe,
+  ParseBoolPipe,
   ForbiddenException,
   BadRequestException,
   HttpCode,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { DocSpaceService } from './docspace.service';
+import { DocBundleService } from './doc-bundle.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { BoardService } from '../board/board.service';
@@ -63,6 +65,7 @@ import {
   TransferCreatorDto,
   DocOverviewQueryDto,
   RepoManifestDto,
+  ImportDocBundleDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { DocSpace } from '../../database/entities/doc-space.entity';
@@ -73,6 +76,7 @@ import { ErrorCode, UserRole } from '@agent-chamber/shared';
 export class DocSpaceController {
   constructor(
     private readonly docSpaceService: DocSpaceService,
+    private readonly docBundleService: DocBundleService,
     private readonly boardService: BoardService,
     private readonly permService: PermissionService,
     private readonly ownerProxy: OwnerProxyService,
@@ -460,7 +464,11 @@ export class DocSpaceController {
       'separately as legendTokenEstimate and do not consume the maxTokens budget (pass includeDescription=false to omit). ' +
       'Configurable filters (v1.38): type/excludeType/category/excludeCategory (comma-separated, include+exclude = ' +
       'include-then-exclude intersection), tag, pathPrefix, applySpaceDefaults=false ignores space-level default ' +
-      'filters (settings.overviewFilter). Response echoes the effective filters as `appliedFilters`.',
+      'filters (settings.overviewFilter). Response echoes the effective filters as `appliedFilters`. ' +
+      'Large-space slimming (v1.56): slim=true projects each doc to {path,title,summary,docType,tokenEstimate} ' +
+      '(category grouping preserved); embedded routes are always navigation-projected ' +
+      '(intent/category/primaryDocId/primaryHeadingPath/codeEntry/health.codeEntryStatus — full fields via ' +
+      'GET /doc-spaces/:id/routes).',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Overview returned successfully' })
@@ -472,5 +480,72 @@ export class DocSpaceController {
     const space = await this.docSpaceService.findById(id);
     await this.permService.ensureCan(space, actor, 'read');
     return this.docSpaceService.getOverview(id, query);
+  }
+
+  // ─── 空间级全量导出 / 回导（任务 T6）────────────────────────
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get(':id/export')
+  @ApiOperation({
+    summary: 'Export a DocSpace as a full bundle (formatVersion 1)',
+    description:
+      'Space-level full export: single JSON bundle containing curated metadata AND full doc ' +
+      'content — space meta (name/description/visibility/settings), categories, intent routes ' +
+      '(docs referenced by path, incl. codeEntryType), and every doc with its verbatim markdown ' +
+      'content plus summary/docType/tags/category. Purpose: version-alignment snapshots + ' +
+      'offline backup (pull into git, diff across releases). ' +
+      'Permission: same as overview (space read). ' +
+      'NOTE: large spaces produce large responses (docs carry full content, no pagination) — ' +
+      'this is by design; snapshot integrity is the priority. The output is directly consumable ' +
+      'by POST /doc-spaces/:id/import-bundle (roundtrip).',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Export bundle returned successfully' })
+  async exportBundle(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+    const space = await this.docSpaceService.findById(id);
+    await this.permService.ensureCan(space, actor, 'read');
+    return this.docBundleService.exportBundle(id);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post(':id/import-bundle')
+  // 回导是"把 bundle 应用到既有空间"的更新语义（非新建资源），200 而非 POST 默认 201
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Import a DocSpace export bundle (formatVersion 1)',
+    description:
+      'Restore a bundle produced by GET /doc-spaces/:id/export. Four ordered phases: ' +
+      '① categories (idempotent by name) → ② docs (per-doc independent transaction via the ' +
+      'batch-upsert pipeline; a single failing doc does not abort the batch) → ' +
+      '③ routes (idempotent by intent + primaryDocPath, write-time validation reused) → ' +
+      '④ space meta, which is SKIPPED unless overwriteSpaceMeta=true (explicit opt-in to avoid ' +
+      'clobbering the target space curation). ' +
+      'formatVersion mismatch → 400 VALIDATION_ERROR. Re-importing the same bundle is fully ' +
+      'idempotent (no duplicate rows). Requires space write permission.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'overwriteSpaceMeta',
+    required: false,
+    description:
+      'When true, also overwrite target space name/description/settings from the bundle ' +
+      '(default false — space meta is never written implicitly).',
+    type: Boolean,
+  })
+  @ApiResponse({ status: 200, description: 'Bundle imported; per-item statuses returned' })
+  @ApiResponse({
+    status: 400,
+    description: 'formatVersion not supported (VALIDATION_ERROR) or bundle shape invalid',
+  })
+  async importBundle(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ImportDocBundleDto,
+    @CurrentActor() actor: UnifiedActor,
+    @Query('overwriteSpaceMeta', new ParseBoolPipe({ optional: true }))
+    overwriteSpaceMeta?: boolean,
+  ) {
+    const space = await this.docSpaceService.findById(id);
+    await this.permService.ensureCan(space, actor, 'write');
+    return this.docBundleService.importBundle(id, dto, actor, overwriteSpaceMeta === true);
   }
 }

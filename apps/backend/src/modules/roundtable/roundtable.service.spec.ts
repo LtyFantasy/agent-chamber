@@ -18,7 +18,12 @@ import {
 } from '@nestjs/common';
 import { EventType, ActorType, ErrorCode, MessageType, UserRole } from '@agent-chamber/shared';
 import { In, Not } from 'typeorm';
-import { buildEnvelope, type Envelope, type InjectBody } from '@agent-chamber/roundtable-protocol';
+import {
+  buildEnvelope,
+  type Envelope,
+  type InjectBody,
+  type InjectPayload,
+} from '@agent-chamber/roundtable-protocol';
 import { RoundtableService, ALL_WAKE_COOLDOWN_MS, type SeatPresence } from './roundtable.service';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import { RoundtableRunner } from '../../database/entities/roundtable-runner.entity';
@@ -99,6 +104,18 @@ const HUMAN_ADMIN_ACTOR: UnifiedActor = {
 
 /** 系统 actor 哨兵 id（与 service 内 SYSTEM_ACTOR_ID 同值，公告断言用） */
 const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * 构造最小合法 PendingInject（注入埋点用例用；buildEnvelope 不校验 payload 结构，
+ * 仅信封级语义，故 payload 形状从简）
+ */
+function makePendingInject(seq: number, messageIds: string[] = ['msg-1']) {
+  return {
+    seq,
+    payload: { ruleHeader: '', body: { batch: { messages: [] } } } as unknown as InjectPayload,
+    messageIds,
+  };
+}
 
 /** 构造审批请求行（M3 阶段 1 默认 pending；options 为 ACP 三选项形状 {optionId, kind, label}） */
 function makePermissionRequest(overrides: Partial<RoundtablePermissionRequest> = {}) {
@@ -322,9 +339,99 @@ describe('RoundtableService', () => {
       content: 'hello',
     });
     // 落库：last_inject_seq=1 + state.recentInjects ring（cap 100）
+    // injectedAt（1.54.0 埋点批）为后端发出时刻 ISO 字符串；存量旧条目无此字段，
+    // 聚合端（monitoring computeInjectionStats）null-skip——故此处断言存在且为 ISO
     expect(seat.lastInjectSeq).toBe('1');
-    expect(seat.state.recentInjects).toEqual([{ seq: 1, messageIds: ['msg-1'] }]);
+    expect(seat.state.recentInjects).toEqual([
+      { seq: 1, messageIds: ['msg-1'], injectedAt: expect.any(String) },
+    ]);
     expect(seatRepo.save).toHaveBeenCalled();
+  });
+
+  // ───────────────────── 注入埋点（1.54.0，0c567f8b）─────────────────────
+  // ring.injectedAt / injectRetryCount / injectFailCount 三处埋点 + bumpInjectCounter 自吞。
+
+  it('persistDispatch 成功后 ring 新条目含 injectedAt（合法 ISO 字符串）且 lastInjectSeq 推进', async () => {
+    const seat = makeSeat();
+    seatRepo.find.mockResolvedValue([seat]); // 注入触发器按 label 匹配座位
+    seatRepo.findOne.mockResolvedValue(seat);
+    seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
+
+    await service.onMessageCreated(makeEvent()); // 直通：派发成功 → persistDispatch
+
+    expect(seat.lastInjectSeq).toBe('1');
+    const entry = seat.state.recentInjects[0];
+    expect(entry).toMatchObject({ seq: 1, messageIds: ['msg-1'] });
+    // injectedAt 必须是可解析的 ISO 字符串（monitoring 端 Date.parse 消费，坏值会污染样本）
+    expect(typeof entry.injectedAt).toBe('string');
+    expect(new Date(entry.injectedAt as string).toISOString()).toBe(entry.injectedAt);
+    // 埋点不应改变既有落库行为：save 照常被调
+    expect(seatRepo.save).toHaveBeenCalled();
+  });
+
+  it('flushPending runner 离线（sendToRunner=false）→ injectRetryCount +1 且队头保留', async () => {
+    const seat = makeSeat();
+    seatRepo.findOne.mockResolvedValue(seat);
+    seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
+    registry.sendToRunner.mockReturnValue(false); // 离线：发送失败
+    service['flights'].set('seat-1', {
+      busy: false,
+      queue: [makePendingInject(1)],
+    });
+
+    await service.flushPending('seat-1');
+
+    expect(registry.sendToRunner).toHaveBeenCalledTimes(1);
+    // 埋点：每次发送失败累计 injectRetryCount（state jsonb 计数器）
+    expect(seat.state.injectRetryCount).toBe(1);
+    // 队头保留（等重连 flush 重试），busy 不置位
+    expect(service['flights'].get('seat-1')?.queue).toHaveLength(1);
+    expect(service['flights'].get('seat-1')?.busy).toBe(false);
+  });
+
+  it('flushPending 座位存在但未绑 runner → injectFailCount +1 且队头出队', async () => {
+    const seat = makeSeat({ runnerId: null }); // 解绑（座位还在）
+    seatRepo.findOne.mockResolvedValue(seat);
+    seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
+    service['flights'].set('seat-1', {
+      busy: false,
+      queue: [makePendingInject(1)],
+    });
+
+    await service.flushPending('seat-1');
+
+    // 不可派发 → 累计 injectFailCount（座位已删才无处计数，仅日志）
+    expect(seat.state.injectFailCount).toBe(1);
+    expect(registry.sendToRunner).not.toHaveBeenCalled();
+    // 丢弃分支：队头出队
+    expect(service['flights'].get('seat-1')?.queue).toHaveLength(0);
+  });
+
+  it('persistDispatch 落库失败 → injectFailCount +1（bump 成功）且不再抛出', async () => {
+    const seat = makeSeat();
+    seatRepo.findOne.mockResolvedValue(seat);
+    // 第一次 save = persistDispatch 落库失败；第二次 save = bumpInjectCounter 落库成功
+    seatRepo.save.mockRejectedValueOnce(new Error('db down')).mockResolvedValueOnce(seat);
+    service['flights'].set('seat-1', {
+      busy: false,
+      queue: [makePendingInject(1)],
+    });
+
+    // 落库失败不阻断已发送的注入：flushPending 正常返回，不向上抛
+    await expect(service.flushPending('seat-1')).resolves.toBeUndefined();
+    // 埋点：catch 分支先 bump injectFailCount 再记日志
+    expect(seat.state.injectFailCount).toBe(1);
+    expect(seatRepo.save).toHaveBeenCalledTimes(2);
+  });
+
+  it('bumpInjectCounter 自身落库失败自吞（不抛出、不递归重试）', async () => {
+    const seat = makeSeat();
+    seatRepo.save.mockRejectedValue(new Error('db down'));
+
+    await expect(service['bumpInjectCounter'](seat, 'injectRetryCount')).resolves.toBeUndefined();
+    // 内存侧计数仍推进（下次 bump 会再试）；save 只尝试一次（无递归）
+    expect(seat.state.injectRetryCount).toBe(1);
+    expect(seatRepo.save).toHaveBeenCalledTimes(1);
   });
 
   it('座位发言投影：name=座位 label，coordinator 取座位标记（身份模型 §6）', async () => {
@@ -669,10 +776,10 @@ describe('RoundtableService', () => {
         '2026-08-07T12:00:30.000Z',
         '2026-08-07T12:01:00.000Z',
       ]);
-      // 一次派发 = 一条 ring 条目（多条 messageIds，重放按批重建）
+      // 一次派发 = 一条 ring 条目（多条 messageIds，重放按批重建）；injectedAt 同直通用例
       expect(seat.lastInjectSeq).toBe('1');
       expect(seat.state.recentInjects).toEqual([
-        { seq: 1, messageIds: ['msg-1', 'msg-2', 'msg-3'] },
+        { seq: 1, messageIds: ['msg-1', 'msg-2', 'msg-3'], injectedAt: expect.any(String) },
       ]);
     });
 
@@ -3958,6 +4065,16 @@ describe('RoundtableService', () => {
       expect((await presenceAfter(2, { type: 'message_complete', stopReason: 'end' }))?.phase).toBe(
         'idle',
       );
+    });
+
+    it('activity thinking → thinking（1.54.0 R4 补边：replying → 再思考 翻转）', async () => {
+      // replying 相位下收到 thought 边沿信号 → 回 thinking；游标照常推进（seq 递增）
+      expect((await presenceAfter(1, { type: 'message_chunk', text: '先说一段' }))?.phase).toBe(
+        'replying',
+      );
+      const p = await presenceAfter(2, { type: 'activity', activity: 'thinking' });
+      expect(p?.phase).toBe('thinking');
+      expect(p?.toolTitle).toBeUndefined(); // 非 tool 相位不带工具标题
     });
 
     it('silent 轮 message_complete → idle（沉默不是相位，💤 由 idle+上轮 silent 在 web 推导）', async () => {

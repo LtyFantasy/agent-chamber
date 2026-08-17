@@ -101,7 +101,15 @@ export const searchDocsTool: CustomTool = {
       'Resolves spaceName via three-layer match. ' +
       'Returns top-k hits projected to {docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}. ' +
       'boosts: {route: "primary"|"secondary", taskLinks} explains why a hit ranked high. ' +
-      'docId + position are preserved for read_doc follow-up.',
+      'Hits are SECTION-level: multiple sections of the same doc occupy separate hit rows — ' +
+      'when you need "which docs are relevant" or page exhaustively, dedupe by docId (consumer\'s job). ' +
+      'docId + position are preserved for read_doc follow-up. ' +
+      'Pagination: offset (skip N hits) pairs with limit for exhaustive retrieval. ' +
+      'Time window: createdAfter/createdBefore (ISO 8601, inclusive) filter docs.created_at; ' +
+      'combine with sort="createdAt_desc"/"createdAt_asc" to order by creation time ' +
+      '(time sort takes over ranking — boost fusion is skipped, score stays raw composite). ' +
+      'Example "read diaries of the last 7 days": q="日记", type="memory", ' +
+      'sort="createdAt_desc", createdAfter=<now minus 7 days ISO>, limit=20.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -129,6 +137,30 @@ export const searchDocsTool: CustomTool = {
           type: 'integer',
           description: 'Max hits (1-20, default 5)',
         },
+        offset: {
+          type: 'integer',
+          description:
+            'Optional: pagination offset — number of hits to skip (default 0). ' +
+            'Pages over SECTION hits, not docs (same doc may appear on multiple rows — dedupe by docId). ' +
+            'Pair with limit to page through all matches exhaustively.',
+        },
+        sort: {
+          type: 'string',
+          enum: ['relevance', 'createdAt_desc', 'createdAt_asc'],
+          description:
+            'Optional: sort mode (default "relevance" = dual-scoring + boost fusion). ' +
+            '"createdAt_desc"/"createdAt_asc" order by doc creation time and skip boost fusion. ' +
+            'Use with createdAfter/createdBefore for time-window queries (e.g. recent diaries).',
+        },
+        createdAfter: {
+          type: 'string',
+          description:
+            'Optional: only docs created at/after this ISO 8601 time (inclusive), e.g. "2026-08-08T00:00:00.000Z"',
+        },
+        createdBefore: {
+          type: 'string',
+          description: 'Optional: only docs created at/before this ISO 8601 time (inclusive)',
+        },
       },
       required: ['spaceName', 'q'],
     },
@@ -141,6 +173,11 @@ export const searchDocsTool: CustomTool = {
     const tag = args.tag as string | undefined;
     const category = args.category as string | undefined;
     const limit = (args.limit as number) ?? 5;
+    // v1.55 翻页/时间序参数：仅在调用方显式传入时透传（缺省保持后端默认行为）
+    const offset = args.offset as number | undefined;
+    const sort = args.sort as string | undefined;
+    const createdAfter = args.createdAfter as string | undefined;
+    const createdBefore = args.createdBefore as string | undefined;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
     // 步骤 1：解析 spaceName
@@ -205,6 +242,10 @@ export const searchDocsTool: CustomTool = {
     if (docType) params.type = docType;
     if (tag) params.tag = tag;
     if (category) params.category = category;
+    if (offset !== undefined) params.offset = offset;
+    if (sort !== undefined) params.sort = sort;
+    if (createdAfter !== undefined) params.createdAfter = createdAfter;
+    if (createdBefore !== undefined) params.createdBefore = createdBefore;
 
     try {
       const hits = await client.request<unknown[]>('GET', `/doc-spaces/${spaceId}/search`, {

@@ -28,6 +28,11 @@ export class SseService implements OnModuleDestroy {
     });
   }
 
+  /** 当前活跃 SSE 连接数（瞬时值，监控 overview 的 sse gauge 用；1.54.0 埋点批） */
+  getActiveConnections(): number {
+    return this.clients;
+  }
+
   onModuleDestroy() {
     this.subject.complete();
   }

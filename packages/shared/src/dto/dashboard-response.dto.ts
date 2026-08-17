@@ -18,6 +18,10 @@ export interface DashboardStats {
   totalMessages: number;
   /** 看板总数 */
   totalBoards: number;
+  /** 全部看板上的任务总数（Board 冗余列 task_count 聚合，不回扫 tasks 表） */
+  boardTaskCount: number;
+  /** 全部看板上已完成任务数（Board 冗余列 completed_task_count 聚合） */
+  boardCompletedTaskCount: number;
   /** 文档空间总数（软删除不计入） */
   docSpaceCount: number;
   /** 文档总数（软删除不计入） */

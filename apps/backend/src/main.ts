@@ -8,10 +8,12 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   // bodyParser: false + 手动注册：body-parser 默认 limit 仅 100kb，
   // DocSpace ingest（scripts/sync-docs.mjs）整文推送 docs/ 大文档（api-definition.md 等
-  // 单文件 >100kb）会触发 PayloadTooLargeError。放宽到 5mb 覆盖文档同步场景。
+  // 单文件 >100kb）会触发 PayloadTooLargeError。放宽到 10mb：覆盖文档同步 +
+  // v1.55 import-bundle 空间回导（export bundle 随空间增长，agent-core 147 篇已 3.4MB）；
+  // 生产 nginx 侧 client_max_body_size 需同步放宽（scripts/nginx/agent-chamber.conf）。
   const app = await NestFactory.create(AppModule, { bodyParser: false });
-  app.use(json({ limit: '5mb' }));
-  app.use(urlencoded({ extended: true, limit: '5mb' }));
+  app.use(json({ limit: '10mb' }));
+  app.use(urlencoded({ extended: true, limit: '10mb' }));
 
   // CORS：默认 origin:true（全放行，行为不变）；生产可设 CORS_ORIGINS 逗号分隔白名单收紧。
   // 当前 Bearer header 鉴权风险本就可控，此项为前置收紧（见 .env.example 模板）。

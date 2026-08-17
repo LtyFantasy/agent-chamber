@@ -47,6 +47,13 @@ describe('DashboardController (e2e)', () => {
     mockRepos.Task.count.mockResolvedValueOnce(20).mockResolvedValueOnce(15);
     mockRepos.Message.count.mockResolvedValueOnce(100);
     mockRepos.Board.count.mockResolvedValueOnce(4);
+    // Board 冗余列 SUM 聚合（PG SUM 返回字符串，service 端 parseInt）
+    const boardQb = {
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      getRawOne: jest.fn().mockResolvedValue({ boardTaskCount: '25', boardCompletedTaskCount: '10' }),
+    };
+    mockRepos.Board.createQueryBuilder.mockReturnValue(boardQb as any);
 
     return request(app.getHttpServer())
       .get('/dashboard/stats')
@@ -63,6 +70,8 @@ describe('DashboardController (e2e)', () => {
           completedTasks: 15,
           totalMessages: 100,
           totalBoards: 4,
+          boardTaskCount: 25,
+          boardCompletedTaskCount: 10,
         });
       });
   });

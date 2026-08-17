@@ -18,13 +18,13 @@
  */
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocService } from './doc.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { CreateDocRouteDto, UpdateDocRouteDto } from './dto';
-import { DocRoute as DocRouteDto, ErrorCode } from '@agent-chamber/shared';
+import { DocRouteCodeEntryType, ErrorCode, PaginatedResponse } from '@agent-chamber/shared';
 
 /**
  * codeEntry 格式校验（铁律 #21 业务校验层）：
@@ -36,6 +36,26 @@ import { DocRoute as DocRouteDto, ErrorCode } from '@agent-chamber/shared';
  * （codeEntry 是否真实存在于仓库）缓行批次 C（需新增 manifest 写通道）。
  */
 const CODE_ENTRY_MAX_LENGTH = 512;
+
+/**
+ * 传统全量模式（不传 page/pageSize）的兜底上限：防空间路由数病态增长时
+ * 单次响应体过大（191 条 × 400~600 字符 ≈ 80~110KB 已是现实量级）。
+ * 超限静默截断——需要全量时走分页模式（page/pageSize）逐页拉取。
+ */
+const ROUTES_LEGACY_LIMIT = 1000;
+
+/**
+ * GET /doc-spaces/:id/routes 过滤参数（v1.55 列表增强）
+ *
+ * q = intent 模糊匹配（ILIKE）；category = 精确匹配。
+ * 全量模式与分页模式共用同一套过滤语义。
+ */
+export interface DocRouteListFilters {
+  /** intent 模糊匹配关键词（ILIKE，大小写不敏感） */
+  q?: string;
+  /** 路由分组精确匹配 */
+  category?: string;
+}
 
 /**
  * doc_routes 意图路由 Service（v1.42 批次 B5）
@@ -74,14 +94,82 @@ export class DocRouteService {
   }
 
   /**
-   * 空间全量路由（GET /doc-spaces/:id/routes）。
+   * 空间全量路由（GET /doc-spaces/:id/routes 传统模式，v1.55 增强）。
+   *
    * 排序：sortOrder ASC → createdAt ASC（策展顺序稳定，同权重先建先出）。
+   * 过滤（可选）：q = intent ILIKE 模糊匹配；category = 精确匹配。
+   *
+   * 向后兼容契约：不带过滤时保持 v1.42 原始实现（routeRepo.find 直查），
+   * 带过滤时走 queryBuilder（find options 表达不了 ILIKE）。
+   * 两路都受 ROUTES_LEGACY_LIMIT 兜底保护（未超限原样返回，超限静默截断）。
    */
-  async findAll(spaceId: string): Promise<DocRoute[]> {
-    return this.routeRepo.find({
-      where: { spaceId },
-      order: { sortOrder: 'ASC', createdAt: 'ASC' },
-    });
+  async findAll(spaceId: string, filters: DocRouteListFilters = {}): Promise<DocRoute[]> {
+    const rows =
+      filters.q || filters.category
+        ? await this.buildFilteredQuery(spaceId, filters).getMany()
+        : await this.routeRepo.find({
+            where: { spaceId },
+            order: { sortOrder: 'ASC', createdAt: 'ASC' },
+          });
+    // 兜底截断只在真正超限时改变返回值（未超限原数组引用透传，行为零漂移）
+    return rows.length > ROUTES_LEGACY_LIMIT ? rows.slice(0, ROUTES_LEGACY_LIMIT) : rows;
+  }
+
+  /**
+   * 空间路由分页查询（GET /doc-spaces/:id/routes?page=&pageSize=，v1.55 增强）。
+   *
+   * 返回标准 PaginatedResponse 信封（与 docs 列表同款，shared D6 契约）；
+   * 过滤语义与 findAll 完全一致（q ILIKE / category 精确），排序同款。
+   * page/pageSize 的格式边界由 QueryDocRouteDto 在 Controller 层校验（铁律 #21），
+   * 此处不再重复防御。
+   */
+  async findPaged(
+    spaceId: string,
+    filters: DocRouteListFilters,
+    page: number,
+    pageSize: number,
+  ): Promise<PaginatedResponse<DocRoute>> {
+    const [items, total] = await this.buildFilteredQuery(spaceId, filters)
+      .skip((page - 1) * pageSize)
+      .take(pageSize)
+      .getManyAndCount();
+
+    const totalPages = Math.ceil(total / pageSize);
+    return {
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages,
+      hasNext: page < totalPages,
+      hasPrev: page > 1,
+    };
+  }
+
+  /**
+   * 组装带过滤的路由查询（findAll/findPaged 共用）：
+   * spaceId 必选 + q（intent ILIKE）/ category（精确）可选，
+   * 排序统一 sortOrder ASC → createdAt ASC。
+   */
+  private buildFilteredQuery(
+    spaceId: string,
+    filters: DocRouteListFilters,
+  ): SelectQueryBuilder<DocRoute> {
+    const qb = this.routeRepo
+      .createQueryBuilder('r')
+      .where('r.space_id = :spaceId', { spaceId })
+      .orderBy('r.sort_order', 'ASC')
+      .addOrderBy('r.created_at', 'ASC');
+
+    // intent 模糊匹配（ILIKE 大小写不敏感；% 包裹 = 包含语义，对齐 docs 列表 q 惯例）
+    if (filters.q) {
+      qb.andWhere('r.intent ILIKE :q', { q: `%${filters.q}%` });
+    }
+    // 分组精确匹配（category 是策展枚举值，模糊匹配无语义价值）
+    if (filters.category) {
+      qb.andWhere('r.category = :category', { category: filters.category });
+    }
+    return qb;
   }
 
   /** 创建路由：写时校验通过后落库，createdBy=actor.id。 */
@@ -97,6 +185,7 @@ export class DocRouteService {
       secondaryDocId: dto.secondaryDocId ?? null,
       secondaryHeadingPath: dto.secondaryHeadingPath ?? null,
       codeEntry: dto.codeEntry ?? null,
+      codeEntryType: dto.codeEntryType ?? 'exact',
       sortOrder: dto.sortOrder ?? 0,
       createdBy: actor.id,
     });
@@ -119,7 +208,8 @@ export class DocRouteService {
       dto.primaryHeadingPath !== undefined ||
       dto.secondaryDocId !== undefined ||
       dto.secondaryHeadingPath !== undefined ||
-      dto.codeEntry !== undefined;
+      dto.codeEntry !== undefined ||
+      dto.codeEntryType !== undefined;
 
     if (refsChanged) {
       const merged = {
@@ -133,6 +223,7 @@ export class DocRouteService {
             ? dto.secondaryHeadingPath
             : route.secondaryHeadingPath,
         codeEntry: dto.codeEntry !== undefined ? dto.codeEntry : route.codeEntry,
+        codeEntryType: dto.codeEntryType !== undefined ? dto.codeEntryType : route.codeEntryType,
       };
       await this.validateRouteRefs(route.spaceId, merged);
     }
@@ -146,6 +237,7 @@ export class DocRouteService {
     if (dto.secondaryHeadingPath !== undefined)
       route.secondaryHeadingPath = dto.secondaryHeadingPath ?? null;
     if (dto.codeEntry !== undefined) route.codeEntry = dto.codeEntry ?? null;
+    if (dto.codeEntryType !== undefined) route.codeEntryType = dto.codeEntryType;
     if (dto.sortOrder !== undefined) route.sortOrder = dto.sortOrder;
 
     return this.routeRepo.save(route);
@@ -166,7 +258,9 @@ export class DocRouteService {
    * ① primary/secondary doc 存在（未软删）且属于该空间 → 400 DOC_ROUTE_DOC_NOT_FOUND；
    * ② headingPath 非空时精确命中该 doc 的 doc_sections.heading_path（exists 查询，
    *    复用 doc.service.sectionExistsByHeadingPath）→ 400 DOC_ROUTE_HEADING_UNRESOLVED；
-   * ③ codeEntry 非空时格式校验 → 400 DOC_ROUTE_INVALID_CODE_ENTRY。
+   * ③ codeEntry 非空时格式校验 → 400 DOC_ROUTE_INVALID_CODE_ENTRY；
+   * ④ codeEntryType='pattern' 必须配套非空 codeEntry（glob 模式是 codeEntry 的修饰符，
+   *    无 codeEntry 即无意义）→ 400 DOC_ROUTE_INVALID_CODE_ENTRY。
    *
    * 已知边界（plan §4-B5 明文注释）：只保证写入当下可解析；doc 后续编辑/重排致
    * headingPath 悬空属批次 C 异步校验范围，本批次不处理。
@@ -179,6 +273,7 @@ export class DocRouteService {
       secondaryDocId?: string | null;
       secondaryHeadingPath?: string | null;
       codeEntry?: string | null;
+      codeEntryType?: DocRouteCodeEntryType;
     },
   ): Promise<void> {
     // ① doc 存在性 + 空间归属（findOne 经 TypeORM 软删过滤，软删文档视同不存在）
@@ -213,9 +308,18 @@ export class DocRouteService {
       }
     }
 
-    // ③ codeEntry 格式校验（≤512、禁绝对路径、禁 `..` 段）
+    // ③ codeEntry 格式校验（≤512、禁绝对路径、禁 `..` 段）——exact/pattern 一视同仁：
+    // glob 模式同样是仓库内相对写法，禁绝对路径与穿越段
     if (refs.codeEntry) {
       this.validateCodeEntry(refs.codeEntry);
+    }
+
+    // ④ codeEntryType='pattern' 必须配套非空 codeEntry（glob 是 codeEntry 的修饰符）
+    if (refs.codeEntryType === 'pattern' && !refs.codeEntry) {
+      throw new BadRequestException({
+        message: 'codeEntryType "pattern" requires a non-empty codeEntry',
+        code: ErrorCode.DOC_ROUTE_INVALID_CODE_ENTRY,
+      });
     }
   }
 
@@ -253,24 +357,4 @@ export class DocRouteService {
       });
     }
   }
-}
-
-/** 实体 → 响应 DTO 投影（字段直拷，含 null 语义；health 原样透传——NULL = 未检） */
-export function toDocRouteDto(route: DocRoute): DocRouteDto {
-  return {
-    id: route.id,
-    spaceId: route.spaceId,
-    intent: route.intent,
-    category: route.category,
-    primaryDocId: route.primaryDocId,
-    primaryHeadingPath: route.primaryHeadingPath,
-    secondaryDocId: route.secondaryDocId,
-    secondaryHeadingPath: route.secondaryHeadingPath,
-    codeEntry: route.codeEntry,
-    health: route.health,
-    sortOrder: route.sortOrder,
-    createdBy: route.createdBy,
-    createdAt: route.createdAt,
-    updatedAt: route.updatedAt,
-  };
 }

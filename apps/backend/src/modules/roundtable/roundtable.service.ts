@@ -1480,7 +1480,9 @@ export class RoundtableService {
     const job = flight.queue[0];
     const seat = await this.seatRepo.findOne({ where: { id: seatId } });
     if (!seat || !seat.runnerId) {
-      // 座位被删/解绑：丢弃队头（防御分支；M1 无座位删除 API，理论不可达）
+      // 座位被删/解绑：丢弃队头（防御分支；M1 无座位删除 API，理论不可达）。
+      // 埋点：座位还在（仅解绑）时累计 injectFailCount；座位已删无处计数，仅日志
+      if (seat) await this.bumpInjectCounter(seat, 'injectFailCount');
       flight.queue.shift();
       this.logger.warn(`flushPending: seat ${seatId} 不可派发（缺失或未绑定），丢弃队头`);
       return;
@@ -1492,7 +1494,10 @@ export class RoundtableService {
     );
     const ok = this.registry.sendToRunner(seat.runnerId, envelope);
     if (!ok) {
-      // runner 离线：保持队头，重连后 bindSeats → reconcile → flushPending 自动重试
+      // runner 离线：保持队头，重连后 bindSeats → reconcile → flushPending 自动重试。
+      // 埋点（1.54.0，0c567f8b）：每次发送失败累计 injectRetryCount（state jsonb，
+      // 注入管线独占写）——观测「重试正在发生」的趋势，非告警信号
+      await this.bumpInjectCounter(seat, 'injectRetryCount');
       this.logger.debug(`flushPending: seat ${seatId} runner 离线，队头保留等待重连`);
       return;
     }
@@ -1502,8 +1507,26 @@ export class RoundtableService {
   }
 
   /**
+   * 注入失败/重试计数（state jsonb 计数器，与安全阀计数同规；1.54.0 埋点批）。
+   * 落库失败只记日志不递归重试（计数丢失可接受——监控看趋势不看精确值）。
+   */
+  private async bumpInjectCounter(
+    seat: RoundtableSeat,
+    key: 'injectRetryCount' | 'injectFailCount',
+  ): Promise<void> {
+    const current = typeof seat.state?.[key] === 'number' ? (seat.state[key] as number) : 0;
+    seat.state = { ...seat.state, [key]: current + 1 };
+    await this.seatRepo.save(seat).catch((err: unknown) => {
+      this.logger.error(`bumpInjectCounter: seat ${seat.id} ${key} 落库失败: ${String(err)}`);
+    });
+  }
+
+  /**
    * 落库下行游标与 ring buffer（发送成功后才调用）：
-   * last_inject_seq = seq；state.recentInjects push {seq, messageIds}，cap 100 淘汰最旧。
+   * last_inject_seq = seq；state.recentInjects push {seq, messageIds, injectedAt}，
+   * cap 100 淘汰最旧。injectedAt（1.54.0 埋点批）= 后端发出时刻，与批内消息
+   * createdAt 配对即注入延迟样本（监控聚合见 monitoring.service getOverview）；
+   * 存量旧条目无该字段，聚合端 null-skip。
    * 重放场景（hello 对账重建的原 seq ≤ 当前游标）不推进游标、不重复记录 ring——
    * 原 seq 已落过库，黑板即真相（§4）。
    * state 列由注入管线独占写（§5 config/state 分列，避免 read-modify-write 竞争）。
@@ -1514,15 +1537,24 @@ export class RoundtableService {
       return; // 重放：游标/ring 已含该 seq，只重发不重记
     }
     const ring = Array.isArray(seat.state?.recentInjects)
-      ? [...(seat.state.recentInjects as Array<{ seq: number; messageIds: string[] }>)]
+      ? [
+          ...(seat.state.recentInjects as Array<{
+            seq: number;
+            messageIds: string[];
+            /** 后端发出时刻（ISO，1.54.0 起写入；旧条目缺失） */
+            injectedAt?: string;
+          }>),
+        ]
       : [];
-    ring.push({ seq: job.seq, messageIds: job.messageIds });
+    ring.push({ seq: job.seq, messageIds: job.messageIds, injectedAt: new Date().toISOString() });
     if (ring.length > RING_BUFFER_CAP) ring.splice(0, ring.length - RING_BUFFER_CAP);
     seat.state = { ...seat.state, recentInjects: ring };
     seat.lastInjectSeq = String(job.seq);
-    await this.seatRepo.save(seat).catch((err: unknown) => {
+    await this.seatRepo.save(seat).catch(async (err: unknown) => {
       // 落库失败不阻断已发送的注入；重连对账时会按旧游标重放该条 → 可能重复一轮
-      //（极端故障窗口，M1 接受，记日志便于排障）
+      //（极端故障窗口，M1 接受，记日志便于排障）。埋点：累计 injectFailCount
+      //（bumpInjectCounter 内部自吞异常，不递归）
+      await this.bumpInjectCounter(seat, 'injectFailCount');
       this.logger.error(`persistDispatch: seat ${seat.id} seq ${job.seq} 落库失败: ${String(err)}`);
     });
   }
@@ -1904,6 +1936,16 @@ export class RoundtableService {
             at: new Date().toISOString(),
           },
         };
+        break;
+      }
+      case 'activity': {
+        // 1.54.0（Board 3c3d9577）：轻量在场信号，只带相位不带内容。目前唯一取值
+        // 'thinking' = agent_thought_chunk 到达的边沿（runner 侧边沿触发，每段思考
+        // 至多一次）——R4 映射补边「replying → thinking」（输出一段后重新思考）。
+        // 思考内容本身仍按 §8b 屏蔽，不落库不进 topic。落尾部统一推进游标（与其他
+        // 无落库分支同规，幂等去重依赖游标推进）。
+        this.setPresence(seatId, 'thinking');
+        this.logger.debug(`activity seat ${seatId} seq ${envelope.seq}: ${payload.activity}`);
         break;
       }
       case 'status': {

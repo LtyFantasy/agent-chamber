@@ -49,7 +49,10 @@ const CSV_FILTER_MAX_LENGTH = 512;
  * - per-call 显式传参逐字段覆盖空间级默认过滤（settings.overviewFilter）
  * - applySpaceDefaults=false 为逃生门：完全忽略空间级默认过滤（本次要全量）
  * - includeDescription（v1.41）：缺省 true（内嵌空间图例全文）；显式 false 省略 spaceDescription/legendTokenEstimate
- * - includeRoutes（v1.42 B5）：缺省 true（内嵌全量意图路由）；显式 false 省略 routes/routesTokenEstimate
+ * - includeRoutes（v1.42 B5）：缺省 true（内嵌意图路由导航投影，v1.55 起截断策展序前 50 条 +
+ *   routesTruncated/routesTotal 标记）；显式 false 省略 routes 相关全部字段
+ * - slim（v1.56）：缺省 false（全字段，向后兼容）；true 时每条 doc 只返回
+ *   {path,title,summary,docType,tokenEstimate}（大空间瘦身，category 分组结构不变）
  */
 export class DocOverviewQueryDto {
   @IsOptional()
@@ -153,7 +156,9 @@ export class DocOverviewQueryDto {
    * 是否内嵌意图路由（routes，v1.42 批次 B5）：query 参数均为字符串，
    * 用 @Transform 严格解析（对齐 includeDescription 的惯例）：
    * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
-   * 语义：缺省视为 true（默认内嵌全量 routes）；显式 false 时响应省略 routes/routesTokenEstimate。
+   * 语义：缺省视为 true（默认内嵌 routes）；显式 false 时响应省略 routes 相关全部字段。
+   * v1.55：内嵌 routes 截断到策展序前 50 条（routesTruncated/routesTotal 透出规模），
+   * 全量获取走 GET /doc-spaces/:id/routes 分页端点或 list_doc_routes 工具。
    */
   @IsOptional()
   @Transform(({ value }: { value: unknown }) => {
@@ -166,7 +171,9 @@ export class DocOverviewQueryDto {
   @ApiPropertyOptional({
     description:
       'Include the intent routes (doc_routes) in the response. Default true; ' +
-      "pass 'false' to omit routes/routesTokenEstimate.",
+      "pass 'false' to omit routes/routesTokenEstimate/routesTruncated/routesTotal. " +
+      'Embedded routes are capped at the first 50 (curation order) with routesTruncated/routesTotal markers; ' +
+      'use GET /doc-spaces/:id/routes (paginated) for the full set.',
     example: 'true',
   })
   includeRoutes?: boolean;
@@ -194,4 +201,30 @@ export class DocOverviewQueryDto {
     example: 'true',
   })
   applySpaceDefaults?: boolean;
+
+  /**
+   * slim 投影（v1.56，大空间瘦身）：query 参数均为字符串，
+   * 用 @Transform 严格解析（对齐 includeDescription/applySpaceDefaults 的惯例）：
+   * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：缺省视为 false（全字段，向后兼容）；显式 true 时每条 doc 只返回导航字段
+   * {path,title,summary,docType,tokenEstimate}（category 分组结构不变，routes 段
+   * 两种模式同为导航投影）。背景：147 文档+191 路由的大空间在 excludeType+includeDescription=false
+   * 下仍超 100KB 被 MCP 截断——slim 把文档条目裁到导航最小集。
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Slim projection for large spaces. Default false (full fields, backward compatible); ' +
+      "pass 'true' to project each doc to {path,title,summary,docType,tokenEstimate} only " +
+      '(category grouping is preserved).',
+    example: 'true',
+  })
+  slim?: boolean;
 }

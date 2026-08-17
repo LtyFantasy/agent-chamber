@@ -6,7 +6,9 @@
  *   - 主文档: plan §5 W5 (upsert_doc 契约)
  *   - 补充: plan §4.3 (文档写 API), plan §1.1-13 (source 隔离)
  *
- * [踩坑索引] -
+ * [踩坑索引]
+ *   - fail-closed 改造（2026-08-16）：新增 expectedContentHash 乐观锁透传——
+ *     响应用 contentHash 可链式回喂；409 DOC_CONTENT_CONFLICT = 期间被他人改动
  *
  * [铁律关联] #9(代理层透传) #11(注释强制)
  *
@@ -95,7 +97,8 @@ export const upsertDocTool: CustomTool = {
       'Upsert a document in a DocSpace by spaceName + path. ' +
       'Resolves spaceName via three-layer match. ' +
       'Source is fixed to "native" — the tool does not expose a source parameter. ' +
-      'Returns {id, path, sectionCount, tokenEstimate, unchanged?}. ' +
+      'Returns {id, path, sectionCount, tokenEstimate, unchanged?, contentHash} — ' +
+      'contentHash can be fed back as expectedContentHash on the next write (optimistic lock). ' +
       '409 DOC_SOURCE_MISMATCH is passed through as a structured error. ' +
       'Metadata authoring: you are the LLM — curate "summary" yourself instead of relying on ' +
       'auto-derivation. Write it for another agent deciding whether to read this doc: ' +
@@ -148,6 +151,14 @@ export const upsertDocTool: CustomTool = {
           items: { type: 'string' },
           description: 'Optional: 3–5 tags, identifiers/technical terms first (search anchors)',
         },
+        expectedContentHash: {
+          type: 'string',
+          description:
+            'Optional optimistic lock (fail-closed): the contentHash captured from a previous ' +
+            'read/write response (upsert responses carry contentHash — chain writes without ' +
+            're-reading). Doc missing or current hash mismatch → 409 DOC_CONTENT_CONFLICT ' +
+            '(rechecked in-transaction); re-read and retry on 409. Omit = no precondition.',
+        },
       },
       required: ['spaceName', 'path', 'content'],
     },
@@ -162,6 +173,7 @@ export const upsertDocTool: CustomTool = {
     const docType = args.docType as string | undefined;
     const category = args.category as string | undefined;
     const tags = args.tags as string[] | undefined;
+    const expectedContentHash = args.expectedContentHash as string | undefined;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
     // 步骤 1：解析 spaceName
@@ -232,6 +244,7 @@ export const upsertDocTool: CustomTool = {
     if (docType !== undefined) body.docType = docType;
     if (category !== undefined) body.category = category;
     if (tags !== undefined) body.tags = tags;
+    if (expectedContentHash !== undefined) body.expectedContentHash = expectedContentHash;
 
     try {
       const result = await client.request<Record<string, unknown>>(

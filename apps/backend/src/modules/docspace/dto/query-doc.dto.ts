@@ -1,13 +1,15 @@
-import { IsOptional, IsString, IsInt, Min, Max } from 'class-validator';
+import { IsOptional, IsString, IsInt, Min, Max, MaxLength } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 
 /**
  * 查询文档列表 DTO
  *
- * GET /doc-spaces/:id/docs?category=&tag=&type=&q=&path=&page=&pageSize=
+ * GET /doc-spaces/:id/docs?category=&tag=&type=&q=&path=&pathPrefix=&page=&pageSize=
  *
  * path= 精确匹配，与模糊 q= 互斥，同传 → 400。
+ * pathPrefix= 前缀匹配（v1.55），与 path= 互斥（同打 path 列，语义包含），同传 → 400；
+ * 可与 q= 组合（前缀限定范围 + 关键词过滤）。
  */
 export class QueryDocDto {
   @ApiPropertyOptional({ description: 'Filter by category slug' })
@@ -38,6 +40,17 @@ export class QueryDocDto {
   @IsOptional()
   @IsString()
   path?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Path prefix match (e.g. "memory/"). Mutually exclusive with path=; combinable with q=. ' +
+      'LIKE wildcards in the input are escaped (literal prefix semantics).',
+  })
+  @IsOptional()
+  @IsString()
+  // 路径最长 512，对齐 UpsertDocDto.path @MaxLength(512)
+  @MaxLength(512)
+  pathPrefix?: string;
 
   @ApiPropertyOptional({ description: 'Page number', minimum: 1, default: 1 })
   @IsOptional()

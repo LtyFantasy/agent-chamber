@@ -212,7 +212,7 @@ function validatePingPayload(payload: unknown): ValidationResult {
   return resultOf(errors);
 }
 
-/** 校验 seat.event payload（契约① SeatEvent 七 variant 透传，含 M3 阶段 5 新增 seat_info） */
+/** 校验 seat.event payload（契约① SeatEvent 八 variant 透传，含 M3 阶段 5 新增 seat_info 与 1.54.0 新增 activity） */
 function validateSeatEventPayload(payload: unknown): ValidationResult {
   if (!isPlainObject(payload)) {
     return failResult('seat.event payload 必须是普通对象');
@@ -291,6 +291,13 @@ function validateSeatEventPayload(payload: unknown): ValidationResult {
       }
       if (payload.detail !== undefined && typeof payload.detail !== 'string') {
         errors.push('status.detail 若存在必须为字符串');
+      }
+      break;
+    case 'activity':
+      // 轻量在场信号（1.54.0）：只带相位类型不带内容；目前唯一取值 'thinking'
+      // （agent_thought_chunk 到达的边沿信号，replying→thinking presence 翻转）
+      if (payload.activity !== 'thinking') {
+        errors.push(`activity.activity 必须为 'thinking'（当前唯一取值）`);
       }
       break;
     default:

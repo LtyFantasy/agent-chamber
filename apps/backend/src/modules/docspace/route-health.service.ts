@@ -55,6 +55,11 @@ function codeEntryInManifest(codeEntry: string, files: string[]): boolean {
  * value} + codeEntryStatus:'broken'。codeEntry 为空省略该键。broken 计数口径不变
  * （issues.length>0），totalBrokenRoutes 装配逻辑不受影响。
  *
+ * T5 扩展（codeEntryType 分支）：codeEntryType='pattern' 的 glob 泛化写法（如
+ * `apps/web/app/**` + `/page.tsx`）豁免精确存在性校验——health 标记
+ * codeEntryStatus:'exempt' + codeEntryNote 说明，不产 issue、绝不报 broken；
+ * 'exact'（缺省）沿用 C2 全量校验。heading 校验（①②）对两型一视同仁。
+ *
  * 触发点（三处，事件驱动无轮询，plan §2）：
  * ① DocService.upsert 内容变更分支事务提交后 setImmediate（unchanged 早退不触发）；
  * ② DocService.remove 删文 setImmediate 内追加；
@@ -132,13 +137,23 @@ export class RouteHealthService {
         }
       }
 
-      // ③ codeEntry manifest 级联校验（批次 C2）：非空才检。
+      // ③ codeEntry manifest 级联校验（批次 C2 + T5 pattern 豁免）：非空才检。
       // 无 manifest → unchecked（不产 issue 不算 broken——「从未上报清单」≠「代码入口失配」）；
       // 有 manifest → 精确/目录前缀命中 ok，否则 broken + kind:'codeEntry' issue。
+      // T5：codeEntryType='pattern'（glob 泛化写法）→ 豁免精确存在性校验（人类指引价值 >
+      // 精确校验价值），codeEntryStatus:'exempt' + codeEntryNote 说明原因，issues 保持为空
+      // → 天然不计入 broken（issues.length>0 是唯一 broken 判据，overview 口径自动对齐）。
       // codeEntryStatus 键由类型注释约定（RouteHealth.codeEntryStatus，shared DTO）。
       const codeEntry = route.codeEntry;
       if (codeEntry) {
-        if (!repoManifest) {
+        if (route.codeEntryType === 'pattern') {
+          route.health = {
+            issues,
+            codeEntryStatus: 'exempt',
+            codeEntryNote: 'glob pattern codeEntry — precise existence check exempted',
+            checkedAt,
+          };
+        } else if (!repoManifest) {
           route.health = {
             issues,
             codeEntryStatus: 'unchecked',

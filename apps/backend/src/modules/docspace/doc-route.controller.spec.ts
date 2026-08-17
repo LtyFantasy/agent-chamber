@@ -27,6 +27,7 @@ describe('DocRouteController', () => {
   const mockRouteService = {
     findById: jest.fn(),
     findAll: jest.fn(),
+    findPaged: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
     remove: jest.fn(),
@@ -94,15 +95,17 @@ describe('DocRouteController', () => {
   // ─── GET /doc-spaces/:id/routes ───────────────────────────
 
   describe('findAll', () => {
-    it('ensures space read permission then returns service result', async () => {
+    it('ensures space read permission then returns legacy full-array result', async () => {
       docSpaceService.findById.mockResolvedValue(space);
       const result = [route];
       routeService.findAll.mockResolvedValue(result);
 
-      expect(await controller.findAll('space-1', mockActor)).toBe(result);
+      // 不传分页参数 → 传统全量模式（v1.42 契约，向后兼容）
+      expect(await controller.findAll('space-1', {}, mockActor)).toBe(result);
       expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
-      expect(routeService.findAll).toHaveBeenCalledWith('space-1');
+      expect(routeService.findAll).toHaveBeenCalledWith('space-1', {});
+      expect(routeService.findPaged).not.toHaveBeenCalled();
     });
 
     it('does not call service when read permission denied (404)', async () => {
@@ -110,8 +113,71 @@ describe('DocRouteController', () => {
       permService.ensureCan.mockRejectedValue(
         new ForbiddenException({ message: 'denied', code: ErrorCode.PERMISSION_DENIED }),
       );
-      await expect(controller.findAll('space-1', nonAdminActor)).rejects.toThrow();
+      await expect(controller.findAll('space-1', {}, nonAdminActor)).rejects.toThrow();
       expect(routeService.findAll).not.toHaveBeenCalled();
+      expect(routeService.findPaged).not.toHaveBeenCalled();
+    });
+
+    // ─── v1.55 过滤 + 分页模式分发 ───
+
+    it('passes q/category filters through in legacy mode', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      routeService.findAll.mockResolvedValue([]);
+
+      await controller.findAll('space-1', { q: '架构', category: 'arch' }, mockActor);
+
+      expect(routeService.findAll).toHaveBeenCalledWith('space-1', {
+        q: '架构',
+        category: 'arch',
+      });
+      expect(routeService.findPaged).not.toHaveBeenCalled();
+    });
+
+    it('page param switches to paginated mode (pageSize defaults to 20)', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      const envelope = {
+        items: [route],
+        total: 1,
+        page: 2,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: true,
+      };
+      routeService.findPaged.mockResolvedValue(envelope);
+
+      const result = await controller.findAll('space-1', { page: 2 }, mockActor);
+
+      expect(result).toBe(envelope);
+      expect(routeService.findPaged).toHaveBeenCalledWith('space-1', {}, 2, 20);
+      expect(routeService.findAll).not.toHaveBeenCalled();
+    });
+
+    it('pageSize param alone switches to paginated mode (page defaults to 1)', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      routeService.findPaged.mockResolvedValue({ items: [], total: 0 });
+
+      await controller.findAll('space-1', { pageSize: 50 }, mockActor);
+
+      expect(routeService.findPaged).toHaveBeenCalledWith('space-1', {}, 1, 50);
+    });
+
+    it('paginated mode carries filters too', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      routeService.findPaged.mockResolvedValue({ items: [], total: 0 });
+
+      await controller.findAll(
+        'space-1',
+        { q: '部署', category: 'ops', page: 1, pageSize: 100 },
+        mockActor,
+      );
+
+      expect(routeService.findPaged).toHaveBeenCalledWith(
+        'space-1',
+        { q: '部署', category: 'ops' },
+        1,
+        100,
+      );
     });
   });
 

@@ -52,6 +52,8 @@ export interface UpdateUserRequest {
 export type { PaginatedResponse } from '@agent-chamber/shared';
 // 存活探针响应（@SkipTransform 裸响应，无 data 包装）
 export type { HealthStatus } from '@agent-chamber/shared';
+// 系统观测总览（GET /system/overview，admin-only）
+export type { SystemOverview, RunnerOverviewItem, SeatOverviewItem } from '@agent-chamber/shared';
 export { UserRole } from '@agent-chamber/shared';
 
 // 枚举类型
@@ -146,6 +148,7 @@ export type {
   AgentActivity,
   AgentLeaderboardItem,
   AuditLog,
+  ApiLogListResponse,
   // DocSpace 响应类型
   DocSpaceSummary,
   DocSpaceDetail,

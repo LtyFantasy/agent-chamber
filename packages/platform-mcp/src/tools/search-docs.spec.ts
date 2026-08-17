@@ -40,7 +40,7 @@ describe('search_docs', () => {
         docId: 'd1',
         docPath: 'docs/arch.md',
         docTitle: 'Architecture',
-        headingPath: '§2 Design',
+        headingPath: '2 Design',
         position: 1,
         snippet: 'The system uses...',
         contentTruncated: false,
@@ -61,7 +61,7 @@ describe('search_docs', () => {
     expect(hit.docId).toBe('d1');
     expect(hit.docPath).toBe('docs/arch.md');
     expect(hit.docTitle).toBe('Architecture');
-    expect(hit.headingPath).toBe('§2 Design');
+    expect(hit.headingPath).toBe('2 Design');
     expect(hit.position).toBe(1);
     expect(hit.snippet).toBe('The system uses...');
     expect(hit.score).toBe(0.95);
@@ -168,6 +168,48 @@ describe('search_docs', () => {
 
     const searchCall = request.mock.calls[1];
     expect(searchCall[2].params.limit).toBe(5);
+  });
+
+  it('v1.55 翻页/时间序参数显式传入时透传（offset/sort/createdAfter/createdBefore）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce([]);
+
+    await searchDocsTool.handler(
+      {
+        spaceName: 'My Docs',
+        q: '日记',
+        offset: 20,
+        sort: 'createdAt_desc',
+        createdAfter: '2026-08-08T00:00:00.000Z',
+        createdBefore: '2026-08-15T23:59:59.999Z',
+      },
+      ctx(),
+    );
+
+    const searchCall = request.mock.calls[1];
+    expect(searchCall[2].params.offset).toBe(20);
+    expect(searchCall[2].params.sort).toBe('createdAt_desc');
+    expect(searchCall[2].params.createdAfter).toBe('2026-08-08T00:00:00.000Z');
+    expect(searchCall[2].params.createdBefore).toBe('2026-08-15T23:59:59.999Z');
+  });
+
+  it('v1.55 新参数缺省时不注入（保持既有调用形态，不污染 query）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce([]);
+
+    await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
+
+    const searchCall = request.mock.calls[1];
+    expect(searchCall[2].params).not.toHaveProperty('offset');
+    expect(searchCall[2].params).not.toHaveProperty('sort');
+    expect(searchCall[2].params).not.toHaveProperty('createdAfter');
+    expect(searchCall[2].params).not.toHaveProperty('createdBefore');
   });
 
   it('0 候选 → isError + availableNames', async () => {

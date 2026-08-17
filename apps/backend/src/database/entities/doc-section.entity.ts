@@ -6,9 +6,12 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: docs/database.md (doc_sections 表), plan §3.1, plan §1.1-13 (sectionId 不稳定性契约)
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [踩坑索引] rundedup-continuation-v1.57.3(续 chunk 事实标记)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释)
+ *
+ * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   rundedup-continuation-v1.57.3: 相邻同 headingPath/headingLevel 可能是真实同名 sibling，不能再用相邻字段猜测续 chunk。新增 isContinuation 持久化 chunker 事实，renderer 仅据该字段去重。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -52,6 +55,10 @@ export class DocSection {
   /** 标题层级：0=文首无标题段，1-6 对应 h1-h6 */
   @Column({ type: 'smallint', default: 0, name: 'heading_level' })
   headingLevel: number;
+
+  /** 是否为长 section 按段落切分产生的续 chunk；首 chunk 与普通 section 为 false */
+  @Column({ type: 'boolean', default: false, name: 'is_continuation' })
+  isContinuation: boolean;
 
   /** section 正文 */
   @Column({ type: 'text', nullable: false })

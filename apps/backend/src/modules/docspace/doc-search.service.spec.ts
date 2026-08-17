@@ -24,6 +24,7 @@ function createMockQueryBuilder(overrides: Record<string, jest.Mock> = {}) {
     addOrderBy: jest.fn().mockReturnThis(),
     groupBy: jest.fn().mockReturnThis(),
     limit: jest.fn().mockReturnThis(),
+    offset: jest.fn().mockReturnThis(),
     getRawMany: jest.fn().mockResolvedValue([]),
     getRawOne: jest.fn().mockResolvedValue(null),
     ...overrides,
@@ -675,5 +676,107 @@ describe('DocSearchService', () => {
     expect(hits).toEqual([]);
     expect(mockRouteRepo.createQueryBuilder).not.toHaveBeenCalled();
     expect(mockTaskLinkRepo.createQueryBuilder).not.toHaveBeenCalled();
+  });
+
+  // ─── v1.55：offset 翻页 ──────────────────────────────────────
+
+  it('applies SQL OFFSET when offset > 0 (paired with limit for exhaustive pagination)', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test', offset: 20, limit: 5 });
+
+    expect(mockOuterQb.offset).toHaveBeenCalledWith(20);
+    expect(mockOuterQb.limit).toHaveBeenCalledWith(5);
+  });
+
+  it('does NOT call offset() when offset is omitted or 0 (keeps default query plan)', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test' });
+    await service.search(['space-1'], { q: 'test', offset: 0 });
+
+    expect(mockOuterQb.offset).not.toHaveBeenCalled();
+  });
+
+  it('clamps negative offset to 0 defensively (service-level floor)', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test', offset: -5 });
+
+    expect(mockOuterQb.offset).not.toHaveBeenCalled();
+  });
+
+  // ─── v1.55：时间窗过滤 createdAfter/createdBefore（含边界）───
+
+  it('adds createdAfter/createdBefore inclusive filters to the subquery WHERE', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], {
+      q: 'test',
+      createdAfter: '2026-08-08T00:00:00.000Z',
+      createdBefore: '2026-08-15T23:59:59.999Z',
+    });
+
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.created_at >= :createdAfter', {
+      createdAfter: '2026-08-08T00:00:00.000Z',
+    });
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.created_at <= :createdBefore', {
+      createdBefore: '2026-08-15T23:59:59.999Z',
+    });
+  });
+
+  it('omits time-window filters when neither bound is provided', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test' });
+
+    const timeCalls = (mockSubQb.andWhere as jest.Mock).mock.calls.filter(
+      (call: string[]) => typeof call[0] === 'string' && call[0].includes('d.created_at'),
+    );
+    expect(timeCalls).toHaveLength(0);
+  });
+
+  // ─── v1.55：sort 接管语义（时间序 vs 相关度）────────────────
+
+  it('sort=createdAt_desc takes over ORDER BY (doc_created_at DESC) and skips boost fusion entirely', async () => {
+    // 时间序下 boost 查询不得执行——即便有命中（SQL 顺序即最终顺序，score 保留原始合成分）
+    mockOuterQb.getRawMany.mockResolvedValue([
+      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ]);
+
+    const hits = await service.search(['space-1'], { q: 'test', sort: 'createdAt_desc' });
+
+    expect(mockOuterQb.orderBy).toHaveBeenCalledWith('sub.doc_created_at', 'DESC');
+    expect(mockOuterQb.addOrderBy).toHaveBeenCalledWith('sub.section_position', 'ASC');
+    // boost 融合仅适用相关度排序：路由/任务链接查询被完全跳过
+    expect(mockRouteRepo.createQueryBuilder).not.toHaveBeenCalled();
+    expect(mockTaskLinkRepo.createQueryBuilder).not.toHaveBeenCalled();
+    // 命中透出但无 boosts 键（时间序下恒省略）
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).not.toHaveProperty('boosts');
+    expect(hits[0].score).toBeCloseTo(0.2, 6);
+  });
+
+  it('sort=createdAt_asc takes over ORDER BY (doc_created_at ASC)', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test', sort: 'createdAt_asc' });
+
+    expect(mockOuterQb.orderBy).toHaveBeenCalledWith('sub.doc_created_at', 'ASC');
+    expect(mockRouteRepo.createQueryBuilder).not.toHaveBeenCalled();
+  });
+
+  it('sort=relevance (default) keeps score DESC ordering and runs boost fusion', async () => {
+    const rawRows = [
+      makeRawRow({ doc_id: 'doc-1', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+    ];
+    mockOuterQb.getRawMany.mockResolvedValue(rawRows);
+    // 路由查询执行（即使无命中路由——查询照发，Node 侧阈值过滤）
+    mockRouteQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(['space-1'], { q: 'test', sort: 'relevance' });
+
+    expect(mockOuterQb.orderBy).toHaveBeenCalledWith('score', 'DESC');
+    expect(mockRouteRepo.createQueryBuilder).toHaveBeenCalled();
   });
 });

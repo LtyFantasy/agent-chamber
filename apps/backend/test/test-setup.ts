@@ -89,6 +89,8 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
         getMany: jest.fn(),
         getOne: jest.fn(),
         getRawMany: jest.fn().mockResolvedValue([]),
+        // 默认 resolve undefined，模拟空表 SUM 场景（service 端有 ?? '0' 兜底）
+        getRawOne: jest.fn().mockResolvedValue(undefined),
         getCount: jest.fn(),
         clone: jest.fn().mockReturnThis(),
       };

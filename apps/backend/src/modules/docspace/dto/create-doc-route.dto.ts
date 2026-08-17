@@ -17,7 +17,18 @@
  * =============================================================================
  */
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsOptional, IsString, IsUUID, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsIn,
+  IsInt,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
+import { DOC_ROUTE_CODE_ENTRY_TYPES, DocRouteCodeEntryType } from '@agent-chamber/shared';
 
 /** sortOrder 上限：同空间路由数量级有限，10000 足够策展排序（对齐 doc_categories 惯例） */
 const ROUTE_SORT_ORDER_MAX = 10000;
@@ -85,8 +96,7 @@ export class CreateDocRouteDto {
   secondaryHeadingPath?: string;
 
   @ApiPropertyOptional({
-    description:
-      '代码入口（仓库内相对路径；Service 层校验：≤512、禁绝对路径与 `..` 段）',
+    description: '代码入口（仓库内相对路径；Service 层校验：≤512、禁绝对路径与 `..` 段）',
     example: 'apps/backend/src/modules/docspace/doc.service.ts',
     maxLength: 512,
   })
@@ -94,6 +104,18 @@ export class CreateDocRouteDto {
   @IsString()
   @MaxLength(512)
   codeEntry?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'codeEntry 类型（缺省 exact）：exact = 精确文件/目录路径（recheck 参与存在性校验）；' +
+      'pattern = glob 泛化写法（如 `apps/web/app/**` + `/page.tsx`），recheck 豁免精确校验、不报 broken',
+    example: 'exact',
+    default: 'exact',
+    enum: [...DOC_ROUTE_CODE_ENTRY_TYPES],
+  })
+  @IsOptional()
+  @IsIn([...DOC_ROUTE_CODE_ENTRY_TYPES])
+  codeEntryType?: DocRouteCodeEntryType;
 
   @ApiPropertyOptional({
     description: '排序权重（同空间内 ASC 升序展示，缺省 0）',

@@ -67,6 +67,38 @@ describe('upsert_doc', () => {
     expect(schema.properties?.['source']).toBeUndefined();
   });
 
+  it('expectedContentHash 乐观锁透传（fail-closed 改造）：body 携带，缺省不带', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({ items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }] });
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'a.md',
+      sectionCount: 1,
+      tokenEstimate: 10,
+      contentHash: 'new-hash',
+    });
+    request.mockResolvedValueOnce({ items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }] });
+    request.mockResolvedValueOnce({ id: 'd1', path: 'a.md', sectionCount: 1, tokenEstimate: 10 });
+
+    // 携带 → 透传
+    const withLock = await upsertDocTool.handler(
+      { spaceName: 'My Docs', path: 'a.md', content: '# A', expectedContentHash: 'old-hash' },
+      ctx(),
+    );
+    expect(withLock.isError).toBeFalsy();
+    expect(request.mock.calls[1][2].body.expectedContentHash).toBe('old-hash');
+    // 响应 contentHash 原样透出（链式写免重读）
+    expect(JSON.parse(withLock.content[0].text).contentHash).toBe('new-hash');
+
+    // 缺省 → body 不含该字段（行为与现状一致）
+    const withoutLock = await upsertDocTool.handler(
+      { spaceName: 'My Docs', path: 'a.md', content: '# A' },
+      ctx(),
+    );
+    expect(withoutLock.isError).toBeFalsy();
+    expect(request.mock.calls[3][2].body).not.toHaveProperty('expectedContentHash');
+  });
+
   it('可选参数透传', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({

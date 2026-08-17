@@ -34,6 +34,8 @@ function createMockRepo<T extends ObjectLiteral>() {
       innerJoinAndSelect: jest.fn().mockReturnThis(),
       leftJoin: jest.fn().mockReturnThis(),
       leftJoinAndSelect: jest.fn().mockReturnThis(),
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
@@ -44,6 +46,8 @@ function createMockRepo<T extends ObjectLiteral>() {
       getManyAndCount: jest.fn(),
       getMany: jest.fn(),
       getOne: jest.fn(),
+      // 默认 resolve undefined，模拟空表 SUM 场景（service 端有 ?? '0' 兜底）
+      getRawOne: jest.fn().mockResolvedValue(undefined),
     })),
   } as unknown as jest.Mocked<Repository<T>>;
 }
@@ -130,6 +134,16 @@ describe('DashboardService', () => {
       mockTaskRepo.count.mockResolvedValueOnce(30);
       mockMessageRepo.count.mockResolvedValueOnce(100);
       mockBoardRepo.count.mockResolvedValueOnce(3);
+      // Board 冗余列 SUM 聚合：PG SUM 返回字符串，service 端 parseInt。
+      // 注意 createQueryBuilder 工厂每次返回新对象，需用 mockReturnValue 固定返回同一个 QB。
+      const boardQb = {
+        select: jest.fn().mockReturnThis(),
+        addSelect: jest.fn().mockReturnThis(),
+        getRawOne: jest
+          .fn()
+          .mockResolvedValue({ boardTaskCount: '15', boardCompletedTaskCount: '9' }),
+      };
+      mockBoardRepo.createQueryBuilder.mockReturnValue(boardQb as any);
       mockDocSpaceRepo.count.mockResolvedValueOnce(4);
       mockDocRepo.count.mockResolvedValueOnce(12);
 
@@ -152,6 +166,8 @@ describe('DashboardService', () => {
         completedTasks: 30,
         totalMessages: 100,
         totalBoards: 3,
+        boardTaskCount: 15,
+        boardCompletedTaskCount: 9,
         docSpaceCount: 4,
         docCount: 12,
       });
@@ -178,6 +194,9 @@ describe('DashboardService', () => {
       expect(mockDocRepo.count).toHaveBeenCalledWith();
       expect(result.docSpaceCount).toBe(2);
       expect(result.docCount).toBe(7);
+      // Board SUM 聚合 raw 为空（空表/无数据）时兜底为 0，不产生 NaN
+      expect(result.boardTaskCount).toBe(0);
+      expect(result.boardCompletedTaskCount).toBe(0);
     });
   });
 

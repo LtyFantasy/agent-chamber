@@ -65,7 +65,7 @@ export type ToolBrief = Record<string, unknown>;
 /** 审批选项（字段未冻结，同上；§4 下行 seat.permission_verdict 的 optionId 即选项 id） */
 export type PermissionOption = Record<string, unknown>;
 
-/** SeatEvent 七 variant 的 type 取值（docs/roundtable-design.md §3 原文 + M3 阶段 5 追加 seat_info） */
+/** SeatEvent 八 variant 的 type 取值（docs/roundtable-design.md §3 原文 + M3 阶段 5 追加 seat_info + 1.54.0 追加 activity） */
 export const SEAT_EVENT_TYPES = [
   'message_chunk',
   'message_complete',
@@ -74,10 +74,11 @@ export const SEAT_EVENT_TYPES = [
   'usage',
   'status',
   'seat_info',
+  'activity',
 ] as const;
 
 /**
- * 座位事件（SeatDriver 事件出口，docs/roundtable-design.md §3 原文，七 variant）
+ * 座位事件（SeatDriver 事件出口，docs/roundtable-design.md §3 原文，八 variant）
  * 上行全部走 onEvent → seat.event 透传。
  * - message_chunk：流式增量
  * - message_complete：turn 终结（含沉默判定输入 silent?）
@@ -87,6 +88,10 @@ export const SEAT_EVENT_TYPES = [
  * - status：online / busy / offline
  * - seat_info：座位**实际在跑**的配置观测（model/thinking/mode 地面真相，M3 阶段 5；
  *   全可选宽松字符串——不同 vendor 的字段可能有缺；本批仅观测上行，不做下发钉死）
+ * - activity：轻量在场信号（1.54.0，Board 3c3d9577）——只带相位类型**不带任何内容**，
+ *   用于把 agent_thought_chunk 的到达转成「思考中」presence 边沿（replying→thinking
+ *   翻转）；思考内容本身仍按 §8b 屏蔽不上行。runner 侧边沿触发（每段思考至多一次），
+ *   非逐 chunk 高频
  */
 export type SeatEvent =
   | { type: 'message_chunk'; seatId: string; text: string }
@@ -118,4 +123,10 @@ export type SeatEvent =
       thinking?: string;
       /** 权限模式（default/plan/auto/yolo 等，原文透传不翻译） */
       mode?: string;
+    }
+  | {
+      type: 'activity';
+      seatId: string;
+      /** 在场相位信号（1.54.0 起仅 'thinking'；只带类型不带内容——思考内容按 §8b 屏蔽） */
+      activity: 'thinking';
     };

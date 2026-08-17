@@ -43,7 +43,9 @@ import type {
   CreateUserRequest,
   UpdateUserRequest,
   AuditLog,
+  ApiLogListResponse,
   HealthStatus,
+  SystemOverview,
   UnreadSummary,
   SearchResult,
   SearchQuery,
@@ -794,6 +796,36 @@ const docs = {
     apiRequest<PaginatedResponse<DocSummary>>('GET', `/doc-spaces/${spaceId}/docs`, undefined, {
       params,
     }),
+  /**
+   * 循环翻页拉取指定空间的全部文档（对齐 agents.listAll 评审 M-e 范式）
+   *
+   * 后端分页硬上限 100（QueryDocDto @Max(100)）：单次 pageSize:100 在 >100 篇文档的
+   * 空间会静默丢失尾部，导致 /docs/[id] 左栏分类树、type/tag 过滤候选、正文相对链接
+   * 解析（docPathToId）缺项。此处按 hasNext/total 翻页收齐，顺序保持后端 path ASC。
+   *
+   * @param spaceId 空间 ID
+   * @param params 可选过滤条件（category/tag/type/q/path）透传；page/pageSize 由本方法接管
+   * @returns 空间内全部文档摘要（DocSummary[]）
+   */
+  listAllDocs: async (
+    spaceId: string,
+    params?: { category?: string; tag?: string; type?: string; q?: string; path?: string },
+  ): Promise<DocSummary[]> => {
+    const pageSize = 100;
+    const all: DocSummary[] = [];
+    for (let page = 1; ; page++) {
+      const res = await apiRequest<PaginatedResponse<DocSummary>>(
+        'GET',
+        `/doc-spaces/${spaceId}/docs`,
+        undefined,
+        { params: { ...params, page, pageSize } },
+      );
+      all.push(...res.items);
+      // 终止条件：后端已声明无下一页，或已收齐 total 条（双保险，防 hasNext 漂移死循环）
+      if (!res.hasNext || all.length >= res.total) break;
+    }
+    return all;
+  },
   search: (
     spaceId: string,
     params: { q: string; type?: string; tag?: string; category?: string; limit?: number },
@@ -899,12 +931,14 @@ const webhooks = {
 // ──────────────────────────────────────────────
 const monitoring = {
   getApiLogs: (params?: { page?: number; pageSize?: number }) =>
-    apiRequest<PaginatedResponse<AuditLog>>('GET', '/system/api-logs', undefined, { params }),
+    apiRequest<ApiLogListResponse>('GET', '/system/api-logs', undefined, { params }),
   exportApiLogs: () =>
     apiRequest<{ data: AuditLog[]; count: number; exportedAt: string }>(
       'GET',
       '/system/api-logs/export',
     ),
+  /** 系统观测总览（admin-only）：runner/座位/events/webhook 只读聚合 */
+  getOverview: () => apiRequest<SystemOverview>('GET', '/system/overview'),
   /**
    * 存活探针（含平台版本 version + git commit，供 sidebar 版本角标）。
    * 注意：/health 是 @SkipTransform 裸响应（无 {data} 包装），

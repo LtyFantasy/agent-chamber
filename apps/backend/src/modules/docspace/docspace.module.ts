@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
+import { DocBundleService } from './doc-bundle.service';
 import { DocSpaceController } from './docspace.controller';
 import { DocController } from './doc.controller';
 import { DocCategoryController } from './doc-category.controller';
@@ -50,7 +51,14 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
     BoardModule,
     EventModule,
   ],
-  providers: [DocSpaceService, DocService, DocSearchService, DocRouteService, RouteHealthService],
+  providers: [
+    DocSpaceService,
+    DocService,
+    DocSearchService,
+    DocRouteService,
+    RouteHealthService,
+    DocBundleService,
+  ],
   controllers: [DocSpaceController, DocController, DocCategoryController, DocRouteController],
   exports: [DocSpaceService, DocService, DocSearchService, RouteHealthService],
 })

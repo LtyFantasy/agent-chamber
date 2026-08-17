@@ -1,6 +1,29 @@
+import { extractLastHeadingSegment } from '@agent-chamber/shared';
 import { chunkMarkdown, estimateTokens } from './markdown-chunker';
 
 describe('markdown-chunker', () => {
+  describe('extractLastHeadingSegment', () => {
+    it('preserves a heading title containing a bare section sign', () => {
+      expect(
+        extractLastHeadingSegment('2.1 TTK 目标区间（以 `numeric-equations.md` §3.2 为准）'),
+      ).toBe('2.1 TTK 目标区间（以 `numeric-equations.md` §3.2 为准）');
+    });
+
+    it('extracts the last segment from a normal nested heading path', () => {
+      expect(extractLastHeadingSegment('Parent § Child')).toBe('Child');
+    });
+
+    it('trims the final segment and handles an empty path', () => {
+      expect(extractLastHeadingSegment('Parent § Child  ')).toBe('Child');
+      expect(extractLastHeadingSegment('')).toBe('');
+    });
+
+    it('preserves a nested child when the parent title contains a bare section sign', () => {
+      const parent = '2.1 TTK 目标区间（以 `numeric-equations.md` §3.2 为准）';
+      expect(extractLastHeadingSegment(`${parent} § 子标题`)).toBe('子标题');
+    });
+  });
+
   // ─── estimateTokens ─────────────────────────────────────────
 
   describe('estimateTokens', () => {
@@ -38,6 +61,29 @@ describe('markdown-chunker', () => {
   // ─── chunkMarkdown ──────────────────────────────────────────
 
   describe('chunkMarkdown', () => {
+    it('preserves section-sign text in parent and nested heading paths', () => {
+      const parentTitle = '2.1 TTK 目标区间（以 `numeric-equations.md` §3.2 为准）';
+      const content = [`# ${parentTitle}`, '父标题正文。', '', '## 子标题', '子标题正文。'].join(
+        '\n',
+      );
+
+      const result = chunkMarkdown(content, parentTitle);
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toMatchObject({
+        headingPath: parentTitle,
+        headingLevel: 1,
+        content: '父标题正文。',
+      });
+      expect(result[1]).toMatchObject({
+        headingPath: `${parentTitle} § 子标题`,
+        headingLevel: 2,
+        content: '子标题正文。',
+      });
+      expect(extractLastHeadingSegment(result[0].headingPath)).toBe(parentTitle);
+      expect(extractLastHeadingSegment(result[1].headingPath)).toBe('子标题');
+    });
+
     it('returns a single level-0 chunk for an empty document', () => {
       const result = chunkMarkdown('', 'My Title');
       expect(result).toHaveLength(1);
@@ -80,11 +126,7 @@ describe('markdown-chunker', () => {
     });
 
     it('frontmatter-only document returns empty level-0 chunk', () => {
-      const content = [
-        '---',
-        'title: Only Frontmatter',
-        '---',
-      ].join('\n');
+      const content = ['---', 'title: Only Frontmatter', '---'].join('\n');
 
       const result = chunkMarkdown(content, 'Empty Doc');
       expect(result).toHaveLength(1);
@@ -156,16 +198,9 @@ describe('markdown-chunker', () => {
     });
 
     it('rebuilds ancestor chain on same-level heading (resets sibling)', () => {
-      const content = [
-        '# A',
-        'content a',
-        '',
-        '## B',
-        'content b',
-        '',
-        '## C',
-        'content c',
-      ].join('\n');
+      const content = ['# A', 'content a', '', '## B', 'content b', '', '## C', 'content c'].join(
+        '\n',
+      );
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(3);
@@ -176,13 +211,7 @@ describe('markdown-chunker', () => {
     });
 
     it('handles higher-level heading popping ancestors', () => {
-      const content = [
-        '## Deep',
-        'deep content',
-        '',
-        '# Shallow',
-        'shallow content',
-      ].join('\n');
+      const content = ['## Deep', 'deep content', '', '# Shallow', 'shallow content'].join('\n');
 
       const result = chunkMarkdown(content, 'Doc');
       expect(result).toHaveLength(2);
@@ -206,6 +235,8 @@ describe('markdown-chunker', () => {
 
       // Should have been split into multiple chunks with same headingPath
       expect(result.length).toBeGreaterThan(1);
+      expect(result[0].isContinuation).toBe(false);
+      expect(result.slice(1).every((chunk) => chunk.isContinuation)).toBe(true);
       for (const chunk of result) {
         expect(chunk.headingPath).toBe('Big');
         expect(chunk.headingLevel).toBe(1);
@@ -323,25 +354,13 @@ describe('markdown-chunker', () => {
       for (let i = 0; i < result.length; i++) {
         expect(result[i].position).toBe(i);
       }
-      expect(result.map((c) => c.content)).toEqual([
-        'content a',
-        '',
-        'content c',
-        '',
-      ]);
+      expect(result.map((c) => c.content)).toEqual(['content a', '', 'content c', '']);
     });
 
     it('positions increment monotonically', () => {
-      const content = [
-        '# A',
-        'content a',
-        '',
-        '## B',
-        'content b',
-        '',
-        '### C',
-        'content c',
-      ].join('\n');
+      const content = ['# A', 'content a', '', '## B', 'content b', '', '### C', 'content c'].join(
+        '\n',
+      );
 
       const result = chunkMarkdown(content, 'Doc');
       for (let i = 0; i < result.length; i++) {
@@ -350,7 +369,8 @@ describe('markdown-chunker', () => {
     });
 
     it('tokenEstimate is consistent: CJK paragraph ≈ char count', () => {
-      const chineseText = '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
+      const chineseText =
+        '这是中文文档的测试内容，用于验证token估算的准确性。深度学习模型在处理中文时通常按字分词。';
       const result = chunkMarkdown('# Title\n' + chineseText, 'Doc');
       expect(result).toHaveLength(1);
       // CJK estimate ≈ char count (each char ≈ 1 token)

@@ -43,6 +43,7 @@ export class DashboardService {
       completedTasks,
       totalMessages,
       totalBoards,
+      boardTaskAgg,
       docSpaceCount,
       docCount,
     ] = await Promise.all([
@@ -64,6 +65,18 @@ export class DashboardService {
       this.taskRepo.count({ where: { status: TaskStatus.DONE } }),
       this.messageRepo.count(),
       this.boardRepo.count(),
+      // Board 任务计数走冗余列聚合（task_count/completed_task_count 由任务写入路径维护），
+      // SUM 只扫 boards 表（行数极小），不回扫 tasks 表；COALESCE 兜底空表 SUM→NULL。
+      // createQueryBuilder 会自动过滤软删除 board（@DeleteDateColumn）。
+      this.boardRepo
+        .createQueryBuilder('board')
+        .select('COALESCE(SUM(board.taskCount), 0)', 'boardTaskCount')
+        .addSelect('COALESCE(SUM(board.completedTaskCount), 0)', 'boardCompletedTaskCount')
+        .getRawOne<{ boardTaskCount: string; boardCompletedTaskCount: string }>()
+        .then((raw) => ({
+          boardTaskCount: parseInt(raw?.boardTaskCount ?? '0', 10),
+          boardCompletedTaskCount: parseInt(raw?.boardCompletedTaskCount ?? '0', 10),
+        })),
       // DocSpace/Doc 计数口径与现有 stats 一致：repo.count() 自动过滤软删除行
       // （@DeleteDateColumn select:false），stats 端点为 admin-only，无访问白名单
       this.docSpaceRepo.count(),
@@ -79,6 +92,8 @@ export class DashboardService {
       completedTasks,
       totalMessages,
       totalBoards,
+      boardTaskCount: boardTaskAgg.boardTaskCount,
+      boardCompletedTaskCount: boardTaskAgg.boardCompletedTaskCount,
       docSpaceCount,
       docCount,
     };

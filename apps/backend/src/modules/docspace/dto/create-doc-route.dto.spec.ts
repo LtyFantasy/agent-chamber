@@ -144,6 +144,38 @@ describe('CreateDocRouteDto', () => {
     expect(errors.some((e) => e.property === 'sortOrder')).toBe(true);
   });
 
+  // ─── T5 codeEntryType 枚举校验（缺省 exact，IsIn 白名单） ────
+
+  it('accepts codeEntryType "pattern"（glob 泛化写法，与 codeEntry 配套）', async () => {
+    const dto = plainToInstance(CreateDocRouteDto, {
+      intent: 'i',
+      primaryDocId: '5f3d1b2a-0000-4000-8000-000000000001',
+      codeEntry: 'apps/web/app/**' + '/page.tsx',
+      codeEntryType: 'pattern',
+    });
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('accepts explicit codeEntryType "exact"', async () => {
+    const dto = plainToInstance(CreateDocRouteDto, {
+      intent: 'i',
+      primaryDocId: '5f3d1b2a-0000-4000-8000-000000000001',
+      codeEntryType: 'exact',
+    });
+    expect(await validate(dto)).toHaveLength(0);
+  });
+
+  it('rejects codeEntryType not in exact|pattern（如 "glob"）', async () => {
+    const dto = plainToInstance(CreateDocRouteDto, {
+      intent: 'i',
+      primaryDocId: '5f3d1b2a-0000-4000-8000-000000000001',
+      codeEntryType: 'glob',
+    });
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'codeEntryType' && e.constraints?.isIn)).toBe(true);
+  });
+
   describe('UpdateDocRouteDto (PartialType)', () => {
     it('accepts an empty patch (all fields optional)', async () => {
       const dto = plainToInstance(UpdateDocRouteDto, {});
@@ -155,6 +187,11 @@ describe('CreateDocRouteDto', () => {
       const errors = await validate(dto);
       expect(errors).toHaveLength(0);
       expect(dto.sortOrder).toBe(9);
+    });
+
+    it('accepts a codeEntryType-only patch (Partial 继承枚举校验)', async () => {
+      const dto = plainToInstance(UpdateDocRouteDto, { codeEntryType: 'pattern' });
+      expect(await validate(dto)).toHaveLength(0);
     });
 
     it('still enforces field constraints on provided fields', async () => {

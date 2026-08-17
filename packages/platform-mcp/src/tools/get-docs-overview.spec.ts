@@ -272,6 +272,45 @@ describe('get_docs_overview', () => {
     expect(overviewCall[2].params).toEqual({ includeDescription: true });
   });
 
+  it('includeRoutes=false 透传（v1.55：routes 段省 token 逃生门）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', includeRoutes: false }, ctx());
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ includeRoutes: false });
+  });
+
+  it('includeRoutes=true 原样透传（缺省语义交给后端，显式传参不吞掉）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', includeRoutes: true }, ctx());
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ includeRoutes: true });
+  });
+
+  it('slim=true 透传（v1.56 大空间瘦身参数）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', slim: true }, ctx());
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ slim: true });
+  });
+
   it('未传过滤参数 → 空 params（不携带多余键）', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({

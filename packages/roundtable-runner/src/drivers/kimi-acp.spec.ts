@@ -34,6 +34,21 @@ function chunkNotification(text: string): Record<string, unknown> {
   };
 }
 
+/** 思考块通知（agent → client；内容应被屏蔽，只触发 presence 边沿信号） */
+function thoughtNotification(text = 'hmm'): Record<string, unknown> {
+  return {
+    method: 'session/update',
+    params: {
+      update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
+    },
+  };
+}
+
+/** activity 事件收集（1.54.0 thinking presence 边沿） */
+function activityEvents(events: SeatEvent[]): Extract<SeatEvent, { type: 'activity' }>[] {
+  return events.filter((e) => e.type === 'activity') as Extract<SeatEvent, { type: 'activity' }>[];
+}
+
 /** initialize 成功响应 */
 const INIT_RESPOND = {
   result: {
@@ -247,6 +262,84 @@ describe('KimiAcpDriver 全链路（initialize/new/prompt/流式）', () => {
       (r) => r.method === 'session/set_config_option' && r.params!.configId === 'model',
     );
     expect(modelReq!.params!.value).toBe('kimi-k2');
+  });
+});
+
+describe('KimiAcpDriver thinking presence 边沿（1.54.0，Board 3c3d9577：thought 内容屏蔽 + 相位信号边沿触发）', () => {
+  it('turn 首批 thought chunk（未输出过）不上行 activity——turn 开始已是 thinking 相位', async () => {
+    const h = makeHarness();
+    h.setFixture(
+      startFixture([
+        {
+          emit: [
+            thoughtNotification(),
+            thoughtNotification('still thinking'),
+            chunkNotification('done'),
+          ],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+      ]),
+    );
+    await h.driver.start(CONFIG);
+    await h.driver.inject('seat-1', { text: 'x' });
+    await waitForEvent(h.events, (e) => e.type === 'message_complete');
+
+    expect(activityEvents(h.events)).toEqual([]);
+  });
+
+  it('replying → thinking 边沿上行一次 activity；连续 thought chunk 不重复；再次输出后重新武装', async () => {
+    const h = makeHarness();
+    h.setFixture(
+      startFixture([
+        {
+          emit: [
+            chunkNotification('第一段输出'),
+            thoughtNotification(), // ← 边沿：上行一次
+            thoughtNotification('继续思考'), // 抑制
+            thoughtNotification('还在思考'), // 抑制
+            chunkNotification('第二段输出'), // 重新武装
+            thoughtNotification(), // ← 新边沿：再上行一次
+          ],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+      ]),
+    );
+    await h.driver.start(CONFIG);
+    await h.driver.inject('seat-1', { text: 'x' });
+    await waitForEvent(h.events, (e) => e.type === 'message_complete');
+
+    const activities = activityEvents(h.events);
+    expect(activities).toHaveLength(2);
+    expect(activities[0]).toEqual({ type: 'activity', seatId: 'seat-1', activity: 'thinking' });
+    // 边沿顺序：第一次 activity 在首个 chunk 之后、第二个 chunk 之前
+    const firstChunkIdx = h.events.findIndex((e) => e.type === 'message_chunk');
+    const firstActivityIdx = h.events.findIndex((e) => e.type === 'activity');
+    expect(firstActivityIdx).toBeGreaterThan(firstChunkIdx);
+  });
+
+  it('跨 turn 复位：新 turn 首批 thought chunk 同样抑制（标志随 inject 重置）', async () => {
+    const h = makeHarness();
+    h.setFixture(
+      startFixture([
+        {
+          emit: [chunkNotification('turn1 输出'), thoughtNotification()],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+        {
+          emit: [thoughtNotification(), chunkNotification('turn2 输出')],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+      ]),
+    );
+    await h.driver.start(CONFIG);
+    await h.driver.inject('seat-1', { text: 'turn1' });
+    await waitForEvent(h.events, (e) => e.type === 'message_complete');
+    expect(activityEvents(h.events)).toHaveLength(1); // turn1 的 replying→thinking 边沿
+
+    await h.driver.inject('seat-1', { text: 'turn2' });
+    await waitFor(() => h.events.filter((e) => e.type === 'message_complete').length === 2);
+    // turn2 首批 thought 被抑制（turn 开始已 thinking），activity 总数仍 1
+    expect(activityEvents(h.events)).toHaveLength(1);
   });
 });
 

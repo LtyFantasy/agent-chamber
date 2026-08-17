@@ -97,7 +97,16 @@ export function AdminDashboard() {
       active: stats?.completedTasks ?? 0,
       icon: CheckSquare,
     },
-    { title: t('boards'), value: stats?.totalBoards ?? 0, icon: KanbanSquare },
+    {
+      title: t('boards'),
+      value: stats?.totalBoards ?? 0,
+      // 副指标：全部看板上的任务总数 / 已完成数（Board 冗余列聚合，?? 0 容错旧后端响应）
+      subtitle: t('boardTasks', {
+        tasks: stats?.boardTaskCount ?? 0,
+        completed: stats?.boardCompletedTaskCount ?? 0,
+      }),
+      icon: KanbanSquare,
+    },
     // Docs 卡：值为文档总数，副标题为空间计数；
     // ?? 0 容错旧后端响应缺字段（v1.35 前后端混部窗口）
     {

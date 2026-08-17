@@ -12,11 +12,18 @@
  *   - 任务 e6eaf06d：空正文标题曾不产 chunk（仅入祖先栈），「全文读 + upsert 回写」往返
  *     永久丢失空标题行（典型 H2 分组标题），文档结构渐进退化；空标题现在也产 content='' 的 chunk
  *   - 任务 e6eaf06d 第二张脸：单 section >4000 字符按段落二次切分时，子 chunk 共用同一
- *     headingPath/headingLevel（step 4 正确设计，勿改）——reconstruct 侧（doc.service.ts
- *     reconstructContent）靠 run-dedup 保证兄弟 chunk 只插回一次标题，修改两侧任一侧前先跑
- *     docspace 测试验证往返幂等
+ *     headingPath/headingLevel（step 4 正确设计，勿改）——续 chunk 必须持久化 isContinuation，
+ *     renderer 才能区分续 chunk 与合法同名标题，修改两侧任一侧前先跑 docspace 测试验证往返幂等
+ *   - headingPath-separator-v1.57.2：headingPath 由 shared HEADING_PATH_SEPARATOR（` § `）
+ *     生成，不能恢复为裸 `§` 字面量，否则正文中的 `§3.2` 会被消费者误拆。
+ *   - rundedup-continuation-v1.57.3：相邻同路径 section 可能是真实同名标题；chunker 直写
+ *     isContinuation=true，renderer 只据事实去重，禁止再用 headingPath/headingLevel 猜测。
  *
  * [铁律关联] #11(注释) #17(测试契约)
+ *
+ * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   rundedup-continuation-v1.57.3: 相邻同路径的真实 sibling 曾被 run-dedup 吞掉。续 chunk
+ *     从 chunker 直写布尔事实，renderer 仅对 isContinuation=true 的 section 去重。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -25,11 +32,13 @@
  * =============================================================================
  */
 
+import { HEADING_PATH_SEPARATOR } from '@agent-chamber/shared';
+
 /**
  * Markdown 文档分块器
  *
  * 纯函数，零依赖注入，可独立单测。
- * 输入 content + title → 输出 Array<{headingPath, headingLevel, position, content, tokenEstimate}>
+ * 输入 content + title → 输出 Array<{headingPath, headingLevel, position, content, tokenEstimate, isContinuation}>
  *
  * 规格严格按 plan §4.4：
  * - 按 ATX 标题 (#{1,6}) 切段；文首无标题内容 → level 0 段，headingPath=文档 title
@@ -38,8 +47,8 @@
  * - 围栏代码块（``` / ~~~）内的行不识别为标题（防代码注释污染标题栈）
  * - headingPath=祖先标题链 "父 § 子" 拼接（截断 512）
  * - 单 section >4000 字符按段落二次切分；子 chunk 共用同一 headingPath/headingLevel，
- *   reconstruct 侧（doc.service.ts reconstructContent）靠 run-dedup 保证标题只插回一次
- *   （任务 e6eaf06d 第二张脸）
+ *   第一个 chunk 的 isContinuation=false，后续 chunk 的 isContinuation=true；reconstruct
+ *   侧（doc.service.ts renderSectionPart，reconstructContent/patchSection 共用）据此只插回一次标题
  * - CJK 感知 tokenEstimate：cjkCharCount + ceil(nonCjkLength / 4)
  * - 防御性跳过开头 "---...---" frontmatter 块
  */
@@ -79,6 +88,8 @@ export interface ChunkResult {
   content: string;
   /** CJK 感知 token 估算 */
   tokenEstimate: number;
+  /** 是否为同一标题 section 按段落切分产生的续 chunk */
+  isContinuation: boolean;
 }
 
 // ─── 辅助函数 ────────────────────────────────────────────────
@@ -118,7 +129,7 @@ function truncateHeadingPath(path: string): string {
  */
 function buildHeadingPath(ancestors: string[], currentTitle: string): string {
   const parts = [...ancestors, currentTitle];
-  return truncateHeadingPath(parts.join(' § '));
+  return truncateHeadingPath(parts.join(HEADING_PATH_SEPARATOR));
 }
 
 // ─── 核心导出 ────────────────────────────────────────────────
@@ -193,6 +204,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
       position: 0,
       content: allContent,
       tokenEstimate: estimateTokens(allContent),
+      isContinuation: false,
     };
     return [chunk];
   }
@@ -210,6 +222,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
         position: 0,
         content: preContent,
         tokenEstimate: estimateTokens(preContent),
+        isContinuation: false,
       });
     }
   }
@@ -242,6 +255,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
         position: chunks.length,
         content: '',
         tokenEstimate: 0,
+        isContinuation: false,
       });
       // 当前标题入祖先栈（供后续子标题使用）
       ancestors.push({ level: h.level, title: h.title });
@@ -262,7 +276,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
       // rationale: 单 section 过长时按段落（连续的换行符）拆分，
       // 避免下游 LLM 一次摄入过大的上下文块
       const paragraphs = body.split(PARAGRAPH_SEP).filter((p) => p.trim());
-      for (const para of paragraphs) {
+      for (const [paragraphIndex, para] of paragraphs.entries()) {
         const trimmed = para.trim();
         if (!trimmed) continue;
         chunks.push({
@@ -271,6 +285,8 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
           position: chunks.length,
           content: trimmed,
           tokenEstimate: estimateTokens(trimmed),
+          // The first paragraph owns the heading; later paragraphs are continuation chunks.
+          isContinuation: paragraphIndex > 0,
         });
       }
     } else {
@@ -280,6 +296,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
         position: chunks.length,
         content: body,
         tokenEstimate: estimateTokens(body),
+        isContinuation: false,
       });
     }
   }

@@ -12,7 +12,15 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
-import { Visibility, ErrorCode, ActorType, UserRole, EventType } from '@agent-chamber/shared';
+import {
+  Visibility,
+  ErrorCode,
+  ActorType,
+  UserRole,
+  EventType,
+  DocSummary,
+  DocSummarySlim,
+} from '@agent-chamber/shared';
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
@@ -907,7 +915,10 @@ describe('DocSpaceService', () => {
       docRepo.createQueryBuilder.mockReturnValue(docQb);
 
       const result = await service.getOverview('space-1');
-      const byPath = Object.fromEntries(result.uncategorized.map((d) => [d.path, d]));
+      // 非 slim 调用 → 全字段形状，收窄为 DocSummary 断言明细字段
+      const byPath = Object.fromEntries(
+        (result.uncategorized as DocSummary[]).map((d) => [d.path, d]),
+      );
       expect(byPath['a.md'].brokenLinkCount).toBe(2);
       expect(byPath['b.md'].brokenLinkCount).toBe(0); // 已检查且 0 断链：0 而非缺省
       expect(byPath['c.md'].brokenLinkCount).toBeUndefined(); // 未检查（NULL）：省略
@@ -1021,6 +1032,15 @@ describe('DocSpaceService', () => {
 
     // ─── v1.38 可配置过滤 ─────────────────────────────────
 
+    /**
+     * 条目 id 提取（v1.56 slim 联合返回类型收窄）：getOverview 返回
+     * DocSpaceOverview | DocSpaceOverviewSlim，id 仅全字段形状存在——本 describe
+     * 的既有断言均为非 slim 调用（全字段形状），故收窄为 DocSummary 后取 id。
+     */
+    function idsOf(items: (DocSummary | DocSummarySlim)[]): string[] {
+      return (items as DocSummary[]).map((d) => d.id);
+    }
+
     /** 构造最小 Doc 对象（docType/tags/categoryId 等过滤字段可覆盖） */
     function makeOverviewDoc(overrides: Partial<Doc> = {}): Doc {
       return {
@@ -1067,7 +1087,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs);
 
       const result = await service.getOverview('space-1', { type: 'guide,reference' });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1', 'd2']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1', 'd2']);
       expect(result.appliedFilters?.types).toEqual(['guide', 'reference']);
     });
 
@@ -1080,7 +1100,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs);
 
       const result = await service.getOverview('space-1', { excludeType: 'memory' });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d2', 'd3']);
+      expect(idsOf(result.uncategorized)).toEqual(['d2', 'd3']);
       expect(result.appliedFilters?.excludeTypes).toEqual(['memory']);
     });
 
@@ -1098,7 +1118,7 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1', { category: 'arch' });
       expect(result.categories.map((c) => c.slug)).toEqual(['arch']);
-      expect(result.categories[0].docs.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.categories[0].docs)).toEqual(['d1']);
       expect(result.uncategorized).toEqual([]);
       expect(result.appliedFilters?.categories).toEqual(['arch']);
     });
@@ -1117,7 +1137,7 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1', { excludeCategory: 'archive' });
       expect(result.categories.map((c) => c.slug)).toEqual(['arch']);
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d3']);
+      expect(idsOf(result.uncategorized)).toEqual(['d3']);
       expect(result.appliedFilters?.excludeCategories).toEqual(['archive']);
     });
 
@@ -1140,7 +1160,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs);
 
       const result = await service.getOverview('space-1', { tag: 'prod' });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       expect(result.appliedFilters?.tag).toBe('prod');
     });
 
@@ -1152,7 +1172,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs);
 
       const result = await service.getOverview('space-1', { pathPrefix: 'memory/' });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       expect(result.appliedFilters?.pathPrefix).toBe('memory/');
     });
 
@@ -1184,7 +1204,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs, space);
 
       const result = await service.getOverview('space-1');
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d2']);
+      expect(idsOf(result.uncategorized)).toEqual(['d2']);
       expect(result.appliedFilters?.excludeTypes).toEqual(['memory']);
     });
 
@@ -1227,7 +1247,7 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1');
       // 非数组 → 无默认过滤：memory 文档保留，appliedFilters 不含 excludeTypes
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1', 'd2']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1', 'd2']);
       expect(result.appliedFilters?.excludeTypes).toBeUndefined();
     });
 
@@ -1247,7 +1267,7 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1', { excludeType: 'note' });
       // 空间默认 ['memory'] 被 per-call ['note'] 完全替换：memory 重新可见
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1', 'd3']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1', 'd3']);
       expect(result.appliedFilters?.excludeTypes).toEqual(['note']);
     });
 
@@ -1266,7 +1286,7 @@ describe('DocSpaceService', () => {
 
       // plan WS2 验证场景：空间默认排除 memory，但显式 type=memory 应能取回
       const result = await service.getOverview('space-1', { type: 'memory' });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       expect(result.appliedFilters?.types).toEqual(['memory']);
       // 空间默认被同维度 per-call 抑制 → 不回显默认 excludeTypes
       expect(result.appliedFilters?.excludeTypes).toBeUndefined();
@@ -1286,7 +1306,7 @@ describe('DocSpaceService', () => {
       mockOverview([], docs, space);
 
       const result = await service.getOverview('space-1', { applySpaceDefaults: false });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1', 'd2']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1', 'd2']);
       // 逃生门下空间默认不生效 → appliedFilters 也不回显默认维度
       expect(result.appliedFilters).toBeUndefined();
     });
@@ -1303,7 +1323,7 @@ describe('DocSpaceService', () => {
         type: 'guide,note',
         excludeType: 'note',
       });
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       expect(result.appliedFilters?.types).toEqual(['guide', 'note']);
       expect(result.appliedFilters?.excludeTypes).toEqual(['note']);
     });
@@ -1375,7 +1395,7 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1', { maxTokens: 2000 });
       expect(result.truncated).toBe(false);
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       expect(result.spaceDescription).toBe('摘'.repeat(10000));
       expect(result.legendTokenEstimate).toBe(10000);
       // totalTokenEstimate = 图例 + 文档条目合计（仅信息回显，可超 maxTokens）
@@ -1445,9 +1465,8 @@ describe('DocSpaceService', () => {
 
       const result = await service.getOverview('space-1');
       expect(result.routes).toHaveLength(2);
-      // 响应 DTO 投影：保留完整字段（含 intent/category/headingPath/codeEntry）
+      // 响应导航投影（v1.56 起 routes 内嵌恒为导航字段，全字段走 list_doc_routes）
       expect(result.routes![0]).toMatchObject({
-        id: 'r1',
         intent: '我要了解系统架构',
         category: 'architecture',
         primaryHeadingPath: '## 3. 架构总览',
@@ -1513,14 +1532,127 @@ describe('DocSpaceService', () => {
       const result = await service.getOverview('space-1', { maxTokens: 500 });
       expect(result.routes).toHaveLength(50);
       expect(result.truncated).toBe(false);
-      expect(result.uncategorized.map((d) => d.id)).toEqual(['d1']);
+      expect(idsOf(result.uncategorized)).toEqual(['d1']);
       // totalTokenEstimate = 文档条目 + routes（仅信息回显，可超 maxTokens）
       expect(result.totalTokenEstimate).toBeGreaterThan(500);
     });
 
-    // ─── v1.42 批次 C1 路由健康透出（health 原样透传 + totalBrokenRoutes 省略键语义） ────
+    // ─── v1.55 routes 段防爆截断（前 50 条 + routesTruncated/routesTotal 标记） ────
 
-    it('routes 段每条 health 原样透传（NULL=未检与已检值均透传）；broken 路由计入 totalBrokenRoutes', async () => {
+    it('routes > 50 条 → 只内嵌策展序前 50 条 + routesTruncated=true + routesTotal=全量', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      // 51 条路由（模拟最重租户 191 条量级的最小越界样本）
+      const routeRows = Array.from({ length: 51 }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `我要了解第 ${i} 号功能`,
+        category: null,
+        primaryDocId: 'doc-1',
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.routes).toHaveLength(50);
+      expect(result.routesTruncated).toBe(true);
+      expect(result.routesTotal).toBe(51);
+      // 截断保留策展序头部（find 结果序不动，slice 前 50；导航投影无 id，用 intent 验证顺序）
+      expect(result.routes![0].intent).toBe('我要了解第 0 号功能');
+      expect(result.routes![49].intent).toBe('我要了解第 49 号功能');
+      // routesTokenEstimate 按截断后实际返回内容记账（>0 即可，具体值随内容）
+      expect(result.routesTokenEstimate).toBeGreaterThan(0);
+    });
+
+    it('routes ≤ 50 条 → 全量内嵌 + routesTruncated=false + routesTotal=条数', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = Array.from({ length: 3 }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `意图 ${i}`,
+        category: null,
+        primaryDocId: 'doc-1',
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.routes).toHaveLength(3);
+      expect(result.routesTruncated).toBe(false);
+      expect(result.routesTotal).toBe(3);
+    });
+
+    it('截断后 totalBrokenRoutes 仍按全量路由统计（空间级健康指标不受展示截断影响）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      // 51 条路由：前 50 条健康（空 issues），第 51 条（被截断不可见）broken
+      const routeRows = Array.from({ length: 51 }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `意图 ${i}`,
+        category: null,
+        primaryDocId: 'doc-1',
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        health:
+          i === 50
+            ? { issues: [{ kind: 'heading', target: 'primary', value: 'x' }], checkedAt: 'now' }
+            : { issues: [], checkedAt: 'now' },
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      expect(result.routes).toHaveLength(50);
+      expect(result.routesTruncated).toBe(true);
+      // broken 路由在被截断掉的尾部，但空间级统计仍计入
+      expect(result.totalBrokenRoutes).toBe(1);
+    });
+
+    // ─── v1.42 批次 C1 路由健康透出（health 导航投影 + totalBrokenRoutes 省略键语义） ────
+
+    it('routes 段 health 导航投影（只保留 codeEntryStatus；null=未检；无 status 已检 → {}）且 broken 计入 totalBrokenRoutes', async () => {
       const space = makeSpace();
       spaceRepo.findOne.mockResolvedValue(space);
       const catQb = createMockQueryBuilder([], 0);
@@ -1586,18 +1718,81 @@ describe('DocSpaceService', () => {
       routeRepo.find.mockResolvedValue(routeRows);
 
       const result = await service.getOverview('space-1');
-      // health 原样透传：已检值完整保留、NULL 透传为 null（区别于 brokenLinkCount 的省略语义）
-      expect(result.routes![0].health).toEqual({
-        issues: [{ kind: 'heading', target: 'primary', value: '## 悬空的节' }],
-        checkedAt: '2026-08-06T00:00:00.000Z',
-      });
-      expect(result.routes![1].health).toEqual({
-        issues: [],
-        checkedAt: '2026-08-06T00:00:00.000Z',
-      });
+      // v1.56 导航投影：health 只保留 codeEntryStatus——
+      // 已检但 codeEntry 为空（无 status）→ {}（区别于 null 未检）；未检 → null
+      expect(result.routes![0].health).toEqual({});
+      expect(result.routes![1].health).toEqual({});
       expect(result.routes![2].health).toBeNull();
+      // 导航投影不携带 id/sortOrder/health.issues 等非导航字段
+      expect(result.routes![0]).not.toHaveProperty('id');
+      expect(result.routes![0]).not.toHaveProperty('sortOrder');
+      expect(result.routes![0].health).not.toHaveProperty('issues');
       // 有已检路由（r1/r2）→ totalBrokenRoutes 返回；只数 issues.length>0 的路由（r1），未检 r3 不计
       expect(result.totalBrokenRoutes).toBe(1);
+    });
+
+    it('T5 口径：pattern 豁免路由（issues=[] + codeEntryStatus:exempt）不计入 totalBrokenRoutes，exact broken 照常计入', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r-pattern',
+          spaceId: 'space-1',
+          intent: 'pattern 豁免路由',
+          category: null,
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: 'apps/web/app/**' + '/page.tsx',
+          codeEntryType: 'pattern',
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          // recheck 后的 exempt 形态：issues 空 → 不计 broken（T5 豁免语义）
+          health: {
+            issues: [],
+            codeEntryStatus: 'exempt',
+            codeEntryNote: 'glob pattern codeEntry — precise existence check exempted',
+            checkedAt: '2026-08-16T00:00:00.000Z',
+          },
+        },
+        {
+          id: 'r-broken',
+          spaceId: 'space-1',
+          intent: 'exact broken 路由',
+          category: null,
+          primaryDocId: 'doc-2',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: 'apps/gone.ts',
+          codeEntryType: 'exact',
+          sortOrder: 1,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: {
+            issues: [{ kind: 'codeEntry', target: 'codeEntry', value: 'apps/gone.ts' }],
+            codeEntryStatus: 'broken',
+            checkedAt: '2026-08-16T00:00:00.000Z',
+          },
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const result = await service.getOverview('space-1');
+      // 豁免路由 health 原样透传（含 exempt 标记），但不计入 broken 汇总
+      expect(result.routes![0].health).toMatchObject({ codeEntryStatus: 'exempt' });
+      expect(result.totalBrokenRoutes).toBe(1); // 只数 exact broken 的 r-broken
     });
 
     it('totalBrokenRoutes：全部路由未检（health NULL）→ 省略该键（"全健康"≠"从未检查"）', async () => {
@@ -1698,6 +1893,244 @@ describe('DocSpaceService', () => {
       expect(result.routes).toBeUndefined();
       expect(result.totalBrokenRoutes).toBeUndefined();
       expect(routeRepo.find).not.toHaveBeenCalled();
+    });
+
+    // ─── v1.56 slim 投影（大空间瘦身：doc 条目裁到导航字段，routes 恒为导航投影） ────
+
+    it('slim=true → doc 条目只含 5 个导航字段（分类与 uncategorized 同投影），category 分组结构不变', async () => {
+      const cats = [
+        makeCategory({ id: 'cat-1', slug: 'arch', name: '架构' }),
+        makeCategory({ id: 'cat-2', slug: 'ref', name: '参考' }),
+      ];
+      const docs = [
+        makeOverviewDoc({
+          id: 'd1',
+          categoryId: 'cat-1',
+          path: 'docs/architecture.md',
+          title: '架构',
+          summary: '架构摘要',
+          docType: 'guide',
+          tags: ['prod'],
+          source: 'native',
+          sourceSha: 'sha-1',
+          sectionCount: 3,
+          createdBy: 'user-1',
+        }),
+        makeOverviewDoc({
+          id: 'd2',
+          categoryId: null,
+          path: 'memory/2026-08-16.md',
+          title: '日记',
+          summary: '日记摘要',
+          docType: 'memory',
+          tags: [],
+          source: 'native',
+          sourceSha: null,
+          sectionCount: 1,
+          createdBy: 'user-1',
+        }),
+      ];
+      mockOverview(cats, docs);
+
+      const result = await service.getOverview('space-1', { slim: true });
+      // category 分组结构保留（id/slug/name 等分类元数据不变）
+      expect(result.categories.map((c) => c.slug)).toEqual(['arch', 'ref']);
+      const catDoc = result.categories[0].docs[0];
+      expect(Object.keys(catDoc).sort()).toEqual([
+        'docType',
+        'path',
+        'summary',
+        'title',
+        'tokenEstimate',
+      ]);
+      expect(catDoc).toMatchObject({
+        path: 'docs/architecture.md',
+        title: '架构',
+        summary: '架构摘要',
+        docType: 'guide',
+        tokenEstimate: 100,
+      });
+      // uncategorized 段同款投影
+      const uncatDoc = result.uncategorized[0];
+      expect(Object.keys(uncatDoc).sort()).toEqual([
+        'docType',
+        'path',
+        'summary',
+        'title',
+        'tokenEstimate',
+      ]);
+      // 非导航字段一律剔除
+      expect(catDoc).not.toHaveProperty('id');
+      expect(catDoc).not.toHaveProperty('tags');
+      expect(catDoc).not.toHaveProperty('sourceSha');
+      expect(catDoc).not.toHaveProperty('createdAt');
+    });
+
+    it('slim 缺省/显式 false → doc 条目全字段（向后兼容，与 v1.55 行为一致）', async () => {
+      const cats = [makeCategory({ id: 'cat-1', slug: 'arch' })];
+      const docs = [
+        makeOverviewDoc({
+          id: 'd1',
+          categoryId: 'cat-1',
+          path: 'docs/a.md',
+          title: 'A',
+          summary: '摘要',
+          docType: 'guide',
+          tags: ['prod'],
+          source: 'native',
+          sourceSha: 'sha-1',
+          sectionCount: 3,
+          createdBy: 'user-1',
+        }),
+      ];
+      mockOverview(cats, docs);
+
+      const byDefault = await service.getOverview('space-1');
+      const explicit = await service.getOverview('space-1', { slim: false });
+      const defaultKeys = Object.keys(byDefault.categories[0].docs[0]);
+      const explicitKeys = Object.keys(explicit.categories[0].docs[0]);
+      // 缺省 = 显式 false：全字段（id/spaceId/tags/source/sourceSha/断链计数/时间戳等 15 键）
+      expect(defaultKeys).toEqual(explicitKeys);
+      expect(defaultKeys).toContain('id');
+      expect(defaultKeys).toContain('spaceId');
+      expect(defaultKeys).toContain('tags');
+      expect(defaultKeys).toContain('sourceSha');
+      expect(defaultKeys).toContain('brokenLinkCount');
+      expect(defaultKeys).toContain('createdAt');
+    });
+
+    it('routes 内嵌恒为导航投影（slim 与否同 6 键）：health 只留 codeEntryStatus，null=未检', async () => {
+      const space = makeSpace({ description: null });
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const routeRows = [
+        {
+          id: 'r1',
+          spaceId: 'space-1',
+          intent: '我要了解系统架构',
+          category: 'architecture',
+          primaryDocId: 'doc-1',
+          primaryHeadingPath: '## 架构总览',
+          secondaryDocId: 'doc-2',
+          secondaryHeadingPath: '## 细节',
+          codeEntry: 'apps/backend/src/app.module.ts',
+          codeEntryType: 'exact',
+          sortOrder: 0,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: {
+            issues: [{ kind: 'codeEntry', target: 'codeEntry', value: 'x' }],
+            codeEntryStatus: 'broken',
+            codeEntryNote: 'note',
+            checkedAt: '2026-08-16T00:00:00.000Z',
+          },
+        },
+        {
+          id: 'r2',
+          spaceId: 'space-1',
+          intent: '未检路由',
+          category: null,
+          primaryDocId: 'doc-3',
+          primaryHeadingPath: null,
+          secondaryDocId: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          codeEntryType: 'exact',
+          sortOrder: 1,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          health: null,
+        },
+      ] as unknown as DocRoute[];
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const full = await service.getOverview('space-1');
+      const slim = await service.getOverview('space-1', { slim: true });
+      for (const result of [full, slim]) {
+        expect(result.routes).toHaveLength(2);
+        const navKeys = [
+          'category',
+          'codeEntry',
+          'health',
+          'intent',
+          'primaryDocId',
+          'primaryHeadingPath',
+        ];
+        expect(Object.keys(result.routes![0]).sort()).toEqual(navKeys);
+        // health 只透 codeEntryStatus（导航指示），明细（issues/checkedAt/note）不携带
+        expect(result.routes![0].health).toEqual({ codeEntryStatus: 'broken' });
+        expect(result.routes![1].health).toBeNull();
+      }
+    });
+
+    it('slim 显著降低响应体积（序列化字节：全字段 vs slim，断言 < 60%）', async () => {
+      const space = makeSpace({ description: null });
+      // 30 篇全字段文档（中长 summary——摘要是地图条目的 token/体积大头）
+      const docs = Array.from({ length: 30 }, (_, i) =>
+        makeOverviewDoc({
+          id: `d${i}`,
+          path: `docs/guide-${i}.md`,
+          title: `指南 ${i}`,
+          summary:
+            `这是第 ${i} 号文档的摘要，覆盖技术术语如 TypeORM、NestJS 与 PostgreSQL 的用法说明。`.repeat(
+              3,
+            ),
+          docType: 'guide',
+          tags: ['prod', `t${i}`],
+          source: 'native',
+          sourceSha: `sha-${i}`,
+          sectionCount: 5,
+          tokenEstimate: 1500,
+          createdBy: 'user-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }),
+      );
+      // 30 条带全字段 health 的路由（secondary*/codeEntryType/sortOrder/时间戳均为体积负担）
+      const routeRows = Array.from({ length: 30 }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `我要了解第 ${i} 号功能的实现细节与配置方式`,
+        category: 'reference',
+        primaryDocId: 'd0',
+        primaryHeadingPath: null,
+        secondaryDocId: 'd1',
+        secondaryHeadingPath: '## 配置',
+        codeEntry: `apps/backend/src/modules/feature-${i}.ts`,
+        codeEntryType: 'exact',
+        health: { issues: [], codeEntryStatus: 'ok', checkedAt: '2026-08-16T00:00:00.000Z' },
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(docs);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+      routeRepo.find.mockResolvedValue(routeRows);
+
+      const full = await service.getOverview('space-1');
+      const slim = await service.getOverview('space-1', { slim: true });
+      const fullBytes = Buffer.byteLength(JSON.stringify(full), 'utf8');
+      const slimBytes = Buffer.byteLength(JSON.stringify(slim), 'utf8');
+      // v1.56 起 routes 恒为导航投影（两模式 routes 段相同），slim 的增量收益在 doc 条目段：
+      // 整体瘦身（默认 vs slim）+ doc 条目段（全字段 vs 5 键）应显著缩小
+      expect(slimBytes).toBeLessThan(fullBytes * 0.8);
+      const fullDocBytes = Buffer.byteLength(JSON.stringify(full.uncategorized), 'utf8');
+      const slimDocBytes = Buffer.byteLength(JSON.stringify(slim.uncategorized), 'utf8');
+      expect(slimDocBytes).toBeLessThan(fullDocBytes * 0.7);
     });
   });
 

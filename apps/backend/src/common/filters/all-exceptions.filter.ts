@@ -63,6 +63,17 @@ export class AllExceptionsFilter implements ExceptionFilter {
           message = resObj.message.map(String).join('; ');
           data = { errors: resObj.message };
         }
+        // 业务自定义 data 透传（v1.55 起）：异常响应显式携带 data 对象时原样透出到
+        // 统一信封 data 槽（如 headingQuery 多命中的 candidates）。仅在 message 数组
+        // 分支未占用 data 时生效（errors 优先，避免两种语义互相覆盖）。
+        if (
+          data === null &&
+          typeof resObj.data === 'object' &&
+          resObj.data !== null &&
+          !Array.isArray(resObj.data)
+        ) {
+          data = resObj.data as Record<string, unknown>;
+        }
         // 优先使用异常响应中自带的业务错误码
         if (typeof resObj.code === 'number') {
           code = resObj.code;

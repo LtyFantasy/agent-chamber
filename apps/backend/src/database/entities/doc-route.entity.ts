@@ -24,7 +24,7 @@ import {
   UpdateDateColumn,
   Index,
 } from 'typeorm';
-import { RouteHealth } from '@agent-chamber/shared';
+import { RouteHealth, DocRouteCodeEntryType } from '@agent-chamber/shared';
 
 /**
  * 意图路由（INDEX.md 功能-文档映射表的结构化形态）
@@ -75,13 +75,30 @@ export class DocRoute {
   codeEntry: string | null;
 
   /**
+   * codeEntry 类型（T5）：'exact'（缺省）= 精确文件/目录路径，recheck 参与
+   * repoManifest.files 存在性校验；'pattern' = glob 泛化写法（如 `apps/web/app/**` + `/page.tsx`），
+   * 人类指引价值 > 精确校验价值，recheck 豁免（health 标记 codeEntryStatus:'exempt'，不报 broken）。
+   * 列默认 'exact' 保证存量行迁移后语义不变（迁移兼容铁律）。
+   */
+  @Column({
+    type: 'varchar',
+    length: 16,
+    nullable: false,
+    default: 'exact',
+    name: 'code_entry_type',
+  })
+  codeEntryType: DocRouteCodeEntryType;
+
+  /**
    * 路由健康巡检结果（v1.42 批次 C1/C2，异步重检写入）
    *
    * jsonb 形状：{ issues: [{kind:'heading'|'codeEntry', target:'primary'|'secondary'|'codeEntry',
-   * value:string}], codeEntryStatus?: 'ok'|'broken'|'unchecked', checkedAt: ISO }。
+   * value:string}], codeEntryStatus?: 'ok'|'broken'|'unchecked'|'exempt', codeEntryNote?: string,
+   * checkedAt: ISO }。
    * 空 issues = 健康；NULL = 尚未检查（对齐 link_health「无数据 ≠ 零断链」）。
-   * codeEntryStatus（C2，仅 codeEntry 非空时携带）：无 repoManifest → 'unchecked'（不算 broken）；
-   * 精确/目录前缀命中 → 'ok'；不命中 → 'broken' 且 issues 含 kind:'codeEntry'。
+   * codeEntryStatus（C2/T5，仅 codeEntry 非空时携带）：无 repoManifest → 'unchecked'（不算 broken）；
+   * 精确/目录前缀命中 → 'ok'；不命中 → 'broken' 且 issues 含 kind:'codeEntry'；
+   * codeEntryType='pattern' → 'exempt'（豁免精确校验，codeEntryNote 附说明，不算 broken）。
    * 写入方：route-health.service.recheckSpace（upsert 内容变更 / remove / 手动 recheck 端点）。
    */
   @Column({ type: 'jsonb', nullable: true })
