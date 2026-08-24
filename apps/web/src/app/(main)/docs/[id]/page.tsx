@@ -57,6 +57,13 @@ import { DocEditor } from '@/components/docs/doc-editor';
 import { BatchUploadDialog } from '@/components/docs/batch-upload-dialog';
 import { isExternalHref, resolveDocPath, PLATFORM_DOC_LINK_RE } from '@/components/docs/doc-link';
 import { confirm, toast } from '@/lib/notify';
+import { buildPathTree, PathTreeView } from './sidebar-tree';
+
+/** 左栏视图模式 localStorage key（同 login 页 auth:last-email 先例；SSR 无 localStorage，挂载后校正） */
+const SIDEBAR_MODE_KEY = 'docs:sidebar-mode';
+
+/** 左栏视图模式：tree = 按 path 前缀的目录树（默认），category = Agent 策展分类（历史行为） */
+type SidebarViewMode = 'tree' | 'category';
 
 /**
  * mutation 错误统一提示（范式照抄 task-detail-panel.tsx addDependencyMutation）：
@@ -104,15 +111,14 @@ function normalizeHeadingText(text: string): string {
   return text.replace(/`([^`]*)`/g, '$1').trim();
 }
 
-/** 滚动到正文内指定标题（headingPath 末段由 shared helper 提取） */
-function scrollToHeading(container: HTMLElement | null, headingPath: string | null | undefined) {
-  if (!container || !headingPath) return;
-  const lastSegment = extractLastHeadingSegment(headingPath);
-  if (!lastSegment) return;
-  const normalizedLastSegment = normalizeHeadingText(lastSegment);
+/** 滚动到正文内指定标题（目录传 outline DTO heading——后端 heading_text 列直读，
+ * 标题正文含 ` § ` 也完整保留；反解析取标题已废弃，见 shared extractLastHeadingSegment 注释） */
+function scrollToHeading(container: HTMLElement | null, heading: string | null | undefined) {
+  if (!container || !heading) return;
+  const normalizedHeading = normalizeHeadingText(heading);
   const headings = container.querySelectorAll('h1, h2, h3, h4, h5, h6');
   for (const el of Array.from(headings)) {
-    if (normalizeHeadingText(el.textContent ?? '') === normalizedLastSegment) {
+    if (normalizeHeadingText(el.textContent ?? '') === normalizedHeading) {
       el.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
@@ -142,6 +148,10 @@ export default function DocSpaceDetailPage() {
   const [tagFilter, setTagFilter] = useState('');
   /** 折叠的分类 id 集合 */
   const [collapsedCats, setCollapsedCats] = useState<Set<string>>(new Set());
+  /** 左栏视图模式（目录/分类双模式）：默认 tree（用户拍板——目录是人脑心智模型），localStorage 持久化记住 */
+  const [viewMode, setViewMode] = useState<SidebarViewMode>('tree');
+  /** 目录树折叠集合（key = 文件夹路径前缀；仅会话内记忆不持久化，默认空 = 全展开，防过度设计） */
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [membersSheetOpen, setMembersSheetOpen] = useState(false);
   const [rightSheetOpen, setRightSheetOpen] = useState(false);
   /** 左栏折叠 Sheet（xl 以下，v1.47.0-dev 移动端优化）：搜索/过滤/分类树收进抽屉 */
@@ -210,6 +220,13 @@ export default function DocSpaceDetailPage() {
     const timer = setTimeout(() => setDebouncedSearchQuery(searchQuery), 300);
     return () => clearTimeout(timer);
   }, [searchQuery]);
+
+  /** 挂载后按 localStorage 校正视图模式（useState 默认值保证首屏与 SSR 一致，避免 hydration 闪烁；
+   *  与 login 页 auth:last-email 回填同款写法） */
+  useEffect(() => {
+    const saved = localStorage.getItem(SIDEBAR_MODE_KEY);
+    if (saved === 'tree' || saved === 'category') setViewMode(saved);
+  }, []);
 
   /** 搜索命中（左栏搜索框，防抖后 q 非空才发） */
   const { data: searchHits } = useQuery({
@@ -307,6 +324,9 @@ export default function DocSpaceDetailPage() {
    * 跨文档 #锚点不做滚动定位：markdown 锚点 slug 与 headingPath 文本匹配规则不同构，落地不可靠。
    */
   const docPathToId = useMemo(() => new Map(facetDocs.map((d) => [d.path, d.id])), [facetDocs]);
+  /** 当前文档 path 标量：markdownComponents 闭包只用到 doc 的 truthiness + path，
+   *  提取标量进 deps 替代 doc 对象本体（消解 exhaustive-deps warning，语义等价） */
+  const currentDocPath = doc?.path;
   const markdownComponents = useMemo<Components>(
     () => ({
       a: ({ href, children }) => {
@@ -331,7 +351,10 @@ export default function DocSpaceDetailPage() {
             </a>
           );
         }
-        const targetId = resolveDocPath(href, docPathToId);
+        // 文档 path 未就绪（doc 未加载）时正文未渲染，天然进默认 <a> 分支（loading 态无 SPA 跳转）
+        const targetId = currentDocPath
+          ? resolveDocPath(href, docPathToId, currentDocPath)
+          : undefined;
         if (targetId) {
           const url = `/docs/${spaceId}?doc=${targetId}`;
           return (
@@ -356,7 +379,7 @@ export default function DocSpaceDetailPage() {
         return <a href={href}>{children}</a>;
       },
     }),
-    [docPathToId, router, spaceId],
+    [docPathToId, router, spaceId, currentDocPath],
   );
 
   /** 分类树：category → docs；未分类单列 */
@@ -374,6 +397,25 @@ export default function DocSpaceDetailPage() {
     }
     return { map, uncategorized };
   }, [docs]);
+
+  /** 目录树节点（viewMode=tree 用；buildPathTree 纯函数独立单测见 sidebar-tree.test.tsx）。
+   *  基于过滤后的 docs 构建——与分类树同源，type/tag 过滤对两种模式行为一致 */
+  const treeNodes = useMemo(() => buildPathTree(docs), [docs]);
+
+  /**
+   * 文档匹配（搜索态 B 组）：对「未过滤全量」facetDocs 的 path + title 做大小写不敏感子串过滤。
+   * 为什么：后端全文搜索只对 section 正文/heading 打分，doc.path/title 不参与——凭文件名找不到文档。
+   * 为什么用 facetDocs 而非 docs：type/tag 过滤激活时列表 query 只剩被筛文档，
+   * 文档匹配不能被过滤器静默吞掉（评审修订②）。
+   * 与内容命中可能重复出现同一篇文档——有意为之：文件级/段落级两个入口各是各的维度，不做去重。
+   */
+  const docMatches = useMemo(() => {
+    const q = debouncedSearchQuery.trim().toLowerCase();
+    if (!q) return [];
+    return facetDocs.filter(
+      (d) => d.path.toLowerCase().includes(q) || d.title.toLowerCase().includes(q),
+    );
+  }, [debouncedSearchQuery, facetDocs]);
 
   /** 断链展示名：从正文 markdown 提取 href → 链接文本（空文本回退 href，仅首个出现生效） */
   const linkTextMap = useMemo(() => {
@@ -544,11 +586,29 @@ export default function DocSpaceDetailPage() {
     selectDoc(docId);
   };
 
+  /** 视图模式切换：同步写回 localStorage（同 login 页 auth:last-email 先例，刷新后记住选择） */
+  const handleViewModeChange = (mode: SidebarViewMode) => {
+    setViewMode(mode);
+    localStorage.setItem(SIDEBAR_MODE_KEY, mode);
+  };
+
+  /** 目录树折叠切换（key = 文件夹路径前缀；Set 不可变更新，与 collapsedCats 同款写法） */
+  const handleToggleFolder = (folderPath: string) => {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderPath)) next.delete(folderPath);
+      else next.add(folderPath);
+      return next;
+    });
+  };
+
   /** 选中搜索命中：编辑态先确认，切文档并排队滚动 */
   const handleHitSelect = async (hit: DocSearchHit) => {
     if (!(await confirmDiscardEditing())) return;
     setEditing(null);
-    pendingHeadingRef.current = hit.headingPath ?? null;
+    // DocSearchHit 只携带 headingPath（搜索索引投影无 heading 字段，见 shared
+    // DocSearchHit），此处反解析末段仅作兼容兜底——outline 消费点已改直读 heading
+    pendingHeadingRef.current = hit.headingPath ? extractLastHeadingSegment(hit.headingPath) : null;
     selectDoc(hit.docId);
     setSearchQuery('');
   };
@@ -576,7 +636,7 @@ export default function DocSpaceDetailPage() {
     );
   }
 
-  /** 左栏内容（搜索 + 类型/标签过滤 + 分类树；xl 常驻列与折叠 Sheet 共用，v1.47.0-dev 移动端折叠） */
+  /** 左栏内容（搜索 + 类型/标签过滤 + 视图模式切换 + 目录树/分类树/搜索命中；xl 常驻列与折叠 Sheet 共用，v1.47.0-dev 移动端折叠） */
   const sidebarContent = (
     <>
       <div className="flex items-center gap-2 rounded-md border border-input bg-background px-2 py-1.5">
@@ -620,41 +680,101 @@ export default function DocSpaceDetailPage() {
         </select>
       </div>
 
+      {/* 视图模式切换（目录/分类双模式）：目录=FolderTree / 分类=ListTree，选中态高亮；
+          title 提示走 i18n；搜索态下切换对渲染无影响但按钮保持常驻，布局不跳格 */}
+      <div className="flex gap-1">
+        <button
+          type="button"
+          onClick={() => handleViewModeChange('tree')}
+          title={t('detail.viewModeTree')}
+          className={`flex h-7 flex-1 items-center justify-center rounded-md transition-colors ${
+            viewMode === 'tree'
+              ? 'bg-primary/10 text-primary'
+              : 'text-muted-foreground hover:bg-accent'
+          }`}
+        >
+          <FolderTree className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => handleViewModeChange('category')}
+          title={t('detail.viewModeCategory')}
+          className={`flex h-7 flex-1 items-center justify-center rounded-md transition-colors ${
+            viewMode === 'category'
+              ? 'bg-primary/10 text-primary'
+              : 'text-muted-foreground hover:bg-accent'
+          }`}
+        >
+          <ListTree className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
       <div className="flex-1 overflow-y-auto pr-1">
         {searchQuery.trim() ? (
-          /* 搜索命中列：点击直达文档 + section 滚动 */
-          <div className="space-y-1">
-            <p className="px-1 py-0.5 text-xs text-muted-foreground">{t('detail.searchHits')}</p>
-            {(searchHits ?? []).length === 0 ? (
-              <p className="px-1 py-2 text-xs text-muted-foreground">
-                {t('detail.noSearchResults')}
-              </p>
-            ) : (
-              (searchHits ?? []).map((hit, idx) => (
-                <button
-                  key={`${hit.docId}-${hit.position}-${idx}`}
-                  onClick={() => handleHitSelect(hit)}
-                  className="block w-full rounded-md border border-border/40 px-2 py-1.5 text-left transition-colors hover:bg-accent"
-                >
-                  <span className="block truncate text-xs font-medium">{hit.docTitle}</span>
-                  {hit.headingPath && (
-                    <span className="block truncate text-[11px] text-primary/80">
-                      {hit.headingPath}
+          /* 搜索命中列：文档匹配（path/title 子串，B 组）在上，内容命中（section 正文，现状）在下 */
+          <div className="space-y-3">
+            {docMatches.length > 0 && (
+              <div className="space-y-1">
+                <p className="px-1 py-0.5 text-xs text-muted-foreground">
+                  {t('detail.docMatches')}
+                </p>
+                {docMatches.map((d) => (
+                  <button
+                    key={d.id}
+                    onClick={() => handleDocSelect(d.id)}
+                    className="block w-full rounded-md border border-border/40 px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                  >
+                    <span className="block truncate text-xs font-medium">{d.title}</span>
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {d.path}
                     </span>
-                  )}
-                  <span className="block truncate text-[11px] text-muted-foreground">
-                    {hit.snippet}
-                  </span>
-                </button>
-              ))
+                  </button>
+                ))}
+              </div>
             )}
+            <div className="space-y-1">
+              <p className="px-1 py-0.5 text-xs text-muted-foreground">{t('detail.searchHits')}</p>
+              {(searchHits ?? []).length === 0 && docMatches.length === 0 ? (
+                /* noSearchResults 两组皆空才显示：文档匹配命中但内容无命中时不该误导「无结果」 */
+                <p className="px-1 py-2 text-xs text-muted-foreground">
+                  {t('detail.noSearchResults')}
+                </p>
+              ) : (
+                (searchHits ?? []).map((hit, idx) => (
+                  <button
+                    key={`${hit.docId}-${hit.position}-${idx}`}
+                    onClick={() => handleHitSelect(hit)}
+                    className="block w-full rounded-md border border-border/40 px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                  >
+                    <span className="block truncate text-xs font-medium">{hit.docTitle}</span>
+                    {hit.headingPath && (
+                      <span className="block truncate text-[11px] text-primary/80">
+                        {hit.headingPath}
+                      </span>
+                    )}
+                    <span className="block truncate text-[11px] text-muted-foreground">
+                      {hit.snippet}
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
           </div>
         ) : docs.length === 0 ? (
           <p className="px-1 py-4 text-center text-xs text-muted-foreground">
             {t('detail.noDocs')}
           </p>
+        ) : viewMode === 'tree' ? (
+          /* 目录模式（默认）：按 path 前缀嵌套树；折叠状态仅会话内记忆 */
+          <PathTreeView
+            nodes={treeNodes}
+            collapsedFolders={collapsedFolders}
+            onToggleFolder={handleToggleFolder}
+            activeDocId={selectedDocId}
+            onSelectDoc={(docId) => handleDocSelect(docId)}
+          />
         ) : (
-          /* 分类树：可折叠分类 + 未分类区 */
+          /* 分类模式：可折叠分类 + 未分类区（原分类树原样保留） */
           <div className="space-y-2">
             {categories.map((cat) => {
               const catDocs = docsByCategory.map.get(cat.id) ?? [];
@@ -733,15 +853,14 @@ export default function DocSpaceDetailPage() {
             {dedupeOutlineSections(doc.sections).map((section) => (
               <button
                 key={section.position}
-                onClick={() => scrollToHeading(contentRef.current, section.headingPath)}
+                onClick={() => scrollToHeading(contentRef.current, section.heading)}
                 className="block w-full truncate rounded px-1.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                 style={{ paddingLeft: `${6 + section.headingLevel * 10}px` }}
                 title={section.headingPath ?? undefined}
               >
-                {/* 目录只显示末段标题（面包屑全路径留在 tooltip），否则每项都被父级标题刷屏 */}
-                {section.headingPath
-                  ? extractLastHeadingSegment(section.headingPath) || t('doc.noOutline')
-                  : t('doc.noOutline')}
+                {/* 目录只显示本地标题（outline DTO heading 列直读——标题正文含 ` § `
+                    也完整保留；面包屑全路径留在 tooltip），否则每项都被父级标题刷屏 */}
+                {section.heading || t('doc.noOutline')}
               </button>
             ))}
           </nav>

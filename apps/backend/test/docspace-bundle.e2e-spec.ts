@@ -43,12 +43,14 @@
 import { DataSource } from 'typeorm';
 import { ActorType, ErrorCode, Visibility } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
+import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocSpaceService } from '../src/modules/docspace/docspace.service';
 import { DocService } from '../src/modules/docspace/doc.service';
 import { DocRouteService } from '../src/modules/docspace/doc-route.service';
 import { DocBundleService } from '../src/modules/docspace/doc-bundle.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
+import { DocVersion } from '../src/database/entities/doc-version.entity';
 import { DocCategory } from '../src/database/entities/doc-category.entity';
 import { DocRoute } from '../src/database/entities/doc-route.entity';
 import { DocSpace } from '../src/database/entities/doc-space.entity';
@@ -180,8 +182,10 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       ds.getRepository(AuditLog),
       ds.getRepository(DocSpace),
       ds.getRepository(Board),
+      ds.getRepository(DocVersion),
       eventStub,
       routeHealthStub,
+      ds.getRepository(IdempotencyRecord),
     );
     docRouteService = new DocRouteService(
       ds.getRepository(DocRoute),
@@ -328,6 +332,14 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
     expect(bundle.docs).toHaveLength(3);
     expect(bundle.categories).toHaveLength(2);
     expect(bundle.routes).toHaveLength(2);
+
+    // v1.62.0：导出 docs[] item 增 docId + contentHash（原始写入 payload 的 SHA-256，
+    // 权威 revision 标识——content 是重建产物，其 SHA-256 ≠ contentHash）；且该新形状
+    // bundle 直接回导不炸（含 docId/contentHash 字段不被 forbidNonWhitelisted 拒绝）
+    for (const item of bundle.docs as Array<{ docId: string; contentHash: string | null }>) {
+      expect(item.docId).toBeTruthy();
+      expect(item.contentHash).toBeTruthy();
+    }
 
     // 目标空间（空壳）导入
     tgtSpaceId = await makeSpace(`BundleTgt ${RUN}`);

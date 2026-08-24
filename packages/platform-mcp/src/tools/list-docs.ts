@@ -5,6 +5,8 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §16 (GET /doc-spaces/:id/docs)
  *   - 补充: 任务 T2（工具面管理/盘点视角补齐——doc_routes/docs 的 MCP 读通道）
+ *   - 补充: v1.62.0（contentHash 读路径透传）——非 slim 条目透传 contentHash（原始写入
+ *     payload 的 SHA-256，乐观锁 token）；slim 投影保持 {path,title,updatedAt} 不动
  *
  * [踩坑索引] -
  *
@@ -128,6 +130,9 @@ export const listDocsTool: CustomTool = {
       'Filters: pathPrefix (e.g. "memory/"), category (slug), docType, tag, q (ILIKE on title/path). ' +
       'Paginated: page (default 1) + pageSize (default 20, max 100); response is ' +
       '{items,total,page,pageSize,totalPages,hasNext,hasPrev} — loop on hasNext to fetch everything. ' +
+      'Each item carries contentHash (SHA-256 of the original upsert payload — the optimistic-' +
+      'lock token used as expectedContentHash on upsert/patch/move; NOT the hash of the returned ' +
+      'summary text, never self-compute). ' +
       'slim=true projects each item to {path,title,updatedAt} only (summaries are the token bulk ' +
       'in inventory scenarios). Use get_docs_overview for the categorized map, read_doc for content.',
     inputSchema: {

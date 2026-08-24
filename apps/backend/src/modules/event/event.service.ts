@@ -6,7 +6,7 @@
  *   - 主文档: docs/architecture.md §3.2.4 (统一事件层)
  *   - 补充: docs/api-definition.md §8. Events, docs/architecture.md §7.2 (统一权限模型)
  *
- * [踩坑索引] B-50(事件轮询越权)
+ * [踩坑索引] B-50(事件轮询越权) B-51(SSE 推送越权)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #9(代理层透传)
  *
@@ -16,6 +16,9 @@
  *          accessibleTopicIds / accessibleBoardIds，QueryBuilder 用 OR 条件过滤
  *          topicId / boardId / actorId；空白名单时仅返回 actor 个人事件。
  *          同时给 Event 实体新增 boardId 字段并生成 migration。见 Plan §5。
+ *   B-51: SSE 广播载荷被裁剪（无 topicId/boardId/actorId）且全量 fan-out。
+ *          修复：emit 载荷顶层补三字段，SseService 按连接 actor 白名单过滤。
+ *          见 memory/2026-08-18.md
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -116,10 +119,14 @@ export class EventService {
       cursor: dto.cursor || this.generateCursor(),
     });
     const saved = await this.eventRepo.save(event);
+    // SSE 广播（B-51 修复：载荷顶层带 topicId/boardId/actorId，SseService 按连接 actor 过滤）
     this.sseService.emit({
       type: saved.eventType,
       resourceType: saved.resourceType,
       resourceId: saved.resourceId,
+      topicId: saved.topicId,
+      boardId: saved.boardId,
+      actorId: saved.actorId,
       payload: saved.payload,
       cursor: saved.cursor,
       createdAt: saved.createdAt,

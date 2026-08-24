@@ -9,6 +9,12 @@
  *     full 原始 markdown 纯文本 / section 原始 markdown（标题行重建）；砍 section
  *     模式 linkHealth 额外 HTTP 请求；shared 类型接线（DocDetail/DocSectionContent
  *     + extractLastHeadingSegment helper），删除本地重复接口
+ *   - 本批次（2026-08-18 债 A 双通道）: renderSectionMarkdown 改双通道
+ *     headingText ?? extractLastHeadingSegment——heading_text 列直读优先（标题正文含
+ *     ` § ` 完整保留），反解析仅作老服务端/旧数据兜底；禁止砍成单读 headingText
+ *   - 本批次（v1.62.0）: outline 模式 JSON 投影增 contentHash（maxFullTokens=0 即 token
+ *     获取通道）；description 的 BYTE-IDENTITY 修正为「仅读路径间一致」，并明示
+ *     contentHash = 原始写入 payload 的 SHA-256，禁止对读出文本自算（乐观锁一律用响应 token）
  *
  * [踩坑索引]
  *   - headingPath-separator-v1.57.2：末段标题必须通过 shared extractLastHeadingSegment() 提取，
@@ -108,14 +114,24 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
  * isContinuation === true 时跳过标题行；老服务端缺少该字段时为 undefined，保留标题行，
  * 避免在没有事实标记时误吞合法同名 sibling。
  *
- * 参数收窄为定位/正文三元组（Pick）：单节通道的 DocSectionContent 与批量通道的
- * DocSectionItem 都满足——两条通道共用同一降级渲染管线。末段标题统一由 shared
- * extractLastHeadingSegment() 提取，避免与 chunker 的 headingPath 契约漂移。
+ * 参数收窄为定位/正文五元组（Pick）：单节通道的 DocSectionContent 与批量通道的
+ * DocSectionItem 都满足——两条通道共用同一降级渲染管线。
+ * **标题取数（债 A 双通道）**：优先 headingText（heading_text 列直读——chunker 清洗
+ * 直写，标题正文含 ` § ` 也完整保留）；老服务端/旧数据无该字段时降级 shared
+ * extractLastHeadingSegment() 反解析 headingPath 末段。⚠️ 双通道不可砍成单读
+ * headingText：本函数存在的意义就是兼容老服务端，单读会让老响应丢标题行。
  */
 function renderSectionMarkdown(
-  section: Pick<DocSectionContent, 'headingPath' | 'headingLevel' | 'content' | 'isContinuation'>,
+  section: Pick<
+    DocSectionContent,
+    'headingPath' | 'headingLevel' | 'content' | 'isContinuation' | 'headingText'
+  >,
 ): string {
-  const headingText = section.headingPath ? extractLastHeadingSegment(section.headingPath) : '';
+  // 双通道（债 A）：headingText（heading_text 列直读）优先——标题正文含 ` § ` 也完整
+  // 保留；null/undefined（老服务端/旧数据无此字段）降级反解析 headingPath 末段
+  const headingText =
+    section.headingText ??
+    (section.headingPath ? extractLastHeadingSegment(section.headingPath) : '');
   if (section.isContinuation === true) {
     return section.content;
   }
@@ -181,11 +197,18 @@ export const readDocTool: CustomTool = {
       'outline JSON — metadata + summary + section map with positions (linkHealth only here). ' +
       'Does NOT accept sectionId (unstable — changes on every content update). ' +
       'Full text and section bodies are raw markdown, never JSON-escaped. ' +
-      'BYTE-IDENTITY GUARANTEE: full text and section markdown are byte-faithful fragments ' +
-      'of the same full-fidelity text that patch_doc MATCH MODE matches against ' +
-      '(== GET /docs/:id/content?full=true) — the full text equals it exactly and each ' +
-      'section markdown is an exact substring, so anything copied from read_doc is a safe ' +
-      'oldString source.',
+      'BYTE-IDENTITY GUARANTEE (read paths only): full text and section markdown are ' +
+      'byte-faithful fragments of each other (read full == GET /docs/:id/content?full=true, ' +
+      'each section markdown is an exact substring) — so anything copied from read_doc ' +
+      'is a safe patch_doc oldString source. ' +
+      '⚠️ This consistency is ONLY between read paths — the reconstructed read text is NOT ' +
+      'byte-identical to the original upsert payload (CRLF→LF, frontmatter strip, section ' +
+      'trim, heading re-injection). ' +
+      '"contentHash" (outline JSON + move_doc + list_docs + get_doc_move_impact) is the ' +
+      'SHA-256 of that ORIGINAL upsert payload — NEVER compute the SHA-256 of read text ' +
+      'and expect it to equal contentHash. For optimistic locking (expectedContentHash on ' +
+      'upsert/patch/move) always use the same-source token the server returned (outline mode ' +
+      'with maxFullTokens=0 is the documented token fetch channel); never self-hash read text.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -518,7 +541,9 @@ export const readDocTool: CustomTool = {
 
         // outline 模式：投影为精简 JSON——只保留消费价值高的元数据字段，砍掉
         // spaceId/categoryId/source/sourceSha/createdBy/createdAt/mode 等低价值字段
-        // （sections 仅含定位元数据，不含 content；linkHealth 是文档级巡检元数据归此处）
+        // （sections 仅含定位元数据，不含 content；linkHealth 是文档级巡检元数据归此处）。
+        // contentHash 透出：原始写入 payload 的 SHA-256（乐观锁 token，maxFullTokens=0
+        // 强制 outline 即文档化的 token 获取通道——见 description 契约）
         return {
           content: [
             {
@@ -533,6 +558,7 @@ export const readDocTool: CustomTool = {
                 tokenEstimate: doc.tokenEstimate,
                 sectionCount: doc.sectionCount,
                 updatedAt: doc.updatedAt,
+                contentHash: doc.contentHash,
                 linkHealth: doc.linkHealth,
                 sections: doc.sections,
               }),

@@ -124,6 +124,14 @@ export interface DocSummary {
    */
   sourceSha?: string | null;
   /**
+   * 原始写入 payload 的 SHA-256（乐观锁 token，v1.62.0）。**与读出正文不可互算**：
+   * 读路径内容 = doc_sections 重建产物（CRLF→LF / 去 frontmatter / 段 trim / 标题行
+   * 重新注入），其 SHA-256 ≠ 本值。乐观锁（expectedContentHash）一律用响应返回的
+   * token，禁止对读出文本自算 SHA。docs.content_hash 为 nullable 列——本字段可选，
+   * 缺省 = 无 contentHash（旧数据/未写入）。
+   */
+  contentHash?: string | null;
+  /**
    * 断链计数（v1.42 B6，仅 overview 装配）：从 link_health jsonb broken 数组取 length。
    * 无 linkHealth（NULL = 尚未检查）时省略该键——与"已检查且 0 断链"区分。
    */
@@ -262,18 +270,25 @@ export interface DocDetail extends DocSummary {
 export interface DocSectionOutline {
   /** 篇内顺序（对外定位锚点，position 跨更新稳定） */
   position: number;
-  /** 层级标题路径（全祖先链，如 "AAA § BBB § CCC"） */
+  /** 层级标题路径（全祖先链，如 "AAA § BBB § CCC"，纯寻址地址） */
   headingPath?: string | null;
   /**
-   * 本地标题（headingPath 末段，如 "CCC"，展示用；增量字段，向后兼容）。
-   * headingPath 为 null（headingLevel 0 文首无标题段）时为 null；
-   * headingPath 保留作寻址地址（headingPath= 精确定位、重名消歧），语义不变。
+   * 本地标题（展示用；**heading_text 列直读**，如 "CCC"；headingLevel=0 文首段为 null。
+   * 债 A 落地后 headingPath 退化纯寻址，标题展示禁止反解析末段——标题正文含 ` § `
+   * 时反解析会切错（9a15f86 / ebe7685 两次踩坑）。headingPath 保留完整链作寻址地址
+   * （headingPath= 精确定位、重名消歧），语义不变。
    */
   heading?: string | null;
   /** 标题层级 0-6 */
   headingLevel: number;
   /** Token 估算（本 section） */
   tokenEstimate?: number;
+  /**
+   * 本地标题原文（heading_text 列直读，债 A）。与 heading 同源，但保留原始清洗文本
+   * （含行内 markdown 标记）；旧服务端/旧数据无此列时为 undefined（消费方可用
+   * 提取 lastHeadingSegment 兜底）。headingLevel=0 文首段为 null。
+   */
+  headingText?: string | null;
 }
 
 /**
@@ -290,6 +305,12 @@ export interface DocSectionContent {
   headingPath?: string | null;
   /** 标题层级 */
   headingLevel: number;
+  /**
+   * 本地标题原文（heading_text 列直读，债 A）：chunker 清洗后的本地标题
+   * （含行内 markdown 标记，标题正文 ` § ` 完整保留）；headingLevel=0 文首段 null；
+   * 旧服务端/旧数据无此列时为 undefined（消费方可用 extractLastHeadingSegment 兜底）。
+   */
+  headingText?: string | null;
   /** 是否为长 section 的续 chunk；老服务端缺字段时为 undefined */
   isContinuation?: boolean;
   /** Section 正文 */
@@ -323,6 +344,11 @@ export interface DocSectionItem {
   headingPath?: string | null;
   /** 标题层级 */
   headingLevel: number;
+  /**
+   * 本地标题原文（heading_text 列直读，债 A）；语义同 DocSectionContent.headingText：
+   * headingLevel=0 文首段 null；旧服务端/旧数据无此列时为 undefined。
+   */
+  headingText?: string | null;
   /** 是否为长 section 的续 chunk；老服务端缺字段时为 undefined */
   isContinuation?: boolean;
   /** Section 正文（不含标题行，chunker 契约） */
@@ -368,6 +394,12 @@ export interface DocFullContent {
   title: string;
   /** 拼接全文 */
   content: string;
+  /**
+   * 原始写入 payload 的 SHA-256（乐观锁 token，v1.62.0）。content 是 sections 重建
+   * 产物，其 SHA-256 ≠ 本值——乐观锁一律用本 token（expectedContentHash），禁止
+   * 对读出正文自算 SHA。docs.content_hash nullable，旧数据可能缺省。
+   */
+  contentHash?: string | null;
 }
 
 // ─── Search ──────────────────────────────────────────────
@@ -589,6 +621,16 @@ export interface DocSpaceOverview {
   totalTokenEstimate?: number;
   /** 是否因 token 上限截断（仅文档条目截断，图例始终全量；意图路由截断见 routesTruncated） */
   truncated?: boolean;
+  /**
+   * 过滤后文档总数（截断元数据补齐）：不受 maxTokens 截断影响（恒为过滤后
+   * 全量计数），供调用方判断是否需要分页拉全；截断时 docsReturned < docsTotal
+   */
+  docsTotal: number;
+  /**
+   * 实际返回的文档条目数（截断元数据补齐）：categories.docs 与 uncategorized
+   * 之和；未截断时等于 docsTotal
+   */
+  docsReturned: number;
   /** 实际生效的过滤条件回显（未传任何过滤且无空间默认时缺省） */
   appliedFilters?: DocSpaceOverviewAppliedFilters;
 }
@@ -670,6 +712,17 @@ export interface UpsertDocResult {
    * 做乐观锁前提校验（409 DOC_CONTENT_CONFLICT = 期间被他人改动）。
    */
   contentHash?: string;
+  /**
+   * true = 内容 hash 未变但 forceRechunk 强制重建了 sections（债 B：section 级
+   * 元数据修复路径）。携带时 unchanged 恒不出现（真早退才返回 unchanged:true）；
+   * 注意 updatedAt 会随元数据重建 bump——这是预期语义，不是 bug。
+   */
+  rechunked?: boolean;
+  /**
+   * true = 幂等重放（v1.63.0）：同 actor + clientRequestId 的重复请求，返回
+   * response_snapshot 存的首次成功响应（非当前状态）。仅携带幂等键的请求可能出现。
+   */
+  idempotentReplay?: boolean;
 }
 
 // ─── Batch Upsert ──────────────────────────────────────────
@@ -712,4 +765,280 @@ export interface BatchUpsertDocsResult {
     /** 失败数 */
     failed: number;
   };
+}
+
+// ─── Doc Version（文档编辑历史，doc history MVP）──────────────
+
+/**
+ * 版本来源字面量（doc_versions.source，单一事实来源）
+ *
+ * - 'upsert'：直接 full upsert（PUT /doc-spaces/:id/docs，含 web 编辑回写）；
+ * - 'patch'：section 级 / match 模式局部写（PATCH /docs/:id/sections/:position、PATCH /docs/:id/content）；
+ * - 'import'：批量导入通道（PUT /doc-spaces/:id/docs/batch，MCP import_docs / import_doc_bundle）；
+ * - 'append'：追加写原语（POST /docs/:id/append，v1.65.0 消费者反馈批 7601e2f5——
+ *   doc_versions.source 为自由 varchar(16) 无 DB 约束，直接扩展字面量即可）。
+ */
+export const DOC_VERSION_SOURCES = ['upsert', 'patch', 'import', 'append'] as const;
+
+/** 版本来源联合（'upsert' | 'patch' | 'import' | 'append'） */
+export type DocVersionSource = (typeof DOC_VERSION_SOURCES)[number];
+
+/**
+ * 文档版本摘要（GET /docs/:id/versions 列表项，不含 content 全文）
+ *
+ * 版本号语义：单调递增（历史最大 version+1），旧版本被保留策略剪除后不回填不归零——
+ * version 是稳定标识，引用不随剪枝漂移。
+ */
+export interface DocVersionSummary {
+  /** 版本号（1 起，单调递增不归零） */
+  version: number;
+  /** 该版本内容 SHA256（= 写入后 docs.content_hash） */
+  contentHash: string;
+  /** 写入者 actor ID（'system' 固定 uuid = 系统/无认证写） */
+  authorActorId: string;
+  /** 版本来源：'upsert' | 'patch' | 'import' */
+  source: DocVersionSource;
+  /** 版本创建时间（服务端时间） */
+  createdAt: string | Date;
+  /** 内容字节数（utf8，octet_length；不含正文仍能评估抓取成本） */
+  contentSize: number;
+}
+
+/**
+ * 版本间行级 diff（读时现算，不落库；与前一版本对比）
+ *
+ * 无外部依赖的行级 LCS 实现：逐行比对（doc-version-diff.ts），输出简易
+ * unified diff 文本 + 增删计数。'fromVersion' = 剪枝后该版本的前一版本
+ * （version 小于当前的最大版本，不一定是 version-1——剪枝可能跳号）。
+ */
+export interface DocVersionDiff {
+  /** 对比基准版本号（前一版本；不存在时为 null 字段） */
+  fromVersion: number;
+  /** 相对前一版本新增的行数 */
+  added: number;
+  /** 相对前一版本删除的行数 */
+  removed: number;
+  /** 行级 unified diff 文本（hunk 头 + ' '/'+'/'-' 前缀行） */
+  unified: string;
+}
+
+/**
+ * 文档版本详情（GET /docs/:id/versions/:version）
+ *
+ * 单版本详情 = 元数据 + 该版本全文快照 + 与前一版本的 diff（读时现算）。
+ */
+export interface DocVersionDetail extends DocVersionSummary {
+  /** 该版本的全文快照（与写通道 dto.content 同形） */
+  content: string;
+  /**
+   * 与前一版的 diff；null = 没有前一版本（该文档最早一版）——
+   * 与「有前版但完全无差异」区分（后者 added/removed 为 0）。
+   */
+  diff: DocVersionDiff | null;
+}
+
+// ---------------------------------------------------------------------------
+// Move impact / atomic move（v1.60.0-dev，P1 双件 73cadb0d + 8d763914）
+// ---------------------------------------------------------------------------
+
+/**
+ * Move impact 入链条目（GET /docs/:id/move-impact 的 inboundLinks 元素）
+ *
+ * 元数据：被移文档的 Markdown 入链出处，供迁移方生成人工改写清单。
+ * 去重契约：按 (sourceDocId, href) 唯一；section 定位 = 该 href 首个命中
+ * section 的 position/headingPath（同一文档多处链同一 href 只记首例）。
+ */
+export interface DocInboundLink {
+  /** 入链来源文档 ID（出链方） */
+  sourceDocId: string;
+  /** 入链来源文档 path（出链方） */
+  sourcePath: string;
+  /** 入链来源文档 title（出链方） */
+  sourceTitle: string;
+  /** 原文 href（未归一化，恢复现场用） */
+  href: string;
+  /**
+   * true = Markdown 相对 .md path 链接（move 改 path 后即断 → 进
+   * pathBasedLinksToRewrite 清单，需人工改写）；false = 平台规范链接
+   * /docs/<spaceId>?doc=<docId>（按 docId 引用，move 不受影响）。
+   */
+  isPathBased: boolean;
+  /** 该 href 首个命中 section 的 position（0-based） */
+  sectionPosition?: number;
+  /** 该 href 首个命中 section 的 headingPath（可空 = headingLevel 0 文首段） */
+  headingPath?: string | null;
+}
+
+/**
+ * Move impact outbound 链条目（被移文档自身的相对 .md 出链失效面，v1.61.0 批次 1）
+ *
+ * 方向语义：inboundLinks 是「别人链我」；本清单是「我链别人」——被移文档移动前后
+ * 基准目录变化，自身相对出链的解析目标随之漂移，逐条标注供迁移方改写自身正文。
+ * 只收录 path-based 相对 .md 链接（?doc= 平台链接按 docId 引用，move 不受影响，
+ * 不收录）；old/new ResolvedTarget 均按严格源目录 POSIX 解析（resolveHrefToDocPath）。
+ * 收录条件：old 与 new 解析结果**不同**（基准目录未变 → 链接不受影响 → 不收录）。
+ */
+export interface DocOutboundLink {
+  /** 原文 href（未归一化，恢复现场用） */
+  href: string;
+  /** 移动前解析目标路径（严格源相对 POSIX 解析，源 = doc.path 的目录） */
+  oldResolvedTarget: string;
+  /** 移动后解析目标路径（严格源相对 POSIX 解析，源 = proposedPath 的目录） */
+  newResolvedTarget: string;
+  /**
+   * 移动前该目标在空间中是否存在（按移动前 path 集合判定）。
+   * true = 移动前健康；false = 移动前已是断链——已断链接入清单会误导迁移方，
+   * 必须显式标注（plan 决策）。
+   */
+  oldTargetExists: boolean;
+  /**
+   * 移动后解析目标是否存活——按「移动后 path 集合」判定：空间现存 path 去掉
+   * doc.path、加上 proposedPath（被移文档自身以 newPath 计入，自引用因此正确）。
+   */
+  targetExists: boolean;
+  /** 移动后解析目标命中的文档 ID（按移动后 path → id 映射反查；无 = undefined） */
+  targetDocId?: string;
+  /** 该 href 首个命中 section 的 position（0-based，与 inbound 同口径） */
+  sectionPosition?: number;
+  /** 该 href 首个命中 section 的 headingPath（可空 = headingLevel 0 文首段） */
+  headingPath?: string | null;
+}
+
+/**
+ * Move impact 意图路由引用条目（doc_routes 中 primary/secondary 指向被移文档）
+ *
+ * doc_routes 存的是裸 docId（无 FK），move 后路由行自动继续指向同一 docId——
+ * 本清单仅供迁移方核对路由的展示语义（intent/锚点）。
+ */
+export interface DocRouteRef {
+  /** 路由 ID */
+  routeId: string;
+  /** 路由意图描述 */
+  intent: string;
+  /** 该文档在路由中的角色：主文档 / 次文档 */
+  role: 'primary' | 'secondary';
+  /** 对应角色的 headingPath 锚点（可空 = 文档级跳转） */
+  headingPath: string | null;
+}
+
+/** 目标 path 碰撞详情（proposedPath/toPath 撞空间内另一未删 doc） */
+export interface DocMoveTargetCollision {
+  collision: true;
+  /** 已占用目标 path 的文档 ID */
+  conflictDocId: string;
+}
+
+/**
+ * computeMoveImpact 完整视图（三处共用：get_move_impact 端点 / move dryRun /
+ * move 响应摘要——同一份实现，保证 dryRun 视图与真实移动前的预演一致）
+ */
+export interface DocMoveImpact {
+  /** 被查文档 ID */
+  docId: string;
+  /** 当前 path（move 前 / 未移动时） */
+  path: string;
+  /**
+   * 被查文档的原始写入 payload SHA-256（乐观锁 token，v1.62.0）。
+   * **与读出正文不可互算**（读路径 = sections 重建产物）；乐观锁
+   * （expectedContentHash）一律用本 token，禁止对读出文本自算 SHA。
+   * docs.content_hash 为 nullable 列——缺省 null = 旧数据/未写入。
+   */
+  contentHash: string | null;
+  /** 提议的新 path（proposedPath/toPath 非空时返回） */
+  proposedPath?: string;
+  /** 入链清单（全空间反扫，按 (sourceDocId, href) 去重） */
+  inboundLinks: DocInboundLink[];
+  /** doc_routes 引用清单 */
+  docRoutes: DocRouteRef[];
+  /** 关联 taskId 列表（task_doc_links WHERE doc_id） */
+  taskLinks: string[];
+  /** 目标 path 碰撞（proposedPath 非空且空间内已有同 path 未删 doc 时） */
+  targetCollision?: DocMoveTargetCollision;
+  /** proposedPath == 当前 path（no-op，调用方判 409 RESOURCE_CONFLICT） */
+  samePath?: boolean;
+  /** 需人工改写的入链子集（inboundLinks 中 isPathBased=true 的项）；
+   *  ?doc= 规范链接按 docId 引用，不受 move 影响，不在此清单 */
+  pathBasedLinksToRewrite: DocInboundLink[];
+  /**
+   * 被移文档自身的相对 .md 出链失效清单（v1.61.0 批次 1；仅 proposedPath 非空时携带）。
+   * 移动后基准目录变化 → 自身相对出链解析目标漂移；old/new 解析结果不同才收录，
+   * 逐条带移动前后解析目标与存在性标记（oldTargetExists/targetExists 双态，
+   * exists 按移动后 path 集合判定——被移文档自身以 newPath 计入，自引用正确）。
+   */
+  outboundPathLinksToRewrite?: DocOutboundLink[];
+}
+
+/**
+ * POST /docs/:id/move 响应（moved=true 已落库 / dryRun 未落库）
+ */
+export interface DocMoveResult {
+  /** 被移文档 ID（move 前后不变——引用面连续性核心） */
+  docId: string;
+  /** 移动前 path */
+  oldPath: string;
+  /** 移动后 path */
+  newPath: string;
+  /** 当前内容 SHA256（move 不重建 content/sections，hash 不变） */
+  contentHash: string | null;
+  /** true = 已落库；false = dryRun */
+  moved: boolean;
+  /** dryRun 专用标记：true = 校验全过、预演视图、未写库 */
+  wouldMove?: boolean;
+  /** impact 完整视图（inboundLinks/docRoutes/taskLinks/pathBasedLinksToRewrite） */
+  impact: DocMoveImpact;
+  /**
+   * true = 幂等重放（v1.63.0）：同 actor + clientRequestId 的重复请求，返回
+   * response_snapshot 存的首次成功响应（文档不会再次移动）。仅携带幂等键的请求可能出现。
+   */
+  idempotentReplay?: boolean;
+}
+
+// ─── Metadata-only patch（v1.61.0 批次 2，Board 任务 201ae04f）──────────────
+
+/**
+ * PATCH /docs/:id/metadata 响应的最终元数据视图
+ *
+ * 写后可核对面：五个可 patch 字段的最终落库值（title/summary/docType/tags/
+ * categoryId）+ categoryName 便捷展示（categoryId 为 null 时 categoryName 亦 null）。
+ * contentHash/sectionCount/content 面不在此视图——metadata-only 语义保证它们不变。
+ */
+export interface PatchDocMetadataView {
+  /** 文档标题（最终值） */
+  title: string;
+  /** 摘要（最终值；null = 无摘要） */
+  summary: string | null;
+  /** 文档类型（最终值；null = 未设置） */
+  docType: string | null;
+  /** 标签数组（最终值；[] = 已清空） */
+  tags: string[];
+  /** 分类 ID（最终值；null = 未分类） */
+  categoryId: string | null;
+  /** 分类名（categoryId 非空时查得；null = 未分类） */
+  categoryName: string | null;
+}
+
+/**
+ * PATCH /docs/:id/metadata 响应（metadata-only 写通道，游戏方 Pilot 1b 契约）
+ *
+ * 不变量契约：本写通道不重切 sections、不落 doc_versions、不动 contentHash/
+ * docId/task_doc_links/doc_routes——只 UPDATE docs 行的元数据列。
+ */
+export interface PatchDocMetadataResult {
+  /** 文档 ID（metadata patch 前后不变） */
+  docId: string;
+  /** 文档 path（不变） */
+  path: string;
+  /** 内容 SHA256（不变——metadata-only 语义核心，与写前 expectedContentHash 一致） */
+  contentHash: string | null;
+  /** 本次实际变更的字段名列表（title/summary/docType/tags/category 的子集；unchanged 时为空） */
+  changedFields: string[];
+  /** true = 全部显式字段与现值相同，未产生任何写操作（无 UPDATE/audit/事件） */
+  unchanged: boolean;
+  /** 最终元数据视图（写后回传，单次调用可核对） */
+  metadata: PatchDocMetadataView;
+  /**
+   * true = 幂等重放（v1.63.0）：同 actor + clientRequestId 的重复请求，返回
+   * response_snapshot 存的首次成功响应。仅携带幂等键的请求可能出现。
+   */
+  idempotentReplay?: boolean;
 }

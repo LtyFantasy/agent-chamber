@@ -100,6 +100,8 @@ export enum EventType {
   DOC_CREATED = 'doc_created',
   DOC_UPDATED = 'doc_updated',
   DOC_DELETED = 'doc_deleted',
+  /** v1.60.0-dev：原子 move（同 docId 改 path，保留引用面） */
+  DOC_MOVED = 'doc_moved',
 }
 
 export enum ActorType {
@@ -127,6 +129,8 @@ export enum AuditAction {
   TOGGLE_AGENT = 'toggle_agent',
   PAUSE_TOPIC = 'pause_topic',
   RESUME_TOPIC = 'resume_topic',
+  /** v1.60.0-dev：文档原子移动（verb_noun 风格对齐 reset_api_key/pause_topic 先例） */
+  MOVE_DOC = 'move_doc',
 }
 
 export enum WebhookStatus {
@@ -243,6 +247,8 @@ export enum ErrorCode {
   // 通用业务 (9000-9099)
   VALIDATION_ERROR = 9000,
   RESOURCE_CONFLICT = 9001,
+  /** 409 — 幂等键冲突：同 clientRequestId 但 request_hash 不符（payload 与首次请求不同），拒绝重放（v1.63.0 DocSpace 写族） */
+  IDEMPOTENCY_KEY_CONFLICT = 9002,
 
   // DocSpace (10000-10099)
   DOC_SPACE_NOT_FOUND = 10000,

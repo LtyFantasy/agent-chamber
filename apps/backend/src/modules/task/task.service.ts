@@ -46,9 +46,12 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, DataSource } from 'typeorm';
+import { createHash } from 'crypto';
 import { Task } from '../../database/entities/task.entity';
 import { TaskComment } from '../../database/entities/task-comment.entity';
 import { TaskActivity } from '../../database/entities/task-activity.entity';
@@ -78,6 +81,8 @@ import {
   AddCommentDto,
   QueryTaskDto,
   BatchCreateTasksDto,
+  ReportTaskResultDto,
+  PatchTaskDescriptionDto,
 } from './dto';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
@@ -90,6 +95,47 @@ import type { TaskDocLinkItem } from '@agent-chamber/shared';
 export interface TaskWithBlockers extends Task {
   blockers?: TaskDependency[];
   assigneeName?: string | null;
+}
+
+/**
+ * POST /tasks/:id/report 的成功响应形状（幂等快照以此为准）。
+ *
+ * task 恒有；comment 仅当评论步骤执行过；docLinks 仅当请求带 docIds。
+ * idempotentReplay 仅在「完整快照直接回放」路径置 true（恢复路径不做标记——
+ * 它补跑了未完成步骤，属于真实的新工作）。
+ */
+export interface TaskReportResult {
+  task: Record<string, unknown>;
+  comment?: unknown;
+  docLinks?: {
+    succeeded: string[];
+    failed: TaskDocLinkFailure[];
+  };
+  idempotentReplay?: boolean;
+}
+
+/** 单条 doc-link 失败项（形状对齐 MCP report_task_result 的 docLinks.failed） */
+export interface TaskDocLinkFailure {
+  docId: string;
+  status?: number;
+  code?: number | string;
+  error: string;
+}
+
+/** report 幂等记录专用 entityType（与既有 'task'/'doc' 区分，共用 uq_idempotency_actor_key 表） */
+const TASK_REPORT_ENTITY_TYPE = 'task_report';
+
+/** patchDescription 幂等记录专用 entityType（与 'task'/'task_report' 区分，共用 uq_idempotency_actor_key 表） */
+const TASK_PATCH_DESCRIPTION_ENTITY_TYPE = 'task_description';
+
+/**
+ * PATCH /tasks/:id/description 的成功响应形状（幂等快照以此为准）。
+ *
+ * task 恒有（含 descriptionHash）；idempotentReplay 仅在「快照直接回放」路径置 true。
+ */
+export interface TaskPatchDescriptionResult {
+  task: Record<string, unknown>;
+  idempotentReplay?: boolean;
 }
 
 @Injectable()
@@ -297,6 +343,17 @@ export class TaskService {
     };
   }
 
+  /**
+   * 描述乐观锁 token：sha256(description ?? '')。
+   * 计算字段（无 DB 列）：findOne 详情响应与 patchDescription 响应携带，
+   * 供调用方在局部 patch 前捕获前提（expectedDescriptionHash）。
+   */
+  private descriptionHash(description: string | null | undefined): string {
+    return createHash('sha256')
+      .update(description ?? '')
+      .digest('hex');
+  }
+
   /** 原始查询：按 ID 查找 Task（含 relations），不做权限检查 */
   async findById(id: string): Promise<Task> {
     const task = await this.taskRepo.findOne({
@@ -398,10 +455,38 @@ export class TaskService {
       }));
     }
 
-    return { ...plain, boardId: taskList?.boardId ?? null, docs };
+    return {
+      ...plain,
+      boardId: taskList?.boardId ?? null,
+      docs,
+      // 描述乐观锁 token（计算字段）：供 PATCH /tasks/:id/description 的
+      // expectedDescriptionHash 前提捕获
+      descriptionHash: this.descriptionHash(plain.description),
+    };
   }
 
   async create(dto: CreateTaskDto, actorId?: string, actorType?: ActorType) {
+    // ── statusName → listId 解析（与 MCP create_task 的 resolveList 契约对齐）──
+    // 契约：listId 与 statusName 必须至少提供一个（都缺 → 400）；同时提供时 listId 优先、
+    // statusName 忽略。仅当 !listId && statusName 时触发解析；此路径要求显式 boardId
+    // （否则无法确定查哪个 board 的列）。解析出的 listId 回填 dto，后续原有流程不变。
+    if (!dto.listId && !dto.statusName) {
+      throw new BadRequestException({
+        message: 'Either listId or statusName is required',
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+    if (!dto.listId && dto.statusName) {
+      if (!dto.boardId) {
+        throw new BadRequestException({
+          message: 'boardId is required when resolving the target list by statusName',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
+      const resolved = await this.resolveListIdByStatusName(dto.statusName, dto.boardId);
+      dto.listId = resolved.listId;
+    }
+
     // boardId 推断：如果未传，通过 listId 查询 BoardList 获取
     let boardId = dto.boardId;
     let topicId: string | null = null;
@@ -450,7 +535,8 @@ export class TaskService {
     const assigneeId = dto.assigneeId?.trim() || actorId || null;
     const assigneeType = assigneeId ? await this.resolveActorType(assigneeId) : null;
 
-    const { clientRequestId, boardId: _boardId, ...taskDto } = dto;
+    // statusName 必须在铺入 taskRepo.create 前剔除，否则 TypeORM 会把它当实体列写入（unknown column）
+    const { clientRequestId, boardId: _boardId, statusName: _statusName, ...taskDto } = dto;
 
     // ── 无幂等键：走原路径（零开销） ──
     if (!clientRequestId) {
@@ -556,6 +642,103 @@ export class TaskService {
       }
       throw err;
     }
+  }
+
+  /**
+   * 按 statusName 解析目标列（与 MCP create_task 的 resolveList 契约逐字对齐）：
+   * ① mappedStatus 大小写不敏感精确 → ② 列名 ci 精确 → ③ 列名 ci 子串。
+   * 0 命中抛 400 并附全部可选项（options）；>1 命中抛 400 并附候选列表
+   * （candidates + isAmbiguous），绝不静默挑选。
+   * @param statusName 调用方传入的列名/mappedStatus（已由 DTO 保证非空字符串）
+   * @param boardId 目标看板 ID（必填，决定查询范围；调用方已校验非空）
+   * @returns 唯一命中的列信息（listId 回填 dto 使用，listName/matchedBy/mappedStatus 供调试）
+   */
+  private async resolveListIdByStatusName(
+    statusName: string,
+    boardId: string,
+  ): Promise<{ listId: string; listName: string; matchedBy: string; mappedStatus: string | null }> {
+    const lists = await this.boardListRepo.find({ where: { boardId } });
+    const lowerStatus = statusName.toLowerCase();
+
+    // Layer 1: mappedStatus ci 精确（MCP resolveList 同款：仅字符串型 mappedStatus 参与比较）
+    const mapped = lists.filter(
+      (l) => typeof l.mappedStatus === 'string' && l.mappedStatus.toLowerCase() === lowerStatus,
+    );
+    if (mapped.length === 1) {
+      return {
+        listId: mapped[0].id,
+        listName: mapped[0].name,
+        matchedBy: `mappedStatus=${mapped[0].mappedStatus}`,
+        mappedStatus: mapped[0].mappedStatus as string,
+      };
+    }
+    if (mapped.length > 1) {
+      throw new BadRequestException({
+        message:
+          `status "${statusName}" matches ${mapped.length} lists via mappedStatus. ` +
+          `Provide a more specific status or use a different status name.`,
+        code: ErrorCode.VALIDATION_ERROR,
+        candidates: mapped.map((l) => ({ id: l.id, name: l.name, mappedStatus: l.mappedStatus })),
+        isAmbiguous: true,
+      });
+    }
+
+    // Layer 2: 列名 ci 精确
+    const nameExact = lists.filter((l) => l.name.toLowerCase() === lowerStatus);
+    if (nameExact.length === 1) {
+      return {
+        listId: nameExact[0].id,
+        listName: nameExact[0].name,
+        matchedBy: 'listName exact',
+        mappedStatus: nameExact[0].mappedStatus ?? null,
+      };
+    }
+    if (nameExact.length > 1) {
+      throw new BadRequestException({
+        message:
+          `status "${statusName}" matches ${nameExact.length} lists by exact name. ` +
+          `Refine the status or provide a different name.`,
+        code: ErrorCode.VALIDATION_ERROR,
+        candidates: nameExact.map((l) => ({
+          id: l.id,
+          name: l.name,
+          mappedStatus: l.mappedStatus,
+        })),
+        isAmbiguous: true,
+      });
+    }
+
+    // Layer 3: 列名 ci 子串
+    const nameSub = lists.filter((l) => l.name.toLowerCase().includes(lowerStatus));
+    if (nameSub.length === 1) {
+      return {
+        listId: nameSub[0].id,
+        listName: nameSub[0].name,
+        matchedBy: 'listName substring',
+        mappedStatus: nameSub[0].mappedStatus ?? null,
+      };
+    }
+    if (nameSub.length > 1) {
+      throw new BadRequestException({
+        message:
+          `status "${statusName}" matches ${nameSub.length} lists by name substring. ` +
+          `Refine the status or provide a more specific name.`,
+        code: ErrorCode.VALIDATION_ERROR,
+        candidates: nameSub.map((l) => ({ id: l.id, name: l.name, mappedStatus: l.mappedStatus })),
+        isAmbiguous: true,
+      });
+    }
+
+    // 0 命中：列出全部可选项，方便调用方修正
+    throw new BadRequestException({
+      message:
+        `status "${statusName}" did not match any list on board. ` +
+        `Available lists: ${lists
+          .map((l) => `${l.name} (mappedStatus=${l.mappedStatus})`)
+          .join(', ')}`,
+      code: ErrorCode.VALIDATION_ERROR,
+      options: lists.map((l) => ({ id: l.id, name: l.name, mappedStatus: l.mappedStatus })),
+    });
   }
 
   async update(id: string, dto: UpdateTaskDto, actorId?: string, actorType?: ActorType) {
@@ -716,6 +899,210 @@ export class TaskService {
       boardId: updatedList?.boardId ?? null,
       topicId: updatedList?.board?.topicId ?? null,
     };
+  }
+
+  /**
+   * 任务描述局部 patch（PATCH /tasks/:id/description，消费者反馈批 5bc4a570）。
+   *
+   * 与 update() 的整段覆盖语义并列的局部写通道：match 模式精确串替换 + 乐观锁 +
+   * 幂等，契约对齐 DocSpace patchByMatch（doc.service.ts）：
+   * - 0 命中 → 404 DOC_NOT_FOUND（提示先读详情核对 oldString）；
+   * - >1 命中 → 409 RESOURCE_CONFLICT + data.matchCount（绝不静默挑选）；
+   * - 恰好 1 命中 → 函数式 replacer 替换（newString 中的 $&/$1 按字面量处理）。
+   *
+   * 乐观锁：expectedDescriptionHash = sha256(description ?? '')（findOne 响应携带
+   * descriptionHash）。事务内 FOR UPDATE 锁行后复核，不符 → 409 DOC_CONTENT_CONFLICT
+   * + data.currentDescriptionHash 提示重读；缺省 = 无前提（不阻塞无锁调用方）。
+   *
+   * 幂等（clientRequestId 可选）：同 actor 同 key 重试返回首次响应快照 +
+   * idempotentReplay（快照在业务事务内登记——业务提交 ⟺ 快照可查）；同 key 不同
+   * payload → 409 IDEMPOTENCY_KEY_CONFLICT。并发同 key 撞 uq_idempotency_actor_key
+   * （23505）→ 事务回滚后重读胜者快照返回（更新语义不能查回实体——文档已被首次
+   * 请求改写，v1.63.0 教训）。
+   *
+   * 刻意不做内部重试（与 appendDoc 相反）：并发改动后 oldString 可能已消失，
+   * 409/404 让调用方重读才是正确语义；FOR UPDATE 行锁已保证不丢更新。
+   *
+   * @param id 任务 ID
+   * @param dto 请求体（oldString 必填非空；newString 可为空串 = 删除该片段）
+   * @param actor 当前操作者（认证 guard 保证非空）
+   * @returns { task, idempotentReplay? }——task 含新 descriptionHash
+   * @throws NotFoundException(4000/10001) / ConflictException(9001/10009/9002)
+   */
+  async patchDescription(
+    id: string,
+    dto: PatchTaskDescriptionDto,
+    actor: UnifiedActor,
+  ): Promise<TaskPatchDescriptionResult> {
+    const { oldString, newString, expectedDescriptionHash, clientRequestId } = dto;
+
+    // ── 幂等上下文：无 key → null（零开销旁路）──
+    const idemCtx = clientRequestId
+      ? {
+          actorKey: actor.id,
+          clientRequestId,
+          // canonical payload（字面量对象，key 顺序稳定）：含路由参数 taskId，
+          // 同 key 换任务也视为不同 payload → 409
+          requestHash: createHash('sha256')
+            .update(JSON.stringify({ taskId: id, oldString, newString, expectedDescriptionHash }))
+            .digest('hex'),
+        }
+      : null;
+
+    // ── 入口重放查询（有 key 的快速路径）──
+    if (idemCtx) {
+      const record = await this.dataSource.getRepository(IdempotencyRecord).findOne({
+        where: { actorId: idemCtx.actorKey, clientRequestId: idemCtx.clientRequestId },
+      });
+      if (record) {
+        this.assertIdempotencyMatch(record, idemCtx, TASK_PATCH_DESCRIPTION_ENTITY_TYPE);
+        const snapshot = record.responseSnapshot as TaskPatchDescriptionResult | null;
+        if (!snapshot) {
+          // 记录恒带快照；缺失说明数据被外部改动——防御性抛错而非返回残缺响应
+          throw new InternalServerErrorException(
+            `idempotency record for key '${idemCtx.clientRequestId}' is missing its response snapshot`,
+          );
+        }
+        return { ...snapshot, idempotentReplay: true };
+      }
+    }
+
+    // ── 主事务：锁行 → 乐观锁 → match → 替换 → save → 幂等记录（同事务）──
+    try {
+      const { response, oldDescription, newDescription, boardId, topicId } =
+        await this.dataSource.transaction(async (manager) => {
+          const taskRepo = manager.getRepository(Task);
+          // FOR UPDATE 行锁：并发 patch 串行化，锁内复核的 oldString/descriptionHash
+          // 不会在写入窗口内漂移（不丢更新；冲突语义交给调用方重读）
+          const task = await taskRepo.findOne({
+            where: { id },
+            lock: { mode: 'pessimistic_write' },
+          });
+          if (!task) {
+            throw new NotFoundException({
+              message: 'Task not found',
+              code: ErrorCode.TASK_NOT_FOUND,
+            });
+          }
+
+          // 乐观锁前提：expectedDescriptionHash 与当前 description 哈希不符 → 409 +
+          // currentDescriptionHash 提示重读（对齐 DocSpace expectedContentHash 语义）
+          const currentHash = this.descriptionHash(task.description);
+          if (expectedDescriptionHash && expectedDescriptionHash !== currentHash) {
+            throw new ConflictException({
+              message:
+                'Task description has changed since the expected hash was captured; ' +
+                're-read the task (GET /tasks/:id) to get the current descriptionHash and retry',
+              code: ErrorCode.DOC_CONTENT_CONFLICT,
+              data: { currentDescriptionHash: currentHash },
+            });
+          }
+
+          // match 计数（split 段数 - 1 = 命中次数；空串 oldString 已在 DTO 层 400 拦截）
+          const currentDescription = task.description ?? '';
+          const matchCount = currentDescription.split(oldString).length - 1;
+          if (matchCount === 0) {
+            throw new NotFoundException({
+              message:
+                `oldString not found in the task description (0 matches); ` +
+                `re-read the task (GET /tasks/:id) and retry`,
+              code: ErrorCode.DOC_NOT_FOUND,
+            });
+          }
+          if (matchCount > 1) {
+            throw new ConflictException({
+              message:
+                `oldString matches ${matchCount} locations in the task description; ` +
+                `expand oldString with more surrounding context to make it unique and retry`,
+              code: ErrorCode.RESOURCE_CONFLICT,
+              data: { matchCount },
+            });
+          }
+
+          // 唯一命中：函数式 replacer（newString 中的 $&/$1 等模式按字面量处理，不被解释）
+          const oldDescription = task.description;
+          task.description = currentDescription.replace(oldString, () => newString);
+          const saved = await taskRepo.save(task);
+
+          // 组装响应（boardId/topicId 从 list→board 派生，与 update() 同款；
+          // 只读查询，事务内外等价）
+          const list = await this.boardListRepo.findOne({
+            where: { id: saved.listId },
+            relations: ['board'],
+          });
+          const response: TaskPatchDescriptionResult = {
+            task: {
+              ...this.toPlain(saved),
+              boardId: list?.boardId ?? null,
+              topicId: list?.board?.topicId ?? null,
+              descriptionHash: this.descriptionHash(saved.description),
+            },
+          };
+
+          // 幂等记录与业务写同事务：业务提交 ⟺ 快照可查（对齐 create() 骨架）
+          if (idemCtx) {
+            await manager.getRepository(IdempotencyRecord).save({
+              actorId: idemCtx.actorKey,
+              clientRequestId: idemCtx.clientRequestId,
+              entityType: TASK_PATCH_DESCRIPTION_ENTITY_TYPE,
+              entityId: id,
+              // 快照列类型为 Record<string, unknown>，接口形状需显式 cast（照 report 先例）
+              responseSnapshot: response as unknown as Record<string, unknown>,
+              requestHash: idemCtx.requestHash,
+            });
+          }
+
+          return {
+            response,
+            oldDescription,
+            newDescription: saved.description,
+            boardId: list?.boardId ?? null,
+            topicId: list?.board?.topicId ?? null,
+          };
+        });
+
+      // ── 事务提交后副作用（照 update() 对 description 变更的既有行为）──
+      await this.eventService.create({
+        eventType: EventType.TASK_UPDATE,
+        resourceType: 'task',
+        resourceId: id,
+        topicId: topicId ?? undefined,
+        boardId: boardId ?? undefined,
+        actorId: actor.id,
+        actorType: actor.type,
+        payload: { taskId: id, action: 'updated', fieldName: 'description' },
+      });
+
+      if (actor.id) {
+        await this.activityRepo.save({
+          taskId: id,
+          action: 'updated',
+          fieldName: 'description',
+          oldValue: oldDescription,
+          newValue: newDescription,
+          actorId: actor.id,
+          actorType: actor.type ?? ActorType.HUMAN,
+          details: '更新了: description',
+        });
+      }
+
+      return response;
+    } catch (err: unknown) {
+      const pgErr = err as { code?: string; constraint?: string };
+      if (idemCtx && pgErr.code === '23505' && pgErr.constraint === 'uq_idempotency_actor_key') {
+        // 并发同 key：事务已回滚（业务写 + 幂等记录同事务），重读胜者快照返回——
+        // 更新语义不能查回实体（文档已被首次请求改写，v1.63.0 教训）
+        const record = await this.dataSource.getRepository(IdempotencyRecord).findOne({
+          where: { actorId: idemCtx.actorKey, clientRequestId: idemCtx.clientRequestId },
+        });
+        if (record) {
+          this.assertIdempotencyMatch(record, idemCtx, TASK_PATCH_DESCRIPTION_ENTITY_TYPE);
+          const snapshot = record.responseSnapshot as TaskPatchDescriptionResult | null;
+          if (snapshot) return { ...snapshot, idempotentReplay: true };
+        }
+      }
+      throw err;
+    }
   }
 
   async remove(id: string): Promise<boolean> {
@@ -1013,5 +1400,260 @@ export class TaskService {
 
     await this.docLinkRepo.remove(link);
     return true;
+  }
+
+  // ─── Task Report（POST /tasks/:id/report 后端化编排）──────────
+
+  /**
+   * 任务结果汇报（原 MCP report_task_result 编排下沉后端）。
+   *
+   * 执行顺序：评论（可选）→ 状态 → 逐 doc 关联文档；与既有 MCP 编排逐字节一致。
+   * - 评论拼接规则：仅 comment → 原文；仅 commitSha → "Commit: <sha>"；
+   *   二者都有 → comment + "\n\nCommit: <sha>"（空字符串视为未提供）。
+   * - docLinks 逐条 try/catch：单条失败内嵌 {docId,status,code,error} 不拖垮主体
+   *   （addDocLink 幂等，重复关联返回既有链接，天然安全）。
+   *
+   * 幂等（clientRequestId 可选）：
+   * - 无 key → 原路径零开销（无任何幂等记录读写）。
+   * - 有 key → 入口先查记录：命中且 hash 不符（或 entityType 非 task_report）→ 409
+   *   IDEMPOTENCY_KEY_CONFLICT（9002，防同 key 不同 payload 被静默吞写）；
+   *   命中且快照含 task 且（未请求 docIds 或快照已含 docLinks）→ 直接返回快照 +
+   *   idempotentReplay:true（零副作用重放）。
+   * - 部分成功恢复路径（不做跨步骤事务——update() 太大不值得重构）：
+   *   评论成功先写快照 {comment} 再改状态；状态成功写 {comment?,task}；docLinks 完成
+   *   写全量。重试命中快照 → 跳过已完成步骤只补未完步骤，绝不重复发评论。
+   *   无 key 调用方：状态步骤失败且本次已发评论时，错误响应 data 槽带
+   *   commentPosted:true（MCP 层归一为 details.commentPosted），盲重试可先自查评论。
+   * - 并发同 key：靠 uq_idempotency_actor_key 23505 catch 重读胜者快照继续（照
+   *   doc-idempotency.helper 范式）；并发窗口内双方都可能已发评论（无共享事务，
+   *   幂等保证的是「重试」而非「并发首击」）。
+   *
+   * @param id   任务 ID
+   * @param dto  请求体（status 必填）
+   * @param actor 当前操作者（认证 guard 保证非空）
+   * @returns { task, comment?, docLinks?, idempotentReplay? }
+   * @throws NotFoundException / 上游 4xx 透传（铁律 #9，不包装为 500）；
+   *         ConflictException(9002) 同 key 不同 payload
+   */
+  async reportResult(
+    id: string,
+    dto: ReportTaskResultDto,
+    actor: UnifiedActor,
+  ): Promise<TaskReportResult> {
+    const { status, comment, commitSha, docIds, clientRequestId } = dto;
+    const hasCommentText = comment !== undefined && comment !== '';
+    const hasCommitSha = commitSha !== undefined && commitSha !== '';
+    const shouldComment = hasCommentText || hasCommitSha;
+    const shouldDocLinks = docIds !== undefined && docIds.length > 0;
+
+    // ── 幂等上下文：无 key → null（零开销旁路）──
+    const idemCtx = clientRequestId
+      ? {
+          actorKey: actor.id,
+          clientRequestId,
+          // canonical payload（字面量对象，key 顺序稳定）：含路由参数 taskId，
+          // 同 key 换任务也视为不同 payload → 409
+          requestHash: createHash('sha256')
+            .update(JSON.stringify({ taskId: id, status, comment, commitSha, docIds }))
+            .digest('hex'),
+        }
+      : null;
+
+    const result: TaskReportResult = {} as TaskReportResult;
+    let idemRecord: IdempotencyRecord | null = null;
+    // 本次调用是否实际发了评论（步骤 1 真正执行 addComment 才置位；从快照恢复的
+    // result.comment 不算）——状态步骤失败时用它给错误响应打 commentPosted 标记
+    let commentPostedThisRun = false;
+
+    // ── 入口重放查询（有 key 的快速路径）──
+    if (idemCtx) {
+      idemRecord = await this.dataSource.getRepository(IdempotencyRecord).findOne({
+        where: { actorId: idemCtx.actorKey, clientRequestId: idemCtx.clientRequestId },
+      });
+      if (idemRecord) {
+        this.assertIdempotencyMatch(idemRecord, idemCtx, TASK_REPORT_ENTITY_TYPE);
+        const snapshot = idemRecord.responseSnapshot as Partial<TaskReportResult> | null;
+        if (snapshot?.task) {
+          if (!(shouldDocLinks && !snapshot.docLinks)) {
+            // 完整快照（或请求本就无 docIds）→ 直接回放，零副作用
+            return { ...(snapshot as TaskReportResult), idempotentReplay: true };
+          }
+          // 恢复路径：状态已完成但 docLinks 未跑（首次在 link 步骤前中断）→
+          // 复用快照中的 task/comment，只补跑 docLinks
+          result.task = snapshot.task as Record<string, unknown>;
+          if (snapshot.comment !== undefined) result.comment = snapshot.comment;
+        } else if (snapshot?.comment !== undefined) {
+          // 恢复路径：评论已完成（checkpoint）→ 跳过评论，继续改状态
+          result.comment = snapshot.comment;
+        }
+      }
+    }
+
+    // ── 步骤 1：发评论（仅当 comment/commitSha 提供；快照已含 comment 则跳过）──
+    if (shouldComment && result.comment === undefined) {
+      let commentText = '';
+      if (hasCommentText && hasCommitSha) {
+        commentText = `${comment}\n\nCommit: ${commitSha}`;
+      } else if (hasCommentText) {
+        commentText = comment!;
+      } else {
+        commentText = `Commit: ${commitSha}`;
+      }
+      // 失败向上透传（4xx 原样），status 未被触碰
+      result.comment = await this.addComment(id, actor.id, actor.type, { content: commentText });
+      commentPostedThisRun = true;
+      // checkpoint：评论结果先落快照再改状态——此后重试不得重复发评论
+      if (idemCtx) {
+        idemRecord = await this.checkpointReportSnapshot(idemCtx, id, result, idemRecord);
+      }
+    }
+
+    // ── 步骤 2：改状态（快照已含 task 的恢复路径跳过）──
+    if (result.task === undefined) {
+      try {
+        result.task = await this.update(id, { status }, actor.id, actor.type);
+      } catch (err: unknown) {
+        // 部分成功语义显式化：本次已发评论而状态步骤失败 → 异常响应 data 槽增补
+        // commentPosted:true（信封约定：异常 body.data 原样透出，见 all-exceptions.filter；
+        // MCP 层归一到 PlatformApiError.details）。仅注入 HttpException 的对象型响应体，
+        // 非 HttpException 原样透传不包（铁律 #9）。幂等恢复路径不受影响：checkpoint
+        // {comment} 已先落库，带 key 重试仍会跳过评论步骤。
+        if (commentPostedThisRun && err instanceof HttpException) {
+          const resp = err.getResponse();
+          if (typeof resp === 'object' && resp !== null) {
+            (resp as Record<string, unknown>).data = { commentPosted: true };
+          }
+        }
+        throw err;
+      }
+      if (idemCtx) {
+        idemRecord = await this.checkpointReportSnapshot(idemCtx, id, result, idemRecord);
+      }
+    }
+
+    // ── 步骤 3（可选）：逐 doc 关联文档 ──
+    if (shouldDocLinks) {
+      result.docLinks = await this.runDocLinks(id, docIds!, actor);
+      if (idemCtx) await this.checkpointReportSnapshot(idemCtx, id, result, idemRecord);
+    }
+
+    return result;
+  }
+
+  /**
+   * 逐 doc 关联任务（单条失败内嵌，不拖垮主体）。
+   *
+   * 失败项形状对齐 MCP report_task_result 的 docLinks.failed：
+   * { docId, status?, code?, error }——Nest 异常提取 status/code，
+   * 未知异常仅 error。重复关联既有 link 由 addDocLink 幂等消化（返回既有链接，非失败）。
+   */
+  private async runDocLinks(
+    taskId: string,
+    docIds: string[],
+    actor: UnifiedActor,
+  ): Promise<{ succeeded: string[]; failed: TaskDocLinkFailure[] }> {
+    const succeeded: string[] = [];
+    const failed: TaskDocLinkFailure[] = [];
+    for (const docId of docIds) {
+      try {
+        await this.addDocLink(taskId, docId, actor);
+        succeeded.push(docId);
+      } catch (err: unknown) {
+        failed.push(this.extractDocLinkFailure(docId, err));
+      }
+    }
+    return { succeeded, failed };
+  }
+
+  /**
+   * 归一化 doc-link 失败项：Nest HttpException → {status, code?, error}；
+   * 其余异常 → {error}。code 取自异常响应体（Nest 业务错误信封的 code 字段）。
+   */
+  private extractDocLinkFailure(docId: string, err: unknown): TaskDocLinkFailure {
+    if (err instanceof HttpException) {
+      const status = err.getStatus();
+      const resp = err.getResponse();
+      const body = typeof resp === 'string' ? { message: resp } : (resp as Record<string, unknown>);
+      return {
+        docId,
+        status,
+        ...(typeof body.code === 'number' || typeof body.code === 'string'
+          ? { code: body.code }
+          : {}),
+        error: typeof body.message === 'string' ? body.message : err.message,
+      };
+    }
+    return { docId, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  /**
+   * 幂等记录 hash/entityType 校验（对齐 doc-idempotency.helper 语义）：
+   * entityType 非预期值、request_hash 缺失或与当前 payload 不符 → 409，
+   * 防「同 key 不同 payload 第二次写被静默吞掉」。
+   *
+   * @param entityType 本入口的幂等 entityType（task_report / task_description 等）
+   */
+  private assertIdempotencyMatch(
+    record: IdempotencyRecord,
+    ctx: { clientRequestId: string; requestHash: string },
+    entityType: string,
+  ): void {
+    if (
+      record.entityType !== entityType ||
+      !record.requestHash ||
+      record.requestHash !== ctx.requestHash
+    ) {
+      throw new ConflictException({
+        message:
+          `clientRequestId '${ctx.clientRequestId}' was already used by a different request ` +
+          `(entityType=${record.entityType}${record.requestHash ? ', requestHash mismatch' : ', legacy record without requestHash'}). ` +
+          'Reusing an idempotency key with a different payload is rejected to prevent silent write loss; generate a new key to proceed',
+        code: ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
+      });
+    }
+  }
+
+  /**
+   * 幂等快照 checkpoint：评论/状态/docLinks 每步成功后写/更新 response_snapshot。
+   *
+   * - 已有记录（顺序重试恢复）→ 更新快照后返回；
+   * - 首次 → 插入记录；撞 uq_idempotency_actor_key（并发同 key）→ 重读胜者记录，
+   *   hash 校验后返回胜者记录（调用方按其快照继续/回放）。
+   *
+   * @returns 生效的幂等记录（调用方用于后续 checkpoint）
+   */
+  private async checkpointReportSnapshot(
+    ctx: { actorKey: string; clientRequestId: string; requestHash: string },
+    taskId: string,
+    snapshot: TaskReportResult,
+    existing: IdempotencyRecord | null,
+  ): Promise<IdempotencyRecord> {
+    const repo = this.dataSource.getRepository(IdempotencyRecord);
+    if (existing) {
+      existing.responseSnapshot = snapshot as unknown as Record<string, unknown>;
+      return repo.save(existing);
+    }
+    try {
+      return await repo.save({
+        actorId: ctx.actorKey,
+        clientRequestId: ctx.clientRequestId,
+        entityType: TASK_REPORT_ENTITY_TYPE,
+        entityId: taskId,
+        responseSnapshot: snapshot as unknown as Record<string, unknown>,
+        requestHash: ctx.requestHash,
+      });
+    } catch (err: unknown) {
+      const pgErr = err as { code?: string; constraint?: string };
+      if (pgErr.code === '23505' && pgErr.constraint === 'uq_idempotency_actor_key') {
+        const winner = await repo.findOne({
+          where: { actorId: ctx.actorKey, clientRequestId: ctx.clientRequestId },
+        });
+        if (winner) {
+          this.assertIdempotencyMatch(winner, ctx, TASK_REPORT_ENTITY_TYPE);
+          return winner;
+        }
+      }
+      throw err;
+    }
   }
 }

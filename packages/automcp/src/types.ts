@@ -251,6 +251,14 @@ export interface ToolCallParams {
 export interface ToolCallResult {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
+  /**
+   * 结构化内容（可选，MCP 2025-06-18 协议引入）
+   *
+   * handler 通常不设置——由框架层（McpServer.withStructuredContent）在 text 为
+   * 合法 JSON 时自动填充，消费端可免二次 JSON.parse；handler 显式设置时框架层
+   * 尊重不覆盖（为将来 outputSchema 校验/定制预留逃生门）。
+   */
+  structuredContent?: unknown;
 }
 
 /** Custom tool 调用上下文：由 McpServer 构造，传给 handler */

@@ -117,7 +117,10 @@ export const getBoardDigestTool: CustomTool = {
       'such as test baselines and MCP tool counts) / priorityDistribution / ' +
       'risks (labels bug|debt) / nextUp / recentDone / docs (bound DocSpace metadata: ' +
       'spaceName + recently updated docs, no bodies). ' +
-      'truncated is set when any section was cut by its limit.',
+      'truncated is set when any section was cut by its limit; each truncatable section ' +
+      'also carries a full-count total (risksTotal/nextUpTotal/recentDoneTotal/docsTotal/versions.total) ' +
+      "— passing limit=0 empties that section's items but its total still reports the true " +
+      'full count (totals are never zeroed by limits).',
     inputSchema: {
       type: 'object',
       properties: {

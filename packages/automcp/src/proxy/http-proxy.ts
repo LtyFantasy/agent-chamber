@@ -106,7 +106,12 @@ export class HttpProxy {
         url: fullUrl,
         headers,
         data: body,
-        timeout: 60_000,
+        // 120s：与生产 nginx /mcp 的 proxy_read_timeout 120s 对齐
+        // （scripts/nginx/agent-chamber.conf location = /mcp）。本代理处于
+        // nginx 与 platform-client 之间，超时同样不得低于上游链路——否则大写慢调用
+        // （如 58k patch）会在这里先断，服务端事务照常提交 = "写成功、响应无人接收"
+        // （Board 任务 7d918c7b 根因之一）。对齐后最先断的是 nginx（504，语义明确）。
+        timeout: 120_000,
         maxRedirects: 5,
         validateStatus: () => true, // 让 axios 不抛出 4xx/5xx，我们自己处理
       });

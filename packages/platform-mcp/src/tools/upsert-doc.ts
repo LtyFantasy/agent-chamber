@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: plan §5 W5 (upsert_doc 契约)
  *   - 补充: plan §4.3 (文档写 API), plan §1.1-13 (source 隔离)
+ *   - 本批次（2026-08-18 债 B forceRechunk）: inputSchema + body 透传 forceRechunk——
+ *     hash 相同也强制重建 sections（修复 chunk 级元数据损坏），响应带 rechunked:true、
+ *     不产生新 doc_versions 行；batch/import 通道后端已类型 Omit + 运行时剔除
  *
  * [踩坑索引]
  *   - fail-closed 改造（2026-08-16）：新增 expectedContentHash 乐观锁透传——
@@ -97,8 +100,12 @@ export const upsertDocTool: CustomTool = {
       'Upsert a document in a DocSpace by spaceName + path. ' +
       'Resolves spaceName via three-layer match. ' +
       'Source is fixed to "native" — the tool does not expose a source parameter. ' +
-      'Returns {id, path, sectionCount, tokenEstimate, unchanged?, contentHash} — ' +
+      'Returns {id, path, sectionCount, tokenEstimate, unchanged?, rechunked?, contentHash} — ' +
       'contentHash can be fed back as expectedContentHash on the next write (optimistic lock). ' +
+      'forceRechunk=true is the repair path for corrupt chunk metadata (heading_path / ' +
+      'is_continuation broken while content is intact): re-import the SAME content with ' +
+      'forceRechunk=true → response carries rechunked:true and NO version row is created ' +
+      '(note: document updatedAt still bumps — expected, not a bug). ' +
       '409 DOC_SOURCE_MISMATCH is passed through as a structured error. ' +
       'Metadata authoring: you are the LLM — curate "summary" yourself instead of relying on ' +
       'auto-derivation. Write it for another agent deciding whether to read this doc: ' +
@@ -159,6 +166,25 @@ export const upsertDocTool: CustomTool = {
             're-reading). Doc missing or current hash mismatch → 409 DOC_CONTENT_CONFLICT ' +
             '(rechecked in-transaction); re-read and retry on 409. Omit = no precondition.',
         },
+        forceRechunk: {
+          type: 'boolean',
+          description:
+            'Optional: force rebuild of sections even when the content hash is unchanged ' +
+            '(default false). Section-metadata repair path: when chunk-level metadata ' +
+            '(heading_path / is_continuation etc.) is corrupted but the content itself is ' +
+            'intact, re-import the SAME content with forceRechunk=true — the response ' +
+            'carries rechunked:true and NO new doc_versions row is created ' +
+            '(updatedAt still bumps — expected). Omit = normal behavior (unchanged content ' +
+            'short-circuits with unchanged:true).',
+        },
+        clientRequestId: {
+          type: 'string',
+          description:
+            'Optional idempotency key (1–64 chars). RECOMMENDED for writes: on transport ' +
+            'error / timeout, retry with the SAME key — the server returns the FIRST ' +
+            'response snapshot with idempotentReplay:true (no event, no doc_versions row, ' +
+            'no side effects). Same key with a different payload → 409 IDEMPOTENCY_KEY_CONFLICT.',
+        },
       },
       required: ['spaceName', 'path', 'content'],
     },
@@ -174,6 +200,8 @@ export const upsertDocTool: CustomTool = {
     const category = args.category as string | undefined;
     const tags = args.tags as string[] | undefined;
     const expectedContentHash = args.expectedContentHash as string | undefined;
+    // 债 B：hash 相同也强制重建 sections（修复 chunk 级元数据损坏），仅透传显式值
+    const forceRechunk = args.forceRechunk as boolean | undefined;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
     // 步骤 1：解析 spaceName
@@ -245,6 +273,10 @@ export const upsertDocTool: CustomTool = {
     if (category !== undefined) body.category = category;
     if (tags !== undefined) body.tags = tags;
     if (expectedContentHash !== undefined) body.expectedContentHash = expectedContentHash;
+    if (forceRechunk !== undefined) body.forceRechunk = forceRechunk;
+    // v1.63.0：幂等键透传——transport error 后同 key 重试返回首次响应快照 + idempotentReplay
+    const clientRequestId = args.clientRequestId as string | undefined;
+    if (clientRequestId !== undefined) body.clientRequestId = clientRequestId;
 
     try {
       const result = await client.request<Record<string, unknown>>(

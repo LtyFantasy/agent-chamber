@@ -58,6 +58,8 @@ import {
   QueryTaskDto,
   QueryMilestoneDto,
   BatchCreateTasksDto,
+  ReportTaskResultDto,
+  PatchTaskDescriptionDto,
 } from './dto';
 import { AddDocLinkDto } from '../docspace/dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
@@ -153,7 +155,7 @@ export class TaskController {
   @ApiOperation({
     summary: 'Create task',
     description:
-      'Create a single task. Required fields: listId, title.' +
+      'Create a single task. Required fields: title, and either listId or statusName (listId wins when both provided; statusName requires boardId).' +
       'Optional fields: boardId (auto-inferred from listId), description, priority, status, assigneeId, dueDate, labels, milestoneId, customFields.' +
       'Returns TaskDetailDto.',
   })
@@ -351,6 +353,45 @@ export class TaskController {
   }
 
   @UseGuards(JwtOrApiKeyGuard)
+  @Patch(':id/description')
+  @ApiOperation({
+    summary: 'Patch task description (match mode)',
+    description:
+      'Local patch of the task description via exact substring replacement — the ' +
+      'preferred channel for concurrent multi-agent description edits (replaces ' +
+      'whole-description PATCH). ' +
+      'oldString must match exactly once: 0 matches → 404, >1 matches → 409 with ' +
+      'matchCount (expand context and retry). newString may be empty (delete the fragment). ' +
+      'Optional expectedDescriptionHash (from GET /tasks/:id descriptionHash) is an ' +
+      'optimistic-lock precondition: mismatch → 409 with currentDescriptionHash. ' +
+      'With clientRequestId, retries return the first response snapshot (idempotentReplay: true); ' +
+      'same key with a different payload is rejected with 409.',
+  })
+  @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Task description patched' })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden (not a board participant or agent lacks update permission)',
+  })
+  @ApiResponse({ status: 404, description: 'Task not found or oldString not found' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'Ambiguous match (matchCount) / optimistic-lock conflict (currentDescriptionHash) / idempotency key conflict',
+  })
+  async patchDescription(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: PatchTaskDescriptionDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'write');
+    return this.taskService.patchDescription(id, dto, actor);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
   @Delete(':id')
   @ApiOperation({
     summary: 'Delete task',
@@ -415,6 +456,38 @@ export class TaskController {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
     return this.taskService.assign(id, dto, actor.id, actor.type);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post(':id/report')
+  @ApiOperation({
+    summary: 'Report task result',
+    description:
+      'One-stop work-result report: post a comment (optional, comment/commitSha concatenation rules), ' +
+      'update the task status, then link optional docIds to the task. ' +
+      'Comment is posted first, then status is updated — producing a logical timeline. ' +
+      'Per-doc failures are embedded in docLinks.failed — never fail the whole report. ' +
+      'With clientRequestId, retries return the first response snapshot (idempotentReplay: true) ' +
+      'without re-posting the comment; same key with a different payload is rejected with 409.',
+  })
+  @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
+  @ApiResponse({ status: 201, description: 'Report applied' })
+  @ApiResponse({ status: 400, description: 'Bad request' })
+  @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden (not a board participant or agent lacks update permission)',
+  })
+  @ApiResponse({ status: 404, description: 'Task not found' })
+  @ApiResponse({ status: 409, description: 'Idempotency key conflict (different payload)' })
+  async report(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReportTaskResultDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'write');
+    return this.taskService.reportResult(id, dto, actor);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

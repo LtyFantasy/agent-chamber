@@ -81,7 +81,7 @@ describe('McpServer', () => {
           id: 1,
           method: 'initialize',
           params: {
-            protocolVersion: '2024-11-05',
+            protocolVersion: '2025-06-18',
             capabilities: {},
             clientInfo: { name: 'test-client', version: '1.0.0' },
           },
@@ -91,7 +91,7 @@ describe('McpServer', () => {
       expect(res.body.jsonrpc).toBe('2.0');
       expect(res.body.id).toBe(1);
       expect(res.body.result).toEqual({
-        protocolVersion: '2024-11-05',
+        protocolVersion: '2025-06-18',
         capabilities: {
           tools: {
             listChanged: false,
@@ -169,7 +169,11 @@ describe('McpServer', () => {
       expect(res.status).toBe(200);
       expect(res.body.jsonrpc).toBe('2.0');
       expect(res.body.id).toBe(4);
-      expect(res.body.result).toEqual(mockResult);
+      // proxy 返回的 JSON text 经框架归一化自动补 structuredContent（text 原样保留）
+      expect(res.body.result).toEqual({
+        content: [{ type: 'text', text: '{"id": "abc"}' }],
+        structuredContent: { id: 'abc' },
+      });
       expect(proxy.execute).toHaveBeenCalledWith(
         expect.objectContaining({ tool: expect.objectContaining({ name: 'list_topics' }) }),
         { page: 1 },
@@ -584,6 +588,135 @@ describe('McpServer', () => {
           server.registerCustomTools([ctA, ctB]);
         }).toThrow(/Duplicate custom tool name/);
       });
+    });
+  });
+
+  describe('structuredContent 归一化', () => {
+    /**
+     * 辅助函数：创建返回指定 result 的 CustomTool
+     */
+    function makeCustomTool(name: string, result: ToolCallResult): CustomTool {
+      return {
+        tool: {
+          name,
+          description: `Custom tool ${name}`,
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+        handler: async () => result,
+      };
+    }
+
+    /** 辅助函数：发起 tools/call 请求并返回 supertest 响应 */
+    function callTool(name: string, args: Record<string, unknown> = {}) {
+      return request(app)
+        .post('/mcp')
+        .send({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name, arguments: args },
+        });
+    }
+
+    it('custom 工具返回 JSON text → 自动填充 structuredContent（与 parse(text) 深度相等）且 text 原样保留', async () => {
+      const jsonText = JSON.stringify({ topics: [{ id: 't1' }], total: 1 }, null, 2);
+      server.registerCustomTools([
+        makeCustomTool('json_tool', { content: [{ type: 'text', text: jsonText }] }),
+      ]);
+      await server.start();
+
+      const res = await callTool('json_tool');
+
+      expect(res.status).toBe(200);
+      expect(res.body.result.content[0].text).toBe(jsonText);
+      expect(res.body.result.structuredContent).toEqual(JSON.parse(jsonText));
+    });
+
+    it('自动映射（proxy）工具 JSON 响应 → 同样自动填充', async () => {
+      const jsonText = JSON.stringify([{ id: 'a' }, { id: 'b' }]);
+      proxy.execute.mockResolvedValueOnce({ content: [{ type: 'text', text: jsonText }] });
+      server.registerTools([makeMapping('list_items')]);
+      await server.start();
+
+      const res = await callTool('list_items');
+
+      expect(res.body.result.content[0].text).toBe(jsonText);
+      expect(res.body.result.structuredContent).toEqual(JSON.parse(jsonText));
+    });
+
+    it('handler 显式设置 structuredContent → 尊重不覆盖', async () => {
+      const explicit = { custom: true, source: 'handler' };
+      server.registerCustomTools([
+        makeCustomTool('explicit_tool', {
+          content: [{ type: 'text', text: '{"ignored": true}' }],
+          structuredContent: explicit,
+        }),
+      ]);
+      await server.start();
+
+      const res = await callTool('explicit_tool');
+
+      expect(res.body.result.structuredContent).toEqual(explicit);
+      expect(res.body.result.content[0].text).toBe('{"ignored": true}');
+    });
+
+    it('非 JSON text（markdown）→ 无 structuredContent 字段', async () => {
+      const markdown = '# Title\n\nsome **markdown** body';
+      server.registerCustomTools([
+        makeCustomTool('md_tool', { content: [{ type: 'text', text: markdown }] }),
+      ]);
+      await server.start();
+
+      const res = await callTool('md_tool');
+
+      expect(res.body.result.content[0].text).toBe(markdown);
+      expect(res.body.result.structuredContent).toBeUndefined();
+    });
+
+    it('scalar JSON text（"123" / "\"str\""）→ 不填充', async () => {
+      server.registerCustomTools([
+        makeCustomTool('num_tool', { content: [{ type: 'text', text: '123' }] }),
+        makeCustomTool('str_tool', { content: [{ type: 'text', text: '"str"' }] }),
+      ]);
+      await server.start();
+
+      const resNum = await callTool('num_tool');
+      const resStr = await callTool('str_tool');
+
+      expect(resNum.body.result.structuredContent).toBeUndefined();
+      expect(resStr.body.result.structuredContent).toBeUndefined();
+    });
+
+    it('isError 错误信封（JSON）→ 同样填充 structuredContent（含 error:true）', async () => {
+      const errorText = JSON.stringify({ error: true, code: 9002, message: 'conflict' });
+      server.registerCustomTools([
+        makeCustomTool('err_tool', {
+          content: [{ type: 'text', text: errorText }],
+          isError: true,
+        }),
+      ]);
+      await server.start();
+
+      const res = await callTool('err_tool');
+
+      expect(res.body.result.isError).toBe(true);
+      expect(res.body.result.content[0].text).toBe(errorText);
+      expect(res.body.result.structuredContent).toEqual(JSON.parse(errorText));
+    });
+
+    it('超过 1MB 的 JSON text → 跳过填充', async () => {
+      // 构造 >1MB 的合法 JSON：真实触发长度阈值短路（而非 parse 失败跳过）
+      const bigText = JSON.stringify({ data: 'x'.repeat(1024 * 1024) });
+      expect(bigText.length).toBeGreaterThan(1024 * 1024);
+      server.registerCustomTools([
+        makeCustomTool('big_tool', { content: [{ type: 'text', text: bigText }] }),
+      ]);
+      await server.start();
+
+      const res = await callTool('big_tool');
+
+      expect(res.body.result.content[0].text).toBe(bigText);
+      expect(res.body.result.structuredContent).toBeUndefined();
     });
   });
 });

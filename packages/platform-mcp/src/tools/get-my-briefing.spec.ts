@@ -105,6 +105,57 @@ describe('get_my_briefing', () => {
     expect(tasksCall[2].params.status).toBe('backlog,todo,in_progress,blocked');
   });
 
+  // ==================== statuses 参数化（看板任务 12cd2a92） ====================
+
+  it('自定义 statuses 替换默认状态集（join 成逗号分隔透传）', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([]);
+
+    await getMyBriefingTool.handler({ statuses: ['todo', 'review'] }, ctx());
+
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
+    expect(tasksCall[2].params.status).toBe('todo,review');
+  });
+
+  it('statuses 含非法枚举值 → 400 + failedStep=validate_statuses，且不发起任何请求', async () => {
+    const request = mockRequest();
+
+    const result = await getMyBriefingTool.handler({ statuses: ['todo', 'bogus'] }, ctx());
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.status).toBe(400);
+    expect(body.failedStep).toBe('validate_statuses');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('statuses 空数组 → 400（避免替换后退化为全量状态查询的静默语义漂移）', async () => {
+    const request = mockRequest();
+
+    const result = await getMyBriefingTool.handler({ statuses: [] }, ctx());
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.status).toBe(400);
+    expect(body.failedStep).toBe('validate_statuses');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('statuses 非数组（字符串）→ 400', async () => {
+    const request = mockRequest();
+
+    const result = await getMyBriefingTool.handler({ statuses: 'todo' }, ctx());
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.status).toBe(400);
+    expect(body.failedStep).toBe('validate_statuses');
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('get_me 步骤失败 → isError + failedStep=get_me', async () => {
     const request = mockRequest();
     request.mockRejectedValueOnce(

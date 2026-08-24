@@ -6,11 +6,16 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.1-§4.3 (W2 空间/分类/成员 API)
 
- * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误)
+ * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误) B52(creator缺成员行)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   B52: create() 历史上只给 invitedAgentIds 写成员行，creator 不落表——成员列表缺席
+ *      + 按成员表算可见性的查询路径对 creator 不命中（4b1ddd1c）。修复：creator 落
+ *      role='editor' 且 invitedBy=null 行，invited 列表过滤 creator 防 PK 冲突；
+ *      removeEditor/uninviteAgent 对 creator 拒绝（409），防 bug 经删除路径复活。
+ *      存量数据由 BackfillCreatorMembership1787300000000 回填
  *   B4: settings.overviewFilter 的 excludeTypes/excludeCategories 手工改库可能存成字符串，
  *      字符串也有 .includes() 会静默产生错误语义。修复：resolveOverviewFilters 加 Array.isArray
  *      防御（非数组视为无默认过滤）。见 memory/2026-08-03.md §B4
@@ -722,9 +727,14 @@ export class DocSpaceService {
     });
     const saved = await this.spaceRepo.save(space);
 
-    // Create initial members
-    if (invitedAgentIds.length > 0) {
-      const memberEntities = [...new Set(invitedAgentIds)].map((agentId) =>
+    // Create initial members。
+    // creator 单独落 role='editor' 行（invitedBy=null）：成员列表可见 + 按成员表算可见性
+    // 的查询路径（AccessQueryService）对 creator 命中；权限本身仍由 isCreator 直比保证。
+    // invited 列表须过滤 creator——creator 行已单独写入，重复会触发 (space_id, actor_id)
+    // PK 冲突。invitedBy=null 标记「非授予产生」，backfill migration 的 down() 据此精确回滚
+    const memberEntities = [...new Set(invitedAgentIds)]
+      .filter((agentId) => agentId !== actor.id)
+      .map((agentId) =>
         this.memberRepo.create({
           spaceId: saved.id,
           actorId: agentId,
@@ -732,8 +742,15 @@ export class DocSpaceService {
           invitedBy: actor.id,
         }),
       );
-      await this.memberRepo.save(memberEntities);
-    }
+    memberEntities.push(
+      this.memberRepo.create({
+        spaceId: saved.id,
+        actorId: actor.id,
+        role: 'editor',
+        invitedBy: null,
+      }),
+    );
+    await this.memberRepo.save(memberEntities);
 
     return saved;
   }
@@ -945,6 +962,14 @@ export class DocSpaceService {
   async uninviteAgent(spaceId: string, agentId: string): Promise<DocSpace> {
     const space = await this.findById(spaceId);
 
+    // creator 成员行不可经 uninvite 移除（显式守卫优先于 editor-role 检查，给出明确语义）
+    if (space.creatorId === agentId) {
+      throw new ConflictException({
+        message: 'Space creator cannot be uninvited',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     const existing = await this.memberRepo.findOne({
@@ -1005,6 +1030,16 @@ export class DocSpaceService {
   /** Demote editor to member. Editor row is changed to member (not deleted — prevents dangling members). */
   async removeEditor(spaceId: string, agentId: string): Promise<DocSpace> {
     const space = await this.findById(spaceId);
+
+    // creator 的 editor 行不可降级：creator 权限由 isCreator 直比保证，但成员行承载
+    // 成员列表可见性 + AccessQueryService 白名单语义，降级会让「creator 缺席成员表
+    // editor 语义」的原始 bug 经本路径复活（4b1ddd1c）
+    if (space.creatorId === agentId) {
+      throw new ConflictException({
+        message: 'Space creator cannot be removed as editor',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
 
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
@@ -1357,6 +1392,14 @@ export class DocSpaceService {
       if (hasCheckedRoutes) totalBrokenRoutes = sum;
     }
 
+    // 文档条目截断元数据补齐：docsTotal = 过滤后文档总数（不受 maxTokens
+    // 截断影响，恒为全量计数，对齐 routesTotal 先例）；docsReturned = 实际返回条目数
+    // （截断时 < docsTotal）。恒输出，形状可预测——调用方凭 docsReturned < docsTotal
+    // 判断需要分页拉全，不再依赖"truncated 布尔 + 自行数条目"。
+    const docsTotal = filteredDocs.length;
+    const docsReturned =
+      categoryOverviews.reduce((sum, c) => sum + c.docs.length, 0) + uncategorized.length;
+
     return {
       spaceId: space.id,
       spaceName: space.name,
@@ -1375,6 +1418,8 @@ export class DocSpaceService {
         (routesTokenEstimate !== undefined ? routesTokenEstimate : 0) +
         totalTokenEstimate,
       truncated,
+      docsTotal,
+      docsReturned,
       ...(Object.keys(filters.appliedFilters).length > 0
         ? { appliedFilters: filters.appliedFilters }
         : {}),

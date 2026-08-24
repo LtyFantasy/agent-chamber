@@ -186,6 +186,15 @@ export const patchDocTool: CustomTool = {
             'MATCH MODE: replacement text (may be an empty string = delete the matched ' +
             'fragment). Must be paired with oldString.',
         },
+        clientRequestId: {
+          type: 'string',
+          description:
+            'Optional idempotency key (1–64 chars, applies to BOTH modes). RECOMMENDED for ' +
+            'writes: on transport error / timeout, retry with the SAME key — the server ' +
+            'returns the FIRST response snapshot with idempotentReplay:true (no event, no ' +
+            'doc_versions row, no side effects). Same key with a different payload → 409 ' +
+            'IDEMPOTENCY_KEY_CONFLICT.',
+        },
       },
       required: ['spaceName', 'path'],
     },
@@ -337,13 +346,18 @@ export const patchDocTool: CustomTool = {
     }
 
     // 步骤 4：写（source 服务端缺省 native，工具面不暴露——与 upsert_doc 一致）
+    // v1.63.0：幂等键两种模式均透传（section → PATCH sections/:position body；
+    // match → PATCH content body）——transport error 后同 key 重试返回首次快照
+    const clientRequestId = args.clientRequestId as string | undefined;
     try {
       if (hasOld) {
         // match 模式：全文精确串替换
+        const matchBody: Record<string, unknown> = { oldString, newString };
+        if (clientRequestId !== undefined) matchBody.clientRequestId = clientRequestId;
         const result = await client.request<Record<string, unknown>>(
           'PATCH',
           `/docs/${resolvedDocId}/content`,
-          { body: { oldString, newString } },
+          { body: matchBody },
         );
         return {
           content: [{ type: 'text', text: JSON.stringify(result) }],
@@ -353,6 +367,7 @@ export const patchDocTool: CustomTool = {
       // section 模式：整节替换（expectedSectionHash 携带时服务端 fail-closed 前提校验）
       const body: Record<string, unknown> = { content };
       if (expectedSectionHash !== undefined) body.expectedSectionHash = expectedSectionHash;
+      if (clientRequestId !== undefined) body.clientRequestId = clientRequestId;
       const result = await client.request<Record<string, unknown>>(
         'PATCH',
         `/docs/${resolvedDocId}/sections/${position}`,

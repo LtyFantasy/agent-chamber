@@ -5,6 +5,10 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: docs/api-definition.md §16 (DocSpace 模块, doc_routes 段) —— 任务 T6（空间级全量导出/回导）
+ *   - 补充: v1.62.0（contentHash 读路径透传）：bundle docs[] item 增 docId + contentHash
+ *     （原始写入 payload 的 SHA-256，revision 对照用——content 是重建产物，其 SHA-256
+ *      ≠ contentHash，禁止对 content 自算 hash）；import DTO 显式忽略这两个字段防
+ *     forbidNonWhitelisted roundtrip 400，formatVersion 保持 1
  *
  * [踩坑索引] (无历史踩坑，新建文件)
  *
@@ -72,6 +76,8 @@ export interface DocBundleCategoryItem {
 
 /** bundle 顶层条目：文档（content = 完整可回导原文） */
 export interface DocBundleDocItem {
+  /** 导出时文档 ID（库内身份，跨空间不可移植——仅供对照/排错，非业务键） */
+  docId: string;
   path: string;
   title: string;
   summary: string | null;
@@ -79,7 +85,19 @@ export interface DocBundleDocItem {
   tags: string[];
   /** 分类名（导出时由 categoryId 解析；分类已删 → null = 未分类） */
   category: string | null;
+  /**
+   * 完整原文（**sections 重建产物**，含首标题行，与 web 编辑器回写保真口径一致）——
+   * 用途 = 可无损回导（roundtrip）。注意它不是原始写入 payload：
+   * **禁止对 content 自算 SHA 作为 contentHash**——revision 对照一律以下方
+   * contentHash 字段为准。
+   */
   content: string;
+  /**
+   * 原始写入 payload 的 SHA-256（revision token，v1.62.0）。
+   * content 是重建产物，其 SHA-256 ≠ 本值；考虑"导出→回导"的版本对照用途，
+   * 以本字段为权威 revision 标识。docs.content_hash nullable → string | null。
+   */
+  contentHash: string | null;
 }
 
 /** 空间级全量导出 bundle（formatVersion 1） */
@@ -213,9 +231,12 @@ export class DocBundleService {
     const docItems: DocBundleDocItem[] = [];
     for (const doc of docs) {
       // getContent(full=true) = reconstructContent skipDuplicateTitle=false——
-      // 完整还原原文（含首标题行），与 upsert 时原文计算口径一致，可无损回导
+      // 完整还原原文（含首标题行），可无损回导；返回的 contentHash 与原始写入
+      // payload 同源（revision token），**与重建正文的 SHA-256 不相等**——
+      // content 用途 = roundtrip，contentHash 用途 = revision 对照（注释已写清）
       const full = await this.docService.getContent(doc.id, true);
       docItems.push({
+        docId: doc.id,
         path: doc.path,
         title: doc.title,
         summary: doc.summary,
@@ -224,6 +245,7 @@ export class DocBundleService {
         // categoryId 指向已软删分类 → null（未分类；回导时不重建该分类，文档落 uncategorized）
         category: doc.categoryId ? (categoryNameById.get(doc.categoryId) ?? null) : null,
         content: full.content,
+        contentHash: doc.contentHash,
       });
     }
 

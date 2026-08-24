@@ -142,6 +142,22 @@ export interface UpsertDocInput {
 }
 
 /**
+ * 追加文档内容输入（POST /docs/:id/append，v1.65.0 消费者反馈批 7601e2f5）
+ *
+ * 语义：一步把 content 追加到文档末尾（position='end'，默认）或指定 heading 小节
+ * 末尾（position='under-heading' + headingPath 精确匹配）。服务端内部消化并发冲突
+ * （DOC_CONTENT_CONFLICT 自动重读重写，最多 3 次）——调用方无需 read→patch 三步。
+ */
+export interface AppendDocInput {
+  /** 追加的 Markdown 内容（非空、非全空白；可自带标题行触发新 section） */
+  content: string;
+  /** 追加位置：'end'（文档末尾，默认）| 'under-heading'（指定小节子树末尾） */
+  position?: 'end' | 'under-heading';
+  /** position='under-heading' 时必填：目标节的 heading_path 精确匹配（0 命中 404 / 多命中 409） */
+  headingPath?: string;
+}
+
+/**
  * 添加/移除 Space 成员输入
  */
 export interface SpaceMemberInput {

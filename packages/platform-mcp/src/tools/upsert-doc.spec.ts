@@ -2,7 +2,7 @@
  * upsert_doc 单元测试
  *
  * 覆盖：happy path、source 固定 native 不透出、409 透传、resolve 失败、
- * 可选参数透传、unchanged 标记、紧凑 JSON。
+ * 可选参数透传、forceRechunk 透传（债 B）、unchanged/rechunked 标记、紧凑 JSON。
  */
 
 import type { CustomToolContext } from '@agent-chamber/automcp';
@@ -97,6 +97,37 @@ describe('upsert_doc', () => {
     );
     expect(withoutLock.isError).toBeFalsy();
     expect(request.mock.calls[3][2].body).not.toHaveProperty('expectedContentHash');
+  });
+
+  it('forceRechunk 透传（债 B）：携带 → body 含 true 且响应 rechunked 透出；缺省 → body 不含该字段', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({ items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }] });
+    request.mockResolvedValueOnce({
+      id: 'd1',
+      path: 'a.md',
+      sectionCount: 1,
+      tokenEstimate: 10,
+      rechunked: true,
+    });
+    request.mockResolvedValueOnce({ items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }] });
+    request.mockResolvedValueOnce({ id: 'd1', path: 'a.md', sectionCount: 1, tokenEstimate: 10 });
+
+    // 携带 → 透传 true；响应 rechunked:true 原样透出（Agent 可感知纯重切而非内容变更）
+    const withForce = await upsertDocTool.handler(
+      { spaceName: 'My Docs', path: 'a.md', content: '# A', forceRechunk: true },
+      ctx(),
+    );
+    expect(withForce.isError).toBeFalsy();
+    expect(request.mock.calls[1][2].body.forceRechunk).toBe(true);
+    expect(JSON.parse(withForce.content[0].text).rechunked).toBe(true);
+
+    // 缺省 → body 不含该字段（行为与现状一致）
+    const withoutForce = await upsertDocTool.handler(
+      { spaceName: 'My Docs', path: 'a.md', content: '# A' },
+      ctx(),
+    );
+    expect(withoutForce.isError).toBeFalsy();
+    expect(request.mock.calls[3][2].body).not.toHaveProperty('forceRechunk');
   });
 
   it('可选参数透传', async () => {

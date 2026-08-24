@@ -2,7 +2,7 @@
 set -e
 
 # Agent Chamber 协作平台 — 一键开发启动脚本
-# 用法: ./scripts/dev.sh [all|frontend|backend]
+# 用法: ./scripts/dev.sh [all|frontend|backend|stop]
 # 默认: all
 
 MODE="${1:-all}"
@@ -24,6 +24,60 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# 按 PID 文件优雅停止进程；PID 已失效时幂等清理，不阻断 stop 流程。
+stop_service() {
+  local pidfile=$1
+  local pname=$2
+  local pid
+  local group_id
+  local signal_target
+  local waited=0
+
+  if [ ! -f "$pidfile" ]; then
+    log_info "$pname PID 文件不存在，跳过"
+    return 0
+  fi
+
+  pid=$(tr -d '[:space:]' < "$pidfile")
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    log_warn "$pname PID 文件无效，清理: $pidfile"
+    rm -f "$pidfile"
+    return 0
+  fi
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log_info "$pname 进程已退出，清理 PID 文件 (PID $pid)"
+    rm -f "$pidfile"
+    return 0
+  fi
+
+  group_id=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  signal_target="$pid"
+  if [[ "$group_id" =~ ^[0-9]+$ ]] && [ "$group_id" = "$pid" ] && [ "$group_id" -ne "$$" ]; then
+    signal_target="-$group_id"
+    log_info "$pname: 使用独立进程组 $group_id"
+  fi
+
+  log_info "$pname: 发送 TERM (PID $pid)..."
+  kill -TERM -- "$signal_target" 2>/dev/null || true
+  while kill -0 -- "$signal_target" 2>/dev/null; do
+    if [ "$waited" -ge 10 ]; then
+      log_warn "$pname: 10s 内未退出，发送 KILL (PID $pid)..."
+      kill -KILL -- "$signal_target" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  rm -f "$pidfile"
+  if kill -0 -- "$signal_target" 2>/dev/null; then
+    log_warn "$pname PID $pid 仍被系统回收中，已清理 PID 文件"
+  else
+    log_ok "$pname 已停止"
+  fi
+}
 
 # 根据端口 kill 进程
 kill_port() {
@@ -53,7 +107,7 @@ wait_port() {
       return 1
     fi
     sleep 1
-    ((waited++))
+    waited=$((waited + 1))
   done
   log_ok "$pname 已就绪 (端口 $port)"
 }
@@ -107,7 +161,7 @@ start_backend() {
   log_info "启动后端 (NestJS) → http://localhost:$BACKEND_PORT"
   log_info "API 文档 → http://localhost:$BACKEND_PORT/api/docs"
   cd "$PROJECT_ROOT"
-  nohup pnpm --filter @agent-chamber/backend dev > "$LOG_DIR/backend.log" 2>&1 &
+  setsid nohup pnpm --filter @agent-chamber/backend dev > "$LOG_DIR/backend.log" 2>&1 &
   echo $! > "$LOG_DIR/backend.pid"
   wait_port "$BACKEND_PORT" "后端" 60
 }
@@ -118,7 +172,7 @@ start_frontend() {
   cd "$PROJECT_ROOT"
   # 本地开发时前端直接连后端，不走 nginx 代理
   export NEXT_PUBLIC_API_URL="http://localhost:$BACKEND_PORT/api/v1"
-  nohup pnpm --filter @agent-chamber/web dev > "$LOG_DIR/frontend.log" 2>&1 &
+  setsid nohup pnpm --filter @agent-chamber/web dev > "$LOG_DIR/frontend.log" 2>&1 &
   echo $! > "$LOG_DIR/frontend.pid"
   wait_port "$WEB_PORT" "前端" 60
 }
@@ -152,6 +206,15 @@ print_access() {
   fi
   echo ""
 }
+
+# stop 模式只执行 PID 文件清理，不触发启动、编译或数据库流程。
+if [ "$MODE" = "stop" ]; then
+  log_info "停止开发服务..."
+  stop_service "$LOG_DIR/backend.pid" "后端"
+  stop_service "$LOG_DIR/frontend.pid" "前端"
+  log_ok "开发服务停止流程完成"
+  exit 0
+fi
 
 # ============ 主流程 ============
 
@@ -192,7 +255,7 @@ elif [ "$MODE" = "frontend" ]; then
   start_frontend
 else
   log_err "未知模式: $MODE"
-  echo "用法: $0 [all|frontend|backend]"
+  echo "用法: $0 [all|frontend|backend|stop]"
   exit 1
 fi
 

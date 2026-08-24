@@ -24,6 +24,7 @@ export { DocSpaceMember } from './doc-space-member.entity';
 export { DocCategory } from './doc-category.entity';
 export { Doc } from './doc.entity';
 export { DocSection } from './doc-section.entity';
+export { DocVersion } from './doc-version.entity';
 export { TaskDocLink } from './task-doc-link.entity';
 export { DocRoute } from './doc-route.entity';
 export { RoundtableRunner } from './roundtable-runner.entity';

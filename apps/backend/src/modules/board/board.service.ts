@@ -10,11 +10,16 @@
  *         Service 只做业务：findById() + enrich()。见 memory/2026-06-05.md
  *   BoardDetail 与 tasks 解耦：findById 不再 join tasks，taskCount 通过 QueryBuilder 聚合。
  *
- * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤)
+ * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行)
  *
  * [铁律关联] #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   B-52: create() 历史上只给 invitedAgentIds 写成员行，creator 不落表——成员列表缺席
+ *         + AccessQueryService 按成员表算可见性对 creator 不命中（4b1ddd1c）。修复：
+ *         creator 落 role='editor' 且 invitedBy=null 行，invited 列表过滤 creator 防
+ *         PK 冲突；removeEditor/uninviteAgent 对 creator 拒绝（409），防 bug 经删除
+ *         路径复活。存量数据由 BackfillCreatorMembership1787300000000 回填
  *   BoardDetail 不再 join tasks: findById relations 改为 ['lists']；enrich 通过 QueryBuilder
  *     聚合 taskCount / completedTaskCount / 每列 taskCount，避免大 Board 全量加载任务。
  *   B-45: reorderLists/reorderTasks 返回 null。TypeORM 实体序列化时动态赋值丢失。
@@ -23,10 +28,6 @@
  *   B-41: Board findAll 列表页任务统计始终显示 0/0。TypeORM 实体动态赋值在 NestJS
  *         序列化时被数据库原始值覆盖。修复：显式展开为 plain object
  *         { ...b, taskCount, completedTaskCount }。见 memory/2026-06-04.md §11
- *   B-6: Board 未继承 Topic 可见性，Topic 私密但 Board 仍公开。
- *         修复：effectiveVisibility = max(Topic.vis, Board.vis)。见 memory/2026-05-25.md
- *   B-5: Topic/Board 缺少可见性控制，私密资源可公开访问。
- *         修复：canAccess() + Visibility enum + findAll 过滤。见 memory/2026-05-25.md
  *   B-50: Topic/Board 列表接口在 Controller 层过滤，导致分页 total 与 items 不一致。
  *         修复：findAll 接收 actor，改为 QueryBuilder 在 Service 层加 IN 过滤，空白名单
  *         直接返回空分页，保持 total 与 items 同源。见 Plan §2.3 / §2.4。
@@ -627,27 +628,46 @@ export class BoardService {
     // ── risks：labels 数组重叠（&& = 任一命中）∧ status 非 done/archived，priority 序 ──
     // 独立 SQL 查询（对齐 plan 指定的 PG && 运算符；内存过滤会与 open 集合强耦合，语义不清）
     let riskAll: DigestRiskRow[] = [];
-    if (riskLimit > 0 && listIds.length > 0) {
-      const riskRows = await this.taskRepo
-        .createQueryBuilder('task')
-        .where('task.list_id IN (:...listIds)', { listIds })
-        .andWhere('task.deleted_at IS NULL')
-        .andWhere("task.labels && ARRAY['bug','debt']")
-        .andWhere('task.status NOT IN (:...excluded)', {
-          excluded: [TaskStatus.DONE, TaskStatus.ARCHIVED],
-        })
-        .orderBy('task.priority', 'ASC')
-        .addOrderBy('task.created_at', 'ASC')
-        .take(riskLimit + 1) // +1 探针：超出 limit 即 truncated（避免全量加载风险任务）
-        .getMany();
-      riskAll = riskRows.map((t) => ({
-        id: t.id,
-        title: t.title,
-        priority: t.priority,
-        status: t.status,
-        labels: t.labels,
-        assigneeId: t.assigneeId,
-      }));
+    // 全量计数：limit>0 时 = 探针行数（min(全量, limit+1)，维持既有语义）；
+    // limit=0 时走 COUNT（调用方只要计数不拉条目——短路空数组会令 total 假报 0）
+    let risksTotal = 0;
+    if (listIds.length > 0) {
+      // 查询条件工厂：行查询与 COUNT 共用同一过滤条件，防口径漂移
+      const riskQuery = () =>
+        this.taskRepo
+          .createQueryBuilder('task')
+          .where('task.list_id IN (:...listIds)', { listIds })
+          .andWhere('task.deleted_at IS NULL')
+          .andWhere("task.labels && ARRAY['bug','debt']")
+          .andWhere('task.status NOT IN (:...excluded)', {
+            excluded: [TaskStatus.DONE, TaskStatus.ARCHIVED],
+          });
+      if (riskLimit > 0) {
+        const riskRows = await riskQuery()
+          .orderBy('task.priority', 'ASC')
+          .addOrderBy('task.created_at', 'ASC')
+          .take(riskLimit + 1) // +1 探针：超出 limit 即 truncated（避免全量加载风险任务）
+          .getMany();
+        riskAll = riskRows.map((t) => ({
+          id: t.id,
+          title: t.title,
+          priority: t.priority,
+          status: t.status,
+          labels: t.labels,
+          assigneeId: t.assigneeId,
+        }));
+        if (riskAll.length > riskLimit) {
+          // 探针截顶（真实数 > limit）：追加 COUNT 拿精确全量——探针行数只是 limit+1 上限，
+          // 直接当 total 会截顶虚报（契约：xxxTotal 恒为真实全量计数）
+          risksTotal = await riskQuery().getCount();
+        } else {
+          // 探针未满：行数即精确总数，无需额外 COUNT
+          risksTotal = riskAll.length;
+        }
+      } else {
+        // limit=0：不拉行，COUNT 拿真实全量（调用方凭 total 决定是否再拉该段）
+        risksTotal = await riskQuery().getCount();
+      }
     }
     const risks = riskAll.slice(0, riskLimit);
     const risksTruncated = riskLimit > 0 && riskAll.length > riskLimit;
@@ -657,18 +677,39 @@ export class BoardService {
     // completedAt NULL 过滤（2026-08-05 产品锚点验收暴露）：PG ORDER BY DESC 默认 NULLS FIRST，
     // 存量 NULL 行（不变量建立前的历史数据）会顶到最前，把真实最近完成挤出 top N。
     let recentDoneAll: DigestDoneRow[] = [];
-    if (doneLimit > 0 && listIds.length > 0) {
-      const doneRows = await this.taskRepo.find({
-        where: { listId: In(listIds), status: TaskStatus.DONE, completedAt: Not(IsNull()) },
-        order: { completedAt: 'DESC', createdAt: 'DESC' },
-        take: doneLimit + 1, // +1 探针：超出 limit 即 truncated
+    // 全量计数：limit>0 时 = 探针行数；limit=0 时走 COUNT（同上，防 total 假报 0）
+    let recentDoneTotal = 0;
+    if (listIds.length > 0) {
+      // 过滤条件工厂：find 与 count 共用同一条件，防口径漂移
+      // （软删过滤均由 TypeORM 自动应用，与既有 find 口径一致）
+      const doneFilter = () => ({
+        listId: In(listIds),
+        status: TaskStatus.DONE,
+        completedAt: Not(IsNull()),
       });
-      recentDoneAll = doneRows.map((t) => ({
-        id: t.id,
-        title: t.title,
-        completedAt: t.completedAt ?? t.updatedAt,
-        assigneeId: t.assigneeId,
-      }));
+      if (doneLimit > 0) {
+        const doneRows = await this.taskRepo.find({
+          where: doneFilter(),
+          order: { completedAt: 'DESC', createdAt: 'DESC' },
+          take: doneLimit + 1, // +1 探针：超出 limit 即 truncated
+        });
+        recentDoneAll = doneRows.map((t) => ({
+          id: t.id,
+          title: t.title,
+          completedAt: t.completedAt ?? t.updatedAt,
+          assigneeId: t.assigneeId,
+        }));
+        if (recentDoneAll.length > doneLimit) {
+          // 探针截顶：追加 COUNT 拿精确全量（探针行数只是 doneLimit+1 上限，会截顶虚报）
+          recentDoneTotal = await this.taskRepo.count({ where: doneFilter() });
+        } else {
+          // 探针未满：行数即精确总数，无需额外 COUNT
+          recentDoneTotal = recentDoneAll.length;
+        }
+      } else {
+        // limit=0：不拉行，COUNT 拿真实全量（调用方凭 total 决定是否再拉该段）
+        recentDoneTotal = await this.taskRepo.count({ where: doneFilter() });
+      }
     }
     const recentDone = recentDoneAll.slice(0, doneLimit);
     const recentDoneTruncated = doneLimit > 0 && recentDoneAll.length > doneLimit;
@@ -746,19 +787,31 @@ export class BoardService {
     // 权限语义（契约层决定，评审已拍板）：board 可读蕴含空间元数据可读，不做 DocSpace 成员校验
     let docs: BoardDigestDocs | null = null;
     let docsTruncated = false;
+    // 截断元数据补齐：docsTotal = 最近更新文档全量计数（不受 docsLimit 截断影响）；
+    // 无绑定空间（docs 为 null）时缺省，与 docs 段"不存在"语义一致
+    let docsTotal: number | undefined;
     const space = await this.docSpaceRepo.findOne({ where: { boardId } });
     if (space) {
+      // 查询条件工厂：行查询与 COUNT 共用同一过滤条件，防口径漂移
+      const docBase = () =>
+        this.docRepo
+          .createQueryBuilder('d')
+          .where('d.space_id = :spaceId', { spaceId: space.id })
+          .andWhere('d.deleted_at IS NULL'); // 显式排除软删文档（对齐 overview 口径）
       const recentDocs =
         docsLimit > 0
-          ? await this.docRepo
-              .createQueryBuilder('d')
-              .where('d.space_id = :spaceId', { spaceId: space.id })
-              .andWhere('d.deleted_at IS NULL') // 显式排除软删文档（对齐 overview 口径）
+          ? await docBase()
               .orderBy('d.updated_at', 'DESC')
               .take(docsLimit + 1) // +1 探针：超出 limit 即 truncated
               .getMany()
           : [];
       docsTruncated = docsLimit > 0 && recentDocs.length > docsLimit;
+      // docsTotal 恒为真实全量：limit=0（不拉行）或探针截顶（行数只是 docsLimit+1 上限）时
+      // 追加 COUNT 拿精确计数；探针未满时行数即精确总数（docsTotal 不受 docsLimit 截断影响）
+      docsTotal =
+        docsLimit === 0 || recentDocs.length > docsLimit
+          ? await docBase().getCount()
+          : recentDocs.length;
       docs = {
         spaceId: space.id,
         spaceName: space.name,
@@ -874,9 +927,15 @@ export class BoardService {
       },
       priorityDistribution: { open: priorityDistribution },
       risks: risks.map(projectRisk),
+      // 截断元数据补齐：各段全量计数恒输出（对齐 versions.total 先例），
+      // 截断判断用 xxxTotal > xxx.length；docsTotal 无绑定空间时缺省
+      risksTotal,
       nextUp: nextUp.map(projectOpen),
+      nextUpTotal: nextUpAll.length,
       recentDone: recentDone.map(projectDone),
+      recentDoneTotal,
       docs,
+      ...(docsTotal !== undefined ? { docsTotal } : {}),
       truncated,
     };
   }
@@ -993,18 +1052,37 @@ export class BoardService {
     });
     const savedBoard = await this.boardRepo.save(board);
 
-    // 为 invitedAgentIds 创建 board_members 行 (role='member')；Set 去重防同批 PK 冲突
+    // 为 invitedAgentIds 创建 board_members 行 (role='member')；Set 去重防同批 PK 冲突。
+    // creator 若同时出现在 invitedAgentIds 必须过滤——creator 单独落 role='editor' 行，
+    // 重复写会触发 (board_id, actor_id) PK 冲突
     if (invitedAgentIds.length > 0) {
-      const memberEntities = [...new Set(invitedAgentIds)].map((agentId) =>
-        this.memberRepo.create({
-          boardId: savedBoard.id,
-          actorId: agentId,
-          role: BoardMemberRole.MEMBER,
-          invitedBy: creatorId,
-        }),
-      );
-      await this.memberRepo.save(memberEntities);
+      const memberEntities = [...new Set(invitedAgentIds)]
+        .filter((agentId) => agentId !== creatorId)
+        .map((agentId) =>
+          this.memberRepo.create({
+            boardId: savedBoard.id,
+            actorId: agentId,
+            role: BoardMemberRole.MEMBER,
+            invitedBy: creatorId,
+          }),
+        );
+      if (memberEntities.length > 0) {
+        await this.memberRepo.save(memberEntities);
+      }
     }
+
+    // creator 落成员行（role='editor', invitedBy=null）：成员列表可见 + 按成员表算可见性
+    // 的查询路径（AccessQueryService.computeAccessibleBoardIds）对 creator 命中。
+    // 权限本身仍由 isCreator 直比保证（board.policy.ts），成员行是补充语义非权限来源；
+    // invitedBy=null 标记「非授予产生」，backfill migration 的 down() 据此精确回滚
+    await this.memberRepo.save(
+      this.memberRepo.create({
+        boardId: savedBoard.id,
+        actorId: creatorId,
+        role: BoardMemberRole.EDITOR,
+        invitedBy: null,
+      }),
+    );
 
     // 如传入初始 lists，批量创建
     if (dto.lists && dto.lists.length > 0) {
@@ -1178,6 +1256,16 @@ export class BoardService {
     if (!board)
       throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
 
+    // creator 的 editor 行不可移除：creator 权限由 isCreator 直比保证，但成员行承载
+    // 成员列表可见性 + AccessQueryService 白名单语义，删行会让「creator 缺席成员表」
+    // 的原始 bug 经本路径复活（4b1ddd1c）
+    if (board.creatorId === agentId) {
+      throw new ConflictException({
+        message: 'Board creator cannot be removed as editor',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+
     // 校验 Agent 真实存在
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
@@ -1256,6 +1344,14 @@ export class BoardService {
     const board = await this.boardRepo.findOne({ where: { id } });
     if (!board)
       throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
+
+    // creator 成员行不可经 uninvite 移除（显式守卫优先于 editor-role 检查，给出明确语义）
+    if (board.creatorId === agentId) {
+      throw new ConflictException({
+        message: 'Board creator cannot be uninvited',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
 
     // 校验 Agent 真实存在
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);

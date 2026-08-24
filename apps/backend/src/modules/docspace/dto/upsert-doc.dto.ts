@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsArray, MaxLength, ArrayMaxSize } from 'class-validator';
+import { IsString, IsOptional, IsArray, IsBoolean, MaxLength, ArrayMaxSize, Length } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
@@ -97,4 +97,32 @@ export class UpsertDocDto {
   // sha256 hex 定长 64；超长 = 格式错误，DTO 层 400（铁律 21）
   @MaxLength(64)
   expectedContentHash?: string;
+
+  @ApiPropertyOptional({
+    description:
+      '债 B：contentHash 相同也强制重建 sections（缺省 false）。用于修复 chunk 级元数据 ' +
+      '损坏（heading_path/is_continuation 被直改出错）——重建后 headingText/headingPath/level ' +
+      '全部按 chunker 重新计算。语义：走事务重建路径但**跳过** doc_versions 版本行插入+剪枝 ' +
+      '（版本契约 = contentHash 变化才落版）；doc.updatedAt 会 bump（元数据确实重建了，预期语义）；' +
+      '响应带 rechunked:true（unchanged 恒不出现）；DOC_UPDATED 事件携带 rechunked 上下文。' +
+      '⚠️ batch 通道（PUT /docs/batch）显式剔除本参数，不生效。',
+  })
+  @IsOptional()
+  @IsBoolean()
+  forceRechunk?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Idempotency key (optional, 1–64 chars). Repeated submissions with the same ' +
+      'clientRequestId by the same actor return the FIRST response snapshot with an ' +
+      'idempotentReplay flag — no event, no doc_versions row, no side effects on replay. ' +
+      'Same key with a different payload → 409 IDEMPOTENCY_KEY_CONFLICT. Safe for retries.',
+    example: 'upsert-docs-20260821-001',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  // 幂等键尺度照 create-task.dto 先例（1~64 字符，不强制 UUID）；超长在 DTO 层 400（铁律 21）
+  @Length(1, 64)
+  clientRequestId?: string;
 }

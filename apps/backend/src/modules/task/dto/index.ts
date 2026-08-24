@@ -3,6 +3,8 @@ export * from './update-task.dto';
 export * from './move-task.dto';
 export * from './assign-task.dto';
 export * from './add-comment.dto';
+export * from './report-task-result.dto';
+export * from './patch-task-description.dto';
 export * from './add-task-dependency.dto';
 export * from './create-milestone.dto';
 export * from './update-milestone.dto';

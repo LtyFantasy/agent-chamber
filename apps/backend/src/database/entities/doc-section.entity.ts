@@ -48,9 +48,22 @@ export class DocSection {
   /**
    * 层级标题路径
    * 如 `§3.2 任务状态机`，祖先标题链 `父 § 子` 拼接（截断 512）
+   * 债 A（doc_sections 标题独立列）之后退化为**纯寻址地址**：标题展示一律读 headingText
    */
   @Column({ type: 'varchar', length: 512, nullable: true, name: 'heading_path' })
   headingPath: string | null;
+
+  /**
+   * 本地标题文本（标题展示的权威源，chunker 直写，consumer 直读——取代 headingPath
+   * 字符串反解析；反解析对标题正文内含 ` § ` 的行会切错，已两次踩坑）
+   *
+   * 取值规范与 chunker 一致：ATX 标题去前导 `#`+空格、去尾部闭合 `#`、trim 后的原始
+   * 文本（保留行内 markdown 标记原样）；headingLevel=0（文首无标题段）为 NULL；
+   * 续 chunk（isContinuation=true）与同 headingPath 的首 chunk 共享同一值。
+   * 存量行由 migration 按 headingPath 末段回填（best-effort，新写入才是权威源）。
+   */
+  @Column({ type: 'varchar', length: 512, nullable: true, name: 'heading_text' })
+  headingText: string | null;
 
   /** 标题层级：0=文首无标题段，1-6 对应 h1-h6 */
   @Column({ type: 'smallint', default: 0, name: 'heading_level' })

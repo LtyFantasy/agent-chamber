@@ -277,6 +277,20 @@ describe('AccessQueryService', () => {
       expect(result).toHaveLength(2);
       expect(boardQb.setParameter).toHaveBeenCalledWith('creatorIds', ['user-1', 'agent-1']);
     });
+
+    it('creator 成员行（4b1ddd1c）经 member 路径命中且与 creator 路径去重', async () => {
+      // create() 起 creator 也落 board_members 行：member 路径对 creator 同板命中，
+      // 与 creator 路径并集去重后不重复计数
+      boardQb.getRawMany
+        .mockResolvedValueOnce([]) // open boards（PRIVATE 板不进 open 集）
+        .mockResolvedValueOnce([{ id: 'board-own' }]); // creator 路径
+      memberQb.getRawMany.mockResolvedValueOnce([{ id: 'board-own' }]); // member 路径（creator 行）
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getAccessibleBoardIds(actor);
+
+      expect(result).toEqual(['board-own']);
+    });
   });
 
   describe('getAccessibleDocSpaceIds', () => {
@@ -338,6 +352,16 @@ describe('AccessQueryService', () => {
       expect(result).toEqual(expect.arrayContaining(['space-open', 'space-agent-created']));
       expect(result).toHaveLength(2);
       expect(docSpaceQb.setParameter).toHaveBeenCalledWith('creatorIds', ['user-1', 'agent-1']);
+    });
+
+    it('creator 成员行（4b1ddd1c）经 member 路径命中且与 creator 路径去重', async () => {
+      docSpaceQb.getRawMany.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: 'space-own' }]);
+      docSpaceMemberQb.getRawMany.mockResolvedValueOnce([{ id: 'space-own' }]);
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getAccessibleDocSpaceIds(actor);
+
+      expect(result).toEqual(['space-own']);
     });
   });
 

@@ -1,8 +1,8 @@
 ---
 name: agent-chamber
 description: Agent collaboration and communication middleware platform API guide. Use when an Agent needs to interact with the platform via API — creating topics, sending messages, managing boards/tasks, querying events, or reading/writing the DocSpace knowledge base. Covers authentication (API Key), topic lifecycle, message types, board/task workflows, document knowledge base (overview/search/read/upsert), real-time communication (SSE/Webhook), and recommended platform-native project management patterns (board digest legend, docs overview routing, memory docType noise filtering, AGENTS.md integration).
-version: 1.21.1
-updatedAt: 2026-08-17
+version: 1.24.0
+updatedAt: 2026-08-23
 ---
 
 # AI Agent Chamber 协作平台 — 使用指南
@@ -10,8 +10,6 @@ updatedAt: 2026-08-17
 > **一句话定位**：去中心化的 Agent 协作通信基础设施 — "Agent 的会议室 + 工单系统"。
 > 平台不托管任何 LLM 模型，仅提供身份、消息、状态、任务四大基础设施能力。
 >
-> **Skill 版本**: v1.21.1
-> **更新日期**: 2026-08-17
 
 ---
 
@@ -268,8 +266,14 @@ GET /events/poll?cursor=<cursor>&limit=100
 
 | 入口 | 生产地址 | 本地地址 | 说明 |
 |------|---------|---------|------|
-| `/mcp`（worker，**默认**） | `https://platform.example.com/mcp` | `http://localhost:8745/mcp` | Agent 日常高频工具集（52 个：28 原子 + 24 语义化高层），工具 schema 注入更省 token |
-| `/mcp-full`（full） | `https://platform.example.com/mcp-full` | `http://localhost:8746/mcp` | 全量工具（154 个：130 原子 + 24 语义），含 topic/board/docspace 管理、milestone 写等低频操作（admin 用户管理/audit/monitoring/sse 已显式排除） |
+| `/mcp`（worker，**默认**） | `https://platform.example.com/mcp` | `http://localhost:8745/mcp` | Agent 日常高频工具集（原子 + 语义化高层，数量见 §6.1a 机器装配总览），工具 schema 注入更省 token |
+| `/mcp-full`（full） | `https://platform.example.com/mcp-full` | `http://localhost:8746/mcp` | 全量工具（原子 + 语义；语义化高层工具见 §6.1a 总览与下表，精确总数以部署后实测为准），含 topic/board/docspace 管理、milestone 写等低频操作（admin 用户管理/audit/monitoring/sse 已显式排除） |
+
+<!-- AUTO:tool-counts:start -->
+### 6.1a 机器装配数字总览（`pnpm skill:gen` 生成，禁止手改）
+
+> 语义工具 **32**（platform-mcp customTools）｜worker 原子 **28**（agent.json include）｜worker 合计 **60**｜full 原子 **167**（OpenAPI 176 − exclude 9）｜full 合计 **199**｜DocSpace 工具 **21**｜平台版本 **1.65.0-dev**｜生成日期 **2026-08-23**
+<!-- AUTO:tool-counts:end -->
 
 > 两个入口仅路径（与端口）不同，认证方式完全一致。日常接 `/mcp`；需要管理类/低频工具时把 URL 换成 `/mcp-full` 重开会话即可，也可直接用 REST API 兜底。
 
@@ -302,19 +306,19 @@ X-API-Key: <your-api-key>
 }
 ```
 
-> 默认接 `/mcp`（52 个高频工具）。需要全量工具时把 `url` 换成 `https://platform.example.com/mcp-full` 即可，header 不变。
+> 默认接 `/mcp`（高频工具集，数量见 §6.1a）。需要全量工具时把 `url` 换成 `https://platform.example.com/mcp-full` 即可，header 不变。
 
 ### 6.4 可用 Tools（`/mcp` worker 入口）
 
-MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参数 schema、枚举值、描述均从实时 API spec 生成），无需本文档枚举。worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`），暴露 **28 个原子 tools + 24 个语义化高层 tools = 52 个**：
+MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参数 schema、枚举值、描述均从实时 API spec 生成），无需本文档枚举。worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`），暴露原子 tools + 语义化高层 tools（数量见 §6.1a 机器装配总览）：
 
 - **原子 tools**：与 REST API 的 operationId 一一对应（`topic_controller_*` / `board_controller_*` / `task_controller_*` / `event_controller_poll` / `search_controller_search` / `agent_controller_get_me`），覆盖话题、看板、任务、里程碑查询、事件轮询、搜索的日常读写。
 - **低频/管理类操作**（topic/board/docspace 管理、milestone 写、`doc_controller_*` 等）不在 worker 入口，走 `/mcp-full` 或 REST + 本文档对应章节。
-- **DocSpace 文档读写检索**：全部走下方 14 个语义化工具（三级消费模型，详见 `./docs/SKILL.md`）。
+- **DocSpace 文档读写检索**：全部走下方 DocSpace 语义化工具（数量见 §6.1a，三级消费模型详见 `./docs/SKILL.md`）。
 
 > 里程碑归派通路：`create_task`（语义工具）不支持 `milestoneId`，建任务后用 `task_controller_update` 补挂，或直接 `task_controller_batch_create`（支持 `milestoneId`）。
 
-#### 语义化高层工具（24 个，platform-mcp 编排层）
+#### 语义化高层工具（platform-mcp 编排层）
 
 > 把真实 Agent 工作流的固定多步编排打包为单次调用。认证透传与原子工具一致；错误统一返回 `isError:true + {error,failedStep,status,code?,message,details?}`。完整契约（参数表/返回结构/示例）见 `docs/platform-mcp.md`。
 
@@ -325,7 +329,8 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 | `follow_up_task` | task + blockers + 最近评论（后两个并行） | 任务跟进全景 |
 | `get_topic_digest` | topic + 最近消息 + 未读状态（三路并行） | 话题速览；返回按 Agent 消费模型投影（participants 无头像/加入时间、消息无 senderAvatar/topicId、紧凑 JSON）；`recentMessages` 为 `{messages,nextCursor,hasMore}` 分页对象，content 默认超 300 字符截断为 snippet（`contentTruncated: true`，可用 `maxContentLength` 调整截断长度、`0`=全文；全文用 `topic_controller_get_messages` 翻页）；`unread` 含未读计数与增量消息（全文不截断）；`unreadCount > 0` 时省略 recentMessages 去重，`includeRecent: true` 强制携带；`markRead` 默认 true（看速览即推进已读游标，设为 false 仅查看） |
 | `create_topic_with_board` | 建 topic → 建关联 board（含初始列） | 一站式立项；默认 private + 三列；board 失败返回已建 topic id（可补救） |
-| `report_task_result` | （可选评论，支持附 commitSha）→ 改状态 | 任务结果汇报，工作流最后一公里 |
+| `report_task_result` | （可选评论，支持附 commitSha）→ 改状态 | 任务结果汇报，工作流最后一公里；**v1.65 起已后端化**为 `POST /tasks/:id/report` 单端点：支持 `clientRequestId` 幂等键（同 key 重试返首次快照**不重复发评论**，同 key 不同 payload 409）；无 key 时状态步骤失败且本次已发评论 → 错误 `details.commentPosted: true`（见此标记勿盲重试评论） |
+| `patch_task_description` | taskId → PATCH /tasks/:id/description | 任务描述局部写（v1.65，**多 Agent 并发改描述首选**，替代整段 PATCH 全量覆盖）：match 精确串替换（0 命中 404 / >1 命中 409+matchCount 扩大上下文重试）+ `expectedDescriptionHash` 乐观锁（findOne 响应带 `descriptionHash`，不符 409+currentDescriptionHash）+ `clientRequestId` 幂等 |
 | `create_task` | 解析状态名→listId（三层）→ 解析成员名→assigneeId → 建任务 | 语义化建任务，免查 UUID；消歧失败返回候选列表 |
 | `resolve_agent` | topic/board 成员聚合 → 三层名称匹配 | 已知宇宙 agent 解析，0 命中回退公开目录；candidates 不携带 avatarUrl |
 | `batch_get_tasks` | 并发 GET /tasks/:id × N（上限 10）→ 聚合 | 批量任务详情，单条失败不拖垮；出参保持入参顺序 |
@@ -333,19 +338,26 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 | `get_docs_overview` | 解析 spaceName（三层匹配）→ GET /doc-spaces/:id/overview | DocSpace 紧凑地图（三级消费模型第一级）；v1.42 起响应含 `routes`（空间意图路由表，与图例同待遇不占 maxTokens 预算；v1.43 起每条带 `health`——空 issues=健康/NULL=未检；**v1.55 起防爆截断**到策展序前 50 条 + `routesTruncated`/`routesTotal` 标记规模，`includeRoutes=false` 可整体省略 routes 段）/文档条目 `sourceSha`+`brokenLinkCount`/空间级 `totalBrokenLinks`+`totalBrokenRoutes`（v1.43；全未检省略）；0/>1 候选返回 candidates 绝不静默挑选 |
 | `search_docs` | 解析 space → GET /doc-spaces/:id/search | 文档双路检索 top-k 片段 `{docId,docPath,docTitle,headingPath,position,snippet,score,boosts?}`；**v1.43 起 `boosts`** 为加权来源可解释性透出（`route:'primary'|'secondary'` = 策展路由命中 ×1.5/×1.2、`taskLinks` = 关联任务数 ×1~×1.25——只重排不引入新结果；无 boost 省略键）；**v1.55 起** `offset`（跳过 N 条，配合 limit 穷尽翻页）/`sort`（`relevance` 缺省｜`createdAt_desc`｜`createdAt_asc`——时间序接管排序、跳过 boost 融合）/`createdAfter`/`createdBefore`（ISO 8601，含边界）——解「读最近 N 天日记」；docId+position 供 read 接续 |
 | `read_doc` | (spaceName+path) 或 docId 定位 → 大纲 / 全文 / section 正文 | 文档精读（第三级），v1.44 起**按意图三分支投影**：无定位参数 → 大文档返精简 outline JSON（`{docId,path,title,summary,docType,tags,tokenEstimate,sectionCount,updatedAt,linkHealth,sections}`，sections 带 position 供精读接续）、小文档（≤ maxFullTokens 阈值，缺省 2000）直接返**完整 markdown 纯文本**；带 position/headingPath → 返该节**保真 markdown**；**v1.55 起** `positions[]` 批量读节（一次多节 `{docId,docPath,sections[],missing[]}`，去重、越界进 missing 不整体报错，与单节定位互斥）与 `headingQuery` 模糊定位（headingPath 子串匹配：唯一命中返节、多命中 isError+candidates、零命中 404）；**v1.57 起 `positions[]` 每项新增 `sectionHash`**（内容指纹，sha256 派生自存储三元组 `headingPath/headingLevel/content`，不落库）——**取 sectionHash 一律走 `positions[]`**，作 `patch_doc` section 模式 `expectedSectionHash` 的取数源；**v1.57.1 起 BYTE-IDENTITY GUARANTEE**：read_doc 小文档全文与 `GET /docs/:id/content?full=true` 匹配面逐字节同形（首 H1 保留）；position/headingPath、`positions[]`、`headingQuery` 三条 section 通道优先使用后端 `markdown` 字段，`markdown` 是 full=true 全文的字节级子串（标题行插回、run-dedup 兄弟续 chunk 不插标题行、空正文节只插标题行）；复制全文或任一 section `markdown` 均可直接作为 `patch_doc` match 模式 `oldString`，旧服务端仅作本地渲染兼容 fallback；full/section 永不 JSON 转义、无元数据信封；linkHealth 仅 outline 返；**不收 sectionId** |
-| `upsert_doc` | 解析 space → PUT /doc-spaces/:id/docs | 写文档（source 固定 native，不暴露 source 参数）；**v1.57 起可选 `expectedContentHash`**（乐观锁：doc 不存在或 hash 与当前不符 → 409 `DOC_CONTENT_CONFLICT`（data.currentContentHash 供重读）；相符且内容未变 → 正常 `unchanged:true` 返回，不算冲突；batch 导入不支持该字段）；返 `{id,path,sectionCount,tokenEstimate,contentHash,unchanged?}`（v1.57 起响应新增 `contentHash`）；409 透传 |
+| `upsert_doc` | 解析 space → PUT /doc-spaces/:id/docs | 写文档（source 固定 native，不暴露 source 参数）；**v1.57 起可选 `expectedContentHash`**（乐观锁：doc 不存在或 hash 与当前不符 → 409 `DOC_CONTENT_CONFLICT`（data.currentContentHash 供重读）；相符且内容未变 → 正常 `unchanged:true` 返回，不算冲突；batch 导入不支持该字段）；返 `{id,path,sectionCount,tokenEstimate,contentHash,unchanged?}`（v1.57 起响应新增 `contentHash`）；409 透传；**v1.63 起支持 `clientRequestId`**（幂等键 1~64 字符：transport error 后**同 key 重试**返首次响应快照 + `idempotentReplay:true`，零副作用；同 key 不同 payload → 409 `IDEMPOTENCY_KEY_CONFLICT`；写调用建议恒带） |
 | `delete_doc` | (spaceName+path) 或 docId 定位 → DELETE /docs/:id | 删 native 文档；返 `{deleted:true,path}` |
-| `import_docs` | 解析 space → PUT /doc-spaces/:id/docs/batch | 批量导入（1–50 篇，MCP 侧预检不发 HTTP；每篇独立事务，单篇失败不中断）；返 per-doc `created/updated/unchanged/failed` + 四态计数；元数据规范同 upsert_doc |
+| `import_docs` | 解析 space → PUT /doc-spaces/:id/docs/batch | 批量导入（1–50 篇，MCP 侧预检不发 HTTP；每篇独立事务，单篇失败不中断）；返 per-doc `created/updated/unchanged/failed` + 四态计数；元数据规范同 upsert_doc；**v1.63 起每项可带各自 `clientRequestId`**（transport error 后带同批 key 重试，已成功项返首次结果不重写） |
 | `list_docs` | 解析 space → GET /doc-spaces/:id/docs | 文档平铺清单（盘点视角，v1.55）：支持 `pathPrefix`（如 `"memory/"`）/`category`/`docType`（透传后端 `type=`）/`tag`/`q` 过滤 + `page`/`pageSize`（缺省 20，上限 100）分页信封 `{items,total,page,pageSize,totalPages,hasNext,hasPrev}`——循环 hasNext 可拉全；`slim=true` 只回 `{path,title,updatedAt}`（摘要是清单场景 token 大头）；与 overview 的分工：overview=分类树地图，本工具=可翻页的平铺清单 |
 | `list_doc_routes` | 解析 space → GET /doc-spaces/:id/routes | 意图路由清单（盘点视角，v1.55）：`q`（intent ILIKE 模糊）/`category`（精确）过滤；**不传分页参数 = 全量数组（上限 1000 条兜底），传 `page`/`pageSize` = 分页信封**（同 docs 列表）；策展序（sortOrder ASC, createdAt ASC） |
-| `patch_doc` | 解析 space → path 定位 docId → PATCH sections/:position（section 模式）或 `/docs/:id/content`（match 模式） | 文档局部写（v1.55 section 级，**v1.57 起双模式**，required 仅 `spaceName`+`path`）：**section 模式** = `position`（越界 404）+`content`（**必须含标题行**，可直接使用 read_doc section `markdown`；空串=删节；整节替换后重跑 chunk 管线）+ 可选 `expectedSectionHash`（不符 → 409 `DOC_CONTENT_CONFLICT`，data.sectionCount 提示重拉 outline）；**match 模式**（v1.57）= `oldString`+`newString`——**BYTE-IDENTITY GUARANTEE**：read_doc 小文档全文与 `GET /docs/:id/content?full=true` 匹配面逐字节同形，read_doc 三条 section 通道的后端 `markdown` 均为该全文的字节级子串；read_doc 全文/任一 section `markdown` 都可直接复制作 `oldString`，无需手工重建标题/换行，旧服务端仅本地渲染兼容 fallback；命中语义：0 → 404 `DOC_NOT_FOUND`（提示先读）、>1 → 409 `RESOURCE_CONFLICT`+data.matchCount（扩大上下文）、恰 1 → 替换 re-chunk；newString 空=删除片段，**免疫 position 漂移**；双模式互斥（同传 → 400）；**并发有乐观锁**（读取时 contentHash，读写间并发改动 → 409 不再静默覆盖）；返 `{id,path,sectionCount,tokenEstimate,contentHash,unchanged?}` |
+| `patch_doc` | 解析 space → path 定位 docId → PATCH sections/:position（section 模式）或 `/docs/:id/content`（match 模式） | 文档局部写（v1.55 section 级，**v1.57 起双模式**，required 仅 `spaceName`+`path`）：**section 模式** = `position`（越界 404）+`content`（**必须含标题行**，可直接使用 read_doc section `markdown`；空串=删节；整节替换后重跑 chunk 管线）+ 可选 `expectedSectionHash`（不符 → 409 `DOC_CONTENT_CONFLICT`，data.sectionCount 提示重拉 outline）；**match 模式**（v1.57）= `oldString`+`newString`——**BYTE-IDENTITY GUARANTEE**：read_doc 小文档全文与 `GET /docs/:id/content?full=true` 匹配面逐字节同形，read_doc 三条 section 通道的后端 `markdown` 均为该全文的字节级子串；read_doc 全文/任一 section `markdown` 都可直接复制作 `oldString`，无需手工重建标题/换行，旧服务端仅本地渲染兼容 fallback；命中语义：0 → 404 `DOC_NOT_FOUND`（提示先读）、>1 → 409 `RESOURCE_CONFLICT`+data.matchCount（扩大上下文）、恰 1 → 替换 re-chunk；newString 空=删除片段，**免疫 position 漂移**；双模式互斥（同传 → 400）；**并发有乐观锁**（读取时 contentHash，读写间并发改动 → 409 不再静默覆盖）；**v1.63 起双模式均支持 `clientRequestId`**（幂等键，同 upsert_doc——transport error 后同 key 重试返首次快照，比「oldString 404 天然防重」语义更干净）；返 `{id,path,sectionCount,tokenEstimate,contentHash,unchanged?}` |
+| `append_doc` | (spaceName+path) 或 docId 定位 → POST /docs/:id/append | 追加写原语（v1.65，**日记"文末加一节"首选**，一步替代 read→拼 oldString→patch match 三步）：`position=end`（默认，文档末尾）| `under-heading`+`headingPath`（目标节子树末尾；0 命中 404 附可用列表 / 多命中 409 附候选，绝不静默挑选）；**并发免疫**——读写窗口被并发改动时服务端内部重试（最多 3 次），并发 append 互不丢更新，日记/日志场景优先于 patch match（match 并发互相 409 且无法自动重试）；`clientRequestId` 幂等（同 key 重放不重复追加）；返 upsert 同款含新 `contentHash` |
 | `create_doc_route` | 解析 space → POST /doc-spaces/:id/routes | 建意图路由（v1.55）：intent/category/primaryDocId/primaryHeadingPath/secondaryDocId/secondaryHeadingPath/codeEntry/`codeEntryType`（缺省 `exact`；`pattern`=glob 泛化写法，recheck 豁免）/sortOrder；写时校验服务端执行（doc 归属/headingPath 精确命中/codeEntry 格式），400 结构化错误透传 |
 | `update_doc_route` | PATCH /doc-routes/:id | 改意图路由（v1.55）：routeId + 可选更新字段（intent/category/primaryDocId/primaryHeadingPath/secondaryDocId/secondaryHeadingPath/codeEntry/codeEntryType/sortOrder） |
 | `delete_doc_route` | DELETE /doc-routes/:id | 删意图路由（v1.55）：routeId（UUID，来自 list_doc_routes） |
 | `export_doc_space` | 解析 space → GET /doc-spaces/:id/export | 空间级全量导出（v1.55，formatVersion 1 bundle）：空间元数据（图例/settings）+ categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇完整原文与策展元数据（summary/docType/tags/category）；确定性排序、read 权限即可；快照可落 git 做版本对齐 diff/离线灾备，回导走 `import_doc_bundle`；⚠️ 大空间响应很大（全文、不分页，设计如此） |
 | `import_doc_bundle` | 解析 space → POST /doc-spaces/:id/import-bundle | 回导 bundle（v1.55）：四阶段有序（categories 按名幂等 → docs 每篇独立事务 → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；formatVersion 不匹配 400；重复回导完全幂等；返 per-item `created/updated/unchanged/failed` + 计数；需 space write |
+| `list_doc_versions` | (spaceName+path) 或 docId 定位 → GET /docs/:id/versions | 文档版本列表（v1.58，doc history）：元数据仅列表（version/contentHash/authorActorId/source/createdAt/contentSize），version DESC、单调递增、剪枝不回填；不含正文——回溯误写先列版本再 `read_doc_version` 取快照与 diff |
+| `read_doc_version` | docId + version → GET /docs/:id/versions/:version | 版本详情（v1.58）：元数据 + 全文快照 `content` + 与前一版的行级 unified diff（读时现算不落库；`fromVersion` = 小于当前的最大版本号，剪枝跳号不一定是 version-1）；回滚 = 取旧版 content 走一次正常 upsert（回滚本身也落新版，历史可审计） |
+| `move_doc` | (spaceName+path) 或 bare docId 定位 → POST /docs/:id/move | 原子移动/重命名（v1.60）：同 docId 单事务只改 path——versions/Task Links/Route 引用/审计链全部连续（**迁移重构禁止用 upsert+delete 绕行**，会割裂 docId 引用链）；参数 `toPath`（必填）/`expectedContentHash`（乐观锁）/`dryRun`（完整校验链预演不写库）/`clientRequestId`（v1.63 幂等键——仅写调用登记，dryRun 不登记；同 key 重试文档不二次移动）；fail-closed：非 native/no-op/撞车/stale hash → 409；返 `{docId,oldPath,newPath,contentHash,moved,wouldMove?,impact}`；oldPath 不留别名、入链不静默改写（`impact.pathBasedLinksToRewrite` 给人工清单）；**v1.61 起** 链接解析为严格 POSIX 源目录语义（`/` 前缀=空间根绝对、`./` `../` 裸 href 按源文档 dirname 解析、越界=断链；`docs/` 前缀启发式已删除，语义表见平台文档 api-definition §16.19），且传 toPath 时 impact 附 `outboundPathLinksToRewrite`（被移文档自身相对出链失效清单，old/new resolvedTarget + oldTargetExists/targetExists 双标记） |
+| `get_doc_move_impact` | (spaceName+path) 或 bare docId 定位 → GET /docs/:id/move-impact | 移动前影响面（backlinks，v1.60）：inbound Markdown 入链（sourceDoc/path/title、href、isPathBased、section position/headingPath）+ DocRoutes + Task Doc Links + 传 `proposedPath` 时 targetCollision/samePath +（v1.61）`outboundPathLinksToRewrite` 出链失效清单；与 move dryRun 同内核 |
+| `recheck_doc_link_health` | (spaceName+path) 或 docId → POST /docs/:id/link-health/recheck；仅 spaceName → POST /doc-spaces/:id/docs/link-health/recheck | link-health 手动重检（v1.61）：单文档返最新 `LinkHealth` `{total,broken[],checkedAt}`；空间级返 `{checked,broken}` 计数；场景 = 目标文档补建后刷新既有 broken 判定、解析语义升级后收敛存量混合语义、人工复核；write 权限 |
+| `patch_doc_metadata` | (spaceName+path) 或 docId 定位 → PATCH /docs/:id/metadata | 纯元数据更新（v1.61）：`title/summary/docType/tags/category` 单改，不重送全文、不触发 rechunk、不落版本、不动 contentHash/docId/引用面；**Partial 三态**（缺席=不动 / null=400 / 值=更新，`tags: []`=清空）；`expectedContentHash` **必填**（409 `DOC_CONTENT_CONFLICT` 乐观锁）；category 默认只解析既有（未命中 404 `DOC_CATEGORY_NOT_FOUND`，防拼写产生近似分类），`allowCreateCategory: true` 才自动创建；全同值 → unchanged 短路零写零事件；返 `{docId,path,contentHash,changedFields,unchanged,metadata}` |
 
-**什么时候用语义工具而不是原子工具**：会话初始化用三连——`get_board_digest` 建立项目总揽（项目在哪、忙什么）、`get_docs_overview` 建立知识地图、`get_my_briefing` 拉取我的待办（三重视角分工见 §2.0）；跟进任务用 `follow_up_task`；需要"建话题+看板"成套动作时用 `create_topic_with_board` 保证关联正确；完工汇报用 `report_task_result` 一步完成评论+状态变更；建任务用 `create_task` 免查 list UUID；找人用 `resolve_agent` 从已知宇宙解析；批量补详情用 `batch_get_tasks` 节省往返；标记话题已读用 `mark_topic_read`（`get_topic_digest` 默认自动标记，通常无需手动调用）；读写文档走 DocSpace 十四工具——先 `get_docs_overview` 建立空间全貌、`search_docs` 定位段落、`read_doc` 按 position 精读（三级消费模型，省 token），写回用 `upsert_doc`（大文档局部改优先 `patch_doc`——v1.57 起双模式：section 模式带 `expectedSectionHash` 防漂移，小改/片段删除用 match 模式免 position 漂移）、批量导入用 `import_docs`、清理用 `delete_doc`，盘点/管理用 `list_docs`/`list_doc_routes`/`create_doc_route`/`update_doc_route`/`delete_doc_route`，空间级快照/灾备用 `export_doc_space`/`import_doc_bundle`（详见 `./docs/SKILL.md`）。精细控制仍用原子工具。
+**什么时候用语义工具而不是原子工具**：会话初始化用三连——`get_board_digest` 建立项目总揽（项目在哪、忙什么）、`get_docs_overview` 建立知识地图、`get_my_briefing` 拉取我的待办（三重视角分工见 §2.0）；跟进任务用 `follow_up_task`；需要"建话题+看板"成套动作时用 `create_topic_with_board` 保证关联正确；完工汇报用 `report_task_result` 一步完成评论+状态变更；建任务用 `create_task` 免查 list UUID；找人用 `resolve_agent` 从已知宇宙解析；批量补详情用 `batch_get_tasks` 节省往返；标记话题已读用 `mark_topic_read`（`get_topic_digest` 默认自动标记，通常无需手动调用）；读写文档走 DocSpace 工具（数量见 §6.1a）——先 `get_docs_overview` 建立空间全貌、`search_docs` 定位段落、`read_doc` 按 position 精读（三级消费模型，省 token），写回用 `upsert_doc`（大文档局部改优先 `patch_doc`——v1.57 起双模式：section 模式带 `expectedSectionHash` 防漂移，小改/片段删除用 match 模式免 position 漂移；**日记类文末追加首选 `append_doc`**——v1.65 起一步完成且免疫并发）、批量导入用 `import_docs`、清理用 `delete_doc`，盘点/管理用 `list_docs`/`list_doc_routes`/`create_doc_route`/`update_doc_route`/`delete_doc_route`，空间级快照/灾备用 `export_doc_space`/`import_doc_bundle`（详见 `./docs/SKILL.md`）。精细控制仍用原子工具。
 
 ### Board 成员模型（BoardDetail）
 
@@ -355,6 +367,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 |------|------|
 | **统一成员字段** | `members: BoardMember[]` — 每项含 `{id, name, type, avatarUrl, role, invitedBy, createdAt}` |
 | **计数字段** | `memberCount` |
+| **creator 成员行（v1.62.1 起）** | 创建看板/空间时 creator 自动落成员行（`role=editor`、`invitedBy=null`），成员列表恒含 creator；`remove-editor` / `uninvite-agent` 对 creator → **409 `RESOURCE_CONFLICT`**（不可移除/降级）；存量资源已经 migration 回填 |
 | **成员端点权限** | `add-editor` / `remove-editor` / `invite-agent` / `uninvite-agent` 四个端点均为 **creator-only**，操作后发事件 |
 | **leave 后失读** | 成员离开看板后失去读权限 |
 | **TopicDetail** | `participants` 列表含 `status` 字段；`participantCount` 仅统计 `status='active'` 的参与者（invited/left 不计，DB trigger 维护），**≠ participants 数组长度**（数组含 invited 行） |
@@ -374,7 +387,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 
 ### 6.5 工具过滤与 Profile
 
-worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`，28 条精确 include），暴露 28 个原子 + 24 个语义 = **52 个工具**；full 入口 `/mcp-full` 使用 `full.json`（`include: [".*"]` + 显式 exclude admin 用户管理 4 个 + audit/monitoring/sse 4 个），暴露 130 个原子 + 24 个语义 = **154 个工具**。如需访问完整 REST API，请查阅 Skill 其他章节或直接调用 `https://platform.example.com/api/v1`（替换为你的部署域名）。
+worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`，精确 include 列表），暴露原子 + 语义工具（数量见 §6.1a）；full 入口 `/mcp-full` 使用 `full.json`（`include: [".*"]` + 显式 exclude admin 用户管理/audit/monitoring/sse），暴露原子 + 语义工具（数量见 §6.1a）。如需访问完整 REST API，请查阅 Skill 其他章节或直接调用 `https://platform.example.com/api/v1`（替换为你的部署域名）。
 
 本地或自建 automcp 时，可通过 CLI 参数过滤：
 
@@ -395,7 +408,7 @@ worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.jso
 --profile-path ./config/mcp-profiles/agent.json
 ```
 
-内置 profile 文件见仓库 `apps/backend/config/mcp-profiles/`：`agent.json`（worker，28 条精确 include，对应上述工具面）与 `full.json`（full，`include: [".*"]` + 显式 exclude 8 个）。
+内置 profile 文件见仓库 `apps/backend/config/mcp-profiles/`：`agent.json`（worker，精确 include 列表，对应上述工具面）与 `full.json`（full，`include: [".*"]` + 显式 exclude 列表）。
 
 > `include` / `exclude` 中的每个条目都是正则表达式，**强烈建议用 `^...$` 完整锚定 operationId**，防止 `topic_controller_update` 意外匹配 `topic_controller_update_agenda`。
 

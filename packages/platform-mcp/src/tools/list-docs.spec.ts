@@ -58,6 +58,7 @@ describe('list_docs', () => {
           title: 'A',
           summary: 'long summary',
           updatedAt: '2024-01-01',
+          contentHash: 'hash-a',
         },
       ]),
     );
@@ -68,8 +69,9 @@ describe('list_docs', () => {
     const body = JSON.parse(result.content[0].text);
     expect(body.items).toHaveLength(1);
     expect(body.total).toBe(1);
-    // 默认非 slim：summary 等元数据保留
+    // 默认非 slim：summary 等元数据保留（v1.62.0：contentHash 也透传——乐观锁 token）
     expect(body.items[0].summary).toBe('long summary');
+    expect(body.items[0].contentHash).toBe('hash-a');
 
     const listCall = request.mock.calls[1];
     expect(listCall[0]).toBe('GET');

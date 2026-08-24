@@ -59,6 +59,8 @@ describe('BoardService', () => {
     boardRepo = {
       findOne: jest.fn(),
       findAndCount: jest.fn(),
+      // create() 单测（4b1ddd1c）需要实体工厂：透传入参
+      create: jest.fn((x: unknown) => x),
       save: jest.fn((b: unknown) => Promise.resolve(b)),
       softDelete: jest.fn(),
       // v1.42 metrics：原生原子 SQL（jsonb_set 合并），Repository.query 直通
@@ -81,6 +83,8 @@ describe('BoardService', () => {
     taskRepo = {
       update: jest.fn(),
       find: jest.fn().mockResolvedValue([]),
+      // digest recentDone limit=0 的 COUNT 兜底（topicRepo.count 已用于 roundtable 段）
+      count: jest.fn().mockResolvedValue(0),
       createQueryBuilder: jest.fn(() => ({
         select: jest.fn().mockReturnThis(),
         addSelect: jest.fn().mockReturnThis(),
@@ -95,6 +99,7 @@ describe('BoardService', () => {
         getRawMany: jest.fn().mockResolvedValue([]),
         getRawOne: jest.fn().mockResolvedValue({ total: '0', completed: '0' }),
         getMany: jest.fn().mockResolvedValue([]),
+        getCount: jest.fn().mockResolvedValue(0),
       })),
     } as unknown as jest.Mocked<Repository<Task>>;
     topicRepo = {
@@ -794,6 +799,44 @@ describe('BoardService', () => {
         } as any),
       ).rejects.toMatchObject({ response: { code: ErrorCode.AGENT_NOT_FOUND } });
     });
+
+    it('writes creator membership row with editor role and null invitedBy (4b1ddd1c)', async () => {
+      boardRepo.save.mockImplementation(async (b: any) => ({ ...b, id: 'board-new' }));
+
+      await service.create('user-1', ActorType.HUMAN, { name: 'New Board' } as any);
+
+      // creator 落成员行：role=editor（与 isCreator 能力对齐）+ invitedBy=null（非授予标记）
+      expect(memberRepo.create).toHaveBeenCalledWith({
+        boardId: 'board-new',
+        actorId: 'user-1',
+        role: BoardMemberRole.EDITOR,
+        invitedBy: null,
+      });
+      expect(memberRepo.save).toHaveBeenCalled();
+    });
+
+    it('filters creator out of invitedAgentIds — single editor row, no PK conflict', async () => {
+      boardRepo.save.mockImplementation(async (b: any) => ({ ...b, id: 'board-new' }));
+      resourceValidator.existsMany.mockResolvedValue([]);
+
+      await service.create('user-1', ActorType.HUMAN, {
+        name: 'New Board',
+        invitedAgentIds: ['agent-1', 'user-1'],
+      } as any);
+
+      const createdRows = memberRepo.create.mock.calls.map((call) => call[0]) as Array<{
+        actorId: string;
+        role: BoardMemberRole;
+      }>;
+      // creator 只出现一次且为 editor 行（invited 列表中的重复被过滤）
+      const creatorRows = createdRows.filter((r) => r.actorId === 'user-1');
+      expect(creatorRows).toHaveLength(1);
+      expect(creatorRows[0].role).toBe(BoardMemberRole.EDITOR);
+      // 受邀 agent 照常落 member 行
+      expect(
+        createdRows.some((r) => r.actorId === 'agent-1' && r.role === BoardMemberRole.MEMBER),
+      ).toBe(true);
+    });
   });
 
   describe('update', () => {
@@ -965,6 +1008,21 @@ describe('BoardService', () => {
       await expect(service.uninviteAgent('board-1', 'agent-2')).rejects.toThrow(ConflictException);
     });
 
+    it('rejects uninviting the creator (4b1ddd1c 守卫)', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } }); // creatorId='creator-1'
+      boardRepo.findOne.mockResolvedValue(board);
+      memberRepo.findOne.mockResolvedValue({
+        boardId: 'board-1',
+        actorId: 'creator-1',
+        role: BoardMemberRole.MEMBER,
+      } as BoardMember);
+
+      await expect(service.uninviteAgent('board-1', 'creator-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+      expect(memberRepo.delete).not.toHaveBeenCalled();
+    });
+
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
@@ -1075,6 +1133,22 @@ describe('BoardService', () => {
       await expect(service.removeEditor('board-1', 'agent-2')).rejects.toThrow(ConflictException);
     });
 
+    it('rejects removing the creator editor row (4b1ddd1c 守卫)', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } }); // creatorId='creator-1'
+      boardRepo.findOne.mockResolvedValue(board);
+      memberRepo.findOne.mockResolvedValue({
+        boardId: 'board-1',
+        actorId: 'creator-1',
+        role: BoardMemberRole.EDITOR,
+      } as BoardMember);
+
+      await expect(service.removeEditor('board-1', 'creator-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+      // 守卫必须先于删行：成员行不被删除
+      expect(memberRepo.delete).not.toHaveBeenCalled();
+    });
+
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
@@ -1173,6 +1247,10 @@ describe('BoardService', () => {
       milestones?: any[];
       space?: any;
       docs?: any[];
+      // limit=0 时 COUNT 查询的返回值（缺省 = 对应 rows 数组长度，模拟真实 DB 计数）
+      riskCount?: number;
+      doneCount?: number;
+      docsCount?: number;
     }) => {
       boardRepo.findOne.mockResolvedValue(
         makeBoard({ id: 'board-1', description: '## 项目图例\n\n由 PM 维护。' }),
@@ -1196,6 +1274,8 @@ describe('BoardService', () => {
               .fn()
               .mockResolvedValue({ total: opts.total ?? '0', completed: opts.completed ?? '0' }),
             getMany: jest.fn().mockResolvedValue(opts.riskRows ?? []),
+            // limit=0 时 risks 段 COUNT（缺省 = riskRows 长度，与行查询同口径）
+            getCount: jest.fn().mockResolvedValue(opts.riskCount ?? (opts.riskRows ?? []).length),
           }) as any,
       );
       taskRepo.find.mockImplementation(((query: any) => {
@@ -1207,6 +1287,8 @@ describe('BoardService', () => {
         }
         return Promise.resolve(opts.openTasks ?? []);
       }) as any);
+      // limit=0 时 recentDone 段 COUNT（缺省 = doneRows 长度，与 find 同口径）
+      taskRepo.count.mockResolvedValue(opts.doneCount ?? (opts.doneRows ?? []).length);
       milestoneRepo.find.mockResolvedValue(opts.milestones ?? []);
       docSpaceRepo.findOne.mockResolvedValue(opts.space ?? null);
       docRepo.createQueryBuilder.mockImplementation(
@@ -1217,6 +1299,8 @@ describe('BoardService', () => {
             orderBy: jest.fn().mockReturnThis(),
             take: jest.fn().mockReturnThis(),
             getMany: jest.fn().mockResolvedValue(opts.docs ?? []),
+            // limit=0 时 docs 段 COUNT（缺省 = docs 长度，与行查询同口径）
+            getCount: jest.fn().mockResolvedValue(opts.docsCount ?? (opts.docs ?? []).length),
           }) as any,
       );
       // assignee 解析：agent-1 → Kimi
@@ -1401,7 +1485,7 @@ describe('BoardService', () => {
       expect(andWheres.some((c) => c[0].includes('status NOT IN'))).toBe(true);
     });
 
-    it('returns empty lists when limits are 0 without querying those sections', async () => {
+    it('limit=0 → 各段条目空数组但 xxxTotal 为真实全量计数（COUNT 兜底，不拉行）', async () => {
       setupDigestMocks({
         openTasks: [makeTaskRow()],
         doneRows: [makeTaskRow({ status: TaskStatus.DONE, completedAt: new Date('2024-01-05') })],
@@ -1429,10 +1513,65 @@ describe('BoardService', () => {
         recentlyUpdated: [],
       });
       expect(result.truncated).toBe(false);
-      // 0 limit 不查询对应段（taskRepo.find 仅 open + milestone stats 两次；docRepo 不查）
+      // 契约：limit=0 只空条目，total 恒为真实全量（调用方凭 total 决定是否再拉该段）
+      expect(result.nextUpTotal).toBe(1);
+      expect(result.risksTotal).toBe(1);
+      expect(result.recentDoneTotal).toBe(1);
+      expect(result.docsTotal).toBe(1);
+      // 0 limit 不拉行：done 行查询（find）短路；docs 段只走 COUNT（getMany 不被调用）
       const findCalls = (taskRepo.find as jest.Mock).mock.calls;
       expect(findCalls.some((c) => c[0]?.where?.status === TaskStatus.DONE)).toBe(false);
-      expect(docRepo.createQueryBuilder).not.toHaveBeenCalled();
+      const docQb = (docRepo.createQueryBuilder as jest.Mock).mock.results[0].value;
+      expect(docQb.getMany).not.toHaveBeenCalled();
+      expect(docQb.getCount).toHaveBeenCalled();
+    });
+
+    it('limit=0 → xxxTotal 为真实全量（多行数据：条目空 + total 不缩水）', async () => {
+      const openTasks = Array.from({ length: 11 }, (_, i) =>
+        makeTaskRow({ id: `t${i}`, title: `Task ${i}`, priority: Priority.P2 }),
+      );
+      const riskRows = Array.from({ length: 6 }, (_, i) =>
+        makeTaskRow({ id: `r${i}`, title: `Risk ${i}`, priority: Priority.P2, labels: ['bug'] }),
+      );
+      const doneRows = Array.from({ length: 4 }, (_, i) =>
+        makeTaskRow({
+          id: `d${i}`,
+          title: `Done ${i}`,
+          status: TaskStatus.DONE,
+          completedAt: new Date(`2024-01-0${i + 1}`),
+        }),
+      );
+      const docs = Array.from({ length: 4 }, (_, i) => ({
+        id: `doc-${i}`,
+        path: `docs/${i}.md`,
+        title: `Doc ${i}`,
+        updatedAt: new Date(`2024-01-0${i + 1}`),
+      }));
+      setupDigestMocks({
+        openTasks,
+        riskRows,
+        doneRows,
+        space: { id: 'sp-1', name: 'Docs', description: 'd' },
+        docs,
+      });
+
+      const result = await service.getDigest('board-1', {
+        openLimit: 0,
+        doneLimit: 0,
+        riskLimit: 0,
+        docsLimit: 0,
+      });
+
+      expect(result.nextUp).toEqual([]);
+      expect(result.risks).toEqual([]);
+      expect(result.recentDone).toEqual([]);
+      expect(result.docs!.recentlyUpdated).toEqual([]);
+      // 全量计数不受 limit=0 影响（契约漏洞回归：短路空数组曾令 total 假报 0）
+      expect(result.nextUpTotal).toBe(11);
+      expect(result.risksTotal).toBe(6);
+      expect(result.recentDoneTotal).toBe(4);
+      expect(result.docsTotal).toBe(4);
+      expect(result.truncated).toBe(false);
     });
 
     it('marks truncated when nextUp exceeds openLimit', async () => {
@@ -1444,7 +1583,123 @@ describe('BoardService', () => {
       const result = await service.getDigest('board-1', { openLimit: 10 });
 
       expect(result.nextUp).toHaveLength(10);
+      // 截断元数据：nextUpTotal 恒为全量计数（截断判断用 nextUpTotal > nextUp.length）
+      expect(result.nextUpTotal).toBe(11);
       expect(result.truncated).toBe(true);
+    });
+
+    it('risks 截断 → risksTruncated + risksTotal 全量计数（截断元数据）', async () => {
+      const riskRows = Array.from({ length: 6 }, (_, i) =>
+        makeTaskRow({ id: `r${i}`, title: `Risk ${i}`, priority: Priority.P2, labels: ['bug'] }),
+      );
+      setupDigestMocks({ riskRows });
+
+      const result = await service.getDigest('board-1', { riskLimit: 5 });
+
+      expect(result.risks).toHaveLength(5);
+      // riskRows 探针 +1：全量 6 条，返回 5 条
+      expect(result.risksTotal).toBe(6);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('risks: actual > limit+1（探针截顶）→ 追加 COUNT，risksTotal 精确全量（不随探针截顶）', async () => {
+      // 探针 take(limit+1) 只返回 11 行，但真实风险 50 条——total 必须为 50 而非 11
+      const riskRows = Array.from({ length: 11 }, (_, i) =>
+        makeTaskRow({ id: `r${i}`, title: `Risk ${i}`, priority: Priority.P2, labels: ['bug'] }),
+      );
+      setupDigestMocks({ riskRows, riskCount: 50 });
+
+      const result = await service.getDigest('board-1', { riskLimit: 10 });
+
+      expect(result.risks).toHaveLength(10);
+      expect(result.risksTotal).toBe(50);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('recentDone 截断 → recentDoneTruncated + recentDoneTotal 全量计数（截断元数据）', async () => {
+      const doneRows = Array.from({ length: 4 }, (_, i) =>
+        makeTaskRow({
+          id: `d${i}`,
+          title: `Done ${i}`,
+          status: TaskStatus.DONE,
+          completedAt: new Date(`2024-01-0${i + 1}`),
+        }),
+      );
+      setupDigestMocks({ doneRows });
+
+      const result = await service.getDigest('board-1', { doneLimit: 3 });
+
+      expect(result.recentDone).toHaveLength(3);
+      // doneRows 探针 +1：全量 4 条，返回 3 条
+      expect(result.recentDoneTotal).toBe(4);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('recentDone: actual > limit+1（探针截顶）→ 追加 COUNT，recentDoneTotal 精确全量', async () => {
+      // 探针 take(limit+1) 只返回 11 行，但真实 done 50 条——total 必须为 50 而非 11
+      const doneRows = Array.from({ length: 11 }, (_, i) =>
+        makeTaskRow({
+          id: `d${i}`,
+          title: `Done ${i}`,
+          status: TaskStatus.DONE,
+          completedAt: new Date(`2024-01-${String(i + 1).padStart(2, '0')}`),
+        }),
+      );
+      setupDigestMocks({ doneRows, doneCount: 50 });
+
+      const result = await service.getDigest('board-1', { doneLimit: 10 });
+
+      expect(result.recentDone).toHaveLength(10);
+      expect(result.recentDoneTotal).toBe(50);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('docs 截断 → docsTruncated + docsTotal 全量计数（截断元数据）', async () => {
+      const docs = Array.from({ length: 4 }, (_, i) => ({
+        id: `doc-${i}`,
+        path: `docs/${i}.md`,
+        title: `Doc ${i}`,
+        updatedAt: new Date(`2024-01-0${i + 1}`),
+      }));
+      setupDigestMocks({ space: { id: 'sp-1', name: 'Docs', description: 'd' }, docs });
+
+      const result = await service.getDigest('board-1', { docsLimit: 3 });
+
+      expect(result.docs!.recentlyUpdated).toHaveLength(3);
+      // docs 探针 +1：全量 4 条，返回 3 条
+      expect(result.docsTotal).toBe(4);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('docs: actual > limit+1（探针截顶）→ 追加 COUNT，docsTotal 精确全量', async () => {
+      // 探针 take(limit+1) 只返回 11 条，但真实文档 50 条——total 必须为 50 而非 11
+      const docs = Array.from({ length: 11 }, (_, i) => ({
+        id: `doc-${i}`,
+        path: `docs/${i}.md`,
+        title: `Doc ${i}`,
+        updatedAt: new Date(`2024-01-${String(i + 1).padStart(2, '0')}`),
+      }));
+      setupDigestMocks({
+        space: { id: 'sp-1', name: 'Docs', description: 'd' },
+        docs,
+        docsCount: 50,
+      });
+
+      const result = await service.getDigest('board-1', { docsLimit: 10 });
+
+      expect(result.docs!.recentlyUpdated).toHaveLength(10);
+      expect(result.docsTotal).toBe(50);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('docs 无绑定空间 → docsTotal 缺省（docs 段不存在，元数据同步缺省）', async () => {
+      setupDigestMocks({ space: null });
+
+      const result = await service.getDigest('board-1');
+
+      expect(result.docs).toBeNull();
+      expect(result.docsTotal).toBeUndefined();
+      expect(result.truncated).toBe(false);
     });
 
     it('returns null description when board has no description', async () => {

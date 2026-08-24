@@ -222,7 +222,29 @@ export class BundleDocItemDto {
   @MaxLength(512)
   path: string;
 
-  @ApiProperty({ description: 'Full markdown content (exported verbatim, re-importable)' })
+  /**
+   * 文档 ID（export 侧附加，v1.62.0）。**纯 informational，import 时忽略不参与写**——
+   * 显式声明为 optional 是为让新版 bundle（带 docId/contentHash）可安全回导
+   * （forbidNonWhitelisted 下未声明字段会被 400 拒），跨版本 roundtrip 兼容。
+   */
+  @ApiPropertyOptional({ description: 'Exported doc id (informational, ignored on import)' })
+  @IsOptional()
+  @IsString()
+  docId?: string;
+
+  /**
+   * 原始写入 payload 的 SHA-256（export 侧附加，v1.62.0；nullable 列可达 null）。
+   * **纯 informational，import 时忽略不参与写**——新增了该字段的新版 bundle 回导
+   * 旧/新服务端皆不报错（formatVersion 保持 1；roundtrip 兼容）。
+   */
+  @ApiPropertyOptional({
+    description: 'Original payload SHA-256 (informational, ignored on import; nullable)',
+  })
+  @IsOptional()
+  @IsString()
+  contentHash?: string | null;
+
+  @ApiProperty({ description: 'Full markdown content (exported full, re-importable)' })
   @IsString()
   content: string;
 

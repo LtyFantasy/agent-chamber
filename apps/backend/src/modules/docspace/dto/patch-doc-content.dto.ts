@@ -19,8 +19,8 @@
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
  * =============================================================================
  */
-import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsNotEmpty, IsString, IsOptional, Length } from 'class-validator';
 
 /**
  * PATCH /docs/:id/content 请求体（match 模式写，fail-closed 改造）
@@ -53,4 +53,18 @@ export class PatchDocContentDto {
   })
   @IsString()
   newString: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Idempotency key (optional, 1–64 chars). Repeated submissions with the same ' +
+      'clientRequestId by the same actor return the FIRST response snapshot with an ' +
+      'idempotentReplay flag — no event, no doc_versions row, no side effects on replay. ' +
+      'Same key with a different payload → 409 IDEMPOTENCY_KEY_CONFLICT. Safe for retries.',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  // 幂等键尺度照 create-task.dto 先例（1~64 字符，不强制 UUID）；超长在 DTO 层 400（铁律 21）
+  @Length(1, 64)
+  clientRequestId?: string;
 }

@@ -38,10 +38,12 @@ import { HEADING_PATH_SEPARATOR } from '@agent-chamber/shared';
  * Markdown 文档分块器
  *
  * 纯函数，零依赖注入，可独立单测。
- * 输入 content + title → 输出 Array<{headingPath, headingLevel, position, content, tokenEstimate, isContinuation}>
+ * 输入 content + title → 输出 Array<{headingPath, headingText, headingLevel, position, content, tokenEstimate, isContinuation}>
  *
  * 规格严格按 plan §4.4：
  * - 按 ATX 标题 (#{1,6}) 切段；文首无标题内容 → level 0 段，headingPath=文档 title
+ * - headingText（债 A 独立列）：本地标题清洗文本（去尾部闭合 `#`、trim，行内标记原样），
+ *   level-0 文首段为 null；headingPath 退化为纯寻址地址——取标题禁止反解析 headingPath
  * - 空正文标题（无自身正文，后紧跟下一标题或 EOF）同样产出 content='' 的 chunk——
  *   保证「全文读 + upsert 回写」往返不丢标题行（丢空标题 = 静默数据损耗，见 AGENT-HOOK e6eaf06d）
  * - 围栏代码块（``` / ~~~）内的行不识别为标题（防代码注释污染标题栈）
@@ -58,6 +60,26 @@ const CJK_RE = /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\u3040-\u309F\u30A0-\u30
 
 /** ATX 标题：行首 #{1,6} + 空格 + 标题文本 */
 const HEADING_RE = /^(#{1,6})\s+(.+)$/;
+
+/**
+ * 从 ATX 标题行的捕获组提取本地标题文本（债 A 的取值规范，单一实现）。
+ *
+ * 清洗规则（plan 决策 #10）：去前导 `#`+空格（HEADING_RE 捕获组已去除）、
+ * 去尾部闭合 `#`（ATX 语法 `## Title ##`，如 "标题 ###"→"标题"）、trim。
+ * 行内 markdown 标记（`**加粗**`、反引号等）原样保留；标题正文中的 ` § `、裸 `§`
+ * 不受影响（headingText 直读，不做任何分隔符处理——这正是独立列的价值）。
+ * 去闭合后若剥成空串（如 "### #"）则回退保留原始 trim 文本——空标题行必须保真
+ * （渲染侧 headingText 空串会触发 "falsy 不插标题" 分支，往返丢标题行）
+ *
+ * @param raw - HEADING_RE 捕获组（`#`+空格之后的原始内容）
+ * @returns 清洗后的本地标题文本
+ */
+export function extractHeadingText(raw: string): string {
+  const text = raw.trim();
+  // 尾部闭合 #：要求 # 前存在空白（避免误伤 "C#" 这类以 # 结尾的真实词）；可带尾部空格
+  const closed = text.replace(/\s+#+\s*$/, '');
+  return closed.trim() || text;
+}
 
 /** 代码围栏行：行首（可缩进）≥3 个反引号或波浪号（可带 info string，如 ```bash） */
 const FENCE_RE = /^\s*(`{3,}|~{3,})/;
@@ -78,8 +100,15 @@ const PARAGRAPH_SEP = /\n\s*\n/;
 
 /** 单个分块结果 */
 export interface ChunkResult {
-  /** 层级标题路径（祖先链拼接，最大 512 字符） */
+  /** 层级标题路径（祖先链拼接，最大 512 字符）——纯寻址地址，不用于取标题 */
   headingPath: string;
+  /**
+   * 本地标题文本（标题展示的权威源，consumer 直读）。
+   * headingLevel>0 时为清洗后的 ATX 标题文本（见 extractHeadingText）；
+   * headingLevel=0（文首无标题段 / 无标题整篇）为 null。
+   * 续 chunk（isContinuation=true）与同 headingPath 的首 chunk 共享同一值。
+   */
+  headingText: string | null;
   /** 标题层级 0-6（0=文首无标题段） */
   headingLevel: number;
   /** 篇内顺序（从 0 开始） */
@@ -169,6 +198,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
     lineIndex: number;
     level: number;
     title: string;
+    headingText: string;
   }
 
   const headings: HeadingInfo[] = [];
@@ -191,6 +221,8 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
         lineIndex: i,
         level: m[1].length,
         title: m[2].trim(),
+        // headingText 走独立取值规范（去尾部闭合 # 等）；headingPath 保持原样作寻址
+        headingText: extractHeadingText(m[2]),
       });
     }
   }
@@ -201,6 +233,8 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
     const chunk: ChunkResult = {
       headingPath: truncateHeadingPath(title),
       headingLevel: 0,
+      // level-0 文首段 → headingText=null（决策 #10；与 headingPath=title 的反解析语义解耦）
+      headingText: null,
       position: 0,
       content: allContent,
       tokenEstimate: estimateTokens(allContent),
@@ -219,6 +253,8 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
       chunks.push({
         headingPath: truncateHeadingPath(title),
         headingLevel: 0,
+        // level-0 文首段 → headingText=null（决策 #10）
+        headingText: null,
         position: 0,
         content: preContent,
         tokenEstimate: estimateTokens(preContent),
@@ -251,6 +287,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
           ancestors.map((a) => a.title),
           h.title,
         ),
+        headingText: h.headingText,
         headingLevel: h.level,
         position: chunks.length,
         content: '',
@@ -281,6 +318,8 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
         if (!trimmed) continue;
         chunks.push({
           headingPath,
+          // 续 chunk 与首 chunk 共享同一本地标题（headingText 与 headingPath 同源派生）
+          headingText: h.headingText,
           headingLevel: h.level,
           position: chunks.length,
           content: trimmed,
@@ -292,6 +331,7 @@ export function chunkMarkdown(content: string, title: string): ChunkResult[] {
     } else {
       chunks.push({
         headingPath,
+        headingText: h.headingText,
         headingLevel: h.level,
         position: chunks.length,
         content: body,

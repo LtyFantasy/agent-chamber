@@ -93,6 +93,11 @@ export interface TaskDetail extends TaskSummary {
   docs?: TaskDocLinkItem[];
   /** 任务描述（详情视图显式保留） */
   description: string | null;
+  /**
+   * 描述内容 SHA-256（sha256(description ?? '')，乐观锁 token；计算字段，无 DB 列）。
+   * 供 PATCH /tasks/:id/description 的 expectedDescriptionHash 前提捕获。
+   */
+  descriptionHash?: string;
 }
 
 /**

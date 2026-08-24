@@ -14,6 +14,13 @@ const messages: Record<string, string> = {
   'docs.detail.contentLoadError': 'Failed to load document content',
   'docs.detail.contentLoadErrorDesc': 'Check your connection and try again',
   'docs.detail.backToDocs': 'Back to doc list',
+  // 侧边栏视图模式 + 文档匹配文案
+  'docs.detail.viewModeTree': 'Tree',
+  'docs.detail.viewModeCategory': 'Category',
+  'docs.detail.docMatches': 'Document matches',
+  'docs.detail.searchHits': 'Search results',
+  'docs.detail.noSearchResults': 'No matching sections',
+  'docs.detail.uncategorized': 'Uncategorized',
 };
 
 jest.mock('next-intl', () => ({
@@ -140,7 +147,14 @@ describe('DocSpaceDetailPage headingPath 导航', () => {
     mockApi.search.mockResolvedValue([]);
     mockApi.getDoc.mockResolvedValue({
       ...docFixture,
-      sections: [{ position: 0, headingPath: specialHeading, headingLevel: 3 }],
+      sections: [
+        {
+          position: 0,
+          headingPath: specialHeading,
+          heading: specialHeading,
+          headingLevel: 3,
+        },
+      ],
     });
     mockApi.getDocContent.mockResolvedValue({
       content: `### ${specialHeading}\n\n正文。`,
@@ -154,6 +168,40 @@ describe('DocSpaceDetailPage headingPath 导航', () => {
 
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: specialHeading }));
+
+    expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it('目录与滚动改读 outline DTO heading（列直读：标题正文含 ` § ` 也不切错）', async () => {
+    // 反解析 headingPath 末段会得到 "分隔"，列直读语义下按钮文案/滚动目标均为完整标题
+    const fullTitle = '价格区间 § 含 § 分隔';
+    mockApi.getSpace.mockResolvedValue(spaceFixture);
+    mockApi.listAllDocs.mockResolvedValue([]);
+    mockApi.search.mockResolvedValue([]);
+    mockApi.getDoc.mockResolvedValue({
+      ...docFixture,
+      sections: [
+        {
+          position: 0,
+          headingPath: `祖先A § 祖先B § ${fullTitle}`,
+          heading: fullTitle,
+          headingLevel: 3,
+        },
+      ],
+    });
+    mockApi.getDocContent.mockResolvedValue({
+      content: `### ${fullTitle}\n\n正文。`,
+      title: docFixture.title,
+    });
+    const scrollSpy = jest.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollSpy,
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: fullTitle }));
 
     expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
     delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
@@ -269,5 +317,146 @@ describe('DocSpaceDetailPage 搜索防抖（B1）', () => {
     });
     // 清空后 enabled 随防抖值关闭：请求数不再增长
     expect(mockApi.search).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('DocSpaceDetailPage 侧边栏视图模式 + 文档匹配', () => {
+  /** 目录树/文档匹配用文档 fixture（多级 path、根级散文件、docType 覆盖过滤场景；
+   *   listAllDocs 被调用两次：列表（带 type/tag 参数）与 facet 候选（不带参数） */
+  const treeDocs = [
+    { id: 'doc-1', title: 'Doc T', path: 'guides/t.md', docType: 'guide' },
+    { id: 'doc-2', title: 'Readme', path: 'README.md' },
+    { id: 'doc-3', title: 'Alpha', path: 'docs/a.md', docType: 'guide' },
+    { id: 'doc-4', title: 'Beta', path: 'docs/sub/b.md' },
+    { id: 'doc-5', title: 'Gamma', path: 'guides/nested/g.md' },
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    localStorage.clear();
+    mockApi.getSpace.mockResolvedValue(spaceFixture);
+    // 模拟服务端过滤语义：带 type/tag 参数的列表查询按 docType 过滤，facet 查询（不带参数）返回全量
+    mockApi.listAllDocs.mockImplementation(
+      (_spaceId?: string, opts?: { type?: string; tag?: string }) =>
+        opts?.type
+          ? Promise.resolve(treeDocs.filter((d) => d.docType === opts.type))
+          : Promise.resolve(treeDocs),
+    );
+    mockApi.search.mockResolvedValue([]);
+    mockApi.getDoc.mockResolvedValue(docFixture);
+    mockApi.getDocContent.mockResolvedValue({ content: '# Doc T\nbody', title: 'Doc T' });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('默认渲染目录树模式（review 修订③：tree 为默认）：目录行/子文件/根级散文件可见', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+    // 目录树：folder 行 + 子文件（默认全展开）+ 根级散文件
+    expect(screen.getByText('docs')).toBeInTheDocument();
+    expect(screen.getByText('guides')).toBeInTheDocument();
+    expect(screen.getByText('Alpha')).toBeInTheDocument();
+    expect(screen.getByText('Readme')).toBeInTheDocument();
+    // 分类模式特征（未分类标签）不应出现
+    expect(screen.queryByText('Uncategorized')).not.toBeInTheDocument();
+    // 目录按钮选中态
+    expect(screen.getByTitle('Tree')).toHaveClass('bg-primary/10');
+  });
+
+  it('切到分类模式：原分类树渲染（未分类区 + 平铺文档），并写回 localStorage', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(screen.getByTitle('Category'));
+
+    // 分类树回归：categories 为空 → 全部文档落未分类区
+    expect(screen.getByText('Uncategorized')).toBeInTheDocument();
+    expect(screen.queryByText('docs')).not.toBeInTheDocument();
+    expect(screen.getByText('Readme')).toBeInTheDocument();
+    // 选中态迁移 + localStorage 持久化
+    expect(screen.getByTitle('Category')).toHaveClass('bg-primary/10');
+    expect(localStorage.getItem('docs:sidebar-mode')).toBe('category');
+  });
+
+  it('文件夹折叠隐藏子文件、展开恢复；根级散文件不受折叠影响', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(screen.getByText('docs'));
+    expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+    expect(screen.getByText('Readme')).toBeInTheDocument(); // 根级文件始终可见
+
+    fireEvent.click(screen.getByText('docs'));
+    expect(screen.getByText('Alpha')).toBeInTheDocument();
+  });
+
+  it('预置 docs:sidebar-mode=category 时挂载后按存储值渲染分类模式', async () => {
+    localStorage.setItem('docs:sidebar-mode', 'category');
+    renderPage();
+    await screen.findByText('Test Space');
+
+    expect(screen.getByText('Uncategorized')).toBeInTheDocument();
+    expect(screen.queryByText('docs')).not.toBeInTheDocument();
+  });
+
+  it('搜索命中 path（大小写不敏感）时渲染「文档匹配」组；单组命中不显示 noSearchResults', async () => {
+    jest.useFakeTimers();
+    renderPage();
+    await screen.findByText('Test Space');
+
+    const input = screen.getByPlaceholderText('docs.detail.searchPlaceholder');
+    fireEvent.change(input, { target: { value: 'readme' } });
+    await act(async () => {
+      jest.advanceTimersByTime(300);
+    });
+
+    // 文档匹配组：title + 弱化 path 行
+    await waitFor(() => {
+      expect(screen.getByText('Document matches')).toBeInTheDocument();
+    });
+    expect(screen.getByText('Readme')).toBeInTheDocument();
+    expect(screen.getByText('README.md')).toBeInTheDocument();
+    // 内容命中为空但文档匹配有命中 → 不显示「无结果」
+    expect(screen.queryByText('No matching sections')).not.toBeInTheDocument();
+  });
+
+  it('开着 type 过滤器时文档匹配仍命中（基于未过滤全量 facetDocs，评审修订②）', async () => {
+    jest.useFakeTimers();
+    renderPage();
+    await screen.findByText('Test Space');
+
+    // type=guide：列表查询只剩 guide 文档（Doc T / Alpha），Beta（无 docType）被过滤
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'guide' } });
+    const input = screen.getByPlaceholderText('docs.detail.searchPlaceholder');
+    fireEvent.change(input, { target: { value: 'beta' } });
+    await act(async () => {
+      jest.advanceTimersByTime(300);
+    });
+
+    // Beta 按 title 命中（facetDocs 未过滤；若误用过滤后的 docs 将不命中）
+    await waitFor(() => {
+      expect(screen.getByText('Beta')).toBeInTheDocument();
+    });
+    expect(screen.getByText('docs/sub/b.md')).toBeInTheDocument();
+  });
+
+  it('文档匹配与内容命中两组皆空时才显示 noSearchResults', async () => {
+    jest.useFakeTimers();
+    renderPage();
+    await screen.findByText('Test Space');
+
+    const input = screen.getByPlaceholderText('docs.detail.searchPlaceholder');
+    fireEvent.change(input, { target: { value: 'zzz-no-match' } });
+    await act(async () => {
+      jest.advanceTimersByTime(300);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('No matching sections')).toBeInTheDocument();
+    });
+    // 文档匹配 0 条 → 整组（含组标题）不渲染
+    expect(screen.queryByText('Document matches')).not.toBeInTheDocument();
   });
 });

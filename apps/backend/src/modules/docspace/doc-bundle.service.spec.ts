@@ -280,6 +280,7 @@ describe('DocBundleService', () => {
       // docs：category 解析为 name、content 走 full=true 完整原文
       expect(bundle.docs).toHaveLength(1);
       expect(bundle.docs[0]).toMatchObject({
+        docId: 'doc-1', // v1.62.0：导出 doc item 增 docId（informational）
         path: 'docs/a.md',
         title: 'Doc A',
         summary: '摘要 A',
@@ -287,6 +288,7 @@ describe('DocBundleService', () => {
         tags: ['backend'],
         category: 'Arch',
         content: '# Doc A\n\n正文。',
+        contentHash: 'abc', // v1.62.0：原始写入 payload 的 SHA-256（makeDoc 默认），权威 revision 标识
       });
       expect(docService.getContent).toHaveBeenCalledWith('doc-1', true);
       // routes：docId → path 解析 + codeEntryType 透传

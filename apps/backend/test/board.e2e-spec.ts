@@ -110,6 +110,54 @@ describe('BoardController (e2e)', () => {
     });
   };
 
+  // dummyAuthGuard 注入的请求身份（test-setup 硬编码）——POST /boards 的实际 creator
+  const requestActorId = '00000000-0000-4000-8000-000000000005';
+
+  it('POST /boards + GET /boards/:id — creator 写入成员表（role=editor, invitedBy=null），成员列表含 creator（4b1ddd1c）', async () => {
+    const board = makeBoard();
+    mockRepos.Board.create.mockReturnValue(board);
+    // save 回填 id（模拟 DB 生成），create() 尾部 findOne 返回完整结构
+    mockRepos.Board.save.mockImplementation(async (b: any) => ({ ...b, id: boardId }));
+    mockRepos.Board.findOne.mockResolvedValue({ ...board, lists: [] });
+
+    await request(app.getHttpServer())
+      .post('/boards')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ name: 'Test Board' })
+      .expect(201);
+
+    // 服务层写入的成员行：creator 落 editor 行 + invitedBy=null（非授予标记）
+    const createdRows = mockRepos.BoardMember.create.mock.calls.map((c: any[]) => c[0]);
+    const creatorRow = createdRows.find((r: any) => r.actorId === requestActorId);
+    expect(creatorRow).toMatchObject({
+      boardId,
+      actorId: requestActorId,
+      role: 'editor',
+      invitedBy: null,
+    });
+
+    // 成员列表（detail.enrich）含 creator 一行
+    mockRepos.BoardMember.find.mockResolvedValue([creatorRow]);
+    mockRepos.Actor.find.mockResolvedValue([{ id: requestActorId, type: 'human' }]);
+    mockRepos.User.find.mockResolvedValue([
+      { id: requestActorId, username: 'testuser', displayName: 'Test User', avatarUrl: null },
+    ]);
+
+    await request(app.getHttpServer())
+      .get(`/boards/${boardId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        const members = res.body.data.members;
+        expect(members).toHaveLength(1);
+        expect(members[0]).toMatchObject({
+          id: requestActorId,
+          role: 'editor',
+          invitedBy: null,
+        });
+      });
+  });
+
   it('GET /boards/:id/lists returns list metadata without tasks', async () => {
     mockRepos.Board.findOne.mockResolvedValue(makeBoard([makeList()]));
     mockRepos.BoardList.find.mockResolvedValue([makeList()]);
@@ -559,5 +607,218 @@ describe('BoardController (e2e)', () => {
         expect(res.body.code).toBe(200);
         expect(res.body.data).toHaveProperty('topicId', '00000000-0000-4000-8000-000000000002');
       });
+  });
+
+  it('POST /tasks/batch — item with statusName resolves the target list via three-layer match', async () => {
+    // 请求体必须通过 DTO 的 @IsUUID()（默认 v4），不能用全局 mock 的 0000 形状常量
+    const boardIdV4 = '550e8400-e29b-41d4-a716-446655440001';
+    // statusName 'todo' → mappedStatus ci 精确命中 makeList()（name='To Do', mappedStatus='todo'）
+    mockRepos.BoardList.find.mockResolvedValue([makeList()]);
+    mockRepos.Board.findOne.mockResolvedValue({ ...makeBoard([makeList()]), id: boardIdV4 });
+    const task = makeTask({ title: 'From statusName' });
+    mockRepos.Task.create.mockReturnValue(task);
+    mockRepos.Task.save.mockImplementation(async (t: any) => ({ ...t, id: task.id }));
+    mockRepos.TaskActivity.save.mockResolvedValue({});
+    mockRepos.Event.save.mockResolvedValue({});
+
+    return request(app.getHttpServer())
+      .post('/tasks/batch')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ tasks: [{ title: 'From statusName', boardId: boardIdV4, statusName: 'todo' }] })
+      .expect(201)
+      .expect((res: any) => {
+        expect(res.body.data.items).toHaveLength(1);
+        expect(res.body.data.items[0]).toMatchObject({ title: 'From statusName', listId });
+      });
+  });
+
+  it('POST /tasks/:id/report — 全链路（评论→状态→docLinks）+ 同 key 重放零副作用', async () => {
+    // DTO @IsUUID() 要求 v4 形状（全局 mock 的 0000 常量会被校验拒绝）
+    const taskIdV4 = '550e8400-e29b-41d4-a716-446655440020';
+    const docIdV4 = '550e8400-e29b-41d4-a716-446655440030';
+    const spaceIdV4 = '550e8400-e29b-41d4-a716-446655440040';
+    const reportKey = 'e2e-report-key-001';
+    const requestBody = {
+      status: TaskStatus.DONE,
+      comment: 'e2e 完成',
+      commitSha: 'abc1234',
+      docIds: [docIdV4],
+      clientRequestId: reportKey,
+    };
+
+    // ── 权限与任务查询链路 ──
+    // TaskService.findById / findOne（controller + addComment + update 共用）
+    mockRepos.Task.findOne.mockResolvedValue(makeTask({ id: taskIdV4 }));
+    // TaskPolicy：list 无 board → 视为公开放行（既有 e2e 同款简化）
+    mockRepos.BoardList.findOne.mockResolvedValue(makeList());
+
+    // ── 评论链路（addComment）──
+    const comment = {
+      id: 'comment-1',
+      taskId: taskIdV4,
+      authorId: requestActorId,
+      authorType: 'human',
+      content: 'e2e 完成\n\nCommit: abc1234',
+      createdAt: new Date('2024-01-01'),
+      updatedAt: new Date('2024-01-01'),
+    };
+    mockRepos.TaskComment.create.mockReturnValue(comment);
+    mockRepos.TaskComment.save.mockResolvedValue(comment);
+    mockRepos.TaskActivity.save.mockResolvedValue({});
+
+    // ── 状态链路（update：save 后的事件落库）──
+    mockRepos.Task.save.mockResolvedValue(makeTask({ id: taskIdV4, status: TaskStatus.DONE }));
+    mockRepos.Event.create = jest.fn().mockReturnValue({});
+    mockRepos.Event.save.mockResolvedValue({});
+
+    // ── doc-link 链路（addDocLink：doc/space 查询 + 权限 + 落库）──
+    const docQb = {
+      select: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
+      getOne: jest.fn().mockResolvedValue({ id: docIdV4, spaceId: spaceIdV4 }),
+      getMany: jest.fn(),
+      getManyAndCount: jest.fn(),
+    };
+    const spaceQb = {
+      select: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
+      getOne: jest.fn().mockResolvedValue({
+        id: spaceIdV4,
+        settings: { visibility: 'open' },
+      }),
+      getMany: jest.fn(),
+      getManyAndCount: jest.fn(),
+    };
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+    mockRepos.DocSpace.createQueryBuilder.mockReturnValue(spaceQb);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+    const link = { taskId: taskIdV4, docId: docIdV4, createdBy: requestActorId };
+    mockRepos.TaskDocLink.findOne.mockResolvedValue(null);
+    mockRepos.TaskDocLink.create.mockReturnValue(link);
+    mockRepos.TaskDocLink.save.mockResolvedValue(link);
+
+    // ── 幂等链路：入口无记录；checkpoint save 回填实体 ──
+    mockRepos.IdempotencyRecord.findOne.mockResolvedValue(null);
+    mockRepos.IdempotencyRecord.save.mockImplementation(async (e: any) => e);
+
+    const first = await request(app.getHttpServer())
+      .post(`/tasks/${taskIdV4}/report`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send(requestBody)
+      .expect(201);
+
+    expect(first.body.data.task.status).toBe(TaskStatus.DONE);
+    expect(first.body.data.comment.content).toBe('e2e 完成\n\nCommit: abc1234');
+    expect(first.body.data.docLinks).toEqual({ succeeded: [docIdV4], failed: [] });
+    expect(first.body.data.idempotentReplay).toBeUndefined();
+    expect(mockRepos.TaskComment.save).toHaveBeenCalledTimes(1);
+    // 幂等记录已落库（checkpoint 链：comment → {comment,task} → 全量）
+    expect(mockRepos.IdempotencyRecord.save).toHaveBeenCalledTimes(3);
+
+    // ── 同 key 重放：入口命中完整快照 → 直接回放，零副作用 ──
+    mockRepos.IdempotencyRecord.findOne.mockResolvedValue({
+      id: 'idem-rec-1',
+      actorId: requestActorId,
+      clientRequestId: reportKey,
+      entityType: 'task_report',
+      entityId: taskIdV4,
+      requestHash: 'mocked-hash', // 与 test-setup 的 crypto mock 产出一致
+      responseSnapshot: {
+        task: { id: taskIdV4, status: TaskStatus.DONE },
+        comment: { id: 'comment-1', content: 'e2e 完成\n\nCommit: abc1234' },
+        docLinks: { succeeded: [docIdV4], failed: [] },
+      },
+      createdAt: new Date('2024-01-01'),
+    });
+
+    const replay = await request(app.getHttpServer())
+      .post(`/tasks/${taskIdV4}/report`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send(requestBody)
+      .expect(201);
+
+    expect(replay.body.data.idempotentReplay).toBe(true);
+    expect(replay.body.data.comment.id).toBe('comment-1');
+    expect(replay.body.data.docLinks).toEqual({ succeeded: [docIdV4], failed: [] });
+    // 评论/状态/链接零副作用：无重复执行
+    expect(mockRepos.TaskComment.save).toHaveBeenCalledTimes(1);
+    expect(mockRepos.Task.save).toHaveBeenCalledTimes(1);
+    expect(mockRepos.TaskDocLink.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('PATCH /tasks/:id/description — match 替换 + 乐观锁 + 同 key 重放零副作用', async () => {
+    // DTO @IsUUID() 要求 v4 形状（全局 mock 的 0000 常量会被校验拒绝）
+    const taskIdV4 = '550e8400-e29b-41d4-a716-446655440050';
+    const patchKey = 'e2e-patch-desc-key-001';
+    const requestBody = {
+      oldString: '旧描述',
+      newString: '新描述',
+      // test-setup 的 crypto mock 使 descriptionHash/requestHash 恒为 'mocked-hash'
+      expectedDescriptionHash: 'mocked-hash',
+      clientRequestId: patchKey,
+    };
+
+    // ── 权限与任务查询链路（controller findById + 事务内锁行查询共用）──
+    mockRepos.Task.findOne.mockResolvedValue(makeTask({ id: taskIdV4, description: '旧描述' }));
+    // list→board 派生（service 内 this.boardListRepo.findOne）
+    mockRepos.BoardList.findOne.mockResolvedValue(makeList());
+    mockRepos.Task.save.mockImplementation(async (t: any) => ({ ...t, id: taskIdV4 }));
+    mockRepos.TaskActivity.save.mockResolvedValue({});
+    mockRepos.Event.create = jest.fn().mockReturnValue({});
+    mockRepos.Event.save.mockResolvedValue({});
+
+    // ── 事务 manager：getRepository(Task/IdempotencyRecord) → 同源 repo mock ──
+    // （照 docspace.e2e-spec 的 setupManagerQb 先例；managerMock 为全 repo 共享实例）
+    const mgr: any = mockRepos.Task.manager;
+    mgr.getRepository = jest.fn((entityClass: any) => mockRepos[entityClass?.name]);
+
+    // ── 幂等链路：入口无记录；事务内 save 回填实体 ──
+    mockRepos.IdempotencyRecord.findOne.mockResolvedValue(null);
+    mockRepos.IdempotencyRecord.save.mockImplementation(async (e: any) => e);
+
+    const first = await request(app.getHttpServer())
+      .patch(`/tasks/${taskIdV4}/description`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send(requestBody)
+      .expect(200);
+
+    expect(first.body.data.task.description).toBe('新描述');
+    expect(first.body.data.task.descriptionHash).toBe('mocked-hash');
+    expect(first.body.data.idempotentReplay).toBeUndefined();
+    // 业务写 1 次 + 幂等记录 1 次（同事务）
+    expect(mockRepos.Task.save).toHaveBeenCalledTimes(1);
+    expect(mockRepos.IdempotencyRecord.save).toHaveBeenCalledTimes(1);
+
+    // ── 同 key 重放：入口命中完整快照 → 直接回放，零副作用 ──
+    mockRepos.IdempotencyRecord.findOne.mockResolvedValue({
+      id: 'idem-rec-2',
+      actorId: requestActorId,
+      clientRequestId: patchKey,
+      entityType: 'task_description',
+      entityId: taskIdV4,
+      requestHash: 'mocked-hash', // 与 test-setup 的 crypto mock 产出一致
+      responseSnapshot: {
+        task: { id: taskIdV4, description: '新描述', descriptionHash: 'mocked-hash' },
+      },
+      createdAt: new Date('2024-01-01'),
+    });
+
+    const replay = await request(app.getHttpServer())
+      .patch(`/tasks/${taskIdV4}/description`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send(requestBody)
+      .expect(200);
+
+    expect(replay.body.data.idempotentReplay).toBe(true);
+    expect(replay.body.data.task.description).toBe('新描述');
+    // 零副作用：无重复写
+    expect(mockRepos.Task.save).toHaveBeenCalledTimes(1);
+    expect(mockRepos.IdempotencyRecord.save).toHaveBeenCalledTimes(1);
   });
 });

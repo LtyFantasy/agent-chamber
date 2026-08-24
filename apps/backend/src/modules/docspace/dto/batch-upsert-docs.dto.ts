@@ -22,6 +22,16 @@ import { ApiProperty } from '@nestjs/swagger';
 import { UpsertDocDto } from './upsert-doc.dto';
 
 /**
+ * batch 通道元素 DTO（显式剔除 forceRechunk，决策 #4）
+ *
+ * BatchUpsertDocsDto 复用 UpsertDocDto 的元素形状，但 forceRechunk（债 B 的单文档
+ * 元数据修复参数）在 batch 语义下无意义——批量导入只做内容落库，不做元数据修复。
+ * 用 Omit 显式剔除（不许「自然继承」）：类型层禁传 + service 层运行时再剔除
+ * （@Type(() => UpsertDocDto) 实例化后仍可能携带该字段，双保险）。
+ */
+export type BatchUpsertItemDto = Omit<UpsertDocDto, 'forceRechunk'>;
+
+/**
  * 批量 upsert 文档 DTO
  *
  * PUT /doc-spaces/:id/docs/batch
@@ -38,5 +48,5 @@ export class BatchUpsertDocsDto {
   @ArrayMaxSize(50)
   @ValidateNested({ each: true })
   @Type(() => UpsertDocDto)
-  docs: UpsertDocDto[];
+  docs: BatchUpsertItemDto[];
 }

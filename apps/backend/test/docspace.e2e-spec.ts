@@ -257,6 +257,50 @@ describe('DocSpaceController (e2e)', () => {
       });
   });
 
+  it('POST /doc-spaces + GET /doc-spaces/:id — creator 写入成员表（role=editor, invitedBy=null），成员列表含 creator（4b1ddd1c）', async () => {
+    const space = makeSpace();
+
+    mockRepos.Board.findOne.mockResolvedValue(makeBoard());
+    mockRepos.BoardMember.findOne.mockResolvedValue(null);
+    const slugQb = genericQb({ getOne: jest.fn().mockResolvedValue(null) });
+    mockRepos.DocSpace.createQueryBuilder.mockReturnValue(slugQb);
+    mockRepos.DocSpace.create.mockReturnValue(space);
+    mockRepos.DocSpace.save.mockImplementation(async (s: any) => ({ ...s, id: spaceId }));
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+
+    await request(app.getHttpServer())
+      .post('/doc-spaces')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ name: 'Test Space' })
+      .expect(201);
+
+    // 服务层写入的成员行：creator 落 editor 行 + invitedBy=null（非授予标记）
+    const createdRows = mockRepos.DocSpaceMember.create.mock.calls.map((c: any[]) => c[0]);
+    const creatorRow = createdRows.find((r: any) => r.actorId === actorId);
+    expect(creatorRow).toMatchObject({ spaceId, actorId, role: 'editor', invitedBy: null });
+
+    // 成员列表（detail.enrich）含 creator 一行
+    mockRepos.DocSpaceMember.find.mockResolvedValue([creatorRow]);
+    mockRepos.Actor.find.mockResolvedValue([{ id: actorId, type: 'human' }]);
+    mockRepos.User.find.mockResolvedValue([
+      { id: actorId, username: 'testuser', displayName: 'Test User', avatarUrl: null },
+    ]);
+
+    await request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        const members = res.body.data.members;
+        expect(members).toHaveLength(1);
+        expect(members[0]).toMatchObject({
+          actorId,
+          role: 'editor',
+          invitedBy: null,
+        });
+      });
+  });
+
   // ─── Test 2: PUT /doc-spaces/:id/docs — upsert document ───────
 
   it('PUT /doc-spaces/:id/docs — upserts a document with content', async () => {
@@ -1624,6 +1668,79 @@ describe('DocSpaceController (e2e)', () => {
       });
   });
 
+  it('POST /docs/:id/link-health/recheck — 单文档重检返回最新 LinkHealth 并落库（v1.61.0）', async () => {
+    const space = makeSpace();
+    const doc = makeDoc({ path: 'test.md' });
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // findById（controller + service 内两次 getOne）+ 空间候选 getMany + update 落库
+    const docQb = genericQb({
+      getOne: jest.fn().mockResolvedValue(doc),
+      getMany: jest.fn().mockResolvedValue([doc]),
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    // sections 无链接 → total 0
+    const sectionQb = genericQb({ getMany: jest.fn().mockResolvedValue([makeSection()]) });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/link-health/recheck`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data).toMatchObject({ total: 0, broken: [] });
+        expect(res.body.data.checkedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+        // service 已把最新 LinkHealth 落库（update 走 QB，覆盖 link_health jsonb）
+        expect(docQb.update).toHaveBeenCalledWith('Doc');
+        expect(docQb.set).toHaveBeenCalledWith(
+          expect.objectContaining({ linkHealth: expect.objectContaining({ total: 0 }) }),
+        );
+      });
+  });
+
+  it('POST /doc-spaces/:id/docs/link-health/recheck — 空间级全量重检返回 {checked, broken}（v1.61.0）', async () => {
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // 空间候选 2 篇；其中一篇内容含断链（relative .md 严格源解析：test.md 内 ./ghost.md
+    // → test 目录下 ghost.md 不存在 → broken 1 条）
+    const docBroken = makeDoc({ path: 'test.md', id: docId });
+    const docOther = makeDoc({ id: '00000000-0000-4000-8000-000000000612', path: 'other.md' });
+    const docQb = genericQb({
+      getMany: jest.fn().mockResolvedValue([docBroken, docOther]),
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    // 批量 sections（一次 IN 查询返回两篇的 sections——N+1 消除的接口面）
+    const brokenSection = makeSection({ content: '见 [ghost](./ghost.md)' });
+    const okSection = makeSection({
+      docId: '00000000-0000-4000-8000-000000000612',
+      content: '无链接正文',
+    });
+    const sectionQb = genericQb({
+      getMany: jest.fn().mockResolvedValue([brokenSection, okSection]),
+    });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    return request(app.getHttpServer())
+      .post(`/doc-spaces/${spaceId}/docs/link-health/recheck`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        // checked = 2 篇全部重算；broken = broken 数组长度合计（1 条）
+        expect(res.body.data).toEqual({ checked: 2, broken: 1 });
+      });
+  });
+
   it('recheck — pattern 型 codeEntry 豁免（T5）：codeEntryStatus:exempt 不报 broken；exact 失配照报 broken', async () => {
     const space = makeSpace({
       // 挂 repoManifest：exact 路由走真实存在性校验；pattern 路由豁免（与 manifest 有无无关）
@@ -2091,6 +2208,105 @@ describe('DocSpaceController (e2e)', () => {
       });
   });
 
+  // ==================== v1.65.0 追加写原语（POST /docs/:id/append） ====================
+  // 变换/子树推导/并发重试语义由 doc.service.spec 单测覆盖；
+  // 本段只覆盖 HTTP 层路由/DTO 校验/权限边界。
+
+  it('POST /docs/:id/append — 200：creator 写放行，走 upsert 重建管线返回结果', async () => {
+    // findById（doc → space 解析链）
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(makeDoc()) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+    mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    // appendDoc 全量 section 查询（position ASC）
+    const sectionQb = genericQb({ getMany: jest.fn().mockResolvedValue([makeSection()]) });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    // upsert 内部：crypto 全局 mock 恒返 'mocked-hash' === makeDoc().contentHash
+    // → unchanged 早退（无需 transaction mock；linkHealth backfill 走 QB update 链）
+    const spaceDocsQb = genericQb({ getMany: jest.fn().mockResolvedValue([]) });
+    // Doc QB 消费顺序：controller findById → appendDoc 内 findById → upsert existing
+    // 查询 → linkHealth 候选 → linkHealth backfill update
+    mockRepos.Doc.createQueryBuilder
+      .mockReturnValueOnce(docQb)
+      .mockReturnValueOnce(docQb)
+      .mockReturnValueOnce(docQb)
+      .mockReturnValueOnce(spaceDocsQb)
+      .mockReturnValueOnce(genericQb());
+
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: '追加内容' })
+      .expect(200)
+      .expect((res: any) => {
+        // unchanged 早退 = upsert 管线被完整驱动的证明（hash mock 恒等）
+        expect(res.body.data).toHaveProperty('id', docId);
+        expect(res.body.data).toHaveProperty('path', 'test.md');
+        expect(res.body.data.unchanged).toBe(true);
+      });
+  });
+
+  it('POST /docs/:id/append — 400：content 全空白在格式层拦截', async () => {
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: '   ' })
+      .expect(400);
+  });
+
+  it('POST /docs/:id/append — 400：under-heading 缺 headingPath（DTO 条件必填）', async () => {
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: 'x', position: 'under-heading' })
+      .expect(400);
+  });
+
+  it('POST /docs/:id/append — 400：position 非法枚举值（@IsIn 白名单）', async () => {
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: 'x', position: 'middle' })
+      .expect(400);
+  });
+
+  it('POST /docs/:id/append — 404：文档不存在（DOC_NOT_FOUND，铁律 #22）', async () => {
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(null) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: 'x' })
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.DOC_NOT_FOUND);
+      });
+  });
+
+  it('POST /docs/:id/append — 403：非 creator/editor 拒绝写（权限在 Controller 层）', async () => {
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(makeDoc()) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+    // 空间创建者是别人，actor 也不是成员 → write 拒绝
+    mockRepos.DocSpace.findOne.mockResolvedValue(
+      makeSpace({ creatorId: '00000000-0000-4000-8000-0000000000bb' }),
+    );
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+    // owner-proxy 未命中（mock repo 默认无 exists 方法，不设会 500；同 DOCSPACE-PERM 先例）
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .post(`/docs/${docId}/append`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ content: 'x' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+      });
+  });
+
   // ==================== fail-closed 改造：match 模式写（PATCH /docs/:id/content） ====================
   // 全文重建/计数语义由真实 PG 集成套件覆盖（docspace-patch.e2e-spec.ts）；
   // 本段只覆盖 HTTP 层路由/DTO 校验/命中分支的错误透传。
@@ -2207,6 +2423,92 @@ describe('DocSpaceController (e2e)', () => {
       .patch(`/docs/${docId}/content`)
       .set('Authorization', `Bearer ${authToken}`)
       .send({ oldString: 'x', newString: 'y' })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);
+      });
+  });
+
+  // ==================== v1.61.0 批次 2：metadata-only patch（PATCH /docs/:id/metadata） ====================
+  // 全链路语义（partial 矩阵/不变量/事务复核）由真实 PG 集成套件覆盖
+  // （docspace-patch-metadata.e2e-spec.ts）；本段覆盖 HTTP 层路由/DTO 三态校验/
+  // 权限分支的错误透传。
+
+  it('PATCH /docs/:id/metadata — 200：unchanged 短路（全字段与现值相同，无写操作）', async () => {
+    const doc = makeDoc(); // contentHash 'mocked-hash'
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(doc) });
+    // 事务内锁行 QB：setLock 链 + getOne 返回同 doc（hash 复核通过）
+    const lockQb = genericQb({
+      setLock: jest.fn().mockReturnThis(),
+      getOne: jest.fn().mockResolvedValue(doc),
+    });
+    // Doc QB 消费顺序：controller findById → service findById → 事务内锁行
+    // （事务 manager.getRepository(Doc) 返回本 repo mock，createQueryBuilder 同源消费）
+    mockRepos.Doc.createQueryBuilder
+      .mockReturnValueOnce(docQb)
+      .mockReturnValueOnce(docQb)
+      .mockReturnValueOnce(lockQb);
+    setupManagerQb('Doc', lockQb);
+    mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    return request(app.getHttpServer())
+      .patch(`/docs/${docId}/metadata`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ title: '测试文档', expectedContentHash: 'mocked-hash' })
+      .expect(200)
+      .expect((res: any) => {
+        // 统一响应包装：业务体在 data 槽
+        expect(res.body.data.unchanged).toBe(true);
+        expect(res.body.data.changedFields).toEqual([]);
+        expect(res.body.data.contentHash).toBe('mocked-hash');
+        expect(res.body.data.metadata.title).toBe('测试文档');
+      });
+  });
+
+  it('PATCH /docs/:id/metadata — 400：null 字段拒绝（三态契约：null ≠ 缺席，DTO 层拦截）', async () => {
+    return request(app.getHttpServer())
+      .patch(`/docs/${docId}/metadata`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ title: null, expectedContentHash: 'mocked-hash' })
+      .expect(400);
+  });
+
+  it('PATCH /docs/:id/metadata — 400：缺 expectedContentHash（必填乐观锁前提）', async () => {
+    return request(app.getHttpServer())
+      .patch(`/docs/${docId}/metadata`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ title: 'x' })
+      .expect(400);
+  });
+
+  it('PATCH /docs/:id/metadata — 404：文档不存在（DOC_NOT_FOUND，铁律 #22）', async () => {
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(null) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+
+    return request(app.getHttpServer())
+      .patch(`/docs/${docId}/metadata`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ title: 'x', expectedContentHash: 'mocked-hash' })
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.DOC_NOT_FOUND);
+      });
+  });
+
+  it('PATCH /docs/:id/metadata — 403：非 creator/editor 拒绝写（权限在 Controller 层）', async () => {
+    const docQb = genericQb({ getOne: jest.fn().mockResolvedValue(makeDoc()) });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+    mockRepos.DocSpace.findOne.mockResolvedValue(
+      makeSpace({ creatorId: '00000000-0000-4000-8000-0000000000bb' }),
+    );
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch(`/docs/${docId}/metadata`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ title: 'x', expectedContentHash: 'mocked-hash' })
       .expect(403)
       .expect((res: any) => {
         expect(res.body.code).toBe(ErrorCode.PERMISSION_DENIED);

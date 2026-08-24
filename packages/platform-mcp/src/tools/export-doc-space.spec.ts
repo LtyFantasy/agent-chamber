@@ -41,8 +41,11 @@ describe('export_doc_space', () => {
       space: { name: 'My Docs', description: '图例', visibility: 'open', settings: {} },
       categories: [],
       routes: [],
+      // v1.62.0：docs[] item 增 docId + contentHash（contentHash = 原始写入 payload 的
+      // SHA-256，权威 revision 标识——content 是重建产物，其 SHA-256 ≠ contentHash）
       docs: [
         {
+          docId: 'd1',
           path: 'docs/a.md',
           title: 'A',
           summary: 'S',
@@ -50,6 +53,7 @@ describe('export_doc_space', () => {
           tags: [],
           category: null,
           content: '# A',
+          contentHash: 'hash-a',
         },
       ],
     };
@@ -61,6 +65,8 @@ describe('export_doc_space', () => {
     const body = JSON.parse(result.content[0].text);
     expect(body.formatVersion).toBe(1);
     expect(body.docs).toHaveLength(1);
+    expect(body.docs[0].docId).toBe('d1');
+    expect(body.docs[0].contentHash).toBe('hash-a');
 
     const getCall = request.mock.calls[1];
     expect(getCall[0]).toBe('GET');

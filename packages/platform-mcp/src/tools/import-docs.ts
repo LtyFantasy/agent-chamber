@@ -155,6 +155,15 @@ export const importDocsTool: CustomTool = {
                 description:
                   'Optional: 3–5 tags, identifiers/technical terms first (search anchors)',
               },
+              clientRequestId: {
+                type: 'string',
+                description:
+                  'Optional per-document idempotency key (1–64 chars). Each document carries ' +
+                  'its OWN key (inherits single-doc upsert semantics): on transport error / ' +
+                  'timeout, retry with the SAME keys — each already-succeeded document returns ' +
+                  'its FIRST result with idempotentReplay:true instead of writing again. ' +
+                  'Same key with a different payload → 409 IDEMPOTENCY_KEY_CONFLICT for that item.',
+              },
             },
             required: ['path', 'content'],
           },
@@ -273,6 +282,8 @@ export const importDocsTool: CustomTool = {
       if (doc.docType !== undefined) item.docType = doc.docType;
       if (doc.category !== undefined) item.category = doc.category;
       if (doc.tags !== undefined) item.tags = doc.tags;
+      // v1.63.0：逐文档幂等键透传（每文档各自 key，继承单条 upsert 幂等语义）
+      if (doc.clientRequestId !== undefined) item.clientRequestId = doc.clientRequestId;
       return item;
     });
 

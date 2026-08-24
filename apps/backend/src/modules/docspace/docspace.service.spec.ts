@@ -429,8 +429,58 @@ describe('DocSpaceService', () => {
         invitedAgentIds: ['agent-1', 'agent-2'],
       });
 
-      expect(memberRepo.create).toHaveBeenCalledTimes(2);
+      // 2 条受邀 member 行 + 1 条 creator editor 行（4b1ddd1c 起 creator 也落成员表）
+      expect(memberRepo.create).toHaveBeenCalledTimes(3);
       expect(memberRepo.save).toHaveBeenCalled();
+    });
+
+    it('writes creator membership row with editor role and null invitedBy (4b1ddd1c)', async () => {
+      const saved = makeSpace({ id: 'space-new' });
+      spaceRepo.createQueryBuilder.mockReturnValue({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(null),
+      } as any);
+      spaceRepo.create.mockReturnValue(saved);
+      spaceRepo.save.mockResolvedValue(saved);
+
+      await service.create(mockActor, { name: 'Test' }); // mockActor.id = 'user-1'
+
+      // creator 落成员行：role=editor（与 isCreator 能力对齐）+ invitedBy=null（非授予标记）
+      expect(memberRepo.create).toHaveBeenCalledWith({
+        spaceId: 'space-new',
+        actorId: 'user-1',
+        role: 'editor',
+        invitedBy: null,
+      });
+      expect(memberRepo.save).toHaveBeenCalled();
+    });
+
+    it('filters creator out of invitedAgentIds — single editor row, no PK conflict', async () => {
+      const saved = makeSpace({ id: 'space-new' });
+      spaceRepo.createQueryBuilder.mockReturnValue({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(null),
+      } as any);
+      spaceRepo.create.mockReturnValue(saved);
+      spaceRepo.save.mockResolvedValue(saved);
+
+      await service.create(mockActor, {
+        name: 'Test',
+        invitedAgentIds: ['agent-1', 'user-1'],
+      });
+
+      const createdRows = memberRepo.create.mock.calls.map((call) => call[0]) as Array<{
+        actorId: string;
+        role: string;
+      }>;
+      // creator 只出现一次且为 editor 行（invited 列表中的重复被过滤）
+      const creatorRows = createdRows.filter((r) => r.actorId === 'user-1');
+      expect(creatorRows).toHaveLength(1);
+      expect(creatorRows[0].role).toBe('editor');
+      // 受邀 agent 照常落 member 行
+      expect(createdRows.some((r) => r.actorId === 'agent-1' && r.role === 'member')).toBe(true);
     });
   });
 
@@ -654,6 +704,21 @@ describe('DocSpaceService', () => {
 
       await expect(service.uninviteAgent('space-1', 'agent-1')).rejects.toThrow(ConflictException);
     });
+
+    it('rejects uninviting the creator (4b1ddd1c 守卫)', async () => {
+      const space = makeSpace(); // creatorId='user-1'
+      spaceRepo.findOne.mockResolvedValue(space);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'user-1',
+        role: 'member',
+      } as DocSpaceMember);
+
+      await expect(service.uninviteAgent('space-1', 'user-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+      expect(memberRepo.delete).not.toHaveBeenCalled();
+    });
   });
 
   describe('addEditor', () => {
@@ -718,6 +783,22 @@ describe('DocSpaceService', () => {
       memberRepo.findOne.mockResolvedValue(null);
 
       await expect(service.removeEditor('space-1', 'agent-1')).rejects.toThrow(ConflictException);
+    });
+
+    it('rejects demoting the creator editor row (4b1ddd1c 守卫)', async () => {
+      const space = makeSpace(); // creatorId='user-1'
+      spaceRepo.findOne.mockResolvedValue(space);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'user-1',
+        role: 'editor',
+      } as DocSpaceMember);
+
+      await expect(service.removeEditor('space-1', 'user-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+      // 守卫必须先于降级：成员行不被改写
+      expect(memberRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -1028,6 +1109,68 @@ describe('DocSpaceService', () => {
       expect(result.truncated).toBe(true);
       expect(result.uncategorized.length).toBeGreaterThan(0);
       expect(result.uncategorized.length).toBeLessThan(50);
+    });
+
+    it('文档截断时 docsTotal/docsReturned 透出全量与实返（截断元数据）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+
+      // 50 条 × 500 字符 summary：超默认 20000 token 上限 → 截断
+      const docs = Array.from({ length: 50 }, (_, i) => ({
+        id: `doc-${i}`,
+        spaceId: 'space-1',
+        categoryId: null,
+        path: `p${i}.md`,
+        title: `T${i}`,
+        summary: '摘'.repeat(500),
+        docType: null,
+        tags: [],
+        source: 'native',
+        contentHash: null,
+        sourceSha: null,
+        sectionCount: 1,
+        tokenEstimate: 600,
+        linkHealth: null,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        deletedAt: null,
+      })) as Doc[];
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(docs);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1');
+
+      expect(result.truncated).toBe(true);
+      // docsTotal = 过滤后全量（不受 maxTokens 截断影响）；docsReturned = 实际返回条目数
+      expect(result.docsTotal).toBe(50);
+      expect(result.docsReturned).toBe(result.uncategorized.length);
+      expect(result.docsReturned).toBeLessThan(50);
+    });
+
+    it('未截断时 docsTotal = docsReturned = 过滤后全量（恒输出，形状可预测）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+
+      const docs = Array.from({ length: 3 }, (_, i) =>
+        makeOverviewDoc({ id: `d${i}`, path: `p${i}.md` }),
+      );
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(docs);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1');
+
+      expect(result.truncated).toBe(false);
+      expect(result.docsTotal).toBe(3);
+      expect(result.docsReturned).toBe(3);
     });
 
     // ─── v1.38 可配置过滤 ─────────────────────────────────

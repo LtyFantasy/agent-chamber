@@ -65,4 +65,20 @@ describe('UpsertDocDto', () => {
     const errors = await validate(dto);
     expect(errors.some((e) => e.property === 'sourceSha' && e.constraints?.maxLength)).toBe(true);
   });
+
+  it('accepts forceRechunk as a boolean (债 B 元数据修复参数)', async () => {
+    const dto = makeValidDto();
+    dto.forceRechunk = true;
+
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects non-boolean forceRechunk (格式层 400，不透传 service)', async () => {
+    const dto = makeValidDto();
+    (dto as unknown as { forceRechunk: unknown }).forceRechunk = 'yes';
+
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'forceRechunk' && e.constraints?.isBoolean)).toBe(true);
+  });
 });

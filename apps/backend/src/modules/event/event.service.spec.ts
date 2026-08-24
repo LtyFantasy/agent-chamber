@@ -248,5 +248,34 @@ describe('EventService', () => {
       // 事件总线挂点：落库成功后同步派发（新增行为，铁律 #17 同步覆盖）
       expect(mockEventEmitter.emit).toHaveBeenCalledWith('event.created', saved);
     });
+
+    // B-51 回归：SSE 广播载荷必须带 topicId/boardId/actorId（SseService 按连接过滤的输入）
+    it('should emit SSE payload with topicId/boardId/actorId for per-connection filtering', async () => {
+      const dto = {
+        eventType: EventType.NEW_MESSAGE,
+        resourceType: 'message',
+        resourceId: 'msg-1',
+        topicId: 'topic-1',
+        boardId: 'board-1',
+        actorId: 'actor-1',
+        payload: { messageId: 'msg-1', spaceId: 'space-1' },
+        cursor: '100',
+      };
+      const saved = { id: 'evt-1', ...dto, createdAt: new Date() } as unknown as Event;
+      mockRepo.create.mockReturnValue(saved);
+      mockRepo.save.mockResolvedValue(saved);
+
+      const sseEmit = jest.mocked(service['sseService'].emit);
+      await service.create(dto);
+
+      expect(sseEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: EventType.NEW_MESSAGE,
+          topicId: 'topic-1',
+          boardId: 'board-1',
+          actorId: 'actor-1',
+        }),
+      );
+    });
   });
 });

@@ -18,9 +18,35 @@ export class CreateTaskDto implements CreateTaskInput {
   @ApiPropertyOptional({ description: 'Board ID', example: '550e8400-e29b-41d4-a716-446655440003' })
   boardId?: string;
 
+  /**
+   * 目标列 ID（UUID）。与 statusName 二选一：两者都提供时 listId 优先、statusName 忽略；
+   * 两者都缺省时由 Service 返回 400（VALIDATION_ERROR）。
+   */
+  @IsOptional()
   @IsUUID()
-  @ApiProperty({ description: 'List ID', example: '550e8400-e29b-41d4-a716-446655440004' })
-  listId: string;
+  @ApiPropertyOptional({
+    description:
+      'List ID. Either listId or statusName is required; listId wins when both are provided.',
+    example: '550e8400-e29b-41d4-a716-446655440004',
+  })
+  listId?: string;
+
+  /**
+   * 目标列名（与 MCP create_task 的 resolveList 契约对齐的三层匹配）：
+   * ① mappedStatus 大小写不敏感精确 → ② 列名 ci 精确 → ③ 列名 ci 子串。
+   * 0 命中或 >1 命中返回 400 并附可选项/候选，绝不静默挑选。
+   * 仅当 listId 缺失时生效；使用 statusName 时必须同时提供 boardId。
+   */
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  @ApiPropertyOptional({
+    description:
+      'Target list name/status, resolved via three-layer match (mappedStatus ci exact → list name ci exact → list name ci substring), aligned with MCP create_task. Requires boardId; ignored when listId is provided.',
+    example: 'in_progress',
+  })
+  statusName?: string;
 
   @IsString()
   @MinLength(1)

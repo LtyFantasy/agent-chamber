@@ -2,7 +2,14 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository, ObjectLiteral, In, FindOneOptions, DataSource, EntityManager } from 'typeorm';
 import { NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
-import { ActorType, TaskStatus, Priority, UserRole, ErrorCode } from '@agent-chamber/shared';
+import {
+  ActorType,
+  TaskStatus,
+  Priority,
+  UserRole,
+  ErrorCode,
+  EventType,
+} from '@agent-chamber/shared';
 import { TaskService } from './task.service';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { Task } from '../../database/entities/task.entity';
@@ -149,6 +156,7 @@ describe('TaskService', () => {
   let mockDocRepo: jest.Mocked<Repository<Doc>>;
   let mockDocSpaceRepo: jest.Mocked<Repository<DocSpace>>;
   let mockDocSpacePolicy: { can: jest.Mock };
+  let mockEventService: { create: jest.Mock };
 
   beforeEach(async () => {
     mockTaskRepo = createMockRepo<Task>();
@@ -166,6 +174,7 @@ describe('TaskService', () => {
     mockDocRepo = createMockRepo<Doc>();
     mockDocSpaceRepo = createMockRepo<DocSpace>();
     mockDocSpacePolicy = { can: jest.fn().mockResolvedValue(true) };
+    mockEventService = { create: jest.fn().mockResolvedValue({}) };
     mockAccessQuery = {
       getAccessibleBoardIds: jest.fn().mockResolvedValue(null),
     } as unknown as jest.Mocked<AccessQueryService>;
@@ -231,7 +240,7 @@ describe('TaskService', () => {
         { provide: getRepositoryToken(Doc), useValue: mockDocRepo },
         { provide: getRepositoryToken(DocSpace), useValue: mockDocSpaceRepo },
         { provide: DocSpacePolicy, useValue: mockDocSpacePolicy },
-        { provide: EventService, useValue: { create: jest.fn().mockResolvedValue({}) } },
+        { provide: EventService, useValue: mockEventService },
         { provide: AccessQueryService, useValue: mockAccessQuery },
         { provide: ResourceValidator, useValue: mockResourceValidator },
         { provide: DataSource, useValue: mockDataSource },
@@ -653,6 +662,40 @@ describe('TaskService', () => {
           summary: 'A readme file',
         },
       ]);
+    });
+
+    it("详情响应含 descriptionHash（sha256(description ?? '')，乐观锁 token）", async () => {
+      const task = createMockTask({ description: '第一段' });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { topicId: 'topic-1' },
+      } as BoardList);
+      mockDepRepo.find.mockResolvedValue([]);
+      mockActorRepo.findOne.mockResolvedValue(null);
+
+      const result = await service.findOne('task-1');
+
+      const { createHash } = require('crypto');
+      expect(result.descriptionHash).toBe(createHash('sha256').update('第一段').digest('hex'));
+    });
+
+    it("description 为 null → descriptionHash = sha256('')", async () => {
+      const task = createMockTask(); // description: null
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { topicId: 'topic-1' },
+      } as BoardList);
+      mockDepRepo.find.mockResolvedValue([]);
+      mockActorRepo.findOne.mockResolvedValue(null);
+
+      const result = await service.findOne('task-1');
+
+      const { createHash } = require('crypto');
+      expect(result.descriptionHash).toBe(createHash('sha256').update('').digest('hex'));
     });
   });
 
@@ -1110,6 +1153,181 @@ describe('TaskService', () => {
         'connection error',
       );
     });
+
+    // ── statusName → listId 解析（与 MCP create_task resolveList 契约对齐）──
+
+    it('should resolve listId from statusName via mappedStatus ci exact match (layer 1)', async () => {
+      const dto = { title: 'StatusName Task', boardId: 'board-1', statusName: 'TODO' };
+      const createdTask = createMockTask({ title: 'StatusName Task', listId: 'list-1' });
+      const savedTask = createMockTask({ title: 'StatusName Task', listId: 'list-1' });
+
+      // layer 1: mappedStatus 大小写不敏感精确命中（'TODO' → 'todo'）
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-1', name: 'To Do', mappedStatus: 'todo' } as BoardList,
+      ]);
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockTaskRepo.create.mockReturnValue(createdTask);
+      mockTaskRepo.save.mockResolvedValue(savedTask);
+
+      const result = await service.create(dto, 'creator-1', ActorType.HUMAN);
+
+      expect(mockBoardListRepo.find).toHaveBeenCalledWith({ where: { boardId: 'board-1' } });
+      // 解析出的 listId 落入 taskRepo.create，且 statusName 必须被剥离（否则 TypeORM unknown column）
+      expect(mockTaskRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'StatusName Task', listId: 'list-1' }),
+      );
+      expect(mockTaskRepo.create.mock.calls[0][0]).not.toHaveProperty('statusName');
+      expect(result).toEqual({ ...savedTask, boardId: 'board-1', topicId: 'topic-1' });
+    });
+
+    it('should resolve listId from statusName via list name ci exact match (layer 2)', async () => {
+      const dto = { title: 'Layer2 Task', boardId: 'board-1', statusName: 'to do' };
+
+      // layer 2: 列名 ci 精确命中（'to do' → 'To Do'），mappedStatus 不匹配
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-1', name: 'To Do', mappedStatus: 'in_progress' } as BoardList,
+      ]);
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockTaskRepo.create.mockReturnValue(
+        createMockTask({ title: 'Layer2 Task', listId: 'list-1' }),
+      );
+      mockTaskRepo.save.mockResolvedValue(
+        createMockTask({ title: 'Layer2 Task', listId: 'list-1' }),
+      );
+
+      await service.create(dto, 'creator-1', ActorType.HUMAN);
+
+      expect(mockTaskRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Layer2 Task', listId: 'list-1' }),
+      );
+      expect(mockTaskRepo.create.mock.calls[0][0]).not.toHaveProperty('statusName');
+    });
+
+    it('should resolve listId from statusName via list name ci substring match (layer 3)', async () => {
+      const dto = { title: 'Layer3 Task', boardId: 'board-1', statusName: 'Do' };
+
+      // layer 3: 列名子串命中（'Do' ⊂ 'To Do'）
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-1', name: 'To Do', mappedStatus: null } as BoardList,
+      ]);
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockTaskRepo.create.mockReturnValue(
+        createMockTask({ title: 'Layer3 Task', listId: 'list-1' }),
+      );
+      mockTaskRepo.save.mockResolvedValue(
+        createMockTask({ title: 'Layer3 Task', listId: 'list-1' }),
+      );
+
+      await service.create(dto, 'creator-1', ActorType.HUMAN);
+
+      expect(mockTaskRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Layer3 Task', listId: 'list-1' }),
+      );
+    });
+
+    it('should reject statusName with 400 + available options when 0 lists match', async () => {
+      const dto = { title: 'NoMatch Task', boardId: 'board-1', statusName: 'nonexistent' };
+
+      // boardListRepo.find 默认 mockResolvedValue([]) → 0 命中
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toMatchObject({
+        response: {
+          message: expect.stringContaining('did not match any list'),
+          code: ErrorCode.VALIDATION_ERROR,
+        },
+      });
+
+      expect(mockTaskRepo.create).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('should reject statusName with 400 + candidates when multiple lists match', async () => {
+      const dto = { title: 'Ambiguous Task', boardId: 'board-1', statusName: 'todo' };
+
+      // 两个列 mappedStatus 均为 todo → 多命中，绝不静默挑选
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-1', name: 'To Do', mappedStatus: 'todo' } as BoardList,
+        { id: 'list-2', name: 'Todos', mappedStatus: 'todo' } as BoardList,
+      ]);
+
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toMatchObject({
+        response: {
+          message: expect.stringContaining('matches 2 lists via mappedStatus'),
+          code: ErrorCode.VALIDATION_ERROR,
+          candidates: [
+            { id: 'list-1', name: 'To Do', mappedStatus: 'todo' },
+            { id: 'list-2', name: 'Todos', mappedStatus: 'todo' },
+          ],
+          isAmbiguous: true,
+        },
+      });
+    });
+
+    it('should prefer listId and ignore statusName when both are provided', async () => {
+      const dto = {
+        title: 'Both Provided',
+        boardId: 'board-1',
+        listId: 'list-1',
+        statusName: 'todo',
+      };
+      const createdTask = createMockTask({ title: 'Both Provided', listId: 'list-1' });
+      const savedTask = createMockTask({ title: 'Both Provided', listId: 'list-1' });
+
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockTaskRepo.create.mockReturnValue(createdTask);
+      mockTaskRepo.save.mockResolvedValue(savedTask);
+
+      await service.create(dto, 'creator-1', ActorType.HUMAN);
+
+      // listId 优先：解析不触发，statusName 仅被剥离不落库
+      expect(mockBoardListRepo.find).not.toHaveBeenCalled();
+      expect(mockTaskRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Both Provided', listId: 'list-1' }),
+      );
+      expect(mockTaskRepo.create.mock.calls[0][0]).not.toHaveProperty('statusName');
+    });
+
+    it('should reject 400 when neither listId nor statusName is provided', async () => {
+      const dto = { title: 'No Target' };
+
+      await expect(service.create(dto)).rejects.toMatchObject({
+        response: {
+          message: 'Either listId or statusName is required',
+          code: ErrorCode.VALIDATION_ERROR,
+        },
+      });
+    });
+
+    it('should reject 400 when statusName is provided without boardId', async () => {
+      const dto = { title: 'No Board', statusName: 'todo' };
+
+      await expect(service.create(dto)).rejects.toMatchObject({
+        response: {
+          message: 'boardId is required when resolving the target list by statusName',
+          code: ErrorCode.VALIDATION_ERROR,
+        },
+      });
+      expect(mockBoardListRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('should not trigger statusName resolution when only listId is provided (legacy path)', async () => {
+      const dto = { title: 'Legacy Task', listId: 'list-1' };
+      const createdTask = createMockTask({ title: 'Legacy Task' });
+      const savedTask = createMockTask({ title: 'Legacy Task' });
+
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+      mockTaskRepo.create.mockReturnValue(createdTask);
+      mockTaskRepo.save.mockResolvedValue(savedTask);
+
+      await service.create(dto, 'creator-1', ActorType.HUMAN);
+
+      expect(mockBoardListRepo.find).not.toHaveBeenCalled();
+      expect(mockTaskRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Legacy Task', listId: 'list-1' }),
+      );
+    });
   });
 
   describe('update', () => {
@@ -1475,6 +1693,34 @@ describe('TaskService', () => {
 
       expect(result.count).toBe(2);
       expect(result.items).toHaveLength(2);
+    });
+
+    it('should create mixed batch items (one with listId, one with statusName)', async () => {
+      const task1 = createMockTask({ id: 'task-1', title: 'Task 1' });
+      const task2 = createMockTask({ id: 'task-2', title: 'Task 2' });
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1' } as Board);
+      // item2 走 statusName 解析（mappedStatus 命中）
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-1', name: 'To Do', mappedStatus: 'todo' } as BoardList,
+      ]);
+      mockTaskRepo.create.mockReturnValueOnce(task1).mockReturnValueOnce(task2);
+      mockTaskRepo.save.mockResolvedValueOnce(task1).mockResolvedValueOnce(task2);
+
+      const result = await service.batchCreate({
+        tasks: [
+          { boardId: 'board-1', listId: 'list-1', title: 'Task 1' } as CreateTaskDto,
+          { boardId: 'board-1', statusName: 'todo', title: 'Task 2' } as CreateTaskDto,
+        ],
+      });
+
+      expect(result.count).toBe(2);
+      // 仅第二个 item 触发解析（boardListRepo.find 一次）；解析出的 listId 落入 create
+      expect(mockBoardListRepo.find).toHaveBeenCalledTimes(1);
+      expect(mockTaskRepo.create).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ title: 'Task 2', listId: 'list-1' }),
+      );
+      expect(mockTaskRepo.create.mock.calls[1][0]).not.toHaveProperty('statusName');
     });
   });
 
@@ -1969,6 +2215,728 @@ describe('TaskService', () => {
       await expect(service.removeDocLink('task-1', 'doc-1')).rejects.toMatchObject({
         response: { code: ErrorCode.DOC_LINK_NOT_FOUND },
       });
+    });
+  });
+
+  describe('reportResult', () => {
+    const actor = { id: 'user-1', type: ActorType.HUMAN };
+    const taskId = 'task-1';
+    // 注意：dto 透传顺序须与实现一致（实现用字面量对象 {taskId,status,comment,commitSha,docIds}，
+    // JSON.stringify 丢弃 undefined 字段）
+    function reportRequestHash(dto: {
+      taskId: string;
+      status: TaskStatus;
+      comment?: string;
+      commitSha?: string;
+      docIds?: string[];
+    }) {
+      const { createHash } = require('crypto');
+      return createHash('sha256').update(JSON.stringify(dto)).digest('hex');
+    }
+    function idemRecord(overrides: Partial<IdempotencyRecord> = {}): IdempotencyRecord {
+      return {
+        id: 'record-1',
+        actorId: 'user-1',
+        clientRequestId: 'key-1',
+        entityType: 'task_report',
+        entityId: taskId,
+        requestHash: 'unused-hash',
+        responseSnapshot: null,
+        createdAt: new Date('2024-01-01'),
+        ...overrides,
+      } as IdempotencyRecord;
+    }
+    /** mock addComment 链路：任务存在校验 + comment 落库 */
+    function mockCommentFlow(comment: any = { id: 'comment-1', content: 'x' }) {
+      mockTaskRepo.findOne.mockResolvedValue(createMockTask());
+      mockCommentRepo.create.mockReturnValue(comment);
+      mockCommentRepo.save.mockResolvedValue(comment);
+      mockActivityRepo.save.mockResolvedValue({} as any);
+    }
+    /** mock update 链路：findById + 状态列联动 + save */
+    function mockUpdateFlow(saved: Task = createMockTask({ status: TaskStatus.DONE })) {
+      mockTaskRepo.findOne.mockResolvedValue(createMockTask());
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+      mockTaskRepo.save.mockResolvedValue(saved);
+      mockActivityRepo.save.mockResolvedValue({} as any);
+    }
+    /** mock addDocLink 链路（doc + space 查询放行） */
+    function mockDocLinkFlow(docOrNulls: (Doc | null)[]) {
+      const docQbs = docOrNulls.map((d) => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(d),
+        getMany: jest.fn(),
+        getManyAndCount: jest.fn(),
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+      }));
+      mockDocRepo.createQueryBuilder
+        .mockReturnValueOnce(docQbs[0] as any)
+        .mockReturnValueOnce((docQbs[1] ?? docQbs[0]) as any);
+      mockDocSpaceRepo.createQueryBuilder.mockReturnValue({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue({ id: 'space-1' } as DocSpace),
+        getMany: jest.fn(),
+        getManyAndCount: jest.fn(),
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+      } as any);
+      mockDocSpacePolicy.can.mockResolvedValue(true);
+      mockDocLinkRepo.findOne.mockResolvedValue(null);
+      mockDocLinkRepo.create.mockImplementation((l: any) => l);
+      mockDocLinkRepo.save.mockImplementation((l: any) => Promise.resolve(l));
+    }
+
+    it('无 comment/commitSha → 跳过步骤 1，仅改状态；无 key 时幂等零开销', async () => {
+      mockUpdateFlow();
+
+      const result = await service.reportResult(taskId, { status: TaskStatus.DONE }, actor);
+
+      expect(mockCommentRepo.save).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).toHaveBeenCalledTimes(1);
+      expect(result.task.status).toBe(TaskStatus.DONE);
+      expect(result.comment).toBeUndefined();
+      expect(result.idempotentReplay).toBeUndefined();
+      // 零开销：无幂等记录读写
+      expect(mockIdempotencyRepo.findOne).not.toHaveBeenCalled();
+      expect(mockIdempotencyRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('仅 comment → 评论文本 = comment', async () => {
+      const comment = { id: 'comment-1', content: '已完成' };
+      mockCommentFlow(comment);
+      mockUpdateFlow();
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, comment: '已完成' },
+        actor,
+      );
+
+      expect(mockCommentRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ content: '已完成' }),
+      );
+      expect(result.comment).toEqual(comment);
+    });
+
+    it('仅 commitSha → 评论文本 = "Commit: <sha>"', async () => {
+      mockCommentFlow({ id: 'comment-1', content: 'Commit: abc123' });
+      mockUpdateFlow();
+
+      await service.reportResult(taskId, { status: TaskStatus.DONE, commitSha: 'abc123' }, actor);
+
+      expect(mockCommentRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ content: 'Commit: abc123' }),
+      );
+    });
+
+    it('comment + commitSha → 拼接为 "comment\\n\\nCommit: <sha>"', async () => {
+      mockCommentFlow({ id: 'comment-1', content: '修复完成\n\nCommit: abc123' });
+      mockUpdateFlow();
+
+      await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, comment: '修复完成', commitSha: 'abc123' },
+        actor,
+      );
+
+      expect(mockCommentRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ content: '修复完成\n\nCommit: abc123' }),
+      );
+    });
+
+    it('空字符串 comment 且无 commitSha → 跳过评论步骤', async () => {
+      mockUpdateFlow();
+
+      await service.reportResult(taskId, { status: TaskStatus.DONE, comment: '' }, actor);
+
+      expect(mockCommentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('docIds 全成功 → docLinks.succeeded 含全部、failed 为空', async () => {
+      mockUpdateFlow();
+      mockDocLinkFlow([
+        { id: 'doc-1', spaceId: 'space-1' } as Doc,
+        { id: 'doc-2', spaceId: 'space-1' } as Doc,
+      ]);
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, docIds: ['doc-1', 'doc-2'] },
+        actor,
+      );
+
+      expect(result.docLinks).toEqual({ succeeded: ['doc-1', 'doc-2'], failed: [] });
+    });
+
+    it('docIds 部分失败 → 失败内嵌 docLinks.failed（status/code），主体仍成功', async () => {
+      mockUpdateFlow();
+      // doc-1 存在；doc-2 不存在 → 404 DOC_NOT_FOUND
+      mockDocLinkFlow([{ id: 'doc-1', spaceId: 'space-1' } as Doc, null]);
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, docIds: ['doc-1', 'doc-2'] },
+        actor,
+      );
+
+      expect(result.docLinks).toEqual({
+        succeeded: ['doc-1'],
+        failed: [
+          {
+            docId: 'doc-2',
+            status: 404,
+            code: ErrorCode.DOC_NOT_FOUND,
+            error: 'Document not found',
+          },
+        ],
+      });
+      expect(result.task.status).toBe(TaskStatus.DONE);
+    });
+
+    it('同 key 完整快照重放 → 返回快照 + idempotentReplay，评论/状态零副作用', async () => {
+      const dto = {
+        taskId,
+        status: TaskStatus.DONE,
+        comment: 'done',
+        commitSha: undefined,
+        docIds: ['doc-1'],
+      };
+      const snapshot = {
+        task: { id: taskId, status: TaskStatus.DONE },
+        comment: { id: 'comment-1', content: 'done' },
+        docLinks: { succeeded: ['doc-1'], failed: [] },
+      };
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({ requestHash: reportRequestHash(dto), responseSnapshot: snapshot }),
+      );
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, comment: 'done', docIds: ['doc-1'], clientRequestId: 'key-1' },
+        actor,
+      );
+
+      expect(result).toEqual({ ...snapshot, idempotentReplay: true });
+      expect(mockCommentRepo.save).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+      expect(mockDocLinkRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('同 key 不同 payload（hash 不符）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({
+          requestHash: 'another-request-hash',
+          responseSnapshot: { task: { id: taskId, status: TaskStatus.DONE } },
+        }),
+      );
+
+      await expect(
+        service.reportResult(
+          taskId,
+          { status: TaskStatus.DONE, comment: '不同评论', clientRequestId: 'key-1' },
+          actor,
+        ),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.IDEMPOTENCY_KEY_CONFLICT } });
+    });
+
+    it('同 key 但 entityType 非 task_report（task 旧记录）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({ entityType: 'task', requestHash: null, responseSnapshot: null }),
+      );
+
+      await expect(
+        service.reportResult(taskId, { status: TaskStatus.DONE, clientRequestId: 'key-1' }, actor),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.IDEMPOTENCY_KEY_CONFLICT } });
+    });
+
+    it('部分成功恢复：快照仅含 comment → 跳过评论只补状态，快照补全 {comment,task}', async () => {
+      const dto = {
+        taskId,
+        status: TaskStatus.DONE,
+        comment: 'done',
+        commitSha: undefined,
+        docIds: undefined,
+      };
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({
+          requestHash: reportRequestHash(dto),
+          responseSnapshot: { comment: { id: 'comment-1', content: 'done' } },
+        }),
+      );
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+      mockUpdateFlow();
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, comment: 'done', clientRequestId: 'key-1' },
+        actor,
+      );
+
+      // 评论不重发；评论结果回放首次快照
+      expect(mockCommentRepo.save).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).toHaveBeenCalledTimes(1);
+      expect(result.comment).toEqual({ id: 'comment-1', content: 'done' });
+      expect(result.task.status).toBe(TaskStatus.DONE);
+      expect(result.idempotentReplay).toBeUndefined();
+      // 最终 checkpoint 写入合并快照（含 task）
+      expect(mockIdempotencyRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'record-1',
+          responseSnapshot: expect.objectContaining({
+            task: expect.anything(),
+            comment: { id: 'comment-1', content: 'done' },
+          }),
+        }),
+      );
+    });
+
+    it('status 失败 → 错误透传（comment 已发 + checkpoint 落 {comment}）', async () => {
+      mockCommentFlow({ id: 'comment-1', content: 'done' });
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+      // update 链路：任务存在，但 save 抛错
+      mockTaskRepo.findOne.mockResolvedValue(createMockTask());
+      mockTaskRepo.save.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        service.reportResult(
+          taskId,
+          { status: TaskStatus.DONE, comment: 'done', clientRequestId: 'key-1' },
+          actor,
+        ),
+      ).rejects.toThrow('db down');
+
+      expect(mockCommentRepo.save).toHaveBeenCalledTimes(1);
+      // 评论 checkpoint 已落快照（仅 comment，无 task）
+      expect(mockIdempotencyRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientRequestId: 'key-1',
+          entityType: 'task_report',
+          responseSnapshot: expect.objectContaining({
+            comment: { id: 'comment-1', content: 'done' },
+          }),
+        }),
+      );
+    });
+
+    it('status 步骤抛 4xx 且本次已发评论 → 错误响应 data 带 commentPosted:true，幂等恢复路径不受影响', async () => {
+      mockCommentFlow({ id: 'comment-1', content: 'done' });
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+      // update 链路：任务存在，但 save 抛 4xx 业务错误
+      mockTaskRepo.findOne.mockResolvedValue(createMockTask());
+      const forbidden = new ForbiddenException({
+        message: 'No permission',
+        code: ErrorCode.PERMISSION_DENIED,
+      });
+      mockTaskRepo.save.mockRejectedValue(forbidden);
+
+      const err = await service
+        .reportResult(
+          taskId,
+          { status: TaskStatus.DONE, comment: 'done', clientRequestId: 'key-1' },
+          actor,
+        )
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ForbiddenException);
+      // 部分成功语义显式化：本次调用发了评论 → data 槽透传 commentPosted（MCP 层归一到 details）
+      expect((err as ForbiddenException).getResponse()).toMatchObject({
+        data: { commentPosted: true },
+      });
+      // 幂等恢复路径不受影响：checkpoint {comment} 已先落库，带 key 重试仍跳过评论步骤
+      expect(mockCommentRepo.save).toHaveBeenCalledTimes(1);
+      expect(mockIdempotencyRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientRequestId: 'key-1',
+          entityType: 'task_report',
+          responseSnapshot: expect.objectContaining({
+            comment: { id: 'comment-1', content: 'done' },
+          }),
+        }),
+      );
+    });
+
+    it('恢复路径：快照含 task 但缺 docLinks + 请求带 docIds → 只补跑 docLinks', async () => {
+      const dto = {
+        taskId,
+        status: TaskStatus.DONE,
+        comment: undefined,
+        commitSha: undefined,
+        docIds: ['doc-1'],
+      };
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({
+          requestHash: reportRequestHash(dto),
+          responseSnapshot: { task: { id: taskId, status: TaskStatus.DONE } },
+        }),
+      );
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+      mockDocLinkFlow([{ id: 'doc-1', spaceId: 'space-1' } as Doc]);
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, docIds: ['doc-1'], clientRequestId: 'key-1' },
+        actor,
+      );
+
+      expect(mockCommentRepo.save).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+      expect(mockDocLinkRepo.save).toHaveBeenCalledTimes(1);
+      expect(result.task).toEqual({ id: taskId, status: TaskStatus.DONE });
+      expect(result.docLinks).toEqual({ succeeded: ['doc-1'], failed: [] });
+      expect(result.idempotentReplay).toBeUndefined();
+    });
+
+    it('并发同 key：评论 checkpoint 撞 23505 → 重读胜者记录继续（不重复 checkpoint 插入）', async () => {
+      const dto = {
+        taskId,
+        status: TaskStatus.DONE,
+        comment: 'done',
+        commitSha: undefined,
+        docIds: undefined,
+      };
+      // 入口查询 miss（并发窗口内无记录）
+      mockIdempotencyRepo.findOne.mockResolvedValueOnce(null);
+      mockCommentFlow({ id: 'comment-1', content: 'done' });
+      // 胜者已先插入 {comment} 快照；本请求 checkpoint 撞 23505
+      const pg23505 = Object.assign(new Error('duplicate key'), {
+        code: '23505',
+        constraint: 'uq_idempotency_actor_key',
+      });
+      mockIdempotencyRepo.save.mockRejectedValueOnce(pg23505);
+      const winnerRecord = idemRecord({
+        requestHash: reportRequestHash(dto),
+        responseSnapshot: { comment: { id: 'comment-winner', content: 'done' } },
+      });
+      mockIdempotencyRepo.findOne.mockResolvedValueOnce(winnerRecord);
+      // 后续 checkpoint 正常
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+      mockUpdateFlow();
+
+      const result = await service.reportResult(
+        taskId,
+        { status: TaskStatus.DONE, comment: 'done', clientRequestId: 'key-1' },
+        actor,
+      );
+
+      // 败者评论已真实落库（无共享事务，无法回滚），保留自身评论；
+      // 胜者记录成为后续 checkpoint 基础（不重复插入），状态照常补跑
+      expect(result.comment).toEqual({ id: 'comment-1', content: 'done' });
+      expect(mockTaskRepo.save).toHaveBeenCalledTimes(1);
+      // checkpoint 两次：首次撞 23505（拒绝），后续基于胜者记录更新
+      expect(mockIdempotencyRepo.save).toHaveBeenCalledTimes(2);
+      expect(mockIdempotencyRepo.save).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: 'record-1' }),
+      );
+    });
+  });
+
+  describe('patchDescription', () => {
+    const actor = { id: 'user-1', type: ActorType.HUMAN };
+    const taskId = 'task-1';
+
+    function sha256(text: string) {
+      const { createHash } = require('crypto');
+      return createHash('sha256').update(text).digest('hex');
+    }
+
+    /** 与实现同款 canonical payload 哈希（字面量对象 key 顺序：taskId/oldString/newString/expectedDescriptionHash） */
+    function patchRequestHash(dto: {
+      taskId: string;
+      oldString: string;
+      newString: string;
+      expectedDescriptionHash?: string;
+    }) {
+      const { createHash } = require('crypto');
+      return createHash('sha256').update(JSON.stringify(dto)).digest('hex');
+    }
+
+    function idemRecord(overrides: Partial<IdempotencyRecord> = {}): IdempotencyRecord {
+      return {
+        id: 'record-1',
+        actorId: 'user-1',
+        clientRequestId: 'key-1',
+        entityType: 'task_description',
+        entityId: taskId,
+        requestHash: 'unused-hash',
+        responseSnapshot: null,
+        createdAt: new Date('2024-01-01'),
+        ...overrides,
+      } as IdempotencyRecord;
+    }
+
+    /** mock 主事务链路：锁行查询（findOne）+ list 派生 + save */
+    function mockPatchFlow(task: Task = createMockTask({ description: '第一段' })) {
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { topicId: 'topic-1' },
+      } as BoardList);
+      mockTaskRepo.save.mockImplementation(async (t: any) => ({ ...t, id: task.id }));
+      mockActivityRepo.save.mockResolvedValue({} as any);
+    }
+
+    it('0 命中 → 404 DOC_NOT_FOUND，不写库', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      await expect(
+        service.patchDescription(taskId, { oldString: '不存在的片段', newString: 'x' }, actor),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.DOC_NOT_FOUND } });
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('>1 命中 → 409 RESOURCE_CONFLICT + data.matchCount，不写库', async () => {
+      mockPatchFlow(createMockTask({ description: '重复 重复' }));
+
+      await expect(
+        service.patchDescription(taskId, { oldString: '重复', newString: 'x' }, actor),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT, data: { matchCount: 2 } },
+      });
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('恰好 1 命中 → 替换成功，响应 task 含新 description + descriptionHash', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段\n第二段' }));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新第一段' },
+        actor,
+      );
+
+      expect(mockTaskRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ description: '新第一段\n第二段' }),
+      );
+      expect(result.task.description).toBe('新第一段\n第二段');
+      expect(result.task.descriptionHash).toBe(sha256('新第一段\n第二段'));
+      expect(result.idempotentReplay).toBeUndefined();
+    });
+
+    it('newString 空串 = 删除该片段', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段\n第二段' }));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段\n', newString: '' },
+        actor,
+      );
+
+      expect(result.task.description).toBe('第二段');
+    });
+
+    it('$ 模式按字面量处理（函数式 replacer 不被 replace 解释）', async () => {
+      mockPatchFlow(createMockTask({ description: '价格 $5 元' }));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '$5', newString: '$&$1' },
+        actor,
+      );
+
+      expect(result.task.description).toBe('价格 $&$1 元');
+    });
+
+    it('成功 → 事务提交后副作用：TASK_UPDATE 事件 + activity updated/description', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      await service.patchDescription(taskId, { oldString: '第一段', newString: '新' }, actor);
+
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: EventType.TASK_UPDATE,
+          resourceType: 'task',
+          resourceId: taskId,
+          payload: expect.objectContaining({ action: 'updated', fieldName: 'description' }),
+        }),
+      );
+      expect(mockActivityRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId,
+          action: 'updated',
+          fieldName: 'description',
+          oldValue: '第一段',
+          newValue: '新',
+        }),
+      );
+    });
+
+    it('expectedDescriptionHash 相符 → 通过', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新', expectedDescriptionHash: sha256('第一段') },
+        actor,
+      );
+
+      expect(result.task.description).toBe('新');
+    });
+
+    it('expectedDescriptionHash 不符 → 409 DOC_CONTENT_CONFLICT + data.currentDescriptionHash，不写库', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      await expect(
+        service.patchDescription(
+          taskId,
+          { oldString: '第一段', newString: '新', expectedDescriptionHash: 'wrong-hash' },
+          actor,
+        ),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { currentDescriptionHash: sha256('第一段') },
+        },
+      });
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('缺省 expectedDescriptionHash → 跳过前提', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新' },
+        actor,
+      );
+
+      expect(result.task.description).toBe('新');
+    });
+
+    it('无 key → 幂等零开销（无记录读写）', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+
+      await service.patchDescription(taskId, { oldString: '第一段', newString: '新' }, actor);
+
+      expect(mockIdempotencyRepo.findOne).not.toHaveBeenCalled();
+      expect(mockIdempotencyRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('有 key 首次成功 → 幂等记录与业务写同事务（快照 = 本入口响应）', async () => {
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+      mockIdempotencyRepo.save.mockImplementation((e: any) => Promise.resolve(e));
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新', clientRequestId: 'key-1' },
+        actor,
+      );
+
+      expect(mockIdempotencyRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          actorId: 'user-1',
+          clientRequestId: 'key-1',
+          entityType: 'task_description',
+          entityId: taskId,
+          responseSnapshot: expect.objectContaining({
+            task: expect.objectContaining({ description: '新' }),
+          }),
+        }),
+      );
+      expect(result.idempotentReplay).toBeUndefined();
+    });
+
+    it('同 key 重放 → 返回快照 + idempotentReplay，零副作用（save 不重复）', async () => {
+      const dto = {
+        taskId,
+        oldString: '第一段',
+        newString: '新',
+        expectedDescriptionHash: undefined,
+      };
+      const snapshot = {
+        task: { id: taskId, description: '新', descriptionHash: 'snapshot-hash' },
+      };
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({ requestHash: patchRequestHash(dto), responseSnapshot: snapshot }),
+      );
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新', clientRequestId: 'key-1' },
+        actor,
+      );
+
+      expect(result).toEqual({ ...snapshot, idempotentReplay: true });
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+      expect(mockIdempotencyRepo.save).not.toHaveBeenCalled();
+      expect(mockEventService.create).not.toHaveBeenCalled();
+    });
+
+    it('同 key 不同 payload（hash 不符）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({ requestHash: 'another-hash', responseSnapshot: { task: { id: taskId } } }),
+      );
+
+      await expect(
+        service.patchDescription(
+          taskId,
+          { oldString: '第一段', newString: '不同', clientRequestId: 'key-1' },
+          actor,
+        ),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.IDEMPOTENCY_KEY_CONFLICT } });
+    });
+
+    it('同 key 但 entityType 非 task_description（task 旧记录）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {
+      mockIdempotencyRepo.findOne.mockResolvedValue(
+        idemRecord({ entityType: 'task', requestHash: null, responseSnapshot: null }),
+      );
+
+      await expect(
+        service.patchDescription(
+          taskId,
+          { oldString: '第一段', newString: '新', clientRequestId: 'key-1' },
+          actor,
+        ),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.IDEMPOTENCY_KEY_CONFLICT } });
+    });
+
+    it('并发同 key：事务内幂等记录撞 23505 → 重读胜者快照返回 + idempotentReplay', async () => {
+      const dto = {
+        taskId,
+        oldString: '第一段',
+        newString: '新',
+        expectedDescriptionHash: undefined,
+      };
+      // 入口查询 miss（并发窗口内无记录）
+      mockIdempotencyRepo.findOne.mockResolvedValueOnce(null);
+      mockPatchFlow(createMockTask({ description: '第一段' }));
+      // 事务内幂等记录 save 撞 23505（胜者已先插入）
+      const pg23505 = Object.assign(new Error('duplicate key'), {
+        code: '23505',
+        constraint: 'uq_idempotency_actor_key',
+      });
+      mockIdempotencyRepo.save.mockRejectedValueOnce(pg23505);
+      const winnerRecord = idemRecord({
+        requestHash: patchRequestHash(dto),
+        responseSnapshot: {
+          task: { id: taskId, description: '新', descriptionHash: 'winner-hash' },
+        },
+      });
+      mockIdempotencyRepo.findOne.mockResolvedValueOnce(winnerRecord);
+
+      const result = await service.patchDescription(
+        taskId,
+        { oldString: '第一段', newString: '新', clientRequestId: 'key-1' },
+        actor,
+      );
+
+      expect(result).toEqual({
+        task: { id: taskId, description: '新', descriptionHash: 'winner-hash' },
+        idempotentReplay: true,
+      });
+      // 业务写已随事务回滚（同事务），不重复 save；无副作用
+      expect(mockTaskRepo.save).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).not.toHaveBeenCalled();
     });
   });
 });

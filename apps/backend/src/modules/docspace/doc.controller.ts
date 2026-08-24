@@ -5,6 +5,10 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.3 (文档读/文档写 API), plan §1.1-13 (sectionId 不稳定性契约)
+ *   - 补充: plan patriot-cyclone-deadman.md §1.5（v1.61.0 批次 1：link-health recheck
+ *     双端点——单文档 + 空间全量，write 权限，对齐 routes/recheck 先例）
+ *   - 补充: plan patriot-cyclone-deadman.md §2.1（v1.61.0 批次 2：PATCH /docs/:id/metadata
+ *     metadata-only 写通道——Partial 三态/hash 必填/native-only/category 解析开关）
  *
  * [踩坑索引]
  *   - Hument 事故（topic msg 6dbc4da3）：stale position fail-open → fail-closed
@@ -25,6 +29,7 @@ import {
   Get,
   Put,
   Patch,
+  Post,
   Delete,
   Body,
   Param,
@@ -33,10 +38,13 @@ import {
   ParseUUIDPipe,
   ParseIntPipe,
   BadRequestException,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { ErrorCode } from '@agent-chamber/shared';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { DocService } from './doc.service';
+import { DocMoveService } from './doc-move.service';
 import { DocSearchService } from './doc-search.service';
 import { DocSpaceService } from './docspace.service';
 import { PermissionService } from '../../common/services/permission.service';
@@ -50,6 +58,9 @@ import {
   DocDetailQueryDto,
   PatchDocSectionDto,
   PatchDocContentDto,
+  AppendDocDto,
+  MoveDocDto,
+  PatchDocMetadataDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
@@ -67,6 +78,7 @@ const MAX_BATCH_POSITIONS = 100;
 export class DocController {
   constructor(
     private readonly docService: DocService,
+    private readonly docMoveService: DocMoveService,
     private readonly docSearchService: DocSearchService,
     private readonly docSpaceService: DocSpaceService,
     private readonly permService: PermissionService,
@@ -109,7 +121,9 @@ export class DocController {
       'Category name is resolved or auto-created. Non-native documents reject writes from different sources (409). ' +
       'Optional optimistic lock: pass expectedContentHash (from a previous read/write response contentHash) — ' +
       'missing doc or hash mismatch → 409 DOC_CONTENT_CONFLICT (rechecked in-transaction under row lock); ' +
-      'match + unchanged content returns unchanged normally.',
+      'match + unchanged content returns unchanged normally. ' +
+      'forceRechunk=true rebuilds sections even when the content hash is unchanged (fixes corrupted chunk-level ' +
+      'metadata); response carries rechunked:true and no doc_versions row is written.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Document upserted successfully' })
@@ -125,7 +139,8 @@ export class DocController {
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor, 'write');
-    return this.docService.upsert(spaceId, dto, actor);
+    // v1.63.0：clientRequestId 幂等键透传（重放返回首次响应快照 + idempotentReplay）
+    return this.docService.upsert(spaceId, dto, actor, dto.clientRequestId);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -322,6 +337,67 @@ export class DocController {
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
     return this.docService.getContent(id, full === 'true');
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('docs/:id/versions')
+  @ApiOperation({
+    summary: 'List document version history (metadata only, doc history MVP)',
+    description:
+      'Return the version history of a document as metadata only — ' +
+      'version / contentHash / authorActorId / source / createdAt / contentSize, NO content body. ' +
+      'Newest version first (version DESC). Version numbers are monotonically increasing ' +
+      '(max+1, never reset after pruning) and stable identifiers. ' +
+      'Each version is created inside the upsert transaction when the content hash actually ' +
+      'changes; at most the latest 20 versions are kept (older ones are pruned in the same transaction). ' +
+      'Requires the same read permission as the document itself.',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Version history returned successfully (version DESC)' })
+  @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND' })
+  async getVersions(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docService.findVersions(id);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('docs/:id/versions/:version')
+  @ApiOperation({
+    summary: 'Get a single document version (full content + diff vs previous version)',
+    description:
+      'Return one version of a document: metadata + full content snapshot + a line-level diff ' +
+      'against the previous version (computed on read, NOT stored). ' +
+      'The previous version is the largest version below the requested one (pruning may skip numbers). ' +
+      'diff is null for the earliest kept version; a diff with added=0/removed=0 means identical content. ' +
+      'Requires the same read permission as the document itself.',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiParam({ name: 'version', description: 'Version number (positive integer)', type: Number })
+  @ApiResponse({
+    status: 200,
+    description: 'Version detail (content + diff) returned successfully',
+  })
+  @ApiResponse({ status: 400, description: 'VALIDATION_ERROR: non-positive version' })
+  @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND: document or version missing' })
+  async getVersion(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('version', ParseIntPipe) version: number,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    // 双层校验（铁律 #21）层 1 格式：version 必须为正整数（<1 无版本语义）—
+    // 格式错误快速失败 400，不透传 service（service 层 404 兜底不存在的版本）
+    if (version < 1) {
+      throw new BadRequestException({
+        message: 'version must be a positive integer (>= 1)',
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docService.findVersion(id, version);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -540,6 +616,7 @@ export class DocController {
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'write');
     // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
+    // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 patchSection 入口，快照 = 本入口响应）
     return this.docService.patchSection(
       id,
       position,
@@ -547,6 +624,7 @@ export class DocController {
       source ?? 'native',
       actor,
       dto.expectedSectionHash,
+      dto.clientRequestId,
     );
   }
 
@@ -606,13 +684,144 @@ export class DocController {
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'write');
     // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
+    // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 patchByMatch 入口，快照 = 本入口响应）
     return this.docService.patchByMatch(
       id,
       dto.oldString,
       dto.newString,
       source ?? 'native',
       actor,
+      dto.clientRequestId,
     );
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('docs/:id/append')
+  // 动作型端点（追加写，不创建资源）：POST 默认 201 → 显式 200
+  // （link-health recheck 同款 @HttpCode 先例）
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary:
+      'Append content to a document (end or under a heading) — concurrency-immune write primitive',
+    description:
+      'One-step append write (v1.65.0 consumer feedback batch 7601e2f5): appends body.content ' +
+      'to the document END (position=end, default) or to the end of the target heading ' +
+      'subtree (position=under-heading + headingPath exact match). ' +
+      '⚠️ CONCURRENCY-IMMUNE: concurrent modification between the server read and write is ' +
+      'retried INTERNALLY (re-read → re-transform → re-write, up to 3 attempts) — the caller ' +
+      'never sees DOC_CONTENT_CONFLICT unless 3 attempts are exhausted. Preferred for diary ' +
+      'append scenarios; replaces the read → patch match three-step round trip. ' +
+      'headingPath semantics: 0 matches → 404 DOC_NOT_FOUND (available headingPaths included); ' +
+      'multiple matches → 409 RESOURCE_CONFLICT (candidate positions included, never silently picked). ' +
+      'The document is re-chunked via the upsert pipeline (outline/position/contentHash/ ' +
+      'tokenEstimate/linkHealth all rebuilt). Requires write access (creator or editor). ' +
+      'Non-native documents require a matching ?source= (409 DOC_SOURCE_MISMATCH otherwise).',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'source',
+    required: false,
+    description:
+      "Source identifier (default 'native'); must match the doc's source for non-native documents",
+  })
+  @ApiBody({ type: AppendDocDto })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Content appended; upsert result returned (includes contentHash for chained writes)',
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'VALIDATION_ERROR: empty/whitespace-only content, under-heading without headingPath, or invalid body',
+  })
+  @ApiResponse({
+    status: 404,
+    description:
+      'DOC_NOT_FOUND: document missing or headingPath has 0 matches (available headingPaths included)',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'RESOURCE_CONFLICT: headingPath matches multiple sections (data.candidates); ' +
+      'DOC_SOURCE_MISMATCH: source conflict; DOC_CONTENT_CONFLICT: concurrent modification ' +
+      'survived 3 internal retries',
+  })
+  async appendDoc(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AppendDocDto,
+    @Query('source') source?: string,
+    @CurrentActor() actor?: UnifiedActor,
+  ) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'write');
+    // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
+    // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 appendDoc 入口，快照 = 本入口响应）
+    return this.docService.appendDoc(
+      id,
+      { content: dto.content, position: dto.position, headingPath: dto.headingPath },
+      source ?? 'native',
+      actor,
+      dto.clientRequestId,
+    );
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Patch('docs/:id/metadata')
+  @ApiOperation({
+    summary: 'Patch document metadata only (no content/section rebuild)',
+    description:
+      'Metadata-only write channel (v1.61.0): updates ONLY the docs row metadata columns — ' +
+      'no section re-chunk, no doc_versions row, contentHash/docId/task_doc_links/doc_routes ' +
+      'all untouched. PARTIAL three-state semantics: only explicit fields are updated ' +
+      '(title/summary/docType/tags/category); absent field = keep; tags: [] = CLEAR; ' +
+      'null = 400 rejected (unambiguous three-state, DTO-enforced). ' +
+      'expectedContentHash is REQUIRED: mismatch → 409 DOC_CONTENT_CONFLICT (checked fast ' +
+      'outside the transaction + rechecked under FOR UPDATE inside — TOCTOU-guarded); ' +
+      'metadata-only writes never change contentHash, so a matching hash stays valid across ' +
+      'chained metadata writes. ' +
+      'category resolves EXISTING space categories only by default — an unknown name → ' +
+      '404 DOC_CATEGORY_NOT_FOUND (prevents typo-born near-duplicate categories); pass ' +
+      'allowCreateCategory=true to auto-create via the existing upsert resolution path. ' +
+      'Non-native documents → 409 DOC_SOURCE_MISMATCH (consistent with upsert/patch). ' +
+      'When every explicit field equals the current value the call short-circuits: ' +
+      'unchanged:true, empty changedFields, NO write/audit/event. ' +
+      'Response carries the final metadata view for single-call verification. ' +
+      'Requires write access (creator or editor).',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiBody({ type: PatchDocMetadataDto })
+  @ApiResponse({
+    status: 200,
+    description:
+      'PatchDocMetadataResult: { docId, path, contentHash (unchanged), changedFields, unchanged, metadata }',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'VALIDATION_ERROR: null field value (three-state contract) or malformed body',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'DOC_NOT_FOUND; DOC_CATEGORY_NOT_FOUND (resolve-only mode miss)',
+  })
+  @ApiResponse({ status: 403, description: 'PERMISSION_DENIED' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'DOC_SOURCE_MISMATCH (non-native); DOC_CONTENT_CONFLICT (expectedContentHash precondition failed)',
+  })
+  async patchMetadata(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: PatchDocMetadataDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    // 权限对齐 PATCH /docs/:id/sections（write：creator 或 editor）
+    await this.permService.ensureCan(space, actor ?? null, 'write');
+    // v1.63.0：clientRequestId 幂等键透传（重放返回首次响应快照 + idempotentReplay）
+    return this.docService.patchMetadata(id, dto, actor, dto.clientRequestId);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -642,5 +851,138 @@ export class DocController {
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor, 'write');
     return this.docService.remove(id, source, actor);
+  }
+
+  // ─── Move / move-impact（v1.60.0-dev，P1 双件 73cadb0d + 8d763914）─────────
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('docs/:id/move-impact')
+  @ApiOperation({
+    summary: 'Get move impact (backlinks / route refs / task links / collision)',
+    description:
+      'Pre-move impact query — same kernel as POST /docs/:id/move dryRun. ' +
+      'Scans the whole space for inbound Markdown links (backlinks) pointing at this doc, ' +
+      'plus doc_routes references, task_doc_links, and optional target-path collision ' +
+      '(pass ?proposedPath= to include no-op detection and collision check). ' +
+      'Requires the same read permission as the document itself.',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'proposedPath',
+    required: false,
+    description:
+      'Proposed target path — when present computes targetCollision and samePath ' +
+      '(same as current path → no-op) in the response',
+    type: String,
+  })
+  @ApiResponse({ status: 200, description: 'DocMoveImpact view returned successfully' })
+  @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND' })
+  async getMoveImpact(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('proposedPath') proposedPath?: string,
+    @CurrentActor() actor?: UnifiedActor,
+  ) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docMoveService.computeMoveImpact(doc.spaceId, doc, proposedPath);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('docs/:id/move')
+  @ApiOperation({
+    summary: 'Atomically move (rename) a document',
+    description:
+      'Atomic rename by doc ID — single transaction, same docId, only docs.path is updated ' +
+      '(content/sections/contentHash/title untouched). docId/versions/task doc links/' +
+      'doc_routes references are preserved (all reference by docId, move is naturally continuous). ' +
+      'Fail-closed validation order: 404 (missing/soft-deleted) → 409 DOC_SOURCE_MISMATCH ' +
+      '(non-native source) → 409 RESOURCE_CONFLICT (toPath == current path, no-op rejected) → ' +
+      '409 DOC_CONTENT_CONFLICT (expectedContentHash mismatch, TOCTOU-guarded in-transaction) → ' +
+      '409 RESOURCE_CONFLICT (target path taken, data.conflictDocId). ' +
+      'dryRun=true runs the full validation chain + impact preview without writing. ' +
+      'Requires write access (creator or editor). ' +
+      'After commit: DOC_MOVED event, audit log, and async link_health recalculation ' +
+      '(old-path inbound links become broken immediately).',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiBody({ type: MoveDocDto })
+  @ApiResponse({ status: 200, description: 'DocMoveResult (moved:true or dryRun preview)' })
+  @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND' })
+  @ApiResponse({ status: 403, description: 'PERMISSION_DENIED' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'DOC_SOURCE_MISMATCH (non-native); RESOURCE_CONFLICT (no-op or target taken, data.conflictDocId); ' +
+      'DOC_CONTENT_CONFLICT (expectedContentHash precondition failed)',
+  })
+  async move(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: MoveDocDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor, 'write');
+    return this.docMoveService.move(id, dto, actor);
+  }
+
+  // ─── Link-health recheck（v1.61.0 批次 1：手动重检入口，对齐 routes/recheck 先例）─────────
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('docs/:id/link-health/recheck')
+  // 动作型端点（重检并覆写存量 health，不创建资源）：POST 默认 201 → 显式 200
+  // （doc-route.controller.ts recheck 同款 @HttpCode 先例）
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Recheck link health of a single document',
+    description:
+      'Manually recompute and persist link_health for one document (strict source-relative ' +
+      'POSIX path resolution, v1.61.0) and return the latest LinkHealth. ' +
+      'Requires write access to the space. ' +
+      'Fallback entry for post-migration reconciliation: after the strict-resolution ' +
+      "semantic change, re-running this endpoint refreshes the doc's broken-link view " +
+      'without touching content/sections.',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Latest LinkHealth of the document' })
+  @ApiResponse({ status: 404, description: 'DOC_NOT_FOUND' })
+  @ApiResponse({ status: 403, description: 'PERMISSION_DENIED' })
+  async recheckDocLinkHealth(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    await this.permService.ensureCan(space, actor, 'write');
+    return this.docService.recheckDocLinkHealth(id);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('doc-spaces/:id/docs/link-health/recheck')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Recheck link health of all documents in a space',
+    description:
+      'Synchronously recompute and persist link_health for every non-deleted doc in the ' +
+      'space (strict source-relative POSIX path resolution, v1.61.0) and return ' +
+      '{ checked, broken } counts — checked = docs re-scanned, broken = total broken ' +
+      'links across all docs. Requires write access to the space. ' +
+      'Deployment-time fallback for the strict-resolution semantic change: run once after ' +
+      'deploy to surface the newly-broken links under exact source-directory rules.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({
+    status: 200,
+    description: 'Space-wide link health rechecked; counts returned',
+  })
+  @ApiResponse({ status: 403, description: 'PERMISSION_DENIED' })
+  async recheckSpaceLinkHealth(
+    @Param('id', ParseUUIDPipe) spaceId: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(spaceId);
+    await this.permService.ensureCan(space, actor, 'write');
+    return this.docService.recalcSpaceLinkHealth(spaceId);
   }
 }

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
+import { DocMoveService } from './doc-move.service';
 import { DocBundleService } from './doc-bundle.service';
 import { DocSpaceController } from './docspace.controller';
 import { DocController } from './doc.controller';
@@ -11,6 +12,8 @@ import { DocSpaceMember } from '../../database/entities/doc-space-member.entity'
 import { DocCategory } from '../../database/entities/doc-category.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSection } from '../../database/entities/doc-section.entity';
+import { DocVersion } from '../../database/entities/doc-version.entity';
+import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
@@ -37,6 +40,9 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
       DocCategory,
       Doc,
       DocSection,
+      DocVersion,
+      // v1.63.0：DocSpace 写族幂等记录（doc.service / doc-move.service 注入）
+      IdempotencyRecord,
       TaskDocLink,
       DocRoute,
       Agent,
@@ -54,6 +60,7 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
   providers: [
     DocSpaceService,
     DocService,
+    DocMoveService,
     DocSearchService,
     DocRouteService,
     RouteHealthService,

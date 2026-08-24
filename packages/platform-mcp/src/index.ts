@@ -48,9 +48,17 @@ import { updateDocRouteTool } from './tools/update-doc-route';
 import { deleteDocRouteTool } from './tools/delete-doc-route';
 import { exportDocSpaceTool } from './tools/export-doc-space';
 import { importDocBundleTool } from './tools/import-doc-bundle';
+import { listDocVersionsTool } from './tools/list-doc-versions';
+import { readDocVersionTool } from './tools/read-doc-version';
+import { getDocMoveImpactTool } from './tools/get-doc-move-impact';
+import { moveDocTool } from './tools/move-doc';
+import { recheckDocLinkHealthTool } from './tools/recheck-doc-link-health';
+import { patchDocMetadataTool } from './tools/patch-doc-metadata';
+import { appendDocTool } from './tools/append-doc';
+import { patchTaskDescriptionTool } from './tools/patch-task-description';
 
 /**
- * 22 个业务语义化高层 MCP tools
+ * 32 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号；新工具追加在尾部，不打乱既有编号）：
@@ -63,7 +71,32 @@ import { importDocBundleTool } from './tools/import-doc-bundle';
  * ⑲ patch_doc → ⑳ create_doc_route → ㉑ update_doc_route → ㉒ delete_doc_route
  * （v1.55 任务 T3 section 级写 + routes 写三件套）→
  * ㉓ export_doc_space → ㉔ import_doc_bundle
- * （任务 T6 空间级全量导出/回导——bundle 含策展元数据 + 全文，可落 git 做版本对齐快照/灾备）
+ * （任务 T6 空间级全量导出/回导——bundle 含策展元数据 + 全文，可落 git 做版本对齐快照/灾备）→
+ * ㉕ list_doc_versions → ㉖ read_doc_version
+ * （doc history MVP 只读两件套：版本元数据清单 + 单版全文/diff 回溯，对应看板任务 27f05ec0）→
+ * ㉗ get_doc_move_impact → ㉘ move_doc
+ * （v1.60.0-dev P1 双件 8d763914 + 73cadb0d：move 影响预演（backlinks 反查/引用清单/
+ * 碰撞检测，与 move dryRun 共用服务端内核）+ 原子移动（同 docId 单事务改 path，
+ * 引用面全按 docId 自然连续；响应带待人工改写入链清单 + v1.61.0 起出链失效清单
+ * outboundPathLinksToRewrite）→
+ * ㉙ recheck_doc_link_health
+ * （v1.61.0 批次 1 d0569c83：linkHealth 手动重检——严格 POSIX 源目录解析语义变更
+ * 后的迁移收口入口；三通道：单文档 docId / spaceName+path / 仅 spaceName 空间级
+ * 全量重检返回 { checked, broken }）→
+ * ㉚ patch_doc_metadata
+ * （v1.61.0 批次 2 201ae04f：metadata-only 写通道——只 UPDATE docs 元数据列，
+ * 不重切 sections/不落 doc_versions/不动 contentHash；Partial 三态语义
+ * （缺席=不动/null=400/tags:[]=清空）+ expectedContentHash 必填乐观锁 +
+ * category 默认只解析既有（allowCreateCategory 开关）；对应 REST
+ * PATCH /docs/:id/metadata，游戏方 Pilot 1b 8 文档消费包依赖能力）→
+ * ㉛ append_doc
+ * （v1.65.0 消费者反馈批 7601e2f5：追加写原语——一步把 content 追加到文档末尾
+ * 或指定 heading 小节末尾，服务端内部消化并发冲突（重读重写自动重试最多 3 次），
+ * 调用方无需 read→patch 三步；日记场景首选；对应 REST POST /docs/:id/append）→
+ * ㉜ patch_task_description
+ * （消费者反馈批 5bc4a570：任务描述局部 patch——match 模式精确串替换 + 乐观锁
+ * （expectedDescriptionHash）+ 幂等键，多 Agent 并发改描述首选通道；
+ * 对应 REST PATCH /tasks/:id/description）
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -90,4 +123,12 @@ export const customTools: CustomTool[] = [
   deleteDocRouteTool,
   exportDocSpaceTool,
   importDocBundleTool,
+  listDocVersionsTool,
+  readDocVersionTool,
+  getDocMoveImpactTool,
+  moveDocTool,
+  recheckDocLinkHealthTool,
+  patchDocMetadataTool,
+  appendDocTool,
+  patchTaskDescriptionTool,
 ];

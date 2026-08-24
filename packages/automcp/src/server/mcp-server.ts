@@ -9,7 +9,7 @@
  *
  * [踩坑索引] -
  *
- * [铁律关联] #7(编译优先) #11(注释强制)
+ * [铁律关联] #7(编译优先) #11(注释强制) #17(测试契约)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
  *   -
@@ -35,6 +35,68 @@ import type {
   CustomToolContext,
 } from '../types';
 import { HttpProxy } from '../proxy/http-proxy';
+
+/**
+ * 自动填充 structuredContent 的 text 长度上限（1MB）
+ *
+ * rationale：超过该长度的 text 大概率是超大响应（如 export_doc_space 全空间导出），
+ * 若再填充 structuredContent 等于把同一份数据序列化两遍（text 已 JSON 一次 +
+ * structuredContent 再存一份），内存与传输开销翻倍，而消费端免二次 parse 的收益
+ * 远小于成本，故超限跳过。
+ */
+const MAX_STRUCTURED_CONTENT_TEXT_LENGTH = 1024 * 1024;
+
+/**
+ * 尝试把 text 解析为结构化内容
+ *
+ * 仅 object / array 算结构化内容；scalar（'123'、'"str"'、'true'、'null'）不算——
+ * JSON.parse('123') 同样成功，但消费端无法从中提取字段，填充无意义。
+ *
+ * @param text - tool 响应的 text 内容
+ * @returns 解析成功且为 object/array 时返回解析结果，否则 undefined
+ */
+function tryParseStructuredContent(text: string): unknown {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed !== null && typeof parsed === 'object') {
+      return parsed;
+    }
+    return undefined;
+  } catch {
+    // 非 JSON text（如 markdown 原文）→ 跳过
+    return undefined;
+  }
+}
+
+/**
+ * 归一化 ToolCallResult：为 JSON text 自动填充 structuredContent
+ *
+ * - handler 显式设置 structuredContent → 尊重不覆盖（为将来 outputSchema 校验/定制预留逃生门）
+ * - 否则若 content[0].text 是 ≤1MB 的合法 JSON 且解析结果为 object/array → 填充
+ * - 其余情况（非 JSON / scalar JSON / 超长 / 无 content）→ 原样返回
+ *
+ * text 原样保留（向后兼容：旧 client 仍读 text，新 client 免二次 JSON.parse）。
+ *
+ * @param result - handler / proxy 返回的原始结果
+ * @returns 归一化后的结果
+ */
+function withStructuredContent(result: ToolCallResult): ToolCallResult {
+  if (result.structuredContent !== undefined) {
+    return result;
+  }
+
+  const text = result.content[0]?.text;
+  if (typeof text !== 'string' || text.length > MAX_STRUCTURED_CONTENT_TEXT_LENGTH) {
+    return result;
+  }
+
+  const parsed = tryParseStructuredContent(text);
+  if (parsed === undefined) {
+    return result;
+  }
+
+  return { ...result, structuredContent: parsed };
+}
 
 /**
  * MCP Server (HTTP 传输)
@@ -264,7 +326,10 @@ export class McpServer {
    */
   private handleInitialize(): InitializeResult {
     return {
-      protocolVersion: '2024-11-05',
+      // 2025-06-18：structuredContent 字段的引入版本（2024-11-05 无此字段）。
+      // 声明新版本后，支持 structuredContent 的 client 可直接消费 result.structuredContent，
+      // 旧 client 仍读 text（向后兼容）。
+      protocolVersion: '2025-06-18',
       capabilities: {
         tools: {
           listChanged: false,
@@ -293,11 +358,24 @@ export class McpServer {
   /**
    * 处理 tools/call 请求
    *
+   * 统一出口：所有路径（自动映射 / custom / 错误信封）都过 withStructuredContent
+   * 归一化——JSON text 自动补 structuredContent，text 原样保留。
+   */
+  private async handleToolsCall(
+    req: Request,
+    params: Record<string, unknown> | undefined,
+  ): Promise<ToolCallResult> {
+    return withStructuredContent(await this.executeToolCall(req, params));
+  }
+
+  /**
+   * 执行 tool 调用（不经过 structuredContent 归一化，由 handleToolsCall 统一收口）
+   *
    * 查找顺序：自动映射 tools 优先 → custom tools 兜底。
    * custom tool handler 抛异常 → 返回 isError:true 文本结果（不冒泡为 JSON-RPC -32603，
    * 与 HttpProxy 错误体验一致）。
    */
-  private async handleToolsCall(
+  private async executeToolCall(
     req: Request,
     params: Record<string, unknown> | undefined,
   ): Promise<ToolCallResult> {

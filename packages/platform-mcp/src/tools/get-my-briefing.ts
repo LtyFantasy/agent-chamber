@@ -8,7 +8,7 @@
  *
  * [踩坑索引] -
  *
- * [铁律关联] #9(代理层透传) #11(注释强制)
+ * [铁律关联] #9(代理层透传) #11(注释强制) #21(双层校验)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
  *   -
@@ -23,6 +23,21 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient, PlatformApiError } from '../platform-client';
 import { omitFields } from './project';
+import { TaskStatus } from '@agent-chamber/shared';
+
+/**
+ * 活跃任务缺省状态集（get_my_briefing 的 active tasks 口径）。
+ *
+ * backlog 是平台的默认待办状态（看板默认列），必须纳入活跃任务，
+ * 否则 Agent 会漏掉尚未开工的已分配任务（本地集成验证实测暴露）。
+ * 调用方可传 statuses 覆盖（替换而非追加，缺省保持本集合）。
+ */
+const DEFAULT_ACTIVE_STATUSES: TaskStatus[] = [
+  TaskStatus.BACKLOG,
+  TaskStatus.TODO,
+  TaskStatus.IN_PROGRESS,
+  TaskStatus.BLOCKED,
+];
 
 /**
  * get_my_briefing — Agent 启动简报
@@ -34,7 +49,8 @@ export const getMyBriefingTool: CustomTool = {
   tool: {
     name: 'get_my_briefing',
     description:
-      'Agent startup briefing: fetch the current agent profile, my active tasks (backlog/todo/in_progress/blocked), ' +
+      'Agent startup briefing: fetch the current agent profile, my active tasks ' +
+      '(backlog/todo/in_progress/blocked by default, overridable via statuses), ' +
       'and recent activities. Replaces 3 individual API calls in a single round trip.',
     inputSchema: {
       type: 'object',
@@ -47,6 +63,13 @@ export const getMyBriefingTool: CustomTool = {
           type: 'integer',
           description: 'Number of recent activities to return (1~50, default 10)',
         },
+        statuses: {
+          type: 'array',
+          items: { type: 'string', enum: Object.values(TaskStatus) },
+          description:
+            'Active task statuses to include (default: backlog/todo/in_progress/blocked). ' +
+            'Pass to override the default set (replaces, not appends).',
+        },
       },
     },
   },
@@ -54,7 +77,41 @@ export const getMyBriefingTool: CustomTool = {
   async handler(args: Record<string, unknown>, ctx: CustomToolContext): Promise<ToolCallResult> {
     const taskLimit = (args.taskLimit as number) ?? 20;
     const activityLimit = (args.activityLimit as number) ?? 10;
+    const statuses = args.statuses as unknown;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
+
+    // 格式校验（铁律 #21）：statuses 必须是合法 TaskStatus 枚举值数组。
+    // automcp 不做运行时参数校验，非法值在此快速失败返回 400，不发起任何请求。
+    // 空数组同样拒绝——替换默认集后 status 参数为空，后端 /tasks 会退化为
+    // "全部状态"查询，静默违背 active tasks 语义（禁止静默语义漂移）。
+    if (statuses !== undefined) {
+      const valid =
+        Array.isArray(statuses) &&
+        statuses.length > 0 &&
+        statuses.every(
+          (s) => typeof s === 'string' && (Object.values(TaskStatus) as string[]).includes(s),
+        );
+      if (!valid) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: true,
+                failedStep: 'validate_statuses',
+                status: 400,
+                message: `statuses must be a non-empty array of TaskStatus values (${Object.values(TaskStatus).join(', ')}).`,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+    // 传入时替换默认集合（join 成后端 /tasks 的逗号分隔 status 参数）
+    const statusParam = statuses
+      ? (statuses as string[]).join(',')
+      : DEFAULT_ACTIVE_STATUSES.join(',');
 
     try {
       // 步骤 1：获取当前 Agent 信息
@@ -65,9 +122,7 @@ export const getMyBriefingTool: CustomTool = {
         client.request<{ items: unknown[]; total: number }>('GET', '/tasks', {
           params: {
             assigneeId: me.id as string,
-            // backlog 是平台的默认待办状态（看板默认列），必须纳入活跃任务，
-            // 否则 Agent 会漏掉尚未开工的已分配任务（本地集成验证实测暴露）
-            status: 'backlog,todo,in_progress,blocked',
+            status: statusParam,
             pageSize: taskLimit,
           },
         }),

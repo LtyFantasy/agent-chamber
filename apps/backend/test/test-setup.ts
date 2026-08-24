@@ -153,6 +153,9 @@ export async function createTestingApp(): Promise<{
     destroy: jest.fn().mockResolvedValue(undefined),
     manager: managerMock,
     transaction: jest.fn((cb: any) => cb(managerMock)),
+    // service 内经 dataSource 取仓库的路径（如 TaskService.create/reportResult 的
+    // 幂等记录读写）→ 按实体类名映射到 mockRepos 中对应的 mock repo
+    getRepository: jest.fn((entityClass: any) => mockRepos[entityClass?.name]),
   };
 
   for (const [name, EntityClass] of Object.entries(entities)) {

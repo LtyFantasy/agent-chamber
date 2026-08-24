@@ -4,7 +4,7 @@ import { TaskService } from './task.service';
 import { TaskDependencyService } from './task-dependency.service';
 import { MilestoneService } from './milestone.service';
 import { PermissionService } from '../../common/services/permission.service';
-import { ActorType, UserRole } from '@agent-chamber/shared';
+import { ActorType, UserRole, TaskStatus } from '@agent-chamber/shared';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
 describe('TaskController', () => {
@@ -21,9 +21,11 @@ describe('TaskController', () => {
     findOne: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
+    patchDescription: jest.fn(),
     remove: jest.fn(),
     move: jest.fn(),
     assign: jest.fn(),
+    reportResult: jest.fn(),
     getComments: jest.fn(),
     addComment: jest.fn(),
     getActivities: jest.fn(),
@@ -197,6 +199,37 @@ describe('TaskController', () => {
       expect(await controller.assign('task-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
       expect(service.assign).toHaveBeenCalledWith('task-1', dto, mockActor.id, mockActor.type);
+    });
+  });
+
+  describe('report', () => {
+    it('should ensure write permission then call service.reportResult with dto and actor', async () => {
+      const task = { id: 'task-1' };
+      const dto = { status: TaskStatus.DONE, comment: 'done', clientRequestId: 'key-1' };
+      const result = {
+        task: { id: 'task-1', status: TaskStatus.DONE },
+        comment: { id: 'comment-1' },
+      };
+      service.findById.mockResolvedValue(task);
+      service.reportResult.mockResolvedValue(result);
+
+      expect(await controller.report('task-1', dto, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
+      expect(service.reportResult).toHaveBeenCalledWith('task-1', dto, mockActor);
+    });
+  });
+
+  describe('patchDescription', () => {
+    it('should ensure write permission then call service.patchDescription with dto and actor', async () => {
+      const task = { id: 'task-1' };
+      const dto = { oldString: '旧', newString: '新', clientRequestId: 'key-1' };
+      const result = { task: { id: 'task-1', description: '新' } };
+      service.findById.mockResolvedValue(task);
+      service.patchDescription.mockResolvedValue(result);
+
+      expect(await controller.patchDescription('task-1', dto, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
+      expect(service.patchDescription).toHaveBeenCalledWith('task-1', dto, mockActor);
     });
   });
 

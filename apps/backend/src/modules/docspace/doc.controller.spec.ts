@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { DocController } from './doc.controller';
 import { DocService } from './doc.service';
+import { DocMoveService } from './doc-move.service';
 import { DocSpaceService } from './docspace.service';
 import { DocSearchService } from './doc-search.service';
 import { PermissionService } from '../../common/services/permission.service';
@@ -26,8 +27,17 @@ describe('DocController', () => {
     getSections: jest.fn(),
     getSectionByHeadingQuery: jest.fn(),
     patchSection: jest.fn(),
+    patchByMatch: jest.fn(),
+    appendDoc: jest.fn(),
     upsert: jest.fn(),
     remove: jest.fn(),
+    findVersions: jest.fn(),
+    findVersion: jest.fn(),
+  };
+
+  const mockDocMoveService = {
+    computeMoveImpact: jest.fn(),
+    move: jest.fn(),
   };
 
   const mockDocSearchService = {
@@ -54,6 +64,7 @@ describe('DocController', () => {
       controllers: [DocController],
       providers: [
         { provide: DocService, useValue: mockDocService },
+        { provide: DocMoveService, useValue: mockDocMoveService },
         { provide: DocSearchService, useValue: mockDocSearchService },
         { provide: DocSpaceService, useValue: mockDocSpaceService },
         { provide: PermissionService, useValue: mockPermService },
@@ -88,7 +99,7 @@ describe('DocController', () => {
 
       expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
-      expect(docService.upsert).toHaveBeenCalledWith('space-1', dto, mockActor);
+      expect(docService.upsert).toHaveBeenCalledWith('space-1', dto, mockActor, undefined);
     });
 
     it('throws 403 when non-editor attempts write', async () => {
@@ -438,6 +449,7 @@ describe('DocController', () => {
         'native',
         mockActor,
         undefined,
+        undefined, // clientRequestId 透传（v1.63.0）
       );
     });
 
@@ -460,6 +472,7 @@ describe('DocController', () => {
         'git:my-repo',
         mockActor,
         undefined,
+        undefined, // clientRequestId 透传（v1.63.0）
       );
     });
 
@@ -488,6 +501,7 @@ describe('DocController', () => {
         'native',
         mockActor,
         'hash-abc',
+        undefined, // clientRequestId 透传（v1.63.0）
       );
     });
 
@@ -501,6 +515,90 @@ describe('DocController', () => {
       );
       expect(docService.findById).not.toHaveBeenCalled();
       expect(docService.patchSection).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── appendDoc（追加写原语，v1.65.0 消费者反馈批 7601e2f5）──────────
+
+  describe('appendDoc', () => {
+    it('delegates to service after ensuring write permission (source defaults to native)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = {
+        id: 'doc-1',
+        path: 'test.md',
+        sectionCount: 2,
+        tokenEstimate: 60,
+        contentHash: 'new-hash',
+      };
+      docService.appendDoc.mockResolvedValue(result);
+
+      expect(
+        await controller.appendDoc('doc-1', { content: '追加内容' }, undefined, mockActor),
+      ).toBe(result);
+
+      // 权限边界：先 doc → space 解析，再 write 校验（与 patch 两入口同款）
+      expect(docService.findById).toHaveBeenCalledWith('doc-1');
+      expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
+      // source 缺省 native；position/headingPath 缺省 → undefined 透传（服务端归一化 'end'）
+      expect(docService.appendDoc).toHaveBeenCalledWith(
+        'doc-1',
+        { content: '追加内容', position: undefined, headingPath: undefined },
+        'native',
+        mockActor,
+        undefined, // clientRequestId 透传（v1.63.0）
+      );
+    });
+
+    it('passes ?source= / position / headingPath / clientRequestId through to the service', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.appendDoc.mockResolvedValue({
+        id: 'doc-1',
+        path: 'test.md',
+        sectionCount: 1,
+        tokenEstimate: 10,
+      });
+
+      await controller.appendDoc(
+        'doc-1',
+        {
+          content: 'x',
+          position: 'under-heading',
+          headingPath: 'Test § 节',
+          clientRequestId: 'key-1',
+        },
+        'git:my-repo',
+        mockActor,
+      );
+      expect(docService.appendDoc).toHaveBeenCalledWith(
+        'doc-1',
+        { content: 'x', position: 'under-heading', headingPath: 'Test § 节' },
+        'git:my-repo',
+        mockActor,
+        'key-1',
+      );
+    });
+
+    it('throws 403 when non-editor attempts write (permission in controller layer)', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(
+        controller.appendDoc('doc-1', { content: 'x' }, undefined, nonAdminActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(docService.appendDoc).not.toHaveBeenCalled();
     });
   });
 
@@ -530,6 +628,55 @@ describe('DocController', () => {
       expect(await controller.remove('doc-1', mockActor, 'git:my-repo')).toBe(result);
       // ingest 清理链路（sync-docs.mjs）依赖 source 精确透传给 service 做匹配校验
       expect(docService.remove).toHaveBeenCalledWith('doc-1', 'git:my-repo', mockActor);
+    });
+  });
+
+  // ─── Doc version history (doc history MVP) ─────────────────
+
+  describe('getVersions', () => {
+    it('lists version metadata after ensuring read permission', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = [
+        {
+          version: 2,
+          contentHash: 'h2',
+          authorActorId: 'u1',
+          source: 'patch',
+          createdAt: new Date(),
+          contentSize: 10,
+        },
+      ];
+      docService.findVersions.mockResolvedValue(result);
+
+      expect(await controller.getVersions('doc-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(docService.findVersions).toHaveBeenCalledWith('doc-1');
+    });
+  });
+
+  describe('getVersion', () => {
+    it('returns version detail after ensuring read permission', async () => {
+      const doc = { id: 'doc-1', spaceId: 'space-1' };
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = { version: 2, content: 'x', diff: null };
+      docService.findVersion.mockResolvedValue(result);
+
+      expect(await controller.getVersion('doc-1', 2, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(docService.findVersion).toHaveBeenCalledWith('doc-1', 2);
+    });
+
+    it('rejects non-positive version with 400 VALIDATION_ERROR (no service call)', async () => {
+      await expect(controller.getVersion('doc-1', 0, mockActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.VALIDATION_ERROR }),
+        }),
+      );
+      expect(docService.findById).not.toHaveBeenCalled();
+      expect(docService.findVersion).not.toHaveBeenCalled();
     });
   });
 
@@ -567,6 +714,102 @@ describe('DocController', () => {
           response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
         }),
       );
+    });
+  });
+
+  // ─── getMoveImpact（v1.60：GET /docs/:id/move-impact）─────────────────
+
+  describe('getMoveImpact', () => {
+    const doc = { id: 'doc-1', spaceId: 'space-1', path: 'docs/a.md', title: 'A' };
+
+    it('calls computeMoveImpact after resolving doc + read permission', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const impact = {
+        docId: 'doc-1',
+        path: 'docs/a.md',
+        inboundLinks: [],
+        docRoutes: [],
+        taskLinks: [],
+        pathBasedLinksToRewrite: [],
+      };
+      mockDocMoveService.computeMoveImpact.mockResolvedValue(impact);
+
+      expect(await controller.getMoveImpact('doc-1', undefined)).toBe(impact);
+      expect(docService.findById).toHaveBeenCalledWith('doc-1');
+      expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, null, 'read');
+      expect(mockDocMoveService.computeMoveImpact).toHaveBeenCalledWith('space-1', doc, undefined);
+    });
+
+    it('forwards proposedPath when provided', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      mockDocMoveService.computeMoveImpact.mockResolvedValue({});
+
+      await controller.getMoveImpact('doc-1', 'docs/b.md');
+      expect(mockDocMoveService.computeMoveImpact).toHaveBeenCalledWith(
+        'space-1',
+        doc,
+        'docs/b.md',
+      );
+    });
+
+    it('403 when actor lacks read permission (service not called)', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(controller.getMoveImpact('doc-1', undefined, nonAdminActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(mockDocMoveService.computeMoveImpact).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── move（v1.60：POST /docs/:id/move）─────────────────────────────
+
+  describe('move', () => {
+    const doc = { id: 'doc-1', spaceId: 'space-1', path: 'docs/a.md', title: 'A' };
+
+    it('calls docMoveService.move after ensuring write permission', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = {
+        docId: 'doc-1',
+        oldPath: 'docs/a.md',
+        newPath: 'docs/b.md',
+        contentHash: 'h',
+        moved: true,
+        impact: {},
+      };
+      mockDocMoveService.move.mockResolvedValue(result);
+
+      const dto = { toPath: 'docs/b.md' };
+      expect(await controller.move('doc-1', dto, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
+      expect(mockDocMoveService.move).toHaveBeenCalledWith('doc-1', dto, mockActor);
+    });
+
+    it('403 when actor lacks write permission (service not called)', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new ForbiddenException({ message: 'Access denied', code: ErrorCode.PERMISSION_DENIED }),
+      );
+
+      await expect(
+        controller.move('doc-1', { toPath: 'docs/b.md' }, nonAdminActor),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.PERMISSION_DENIED }),
+        }),
+      );
+      expect(mockDocMoveService.move).not.toHaveBeenCalled();
     });
   });
 });

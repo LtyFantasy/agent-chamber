@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §16 (DocSpace 模块) —— 任务 T6（空间级全量导出/回导）
  *   - 补充: docs/platform-mcp.md §2（语义化高层工具契约）
+ *   - 补充: v1.62.0（contentHash 读路径透传）——bundle docs[] item 增 docId + contentHash
+ *     （原始写入 payload 的 SHA-256 = 权威 revision 标识；content 是重建产物，勿对 content
+ *     自算 hash）；formatVersion 保持 1，import DTO 显式忽略新字段防 roundtrip 400
  *
  * [踩坑索引] -
  *
@@ -95,8 +98,12 @@ export const exportDocSpaceTool: CustomTool = {
     description:
       'Export an entire DocSpace as a single JSON bundle (formatVersion 1): space legend + ' +
       'settings, categories, intent routes (docs referenced by path, incl. codeEntryType), ' +
-      'and every doc with its full verbatim markdown content plus curated metadata ' +
-      '(summary/docType/tags/category). Resolves spaceName via three-layer match ' +
+      'and every doc with its full reconstructed markdown content plus curated metadata ' +
+      '(summary/docType/tags/category) and revision fields: each docs[] item carries docId ' +
+      '(informational, not the import business key) and contentHash (SHA-256 of the original ' +
+      'upsert payload — the authoritative revision identifier for export/import diffing; ' +
+      'content is a reconstruction whose own SHA-256 does NOT equal contentHash, never ' +
+      'self-compute). Resolves spaceName via three-layer match ' +
       '(exact → prefix → substring, case-insensitive); 0 or >1 candidates returns ' +
       'isError:true + structured candidate info — never silently picks one. ' +
       'Purpose: version-alignment snapshots (pull into git, diff across releases) and offline ' +

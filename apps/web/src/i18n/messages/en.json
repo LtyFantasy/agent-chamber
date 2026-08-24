@@ -706,7 +706,10 @@
       "contentLoadError": "Failed to load document content",
       "contentLoadErrorDesc": "Check your connection and try again",
       "legend": "Legend",
-      "browse": "Browse"
+      "browse": "Browse",
+      "viewModeTree": "Tree",
+      "viewModeCategory": "Category",
+      "docMatches": "Document matches"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",

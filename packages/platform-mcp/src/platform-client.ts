@@ -77,7 +77,11 @@ export class PlatformApiClient {
   ) {
     this.axiosInstance = axios.create({
       baseURL: baseUrl,
-      timeout: 60_000,
+      // 120s：与生产 nginx /mcp 的 proxy_read_timeout 120s 对齐
+      // （scripts/nginx/agent-chamber.conf location = /mcp）。客户端超时不得超过
+      // nginx 上限——否则大写（如 58k patch 全文重建）服务端事务照常提交而响应无人接收；
+      // 对齐后先断的只会是 nginx（504，语义明确）。背景事故：Board 任务 7d918c7b。
+      timeout: 120_000,
       // 不抛 axios 异常——所有状态码由本类自行处理
       validateStatus: () => true,
     });

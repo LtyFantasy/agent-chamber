@@ -6,7 +6,8 @@
  * markdown 纯文本、position/headingPath → section 原始 markdown（标题行重建：
  * headingLevel>6 截断为 6 个 #、headingLevel=0 无标题行）、headingPath 未命中/多候选、
  * 双通道校验（缺参数→isError）、path 定位失败、HTTP 失败、maxFullTokens 透传、
- * 紧凑 JSON（outline 单行）、不收 sectionId。
+ * 紧凑 JSON（outline 单行）、不收 sectionId、债 A 降级渲染双通道（headingText
+ * 列直读优先 / 老服务端 extract 兜底）。
  */
 
 import type { CustomToolContext } from '@agent-chamber/automcp';
@@ -63,6 +64,7 @@ describe('read_doc', () => {
       createdBy: 'agent-1',
       createdAt: '2026-07-01T00:00:00Z',
       updatedAt: '2026-07-30T00:00:00Z',
+      contentHash: 'hash-arch', // v1.62.0：读路径透出的乐观锁 token
       sections: [
         { position: 0, headingPath: null, headingLevel: 0, tokenEstimate: 50 },
         { position: 1, headingPath: '1 Intro', headingLevel: 1, tokenEstimate: 30 },
@@ -75,7 +77,7 @@ describe('read_doc', () => {
 
     expect(result.isError).toBeFalsy();
     const body = JSON.parse(result.content[0].text);
-    // 投影后字段集合 = 白名单 11 字段（docId 取自后端响应 id）
+    // 投影后字段集合 = 白名单 12 字段（docId 取自后端响应 id；v1.62.0 增 contentHash）
     expect(Object.keys(body).sort()).toEqual(
       [
         'docId',
@@ -87,11 +89,13 @@ describe('read_doc', () => {
         'tokenEstimate',
         'sectionCount',
         'updatedAt',
+        'contentHash',
         'linkHealth',
         'sections',
       ].sort(),
     );
     expect(body.docId).toBe('d1');
+    expect(body.contentHash).toBe('hash-arch');
     expect(body.sections).toBeDefined();
     expect(body.sections.length).toBe(2);
     expect(body.sections[1]).toEqual({
@@ -131,6 +135,7 @@ describe('read_doc', () => {
       createdBy: 'agent-1',
       createdAt: '2026-07-01T00:00:00Z',
       updatedAt: '2026-07-02T00:00:00Z',
+      contentHash: 'hash-x', // v1.62.0：outline 投影透出乐观锁 token
       sections: [],
       linkHealth: { total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' },
       mode: 'outline',
@@ -151,11 +156,13 @@ describe('read_doc', () => {
         'tokenEstimate',
         'sectionCount',
         'updatedAt',
+        'contentHash',
         'linkHealth',
         'sections',
       ].sort(),
     );
     expect(body.docId).toBe('d1');
+    expect(body.contentHash).toBe('hash-x');
     expect(body.sections).toEqual([]);
     expect(body.linkHealth).toEqual({ total: 0, broken: [], checkedAt: '2026-07-30T00:00:00Z' });
 
@@ -298,6 +305,45 @@ describe('read_doc', () => {
     const result = await readDocTool.handler({ docId: 'd1', position: 2 }, ctx());
 
     expect(result.content[0].text).toBe('Continuation body');
+  });
+
+  // ─── 债 A：降级渲染双通道（headingText 列直读优先 → extract 反解析兜底）───
+
+  it('新服务端带 headingText → 降级渲染用列直读标题（标题正文含 ` § ` 也不切错）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      docId: 'd1',
+      docPath: 'docs/x.md',
+      position: 1,
+      headingPath: '价格区间 § 含 § 分隔符', // 反解析取末段会得到错误的 "分隔符"
+      headingText: '价格区间 § 含 § 分隔符',
+      headingLevel: 3,
+      content: 'Section body',
+      tokenEstimate: 10,
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1', position: 1 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe('### 价格区间 § 含 § 分隔符\n\nSection body');
+  });
+
+  it('老服务端无 headingText → 降级 extractLastHeadingSegment 反解析末段', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      docId: 'd1',
+      docPath: 'docs/x.md',
+      position: 1,
+      headingPath: 'Parent § Child',
+      headingLevel: 2,
+      content: 'Legacy body',
+      tokenEstimate: 10,
+    });
+
+    const result = await readDocTool.handler({ docId: 'd1', position: 1 }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe('## Child\n\nLegacy body');
   });
 
   it('headingPath 定位 → 先取大纲匹配 position 再读 section，返回含标题行 markdown', async () => {

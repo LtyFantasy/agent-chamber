@@ -41,7 +41,7 @@ describe('PlatformApiClient', () => {
       await client.request('GET', '/agents/me');
 
       expect(mockedAxios.create).toHaveBeenCalledWith(
-        expect.objectContaining({ baseURL: 'http://localhost:8743/api/v1', timeout: 60_000 }),
+        expect.objectContaining({ baseURL: 'http://localhost:8743/api/v1', timeout: 120_000 }),
       );
       // headers 中不应有 X-API-Key 或 Authorization
       const callHeaders = inst.request.mock.calls[0][0]?.headers ?? {};

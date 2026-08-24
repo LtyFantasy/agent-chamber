@@ -323,12 +323,33 @@ export interface BoardDigest {
   };
   /** 风险任务（labels 含 bug/debt 且状态非 done/archived，priority 序，riskLimit 截断） */
   risks: BoardDigestRisk[];
+  /**
+   * 风险任务总数（截断元数据补齐）：risks 全量计数，不受 riskLimit 截断影响；
+   * 截断判断用：risksTotal > risks.length
+   */
+  risksTotal: number;
   /** 下一步任务（open 任务 priority 序，openLimit 截断） */
   nextUp: BoardDigestOpenTask[];
+  /**
+   * 开放任务总数（截断元数据补齐）：nextUp 全量计数，不受 openLimit 截断影响；
+   * 截断判断用：nextUpTotal > nextUp.length
+   */
+  nextUpTotal: number;
   /** 最近完成任务（completedAt desc，doneLimit 截断） */
   recentDone: BoardDigestDoneTask[];
+  /**
+   * 最近完成任务总数（截断元数据补齐）：recentDone 全量计数，不受 doneLimit
+   * 截断影响；截断判断用：recentDoneTotal > recentDone.length
+   */
+  recentDoneTotal: number;
   /** 绑定 DocSpace 元数据；无绑定空间时为 null */
   docs: BoardDigestDocs | null;
+  /**
+   * 绑定空间最近更新文档总数（截断元数据补齐）：docs.recentlyUpdated 全量计数，
+   * 不受 docsLimit 截断影响；截断判断用：docsTotal > docs.recentlyUpdated.length。
+   * 无绑定空间（docs 为 null）时缺省。
+   */
+  docsTotal?: number;
   /**
    * 测试基线等机器事实（settings.metrics，由 report-metrics.mjs 上报；透传不加工）。
    * 无 metrics 时 null。设计与 metrics 端点的唯一写口对齐：digest 永不写入。

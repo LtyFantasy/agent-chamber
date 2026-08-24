@@ -39,9 +39,11 @@
 import { DataSource } from 'typeorm';
 import { ActorType, ErrorCode } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
+import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocService } from '../src/modules/docspace/doc.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
+import { DocVersion } from '../src/database/entities/doc-version.entity';
 import { DocCategory } from '../src/database/entities/doc-category.entity';
 import { DocSpace } from '../src/database/entities/doc-space.entity';
 import { Board } from '../src/database/entities/board.entity';
@@ -77,6 +79,8 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
   let docE: Doc; // 长节文档（Hument 场景复现：chunk 漂移 + stale hash）
   let docF: Doc; // 字节一致性文档（首 H1==title + 长节 + 空分组，v1.57.1 MATCH 面字节一致性验收）
   let docG: Doc; // 同名 sibling 标题文档（v1.57.3 run-dedup 回归）
+  let docH: Doc; // 债 B forceRechunk 修复对象（heading_path/is_continuation 直改损坏）
+  let docI: string; // v1.62.0 contentHash 读路径透传 + 乐观锁链路用例（docId）
 
   /** 冲刷 setImmediate 队列（route health recheck fire-and-forget） */
   const flushImmediates = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -113,8 +117,10 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
       ds.getRepository(AuditLog),
       ds.getRepository(DocSpace),
       ds.getRepository(Board),
+      ds.getRepository(DocVersion),
       eventStub,
       routeHealthStub,
+      ds.getRepository(IdempotencyRecord),
     );
 
     // ── 种子数据：一个空间 + 四个文档（路径带 RUN 后缀隔离）──
@@ -162,7 +168,7 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
     if (!dbAvailable) return;
 
     // 硬删兜底清理（sections 走 CASCADE，显式删更直白）
-    for (const doc of [docA, docB, docC, docD, docE, docF, docG]) {
+    for (const doc of [docA, docB, docC, docD, docE, docF, docG, docH]) {
       if (doc?.id) {
         await ds.getRepository(DocSection).delete({ docId: doc.id });
         await ds.getRepository(Doc).delete({ id: doc.id });
@@ -224,7 +230,8 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
     // 读出现存节的渲染片段（标题行 + 正文，与 patch content 契约同形）
     const section = await service.getSection(docB.id, 1);
     const headingLine = '#'.repeat(Math.min(section.headingLevel, 6));
-    const headingText = section.headingPath?.split(' § ').pop() ?? '';
+    // 债 A 新口径：标题直读 headingText 字段（不再裸 split(' § ') 反解析）
+    const headingText = section.headingText ?? '';
     const rendered = `${headingLine} ${headingText}\n\n${section.content}`;
 
     const result = await service.patchSection(docB.id, 1, rendered, 'native', testActor);
@@ -275,11 +282,13 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
   it('linkHealth 一致：patch 引入的链接按空间候选重算（健康 + 断链两向）', async () => {
     if (!dbAvailable) return;
 
-    // 健康链接：指向同空间 docD 的相对 .md 路径
+    // 健康链接：指向同空间 docD 的根绝对 .md 路径（v1.61.0 严格源目录解析——
+    // 跨目录引用必须 / 前缀根绝对，旧「./tmp/xxx.md 剥前缀命中」写法在严格语义下
+    // 是 tmp/tmp/xxx.md 断链，测试即文档——改用严格语义的正确写法）
     const healthyResult = await service.patchSection(
       docA.id,
       2,
-      `## 第二节\n\n第二节正文，引用 [文档 D](./tmp/${RUN}-d.md)。`,
+      `## 第二节\n\n第二节正文，引用 [文档 D](/tmp/${RUN}-d.md)。`,
       'native',
       testActor,
     );
@@ -295,14 +304,14 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
     await service.patchSection(
       docA.id,
       2,
-      `## 第二节\n\n第二节正文，引用 [幽灵](./tmp/${RUN}-ghost.md)。`,
+      `## 第二节\n\n第二节正文，引用 [幽灵](/tmp/${RUN}-ghost.md)。`,
       'native',
       testActor,
     );
     await flushImmediates();
 
     fresh = await service.findById(docA.id);
-    expect((fresh.linkHealth as { broken: string[] }).broken).toEqual([`./tmp/${RUN}-ghost.md`]);
+    expect((fresh.linkHealth as { broken: string[] }).broken).toEqual([`/tmp/${RUN}-ghost.md`]);
   });
 
   it('position 越界 → 404 DOC_NOT_FOUND（业务存在性层）', async () => {
@@ -775,5 +784,285 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
     const full = await service.getContent(docF.id, true);
     expect(full.content).toContain(newString);
     expect(full.content).not.toContain(oldString);
+  });
+
+  // ==================== 债 A：heading_text 独立列 + 债 B：forceRechunk（真实 PG，铁律 #23） ====================
+  // chunker 直写 heading_text / DB 直查列值 / 回填 LOGIC / forceRechunk 重建事务 + 版本守卫——
+  // 全链路都是 ORM/真实 SQL 行为，mock 单测测不出（RT-SEAT-1 教训），必须打真实 PG。
+
+  it('债 A：upsert 后直查 heading_text 列（" § " 标题完整本地标题；level-0 文首段 NULL；空标题分组有值）', async () => {
+    if (!dbAvailable) return;
+
+    // 文档含：文首 level-0 段（heading_text 应 NULL）+ 嵌套标题（子标题正文含 ' § '——
+    // heading_text 直读完整本地标题，反解析会切错）+ 空正文 H3 分组（往返保真有值）
+    const r = await service.upsert(
+      spaceId,
+      {
+        path: `tmp/${RUN}-headingtext.md`,
+        content: [
+          '简介段落。',
+          '',
+          '# 父标题',
+          '父正文。',
+          '',
+          '## A § B 子标题',
+          '子正文。',
+          '',
+          '### 空分组',
+        ].join('\n'),
+      },
+      testActor,
+    );
+    await flushImmediates();
+
+    try {
+      // ── DB 层直查：heading_text 列由 chunker 写入 ──
+      const rows = (await ds.query(
+        `SELECT position, heading_path, heading_text FROM doc_sections
+         WHERE doc_id = $1 ORDER BY position ASC`,
+        [r.id],
+      )) as Array<{ position: number; heading_path: string | null; heading_text: string | null }>;
+
+      expect(rows).toHaveLength(4);
+      // level-0 文首段：heading_text NULL（决策 #10）
+      expect(rows[0]).toMatchObject({
+        position: 0,
+        heading_path: `tmp/${RUN}-headingtext.md`,
+        heading_text: null,
+      });
+      // 普通标题：清洗后本地标题
+      expect(rows[1]).toMatchObject({ position: 1, heading_text: '父标题' });
+      // 核心价值：标题正文含 ' § ' → heading_text 完整保留（反解析得 'B 子标题' 是错值）
+      expect(rows[2].heading_text).toBe('A § B 子标题');
+      expect(rows[2].heading_path).toBe('父标题 § A § B 子标题');
+      // 空正文标题：heading_text 照常写入（往返保真）
+      expect(rows[3]).toMatchObject({
+        heading_path: '父标题 § A § B 子标题 § 空分组',
+        heading_text: '空分组',
+      });
+
+      // ── Service 读侧透传：getSection / findOne outline ──
+      const section = await service.getSection(r.id, 2);
+      expect(section.headingText).toBe('A § B 子标题');
+      expect(section.headingPath).toBe('父标题 § A § B 子标题');
+
+      const outline = (await service.findOne(r.id, 0)).sections ?? [];
+      const inner = outline.find((s) => s.position === 2);
+      expect(inner?.heading).toBe('A § B 子标题');
+      expect(inner?.headingText).toBe('A § B 子标题');
+      // 反解析对照：旧口径必切错（验证列直读是唯一正解）
+      expect(inner?.headingPath?.split(' § ').pop()).toBe('B 子标题');
+      expect(inner?.heading).not.toBe('B 子标题');
+    } finally {
+      await ds.getRepository(DocSection).delete({ docId: r.id });
+      await ds.getRepository(Doc).delete({ id: r.id });
+    }
+  });
+
+  it('债 A：migration 回填逻辑集成验证（存量行 heading_text NULL → 执行与 migration 相同的回填 UPDATE → 末段正确）', async () => {
+    if (!dbAvailable) return;
+
+    const r = await service.upsert(
+      spaceId,
+      {
+        path: `tmp/${RUN}-backfill.md`,
+        content: `# 回填文档\n\n## 子标题一\n\n正文一。\n\n### 孙标题\n\n正文二。`,
+      },
+      testActor,
+    );
+    await flushImmediates();
+
+    try {
+      // 模拟 migration 前的存量数据：把回填目标行 heading_text 置 NULL（保留 heading_path）
+      await ds.query(`UPDATE doc_sections SET heading_text = NULL WHERE doc_id = $1`, [r.id]);
+
+      // 执行与 migration up() 完全相同的回填 STATEMENT（正本在
+      // migrations/1787028746871-AddDocSectionHeadingText.ts，此处验证逻辑本身）
+      await ds.query(
+        `UPDATE doc_sections SET heading_text = trim(reverse(split_part(reverse(heading_path), ' § ', 1)))
+         WHERE heading_path IS NOT NULL`,
+      );
+
+      const rows = (await ds.query(
+        `SELECT position, heading_path, heading_text FROM doc_sections
+         WHERE doc_id = $1 ORDER BY position ASC`,
+        [r.id],
+      )) as Array<{ position: number; heading_path: string; heading_text: string | null }>;
+
+      // 每行取到 heading_path 的末段（层级正确：孙标题取 '孙标题' 而非整链）
+      expect(rows[0]).toMatchObject({ heading_text: '回填文档' });
+      expect(rows[1]).toMatchObject({ heading_text: '子标题一' });
+      expect(rows[2]).toMatchObject({
+        heading_path: '回填文档 § 子标题一 § 孙标题',
+        heading_text: '孙标题',
+      });
+    } finally {
+      await ds.getRepository(DocSection).delete({ docId: r.id });
+      await ds.getRepository(Doc).delete({ id: r.id });
+    }
+  });
+
+  it('债 B：forceRechunk 修复损坏的 section 元数据（heading_path/is_continuation 直改 → 重建修复；无 force 保持损坏；doc_versions 行数不变）', async () => {
+    if (!dbAvailable) return;
+
+    const content = `# 文档 H\n\n## 好节\n\n好正文。`;
+    const r = await service.upsert(
+      spaceId,
+      {
+        path: `tmp/${RUN}-force-rechunk.md`,
+        content,
+      },
+      testActor,
+    );
+    await flushImmediates();
+    docH = await service.findById(r.id);
+
+    try {
+      // 版本基线：重建前 doc_versions 行数
+      const versionCountBefore = (await ds.query(
+        `SELECT count(*)::int AS n FROM doc_versions WHERE doc_id = $1`,
+        [r.id],
+      )) as Array<{ n: number }>;
+      const versionsBefore = versionCountBefore[0].n;
+      expect(versionsBefore).toBe(1); // 创建时写了 version 1
+
+      // 模拟生产事故：外部 SQL 直改 section 元数据损坏（heading_path 被改错 + 续标志误置）
+      await ds.query(
+        `UPDATE doc_sections SET heading_path = '损坏标题', is_continuation = TRUE WHERE doc_id = $1 AND position = 1`,
+        [r.id],
+      );
+
+      // ① 无 forceRechunk：内容 hash 相同 → unchanged 早退，损坏保持（修复必须显式触发）
+      const plain = await service.upsert(spaceId, { path: docH.path, content }, testActor);
+      await flushImmediates();
+      expect(plain.unchanged).toBe(true);
+      expect(plain.rechunked).toBeUndefined();
+      const stillBroken = (await ds.query(
+        `SELECT heading_path, is_continuation FROM doc_sections WHERE doc_id = $1 AND position = 1`,
+        [r.id],
+      )) as Array<{ heading_path: string; is_continuation: boolean }>;
+      expect(stillBroken[0]).toMatchObject({ heading_path: '损坏标题', is_continuation: true });
+
+      // ② forceRechunk=true：同内容强制重建 → 元数据修复 + rechunked:true + 版本行数不变
+      const fixed = await service.upsert(
+        spaceId,
+        {
+          path: docH.path,
+          content,
+          forceRechunk: true,
+        },
+        testActor,
+      );
+      await flushImmediates();
+      expect(fixed.unchanged).toBeUndefined();
+      expect(fixed.rechunked).toBe(true);
+      expect(fixed.id).toBe(r.id);
+
+      // sections 重建后（删旧插新）heading_path/is_continuation 恢复 chunker 事实
+      const repaired = (await ds.query(
+        `SELECT heading_path, heading_text, is_continuation FROM doc_sections
+         WHERE doc_id = $1 ORDER BY position ASC`,
+        [r.id],
+      )) as Array<{ heading_path: string; heading_text: string; is_continuation: boolean }>;
+      expect(repaired[1]).toMatchObject({
+        heading_path: '文档 H § 好节',
+        heading_text: '好节',
+        is_continuation: false,
+      });
+
+      // 版本守卫（决策 #3）：内容 hash 未变的纯重切不写 doc_versions
+      const versionCountAfter = (await ds.query(
+        `SELECT count(*)::int AS n FROM doc_versions WHERE doc_id = $1`,
+        [r.id],
+      )) as Array<{ n: number }>;
+      expect(versionCountAfter[0].n).toBe(versionsBefore);
+
+      // 全链路健康：全文可正常重建、读通道 heading 直读修复后的标题
+      const full = await service.getContent(r.id, true);
+      expect(full.content).toContain('## 好节');
+      const outlet = (await service.findOne(r.id, 0)).sections ?? [];
+      expect(outlet.find((s) => s.position === 1)?.heading).toBe('好节');
+    } finally {
+      await ds.getRepository(DocSection).delete({ docId: r.id });
+      await ds.getRepository(Doc).delete({ id: r.id });
+      docH = undefined as unknown as Doc;
+    }
+  });
+
+  // ==================== v1.62.0：读路径 contentHash 透传 + 乐观锁链路（真实 PG） ====================
+  // contentHash = 原始写入 payload 的 SHA-256（docs.content_hash，nullable 列）。读路径
+  // （list/read outline/full/content）统一返回该 token；读出正文是 sections 重建产物，
+  // 其 SHA-256 ≠ contentHash（设计使然）——乐观锁（expectedContentHash）一律用响应返回
+  // 的同源 token，禁止对读出文本自算 SHA。真实 PG 验证 token 与 DB 值一致 + 链式写成立。
+
+  it('v1.62.0：读路径全部返回 contentHash（== DB docs.content_hash）；链式乐观锁写成立；并发改后旧 hash → 409', async () => {
+    if (!dbAvailable) return;
+
+    const upserted = await service.upsert(
+      spaceId,
+      {
+        path: `tmp/${RUN}-contenthash.md`,
+        content: '# contentHash 文档\n\n正文。',
+      },
+      testActor,
+    );
+    await flushImmediates();
+    docI = upserted.id;
+
+    try {
+      // DB 权威值（docs.content_hash）
+      const dbDoc = await service.findById(docI);
+      const dbHash = dbDoc.contentHash;
+      expect(dbHash).toBeTruthy();
+
+      // ① outline（maxFullTokens=0 强制）：contentHash === DB 值
+      const outline = await service.findOne(docI, 0);
+      expect(outline.mode).toBe('outline');
+      expect(outline.contentHash).toBe(dbHash);
+
+      // ② full（maxFullTokens 覆盖阈值）：contentHash === DB 值
+      const full = await service.findOne(docI, 50000);
+      expect(full.mode).toBe('full');
+      expect(full.contentHash).toBe(dbHash);
+
+      // ③ content 端点（DocFullContent）：contentHash === DB 值
+      const content = await service.getContent(docI, true);
+      expect(content.contentHash).toBe(dbHash);
+      // 契约注记：重建正文的 SHA-256 ≠ contentHash（设计使然，禁止对读出文本自算）
+      // 此处不硬断言不相等，避免与重建渲染细节耦合——语义以 shared/文档契约为准。
+
+      // ④ 链路：read 取 hash → 带该 hash upsert → 200（乐观锁前提校验通过）
+      // dbHash 已在上方 `expect(dbHash).toBeTruthy()` 断言非空——非空断言收窄 string
+      const ok = await service.upsert(
+        spaceId,
+        {
+          path: `tmp/${RUN}-contenthash.md`,
+          content: '# contentHash 文档\n\n正文。v2',
+          expectedContentHash: dbHash!,
+        },
+        testActor,
+      );
+      await flushImmediates();
+      expect(ok.id).toBe(docI);
+
+      // ⑤ 并发改后旧 hash → 409 DOC_CONTENT_CONFLICT（游戏方最小验收原样落地）
+      await expect(
+        service.upsert(
+          spaceId,
+          {
+            path: `tmp/${RUN}-contenthash.md`,
+            content: '# contentHash 文档\n\n正文。v3',
+            expectedContentHash: dbHash!, // 旧 hash——期间已被 v2 覆盖，当前 hash 已变
+          },
+          testActor,
+        ),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DOC_CONTENT_CONFLICT },
+      });
+    } finally {
+      await ds.getRepository(DocSection).delete({ docId: docI });
+      await ds.getRepository(Doc).delete({ id: docI });
+      docI = undefined as unknown as string;
+    }
   });
 });

@@ -42,38 +42,55 @@ describe('PLATFORM_DOC_LINK_RE', () => {
   });
 });
 
-describe('resolveDocPath', () => {
-  it('原样 path 直接命中', () => {
-    expect(resolveDocPath('docs/architecture.md', pathToId)).toBe('id-arch');
-    expect(resolveDocPath('README.md', pathToId)).toBe('id-readme');
+describe('resolveDocPath（v1.61.0 严格 POSIX 源目录解析，与后端 link-health.ts 同源）', () => {
+  it('空间根绝对（/ 前缀）：去前导 / 后精确命中，不依赖源目录', () => {
+    expect(resolveDocPath('/docs/architecture.md', pathToId, 'docs/spec.md')).toBe('id-arch');
+    expect(resolveDocPath('/README.md', pathToId, 'docs/vision/README.md')).toBe('id-readme');
   });
 
-  it('剥离 # 锚点后命中', () => {
-    expect(resolveDocPath('docs/spec.md#error-codes', pathToId)).toBe('id-spec');
+  it('剥离 # 锚点后命中（根绝对 + 源相对双形态）', () => {
+    expect(resolveDocPath('/docs/spec.md#error-codes', pathToId, 'docs/README.md')).toBe('id-spec');
+    expect(resolveDocPath('./spec.md#section-x', pathToId, 'docs/README.md')).toBe('id-spec');
   });
 
-  it('归一化 ./ 前缀', () => {
-    expect(resolveDocPath('./README.md', pathToId)).toBe('id-readme');
+  it('同目录相对 ./ 与裸文件名：按源目录精确解析', () => {
+    // docs/README.md 内 ./spec.md → docs/spec.md；裸 spec.md 同理
+    expect(resolveDocPath('./spec.md', pathToId, 'docs/README.md')).toBe('id-spec');
+    expect(resolveDocPath('spec.md', pathToId, 'docs/README.md')).toBe('id-spec');
   });
 
-  it('归一化连续 ../ 前缀', () => {
-    expect(resolveDocPath('../README.md', pathToId)).toBe('id-readme');
-    expect(resolveDocPath('../../docs/spec.md', pathToId)).toBe('id-spec');
+  it('嵌套目录上溯 ../：docs/spec.md 内 ../guides/t.md → guides/t.md', () => {
+    expect(resolveDocPath('../guides/t.md', pathToId, 'docs/spec.md')).toBe('id-guide');
   });
 
-  it('原样未命中时尝试补 docs/ 前缀', () => {
-    expect(resolveDocPath('architecture.md', pathToId)).toBe('id-arch');
+  it('旧启发式 docs/ 前缀补全已删除：docs/README.md 内 ../架构 裸文件名不再命中顶层', () => {
+    // 从 docs/ 子目录写顶层 README.md 裸文件名 = docs/README.md 不存在 → 断链，
+    // 根绝对写法（/README.md）才是正确姿势（行为变更钉死）
+    expect(resolveDocPath('README.md', pathToId, 'docs/README.md')).toBeNull();
+    expect(resolveDocPath('/README.md', pathToId, 'docs/README.md')).toBe('id-readme');
+  });
+
+  it('越出空间根（normalize 结果以 .. 开头）→ null（不可达 = 断链）', () => {
+    // docs/spec.md 上加两级 → ../t.md 越界；一层 → guides/t.md 恰好不越界
+    expect(resolveDocPath('../../t.md', pathToId, 'docs/spec.md')).toBeNull();
+    expect(resolveDocPath('../guides/t.md', pathToId, 'docs/spec.md')).toBe('id-guide');
+  });
+
+  it('自引用：docs/spec.md 内 ./spec.md 命中自身', () => {
+    expect(resolveDocPath('./spec.md', pathToId, 'docs/spec.md')).toBe('id-spec');
   });
 
   it('未命中返回 null（断链）', () => {
-    expect(resolveDocPath('docs/missing.md', pathToId)).toBeNull();
+    expect(resolveDocPath('/docs/missing.md', pathToId, 'docs/spec.md')).toBeNull();
+    expect(resolveDocPath('./missing.md', pathToId, 'docs/spec.md')).toBeNull();
   });
 
   it.each([
     '#section', // 纯锚点
     'images/logo.png', // 非 .md 相对路径
     'assets/', // 目录
+    '', // 空 href
   ])('非职责范围 %s 返回 undefined（不干预）', (href) => {
-    expect(resolveDocPath(href, pathToId)).toBeUndefined();
+    expect(resolveDocPath(href, pathToId, 'docs/spec.md')).toBeUndefined();
   });
 });

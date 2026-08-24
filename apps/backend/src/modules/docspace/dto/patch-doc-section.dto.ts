@@ -20,7 +20,7 @@
  * =============================================================================
  */
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsOptional, IsString } from 'class-validator';
+import { IsOptional, IsString, Length } from 'class-validator';
 
 /**
  * PATCH /docs/:id/sections/:position 请求体（v1.55 section 级写）
@@ -56,4 +56,18 @@ export class PatchDocSectionDto {
   @IsOptional()
   @IsString()
   expectedSectionHash?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Idempotency key (optional, 1–64 chars). Repeated submissions with the same ' +
+      'clientRequestId by the same actor return the FIRST response snapshot with an ' +
+      'idempotentReplay flag — no event, no doc_versions row, no side effects on replay. ' +
+      'Same key with a different payload → 409 IDEMPOTENCY_KEY_CONFLICT. Safe for retries.',
+    maxLength: 64,
+  })
+  @IsOptional()
+  @IsString()
+  // 幂等键尺度照 create-task.dto 先例（1~64 字符，不强制 UUID）；超长在 DTO 层 400（铁律 21）
+  @Length(1, 64)
+  clientRequestId?: string;
 }

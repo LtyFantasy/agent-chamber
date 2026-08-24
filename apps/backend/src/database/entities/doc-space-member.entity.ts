@@ -38,8 +38,10 @@ export class DocSpaceMember {
 
   /**
    * 成员角色
-   * - editor: 可编辑空间内容（文档/分类），由 addEditor 授予
+   * - editor: 可编辑空间内容（文档/分类），由 addEditor 授予，或 create() 时 creator 自动写入
    * - member: 只读访问，由 inviteAgent 授予
+   * creator 行约定：role='editor' 且 invitedBy=null（非授予产生），removeEditor/uninviteAgent
+   * 对 creator 拒绝操作；backfill migration 的 down() 按 invited_by IS NULL 精确回滚
    */
   @Column({ type: 'varchar', length: 20, default: 'member' })
   role: string;

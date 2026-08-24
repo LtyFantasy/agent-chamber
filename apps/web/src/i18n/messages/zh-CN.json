@@ -706,7 +706,10 @@
       "contentLoadError": "文档内容加载失败",
       "contentLoadErrorDesc": "请检查网络后重试",
       "legend": "图例",
-      "browse": "文档目录"
+      "browse": "文档目录",
+      "viewModeTree": "目录",
+      "viewModeCategory": "分类",
+      "docMatches": "文档匹配"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",

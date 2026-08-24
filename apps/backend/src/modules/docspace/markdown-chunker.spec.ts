@@ -467,5 +467,104 @@ describe('markdown-chunker', () => {
         expect(result[1].headingPath).toBe('Real § Child');
       });
     });
+
+    // ─── headingText（债 A 独立列：取值规范 + 4 产出点）────────────
+
+    describe('headingText（本地标题独立列，headingPath 退化纯寻址）', () => {
+      it('无标题整篇（level-0）→ headingText=null（决策 #10：level-0 文首段为 NULL）', () => {
+        const result = chunkMarkdown('No headings at all.', 'My Doc');
+        expect(result).toHaveLength(1);
+        expect(result[0]).toMatchObject({ headingLevel: 0, headingText: null });
+      });
+
+      it('文首 level-0 段 → headingText=null；后续标题段 → 清洗后标题文本', () => {
+        const result = chunkMarkdown(
+          ['Intro paragraph.', '', '# Section 1', '', 'Body.'].join('\n'),
+          'My Doc',
+        );
+        expect(result).toHaveLength(2);
+        expect(result[0]).toMatchObject({ headingLevel: 0, headingText: null });
+        expect(result[1]).toMatchObject({ headingLevel: 1, headingText: 'Section 1' });
+      });
+
+      it('空正文标题（content=""）→ headingText 照常产出（往返保真不丢标题行）', () => {
+        const result = chunkMarkdown(['# A', 'a', '', '# B', '', '# C', 'c'].join('\n'), 'Doc');
+        expect(result).toHaveLength(3);
+        expect(result[1]).toMatchObject({
+          headingPath: 'B',
+          headingLevel: 1,
+          content: '',
+          headingText: 'B',
+        });
+      });
+
+      it('大段二次切分：续 chunk 与首 chunk 共享同一 headingText', () => {
+        const para = 'A'.repeat(800) + '\n';
+        let bigSection = '';
+        for (let i = 0; i < 6; i++) bigSection += para + '\n';
+        const result = chunkMarkdown('# Big\n' + bigSection, 'Doc');
+
+        expect(result.length).toBeGreaterThan(1);
+        for (const chunk of result) {
+          expect(chunk.headingText).toBe('Big');
+        }
+        // 共享 = 与 headingPath 同源派生（全链一致）
+        expect(result.every((c) => c.headingPath === 'Big')).toBe(true);
+      });
+
+      it('取值规范：去尾部闭合 # + trim（"## 标题 ## " → "标题"）', () => {
+        const result = chunkMarkdown('## 标题 ## \n\n正文。', 'Doc');
+        expect(result).toHaveLength(1);
+        expect(result[0].headingText).toBe('标题');
+        // headingPath 保持不变（寻址地址维度不受清洗影响）
+        expect(result[0].headingPath).toBe('标题 ##');
+      });
+
+      it('取值规范：保留行内 markdown 标记原样（**加粗**、反引号、链接）', () => {
+        const result = chunkMarkdown('## **加粗标题** 与 `code` 与 [链接](a.md)\n\n正文。', 'Doc');
+        expect(result[0].headingText).toBe('**加粗标题** 与 `code` 与 [链接](a.md)');
+      });
+
+      it('取值规范：标题正文中的裸 § 完整保留（不按分隔符拆分）', () => {
+        const result = chunkMarkdown('## 目标区间（以 `x.md` §3.2 为准）\n\n正文。', 'Doc');
+        expect(result[0].headingText).toBe('目标区间（以 `x.md` §3.2 为准）');
+      });
+
+      it("核心价值：标题正文含 ' § ' 时 headingText 保留完整本地标题（反解析会切错）", () => {
+        const result = chunkMarkdown(
+          ['# 父标题', '父正文。', '', '## A § B 子标题', '子正文。'].join('\n'),
+          'Doc',
+        );
+        expect(result).toHaveLength(2);
+        // headingPath 保留完整链（寻址地址）
+        expect(result[1].headingPath).toBe('父标题 § A § B 子标题');
+        // headingText 直读完整本地标题——extractLastHeadingSegment 对此路径会切错得 'B 子标题'
+        expect(result[1].headingText).toBe('A § B 子标题');
+      });
+
+      it('取值规范：中间 # 不误删（"A # B"），以 # 结尾的真实词不误删（"C#"）', () => {
+        const result = chunkMarkdown(
+          ['## A # B', 'body1', '', '## C# 教程', 'body2'].join('\n'),
+          'Doc',
+        );
+        expect(result[0].headingText).toBe('A # B');
+        expect(result[1].headingText).toBe('C# 教程');
+      });
+
+      it('取值规范：闭合 # 剥空后回退保留原文（"### #" 不丢标题行）', () => {
+        const result = chunkMarkdown(['### #', '', '## 下一节', '正文。'].join('\n'), 'Doc');
+        // 空标题行必须保真（headingText 非空串，渲染侧才能插回 "### #"）
+        expect(result[0].headingText).toBe('#');
+        expect(result[0].content).toBe('');
+      });
+
+      it('父子嵌套：各级 headingText 均为各自本地标题（不含祖先链）', () => {
+        const result = chunkMarkdown(
+          ['# L1', 'l1', '', '## L2', 'l2', '', '### L3', 'l3'].join('\n'),
+          'Doc',
+        );
+        expect(result.map((c) => c.headingText)).toEqual(['L1', 'L2', 'L3']);
+      });
+    });
   });
 });
