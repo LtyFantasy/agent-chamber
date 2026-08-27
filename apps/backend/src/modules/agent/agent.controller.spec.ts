@@ -32,6 +32,8 @@ describe('AgentController', () => {
     updateMe: jest.fn(),
     findMyTopics: jest.fn(),
     findMyActivities: jest.fn(),
+    findMyUnreadCounts: jest.fn(),
+    getDeletionImpact: jest.fn(),
   };
 
   const mockPermService = {
@@ -124,6 +126,36 @@ describe('AgentController', () => {
       expect(item.systemPrompt).toBeUndefined();
     });
 
+    it('should include descriptionSnippet in admin list response (regression: pickPublicAgentFields whitelist)', async () => {
+      // 模拟贴合真实 findAll 输出：service 已剥离 description，仅带 descriptionSnippet（agent.service.ts findAll）
+      const result = {
+        items: [
+          {
+            id: 'agent-1',
+            name: 'Test Agent',
+            status: 'active',
+            descriptionSnippet: 'A brief introduction of the agent...',
+            topicCount: 0,
+            messageCount: 0,
+          },
+        ],
+        total: 1,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      };
+      service.findAll.mockResolvedValue(result);
+
+      const res = await controller.findAll({}, { headers: {} }, mockActor);
+
+      const item = res.items[0] as Record<string, unknown>;
+      expect(item.descriptionSnippet).toBe('A brief introduction of the agent...');
+      // 完整 description 在 service 层已被剥离，controller 白名单不应凭空引入
+      expect(item.description).toBeUndefined();
+    });
+
     it('should return only own agents for non-admin user', async () => {
       const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
       const result = {
@@ -166,6 +198,38 @@ describe('AgentController', () => {
       expect(response).toEqual(result);
       expect(response.items).toHaveLength(1);
       expect(response.items[0].ownerId).toBe('user-2');
+    });
+
+    it('should include descriptionSnippet in non-admin own-agents list response', async () => {
+      const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
+      // 模拟贴合真实 findAll 输出：剥离 description、仅保留 descriptionSnippet
+      const result = {
+        items: [
+          {
+            id: 'agent-1',
+            name: 'My Agent',
+            status: 'active',
+            ownerId: 'user-2',
+            descriptionSnippet: 'Short introduction',
+            createdAt: new Date('2024-01-01'),
+            topicCount: 1,
+            messageCount: 10,
+          },
+        ],
+        total: 1,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      };
+      service.findAll.mockResolvedValue(result);
+
+      const response = await controller.findAll({ page: 1 }, { headers: {} }, nonAdminActor);
+
+      const item = response.items[0] as Record<string, unknown>;
+      expect(item.descriptionSnippet).toBe('Short introduction');
+      expect(item.description).toBeUndefined();
     });
 
     it('should return public fields and strip apiKeyPrefix for non-owned agents when admin', async () => {
@@ -395,6 +459,30 @@ describe('AgentController', () => {
     });
   });
 
+  describe('getDeletionImpact', () => {
+    it('should ensure DELETE-level permission then return impact counts (R13: caller is the deleter)', async () => {
+      const agent = { id: 'agent-1' };
+      const impact = { openTaskCount: 3, messageCount: 7, topicCount: 2, seatCount: 1 };
+      service.findOne.mockResolvedValue(agent);
+      service.getDeletionImpact.mockResolvedValue(impact);
+
+      expect(await controller.getDeletionImpact('agent-1', mockActor)).toEqual(impact);
+      // 与 DELETE 同权——'read' 会向只读协作者泄露聚合计数
+      expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'delete');
+      expect(service.getDeletionImpact).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('should not call service when agent not found (404 short-circuit)', async () => {
+      service.findOne.mockRejectedValue(new Error('AGENT_NOT_FOUND'));
+
+      await expect(controller.getDeletionImpact('missing', mockActor)).rejects.toThrow(
+        'AGENT_NOT_FOUND',
+      );
+      expect(permService.ensureCan).not.toHaveBeenCalled();
+      expect(service.getDeletionImpact).not.toHaveBeenCalled();
+    });
+  });
+
   describe('resetKey', () => {
     it('should ensure write permission then reset key', async () => {
       const agent = { id: 'agent-1' };
@@ -541,6 +629,16 @@ describe('AgentController', () => {
 
       expect(await controller.getMyActivities(mockAgentActor, {})).toBe(result);
       expect(service.findMyActivities).toHaveBeenCalledWith(mockAgentActor.id, {});
+    });
+  });
+
+  describe('getMyUnread', () => {
+    it('should call service.findMyUnreadCounts with agentId and return result', async () => {
+      const result = [{ topicId: 'topic-1', topicName: 'T1', unreadCount: 3 }];
+      service.findMyUnreadCounts.mockResolvedValue(result);
+
+      expect(await controller.getMyUnread(mockAgentActor)).toBe(result);
+      expect(service.findMyUnreadCounts).toHaveBeenCalledWith(mockAgentActor.id);
     });
   });
 });

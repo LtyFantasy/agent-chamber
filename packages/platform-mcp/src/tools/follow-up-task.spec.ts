@@ -136,4 +136,110 @@ describe('follow_up_task', () => {
       { docId: 'd1', path: 'docs/arch.md', title: '架构', summary: '摘要' },
     ]);
   });
+
+  it('评论 >500 字符 → 截断到 500 + contentTruncated', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(600);
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: longContent }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1' }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe('c'.repeat(500));
+    expect(body.recentComments[0].contentTruncated).toBe(true);
+  });
+
+  it('评论 ≤500 → 不截断无标记', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: 'short' }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1' }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe('short');
+    expect(body.recentComments[0].contentTruncated).toBeUndefined();
+  });
+
+  it('commentMaxLength=1000 → 按 1000 截断', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(1200);
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: longContent }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1', commentMaxLength: 1000 }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe('c'.repeat(1000));
+    expect(body.recentComments[0].contentTruncated).toBe(true);
+  });
+
+  it('commentMaxLength=0 → 全文不截断', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(600);
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: longContent }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1', commentMaxLength: 0 }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe(longContent);
+    expect(body.recentComments[0].contentTruncated).toBeUndefined();
+  });
+
+  it('commentMaxLength 非法（非数字）→ 回落默认 500', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(600);
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: longContent }]);
+
+    const result = await followUpTaskTool.handler(
+      { taskId: 't1', commentMaxLength: 'abc' as unknown as number },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe('c'.repeat(500));
+    expect(body.recentComments[0].contentTruncated).toBe(true);
+  });
+
+  it('commentMaxLength >50000 → 钳到 50000', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(60000);
+    request
+      .mockResolvedValueOnce({ id: 't1' })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: longContent }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1', commentMaxLength: 99999 }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recentComments[0].content).toBe('c'.repeat(50000));
+    expect(body.recentComments[0].contentTruncated).toBe(true);
+  });
+
+  it('task.description 全文不动（深入通道 by design）', async () => {
+    const request = mockRequest();
+    const longDesc = 'd'.repeat(2000);
+    request
+      .mockResolvedValueOnce({ id: 't1', description: longDesc })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'c1', content: 'short' }]);
+
+    const result = await followUpTaskTool.handler({ taskId: 't1' }, ctx());
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.task.description).toBe(longDesc);
+  });
 });

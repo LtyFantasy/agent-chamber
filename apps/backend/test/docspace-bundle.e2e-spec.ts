@@ -65,6 +65,7 @@ import { AuditLog } from '../src/database/entities/audit-log.entity';
 import type { EventService } from '../src/modules/event/event.service';
 import type { RouteHealthService } from '../src/modules/docspace/route-health.service';
 import type { AccessQueryService } from '../src/common/services/access-query.service';
+import { ActorProfileService } from '../src/common/services/actor-profile.service';
 import type { ResourceValidator } from '../src/common/resource-validator';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
@@ -157,6 +158,12 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
     } as unknown as RouteHealthService;
     const accessQueryStub = {} as unknown as AccessQueryService;
     const resourceValidatorStub = {} as unknown as ResourceValidator;
+    // 统一批 A1：DocSpaceService 构造新增 actorProfileService（真实例，成员 enrich 走公共解析）
+    const actorProfileService = new ActorProfileService(
+      ds.getRepository(Actor),
+      ds.getRepository(Agent),
+      ds.getRepository(User),
+    );
 
     docspaceService = new DocSpaceService(
       ds.getRepository(DocSpace),
@@ -174,6 +181,7 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       accessQueryStub,
       resourceValidatorStub,
       eventStub,
+      actorProfileService,
     );
     docService = new DocService(
       ds.getRepository(Doc),

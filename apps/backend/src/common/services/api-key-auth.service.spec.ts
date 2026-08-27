@@ -128,13 +128,14 @@ describe('ApiKeyAuthService', () => {
       });
     });
 
-    it('should reject when agent actor deleted with AGENT_NOT_FOUND', async () => {
+    it('should reject when agent actor is missing (soft-deleted row filtered by eager join) with AGENT_DISABLED', async () => {
+      // 统一批 A3-1b 死代码清理后：actor.deletedAt 是 select:false 列，正常查询恒 undefined，
+      // 软删 agent 的拦截语义由 status 兜底承担——eager LEFT JOIN 的 actor 行被软删过滤后
+      // agent.actor = null → actor.status !== ACTIVE → AGENT_DISABLED 拒绝。
       apiKeyRepo.findOne.mockResolvedValue(validApiKey());
-      agentRepo.findOne.mockResolvedValue(
-        makeAgent({ actor: { status: AgentStatus.ACTIVE, deletedAt: new Date() } }),
-      );
+      agentRepo.findOne.mockResolvedValue(makeAgent({ actor: null }));
       await expect(service.authenticate(VALID_KEY)).rejects.toMatchObject({
-        response: { message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND },
+        response: { message: 'Agent is not active', code: ErrorCode.AGENT_DISABLED },
       });
     });
 

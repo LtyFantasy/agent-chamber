@@ -9,11 +9,20 @@
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   A2.5: 写入口（inviteAgent/addEditor/create/update 的 invitedAgentIds）统一走
+ *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND）。
+ *       ⚠️ R11: update 的 invitedAgentIds 是完整替换语义，一刀切校验会让「存量含已删
+ *       agent 的话题」永远无法保存——只拦不在 participants 表的新增 id（含 left 状态
+ *       跳过）；uninvite 后 re-invite 已删 agent 漏检为声明边界。2026-08-26 统一批 A2.5。
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件所有 actor 投影（消息 sender/参与者）一律经 ActorProfileService.resolveProfiles
+ *       取 deletedAt/type/name，禁止散落 queryBuilder 或自建 actors 查询（收口见
+ *       common/services/actor-profile.service.ts，契约 docs/spec.md §1）。2026-08-26 统一批 A2。
  *   SYS-PARTICIPANT: findOneWithParticipants 把 system 哨兵（公告通道 sendSystemMessage 为
  *         私密桌 join 的 actor）当成员返回——参与者面板出现 "Agent · member" 且计数虚高。
  *         修复：resolveActorProfiles 后按 profile.type===SYSTEM 过滤，只动返回数组不动 DB 行
@@ -55,7 +64,7 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, DataSource } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
 import { Message } from '../../database/entities/message.entity';
@@ -92,6 +101,7 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 /**
  * sendMessage 自动 join 的原子条件 upsert（v1.40 joinedAt 语义修复）。
@@ -147,83 +157,30 @@ export class TopicService {
     private readonly resourceValidator: ResourceValidator,
     private readonly dataSource: DataSource,
     private readonly ownerProxy: OwnerProxyService,
+    private readonly actorProfileService: ActorProfileService,
   ) {}
 
   /**
    * 批量解析 Actor 类型
    * 业务表中的 *_type 列即将删除，加载实体时该字段为 undefined，
    * 需要通过 actors 表重新推导类型。
+   * 统一批 A1 收敛：委托 ActorProfileService.resolveProfiles 取 type（withDeleted 查询，
+   * 覆盖软删 actor——原 actorRepo.find 默认过滤软删，软删 actor 会漏判 fallback 到 HUMAN）。
    */
   private async resolveActorTypes(actorIds: string[]): Promise<Map<string, ActorType>> {
-    const uniqueIds = [...new Set(actorIds)].filter(Boolean);
-    if (uniqueIds.length === 0) return new Map();
-    const actors = await this.actorRepo.find({ where: { id: In(uniqueIds) } });
-    return new Map(actors.map((a) => [a.id, a.type]));
+    const profiles = await this.actorProfileService.resolveProfiles(actorIds);
+    return new Map([...profiles].map(([id, p]) => [id, p.type]));
   }
 
   /**
    * 批量聚合 Actor 公开信息（类型、显示名、头像、描述）
    * 用于参与者列表、消息发送者等场景的响应组装。
+   * 统一批 A1 收敛：委托 ActorProfileService（返回元素新增 deletedAt 信号；
+   * 软删 actor 解析出真名 + 真实 type，不再是 'System'/被过滤——契约变更见
+   * docs/spec.md §1；真孤儿不进 map，由调用方兜底）。
    */
-  private async resolveActorProfiles(actorIds: string[]): Promise<
-    Map<
-      string,
-      {
-        type: ActorType;
-        name: string;
-        avatarUrl: string | null;
-        description: string | null;
-      }
-    >
-  > {
-    const typeMap = await this.resolveActorTypes(actorIds);
-    const humanIds = actorIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
-    const agentIds = actorIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
-
-    const [humans, agents] = await Promise.all([
-      humanIds.length > 0
-        ? this.userRepo.findBy({ id: In(humanIds) })
-        : Promise.resolve([] as User[]),
-      agentIds.length > 0
-        ? this.agentRepo.findBy({ id: In(agentIds) })
-        : Promise.resolve([] as Agent[]),
-    ]);
-
-    const humanMap = new Map(humans.map((u) => [u.id, u]));
-    const agentMap = new Map(agents.map((a) => [a.id, a]));
-
-    const result = new Map<
-      string,
-      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
-    >();
-    for (const id of actorIds) {
-      const type = typeMap.get(id);
-      if (type === ActorType.HUMAN) {
-        const user = humanMap.get(id);
-        result.set(id, {
-          type,
-          name: user?.displayName || 'Unknown User',
-          avatarUrl: user?.avatarUrl ?? null,
-          description: null,
-        });
-      } else if (type === ActorType.AGENT) {
-        const agent = agentMap.get(id);
-        result.set(id, {
-          type,
-          name: agent?.name || 'Unknown Agent',
-          avatarUrl: agent?.avatarUrl ?? null,
-          description: agent?.description ?? null,
-        });
-      } else {
-        result.set(id, {
-          type: type ?? ActorType.SYSTEM,
-          name: 'System',
-          avatarUrl: null,
-          description: null,
-        });
-      }
-    }
-    return result;
+  private async resolveActorProfiles(actorIds: string[]): Promise<Map<string, ActorProfile>> {
+    return this.actorProfileService.resolveProfiles(actorIds);
   }
 
   /** 原始查询：按 ID 查找 Topic，不做权限检查 */
@@ -320,24 +277,30 @@ export class TopicService {
     // 过滤 system 哨兵参与者（公告通道实现细节，不是成员）：sendSystemMessage 为私密桌
     // 自动 join 的 system 哨兵（SYSTEM_ACTOR_ID，roundtable.service 播种）不应出现在参与者
     // 面板/计数里——RT-ROUTE 系列（失败回执/安全阀/审批公告）全部复用该通道，同源设计。
+    // 同时过滤真孤儿（R12：公共服务对 actors 表无行的 id 不进 map）——两种非成员
+    // （哨兵/孤儿）统一 `!profile || profile.type === SYSTEM` 挡在返回数组外。
     // 只过滤返回的 participants 数组：不动 DB 行（哨兵 join 是公告通道需要，保留）、
     // 不动 invitedAgentIds 派生（其按 topic.participants 原样派生，与 participants 无关）。
     const participants = activeParticipants
-      .filter((p) => profileMap.get(p.participantId)?.type !== ActorType.SYSTEM)
-      .map((p) => {
+      .filter((p) => {
         const profile = profileMap.get(p.participantId);
+        return profile !== undefined && profile.type !== ActorType.SYSTEM;
+      })
+      .map((p) => {
+        const profile = profileMap.get(p.participantId) as ActorProfile;
         return {
           participantId: p.participantId,
-          // 非 HUMAN 即 'agent'：SYSTEM 已在上方过滤，此分支不会有 system 漏网
-          // （resolveActorProfiles 对 actors 表缺失的行兜底归为 SYSTEM，同样被过滤）
+          // 非 HUMAN 即 'agent'：SYSTEM 与真孤儿已在上方过滤，此分支不会有漏网
           participantType:
-            profile?.type === ActorType.HUMAN ? ('human' as const) : ('agent' as const),
-          name: profile?.name || 'Unknown Actor',
-          avatarUrl: profile?.avatarUrl ?? null,
-          description: profile?.description ?? null,
+            profile.type === ActorType.HUMAN ? ('human' as const) : ('agent' as const),
+          name: profile.name,
+          avatarUrl: profile.avatarUrl ?? null,
+          description: profile.description ?? null,
           role: p.role,
           status: p.status as ParticipantStatus,
           joinedAt: p.joinedAt,
+          // 软删信号透传：非空 = 该参与者已删除，name 仍可显示（契约 docs/spec.md §1）
+          deletedAt: profile.deletedAt ? profile.deletedAt.toISOString() : null,
         };
       });
 
@@ -408,12 +371,11 @@ export class TopicService {
     const visibility = dto.visibility ?? dto.config?.visibility ?? Visibility.OPEN;
     const invitedAgentIds = dto.invitedAgentIds || dto.config?.invitedAgentIds || [];
 
-    // 批量校验 invitedAgentIds 中所有 Agent 真实存在，避免脏 settings（Phase 2）
+    // 批量校验 invitedAgentIds 中所有 Agent 存在且未软删（Phase 2 + 统一批 A2.5：
+    // create 一刀切校验全部 id——契约 docs/spec.md §1 规则 6：存量历史保留，新增引用禁止）
     if (invitedAgentIds.length > 0) {
-      await this.resourceValidator.existsMany(
-        this.agentRepo,
-        invitedAgentIds,
-        ErrorCode.AGENT_NOT_FOUND,
+      await Promise.all(
+        [...new Set(invitedAgentIds)].map((id) => this.actorProfileService.assertActorUsable(id)),
       );
     }
 
@@ -572,15 +534,6 @@ export class TopicService {
       throw new BadRequestException({ message: 'Topic is closed', code: ErrorCode.TOPIC_CLOSED });
     }
 
-    // 批量校验 invitedAgentIds 中所有 Agent 真实存在，避免脏 settings（Phase 2）
-    if (dto.invitedAgentIds !== undefined && dto.invitedAgentIds.length > 0) {
-      await this.resourceValidator.existsMany(
-        this.agentRepo,
-        dto.invitedAgentIds,
-        ErrorCode.AGENT_NOT_FOUND,
-      );
-    }
-
     // 处理 invitedAgentIds 更新：set invited set via participant table
     if (dto.invitedAgentIds !== undefined) {
       const newSet = new Set(dto.invitedAgentIds);
@@ -598,6 +551,15 @@ export class TopicService {
         select: ['participantId'],
       });
       const existingIds = new Set(existingRows.map((p) => p.participantId));
+
+      // 统一批 A2.5（R11）：update 是完整替换语义，只拦"新增" id——已在该 topic
+      // participants 表任何状态（含 left）的 id 跳过软删校验，否则存量含已删 agent
+      // 的话题永远无法保存（存量成员关系保留，契约 docs/spec.md §1 规则 5/6）。
+      // 边界声明：uninvite 后 re-invite 已删 agent 会漏过，可接受（plan R11）。
+      const newIds = [...newSet].filter((aid) => !existingIds.has(aid));
+      if (newIds.length > 0) {
+        await Promise.all(newIds.map((aid) => this.actorProfileService.assertActorUsable(aid)));
+      }
 
       // New IDs not in current: insert invited rows（有意不写 joinedAt，激活时才写入）
       const toAdd = [...newSet].filter((aid) => !currentSet.has(aid) && !existingIds.has(aid));
@@ -1227,19 +1189,15 @@ export class TopicService {
   /**
    * 构建 sendMessage 一致响应形状：解析 sender 名称/头像 + 统一字段映射。
    * 正常路径与幂等 replay 路径共用，保证响应契约一致。
+   * 统一批 A2：sender 解析改走公共 ActorProfileService（withDeleted 查询覆盖软删 actor，
+   * 顺带修复软删 agent 因 eager join 过滤而 senderAvatar 恒 null 的既有缺陷——R7 行为变更）。
    */
   private async buildMessageResponse(msg: Message, senderId: string, actorType: ActorType) {
-    let senderName = 'Unknown';
-    let senderAvatar: string | null = null;
-    if (actorType === ActorType.HUMAN) {
-      const user = await this.userRepo.findOne({ where: { id: senderId } });
-      senderName = user?.displayName || 'Unknown User';
-      senderAvatar = user?.avatarUrl || null;
-    } else {
-      const agent = await this.agentRepo.findOne({ where: { id: senderId } });
-      senderName = agent?.name || 'Unknown Agent';
-      senderAvatar = agent?.avatarUrl || null;
-    }
+    const profile = (await this.actorProfileService.resolveProfiles([senderId])).get(senderId);
+    // 真孤儿（actors 表无行）兜底：按 actorType 归位（契约：'Unknown' 仅留真孤儿）
+    const senderName =
+      profile?.name ?? (actorType === ActorType.HUMAN ? 'Unknown User' : 'Unknown Agent');
+    const senderAvatar = profile?.avatarUrl ?? null;
 
     // 圆桌座位标签：仅透传 metadata.seatLabel 单键（座位子身份展示语义，
     // 设计 docs/roundtable-design.md §6/§7），不透全量 metadata——隐私/体积。
@@ -1406,6 +1364,10 @@ export class TopicService {
         replyTo: msg.replyToId,
         type: msg.type,
         createdAt: msg.createdAt,
+        // 软删信号透传（统一批契约 docs/spec.md §1）：软删 agent 的消息解析出真名 +
+        // senderType='agent'（A1 前被 actors 查询软删过滤误归 'system'，行为变更）；
+        // 真孤儿（不进 map）保持 'System' 兜底
+        deletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
       };
     });
   }
@@ -1540,8 +1502,9 @@ export class TopicService {
     if (!topic)
       throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
 
-    // 校验 Agent 真实存在，避免邀请幽灵 Agent（Phase 2）
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（Phase 2 + 统一批 A2.5：新邀请指向已删 agent = 活配置
+    // 错误，统一 404 AGENT_NOT_FOUND——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     // 查找现有 participant 行
     const tp = await this.participantRepo.findOne({
@@ -1613,8 +1576,9 @@ export class TopicService {
     if (!topic)
       throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
 
-    // 校验 Agent 真实存在，避免提升幽灵 Agent
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（Phase 2 + 统一批 A2.5：提升已删 agent = 活配置错误，
+    // 统一 404 AGENT_NOT_FOUND——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     const tp = await this.participantRepo.findOne({
       where: { topicId: id, participantId: agentId },

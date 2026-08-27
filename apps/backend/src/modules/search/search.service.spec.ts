@@ -1,14 +1,16 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository, SelectQueryBuilder } from 'typeorm';
+import { Repository, SelectQueryBuilder, In } from 'typeorm';
 import { SearchService } from './search.service';
 import { Message } from '../../database/entities/message.entity';
 import { Task } from '../../database/entities/task.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
+import { Actor } from '../../database/entities/actor.entity';
 import { SearchQueryDto, SearchType } from './dto';
 import { ActorType, UserRole } from '@agent-chamber/shared';
 import { AccessQueryService } from '../../common/services/access-query.service';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import type { UnifiedActor } from '../../common/types/actor.types';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSearchService } from '../docspace/doc-search.service';
@@ -141,8 +143,10 @@ describe('SearchService', () => {
   let mockAgentRepo: jest.Mocked<Repository<Agent>>;
   let mockUserRepo: jest.Mocked<Repository<User>>;
   let mockDocRepo: jest.Mocked<Repository<Doc>>;
+  let mockActorRepo: jest.Mocked<Repository<Actor>>;
   let mockDocSearchService: jest.Mocked<DocSearchService>;
   let mockAccessQuery: jest.Mocked<AccessQueryService>;
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
   let messageQb: ReturnType<typeof createMockQueryBuilder>;
   let taskQb: ReturnType<typeof createMockQueryBuilder>;
   /** taskRepo.manager.createQueryBuilder() 用于 resolveBoardTopicIds */
@@ -166,6 +170,9 @@ describe('SearchService', () => {
     const docRepoPair = createMockRepo<Doc>();
     mockDocRepo = docRepoPair.mock;
 
+    const actorRepoPair = createMockRepo<Actor>();
+    mockActorRepo = actorRepoPair.mock;
+
     // DocSearchService 默认空命中：type=all 的既有用例（不关心 docs）不会因 docs 分支崩掉；
     // docs 专项用例在 setupDocSearchMock 中覆盖默认值
     mockDocSearchService = {
@@ -185,6 +192,65 @@ describe('SearchService', () => {
     // 让 taskRepo.manager.createQueryBuilder() 不带参数时也使用该 qb
     (mockTaskRepo.manager.createQueryBuilder as jest.Mock).mockReturnValue(boardTopicQb);
 
+    // 统一批 A2：发送者解析委托 ActorProfileService。mock 默认实现以 actorRepo.find 返回
+    // 的 actors 行为准（deletedAt 透传）——默认 find 为空 → 真孤儿不进 map → 调用方
+    // 以 'System'/'system' 兜底（对齐公共服务 R12 语义）。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        const typeRows = await mockActorRepo.find({} as any);
+        const typeMap = new Map(typeRows.map((a) => [a.id, a.type]));
+        const actorRowMap = new Map(typeRows.map((a) => [a.id, a]));
+        const humanIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+        const agentIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+        const [humans, agents] = await Promise.all([
+          humanIds.length > 0
+            ? mockUserRepo.findBy({ id: In(humanIds) } as any)
+            : Promise.resolve([] as User[]),
+          agentIds.length > 0
+            ? mockAgentRepo.findBy({ id: In(agentIds) } as any)
+            : Promise.resolve([] as Agent[]),
+        ]);
+        const humanMap = new Map(humans.map((u) => [u.id, u]));
+        const agentMap = new Map(agents.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const type = typeMap.get(id);
+          const deletedAt = actorRowMap.get(id)?.deletedAt ?? null;
+          if (type === ActorType.HUMAN) {
+            const u = humanMap.get(id);
+            map.set(id, {
+              type,
+              name: u?.displayName || u?.username || 'Unknown User',
+              avatarUrl: u?.avatarUrl ?? null,
+              description: null,
+              deletedAt,
+            });
+          } else if (type === ActorType.AGENT) {
+            const a = agentMap.get(id);
+            map.set(id, {
+              type,
+              name: a?.name || 'Unknown Agent',
+              avatarUrl: a?.avatarUrl ?? null,
+              description: a?.description ?? null,
+              deletedAt,
+            });
+          } else if (type) {
+            map.set(id, {
+              type,
+              name: 'System',
+              avatarUrl: null,
+              description: null,
+              deletedAt,
+            });
+          }
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
+    };
+
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         SearchService,
@@ -193,12 +259,16 @@ describe('SearchService', () => {
         { provide: getRepositoryToken(Agent), useValue: mockAgentRepo },
         { provide: getRepositoryToken(User), useValue: mockUserRepo },
         { provide: getRepositoryToken(Doc), useValue: mockDocRepo },
+        { provide: getRepositoryToken(Actor), useValue: mockActorRepo },
         { provide: DocSearchService, useValue: mockDocSearchService },
         { provide: AccessQueryService, useValue: mockAccessQuery },
+        { provide: ActorProfileService, useValue: mockActorProfileService },
       ],
     }).compile();
 
     service = moduleRef.get<SearchService>(SearchService);
+    // 默认无 actors 行（真孤儿 → 'System' 兜底）；软删/有主用例用 mockResolvedValueOnce 覆盖
+    mockActorRepo.find.mockResolvedValue([]);
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -286,6 +356,7 @@ describe('SearchService', () => {
       'senderId',
       'senderType',
       'senderName',
+      'senderDeletedAt',
       'type',
       'createdAt',
       'contentSnippet',
@@ -333,7 +404,10 @@ describe('SearchService', () => {
       const messages = [makeMsg({ id: 'msg-1', content: 'hello world', senderId: 'sender-1' })];
       const tasks = [makeTask({ id: 'task-1', title: 'hello task' })];
 
-      // sender resolution
+      // sender resolution（统一批 A2：公共解析经 actorRepo.find 驱动）
+      mockActorRepo.find.mockResolvedValueOnce([
+        { id: 'sender-1', type: ActorType.HUMAN } as Actor,
+      ]);
       mockAgentRepo.findBy.mockResolvedValue([]);
       mockUserRepo.findBy.mockResolvedValue([
         { id: 'sender-1', displayName: 'Test User', username: 'test' } as any,
@@ -412,6 +486,9 @@ describe('SearchService', () => {
     it('should return only messages and null tasks', async () => {
       const messages = [makeMsg({ id: 'msg-1', content: 'hello', senderId: 'sender-1' })];
 
+      mockActorRepo.find.mockResolvedValueOnce([
+        { id: 'sender-1', type: ActorType.AGENT } as Actor,
+      ]);
       mockAgentRepo.findBy.mockResolvedValue([{ id: 'sender-1', name: 'TestAgent' } as any]);
       mockUserRepo.findBy.mockResolvedValue([]);
 
@@ -465,6 +542,32 @@ describe('SearchService', () => {
 
       expect(result.messages!.items[0].senderName).toBe('System');
       expect(result.messages!.items[0].senderType).toBe('system');
+      // 真孤儿 senderDeletedAt 兜底 null（契约：'System' 仅留真孤儿）
+      expect(result.messages!.items[0].senderDeletedAt).toBeNull();
+    });
+
+    it('软删 agent 发送者：真名保留 + senderDeletedAt 非空（统一批契约，原归 System 行为变更）', async () => {
+      const messages = [makeMsg({ id: 'msg-1', content: 'hello', senderId: 'sender-1' })];
+
+      // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'sender-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+      mockAgentRepo.findBy.mockResolvedValue([{ id: 'sender-1', name: 'TestAgent' } as any]);
+      mockUserRepo.findBy.mockResolvedValue([]);
+
+      setupMessageSearchMock(['topic-1'], messages, 1, new Map([['msg-1', '<<<hello>>>']]));
+
+      const dto: SearchQueryDto = { q: 'hello', type: SearchType.MESSAGES, page: 1, pageSize: 20 };
+      const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
+
+      expect(result.messages!.items[0].senderName).toBe('TestAgent');
+      expect(result.messages!.items[0].senderType).toBe('agent');
+      expect(result.messages!.items[0].senderDeletedAt).toBe('2024-06-01T00:00:00.000Z');
     });
   });
 

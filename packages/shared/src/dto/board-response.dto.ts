@@ -14,6 +14,8 @@ export interface BoardMember {
   type: 'human' | 'agent';
   /** 头像 URL */
   avatarUrl?: string | null;
+  /** 软删时间；非空 = 该成员已删除，name 仍可显示（历史归因保留） */
+  deletedAt?: string | null;
   /** 成员角色：editor 可编辑看板内容，member 只读 */
   role: BoardMemberRole;
   /** 邀请者 Actor ID（可空） */
@@ -208,6 +210,8 @@ export interface BoardDigestRisk {
   labels: string[] | null;
   /** 负责人显示名（未分配为 null） */
   assigneeName: string | null;
+  /** 软删时间；非空 = 该 assignee 已删除，assigneeName 仍可显示（历史归因保留） */
+  assigneeDeletedAt?: string | null;
 }
 
 /**
@@ -224,6 +228,8 @@ export interface BoardDigestOpenTask {
   status: TaskStatus;
   /** 负责人显示名（未分配为 null） */
   assigneeName: string | null;
+  /** 软删时间；非空 = 该 assignee 已删除，assigneeName 仍可显示（历史归因保留） */
+  assigneeDeletedAt?: string | null;
 }
 
 /**
@@ -238,6 +244,8 @@ export interface BoardDigestDoneTask {
   completedAt: string | Date;
   /** 负责人显示名（未分配为 null） */
   assigneeName: string | null;
+  /** 软删时间；非空 = 该 assignee 已删除，assigneeName 仍可显示（历史归因保留） */
+  assigneeDeletedAt?: string | null;
 }
 
 /**

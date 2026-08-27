@@ -6,11 +6,22 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.1-§4.3 (W2 空间/分类/成员 API)
 
- * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误) B52(creator缺成员行)
+ * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误) B52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create补齐)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   A2.5b: 拦截只针对"新增引用"——uninviteAgent/removeEditor 回退
+ *       resourceValidator.exists（软删 agent 的 agents 行永在，移除=清理动作必须可用，
+ *       否则已删成员行永远无法清理）；create invitedAgentIds 补齐 assertActorUsable
+ *       （一刀切，与 topic create 对齐）。2026-08-26 统一批 A2.5b 修正。
+ *   A2.5: 新增类写入口（inviteAgent/addEditor + create invitedAgentIds）走
+ *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND——
+ *       契约 docs/spec.md §1 规则 6）。2026-08-26 统一批 A2.5。
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件所有 actor 投影（enrichMembers）一律经 ActorProfileService.resolveProfiles
+ *       取 deletedAt/type/name，禁止散落 queryBuilder 或自建 actors 查询（收口见
+ *       common/services/actor-profile.service.ts，契约 docs/spec.md §1）。2026-08-26 统一批 A2。
  *   B52: create() 历史上只给 invitedAgentIds 写成员行，creator 不落表——成员列表缺席
  *      + 按成员表算可见性的查询路径对 creator 不命中（4b1ddd1c）。修复：creator 落
  *      role='editor' 且 invitedBy=null 行，invited 列表过滤 creator 防 PK 冲突；
@@ -52,6 +63,7 @@ import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
 import { Visibility, ErrorCode, ActorType, EventType } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import type {
   DocSpaceSummary,
   DocSpaceDetail,
@@ -59,10 +71,13 @@ import type {
   DocCategoryDto,
   DocSummary,
   DocSummarySlim,
+  DocSummaryCatalog,
   DocSpaceOverview,
   DocSpaceOverviewSlim,
+  DocSpaceOverviewCatalog,
   DocCategoryOverview,
   DocCategoryOverviewSlim,
+  DocCategoryOverviewCatalog,
   DocRouteNav,
   DocSpaceOverviewFilter,
   DocSpaceOverviewAppliedFilters,
@@ -131,14 +146,36 @@ function brokenRouteCountOf(route: DocRoute): number | undefined {
 }
 
 /**
- * Overview 文档条目投影（v1.56 slim）：
- * - slim=true → 只保留地图导航字段 {path,title,summary,docType,tokenEstimate}
- *   （大空间瘦身，摘要是条目 token 大头；其余元数据走 read_doc/list_docs 全字段通道）
- * - slim=false（缺省）→ 全字段 DocSummary（向后兼容，行为不变）
+ * Overview 文档条目投影模式（v1.66 三态）：
+ * - 'full' → 全字段 DocSummary（缺省，向后兼容）
+ * - 'slim' → 导航五键 {path,title,summary,docType,tokenEstimate}（v1.56 大空间瘦身）
+ * - 'catalog' → 目录三键 {path,title,tokenEstimate}（v1.66 冷启动完整目录感知，
+ *   category 由分组结构承载；截断豁免在 getOverview 内处理，本函数只管条目形状）
  * category 分组结构由调用方保持，本函数只管条目形状。
  */
-function toOverviewDocItem(doc: Doc, slim: boolean): DocSummary | DocSummarySlim {
-  if (slim) {
+type OverviewDocMode = 'full' | 'slim' | 'catalog';
+
+/**
+ * Overview 文档条目投影：
+ * - 'slim' → 只保留地图导航字段 {path,title,summary,docType,tokenEstimate}
+ *   （大空间瘦身，摘要是条目 token 大头；其余元数据走 read_doc/list_docs 全字段通道）
+ * - 'catalog' → 只保留目录三键 {path,title,tokenEstimate}（比 slim 更瘦——
+ *   summary/docType 也省略；tokenEstimate 是消费方决定要不要 read_doc 读全文的
+ *   唯一预算依据，R3 保留）
+ * - 'full'（缺省）→ 全字段 DocSummary（向后兼容，行为不变）
+ */
+function toOverviewDocItem(
+  doc: Doc,
+  mode: OverviewDocMode,
+): DocSummary | DocSummarySlim | DocSummaryCatalog {
+  if (mode === 'catalog') {
+    return {
+      path: doc.path,
+      title: doc.title,
+      tokenEstimate: doc.tokenEstimate,
+    };
+  }
+  if (mode === 'slim') {
     return {
       path: doc.path,
       title: doc.title,
@@ -344,72 +381,19 @@ export class DocSpaceService {
     private readonly accessQuery: AccessQueryService,
     private readonly resourceValidator: ResourceValidator,
     private readonly eventService: EventService,
+    private readonly actorProfileService: ActorProfileService,
   ) {}
 
   // ─── Actor helpers ──────────────────────────────────────────
 
   /**
-   * Batch resolve actor types from the actors table.
+   * Batch resolve actor public profiles (type, name, avatar, description, deletedAt).
+   * 统一批 A1 收敛：委托 ActorProfileService（返回元素新增 deletedAt 信号；
+   * 软删 actor 解析出真名 + 真实 type，不再是 'Unknown'/被过滤——契约变更见
+   * docs/spec.md §1；真孤儿不进 map，由调用方兜底）。
    */
-  private async resolveActorTypes(actorIds: string[]): Promise<Map<string, ActorType>> {
-    const uniqueIds = [...new Set(actorIds)].filter(Boolean);
-    if (uniqueIds.length === 0) return new Map();
-    const actors = await this.actorRepo.find({ where: { id: In(uniqueIds) } });
-    return new Map(actors.map((a) => [a.id, a.type]));
-  }
-
-  /**
-   * Batch resolve actor public profiles (type, name, avatar).
-   */
-  private async resolveActorProfiles(
-    actorIds: string[],
-  ): Promise<
-    Map<
-      string,
-      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
-    >
-  > {
-    const typeMap = await this.resolveActorTypes(actorIds);
-    const humanIds = actorIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
-    const agentIds = actorIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
-
-    const [humans, agents] = await Promise.all([
-      humanIds.length > 0
-        ? this.userRepo.find({ where: { id: In(humanIds) }, relations: { actor: true } })
-        : Promise.resolve([] as User[]),
-      agentIds.length > 0
-        ? this.agentRepo.find({ where: { id: In(agentIds) }, relations: { actor: true } })
-        : Promise.resolve([] as Agent[]),
-    ]);
-
-    const humanMap = new Map(humans.map((u) => [u.id, u]));
-    const agentMap = new Map(agents.map((a) => [a.id, a]));
-
-    const result = new Map<
-      string,
-      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
-    >();
-    for (const id of actorIds) {
-      const type = typeMap.get(id);
-      if (type === ActorType.HUMAN) {
-        const user = humanMap.get(id);
-        result.set(id, {
-          type,
-          name: user?.displayName || user?.username || 'Unknown User',
-          avatarUrl: user?.avatarUrl ?? null,
-          description: null,
-        });
-      } else if (type === ActorType.AGENT) {
-        const agent = agentMap.get(id);
-        result.set(id, {
-          type,
-          name: agent?.name || 'Unknown Agent',
-          avatarUrl: agent?.avatarUrl ?? null,
-          description: agent?.description ?? null,
-        });
-      }
-    }
-    return result;
+  private async resolveActorProfiles(actorIds: string[]): Promise<Map<string, ActorProfile>> {
+    return this.actorProfileService.resolveProfiles(actorIds);
   }
 
   // ─── Slug generation ────────────────────────────────────────
@@ -518,8 +502,11 @@ export class DocSpaceService {
       const profile = profileMap.get(m.actorId);
       return {
         actorId: m.actorId,
+        // 'Unknown' 兜底仅留真孤儿（actors 表无行，公共服务不进 map——R12）
         actorName: profile?.name || 'Unknown',
         actorType: (profile?.type === ActorType.HUMAN ? 'human' : 'agent') as 'human' | 'agent',
+        // 软删信号透传：非空 = 该成员已删除，actorName 仍可显示（契约 docs/spec.md §1）
+        deletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
         role: m.role,
         invitedBy: m.invitedBy,
         createdAt: m.createdAt,
@@ -702,13 +689,12 @@ export class DocSpaceService {
       await this.ensureBoardExists(dto.boardId);
     }
 
-    // Validate invited agents exist
+    // 批量校验 invitedAgentIds 中所有 Agent 存在且未软删（统一批 A2.5b：create 一刀切校验
+    // 全部 id——新增引用禁止指向已删 actor，契约 docs/spec.md §1 规则 6；与 topic create 对齐）
     const invitedAgentIds = dto.invitedAgentIds || [];
     if (invitedAgentIds.length > 0) {
-      await this.resourceValidator.existsMany(
-        this.agentRepo,
-        invitedAgentIds,
-        ErrorCode.AGENT_NOT_FOUND,
+      await Promise.all(
+        [...new Set(invitedAgentIds)].map((id) => this.actorProfileService.assertActorUsable(id)),
       );
     }
 
@@ -935,7 +921,8 @@ export class DocSpaceService {
   async inviteAgent(spaceId: string, agentId: string): Promise<DocSpace> {
     const space = await this.findById(spaceId);
 
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（统一批 A2.5：写入口统一拒绝已删 actor——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     const existing = await this.memberRepo.findOne({
       where: { spaceId, actorId: agentId },
@@ -970,6 +957,8 @@ export class DocSpaceService {
       });
     }
 
+    // 校验 Agent 真实存在（A2.5b：移除类入口不拦软删——软删 agent 的 agents 行永在，移除是
+    // 清理动作必须可用，否则已删成员行永远无法清理；完全不存在仍 404。拦截只针对新增引用）
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     const existing = await this.memberRepo.findOne({
@@ -997,7 +986,8 @@ export class DocSpaceService {
   async addEditor(spaceId: string, agentId: string): Promise<DocSpace> {
     const space = await this.findById(spaceId);
 
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（统一批 A2.5：写入口统一拒绝已删 actor——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     const existing = await this.memberRepo.findOne({
       where: { spaceId, actorId: agentId },
@@ -1041,6 +1031,8 @@ export class DocSpaceService {
       });
     }
 
+    // 校验 Agent 真实存在（A2.5b：移除类入口不拦软删——软删 agent 的 agents 行永在，降级是
+    // 清理动作必须可用，否则已删成员行永远无法清理；完全不存在仍 404。拦截只针对新增引用）
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     const existing = await this.memberRepo.findOne({
@@ -1209,11 +1201,18 @@ export class DocSpaceService {
    * {path,title,summary,docType,tokenEstimate}（category 分组结构不变，返回
    * DocSpaceOverviewSlim 形状）；routes 内嵌段恒为导航投影（toDocRouteNav，默认行为
    * 变更，全字段走 list_doc_routes）。缺省 slim=false 全字段不变（向后兼容）。
+   *
+   * v1.66 catalog 目录模式：catalog=true 时每条 doc 只返回目录三键
+   * {path,title,tokenEstimate}（返回 DocSpaceOverviewCatalog 形状，比 slim 更瘦）；
+   * **豁免 maxTokens 对 doc 条目的截断**——目录完整性是该模式的契约
+   * （docsReturned === docsTotal 恒成立，truncated 恒 false；legend/routes 段
+   * 行为不变）；与现有过滤器正交组合（先过滤 → 再投影 → 不截断）；
+   * 与 slim 同给时 catalog 胜出（更强投影）。缺省不传行为完全不变。
    */
   async getOverview(
     spaceId: string,
     query?: DocOverviewQueryDto,
-  ): Promise<DocSpaceOverview | DocSpaceOverviewSlim> {
+  ): Promise<DocSpaceOverview | DocSpaceOverviewSlim | DocSpaceOverviewCatalog> {
     const space = await this.findById(spaceId);
 
     const filters = resolveOverviewFilters(space, query);
@@ -1221,10 +1220,15 @@ export class DocSpaceService {
     const maxTokens = filters.maxTokens;
     // slim 投影（v1.56）：显式 'true' 才生效，缺省/‘false’ = 全字段（向后兼容）
     const slim = query?.slim === true;
+    // catalog 目录模式（v1.66）：显式 'true' 才生效；与 slim 同给时 catalog 胜出（更强投影）
+    const catalog = query?.catalog === true;
     // 缺省内嵌图例（v1.41）：显式 false 才省略（对齐 applySpaceDefaults 的"缺省 true"语义）
     const includeDescription = query?.includeDescription !== false;
     // 缺省内嵌意图路由（v1.42 B5）：显式 false 才省略（与 includeDescription 同惯例）
     const includeRoutes = query?.includeRoutes !== false;
+    // 投影模式三态：catalog 优先于 slim（更强投影）；截断豁免随 catalog（目录完整性契约）
+    const mode: OverviewDocMode = catalog ? 'catalog' : slim ? 'slim' : 'full';
+    const skipTruncation = catalog;
 
     // Load non-deleted categories sorted by sortOrder
     // Note: deletedAt has select:false, so we use a raw query or QB
@@ -1285,7 +1289,11 @@ export class DocSpaceService {
     let totalTokenEstimate = 0;
     let truncated = false;
 
-    const categoryOverviews: (DocCategoryOverview | DocCategoryOverviewSlim)[] = [];
+    const categoryOverviews: (
+      | DocCategoryOverview
+      | DocCategoryOverviewSlim
+      | DocCategoryOverviewCatalog
+    )[] = [];
 
     // 分类输出：白名单命中分类保留（未命中整体省略）；黑名单命中分类整体隐藏（含其文档）。
     // 两维度对称——include 保留命中分类，exclude 剔除命中分类
@@ -1293,15 +1301,16 @@ export class DocSpaceService {
       if (whiteCategoryIds && !whiteCategoryIds.has(cat.id)) continue;
       if (blackCategoryIds && blackCategoryIds.has(cat.id)) continue;
       const catDocs = docMap.get(cat.id) || [];
-      // 条目形状随 slim 参数（slim=true → DocSummarySlim，缺省 → DocSummary 全字段）
-      const docItems: (DocSummary | DocSummarySlim)[] = [];
+      // 条目形状随投影模式（catalog/slim → 瘦身投影，缺省 → DocSummary 全字段）；
+      // catalog 模式豁免 maxTokens 截断（目录完整性契约，R3）
+      const docItems: (DocSummary | DocSummarySlim | DocSummaryCatalog)[] = [];
       for (const doc of catDocs) {
-        if (totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
+        if (!skipTruncation && totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
           truncated = true;
           break;
         }
         totalTokenEstimate += overviewEntryTokens(doc);
-        docItems.push(toOverviewDocItem(doc, slim));
+        docItems.push(toOverviewDocItem(doc, mode));
       }
       if (truncated) break;
 
@@ -1319,16 +1328,16 @@ export class DocSpaceService {
     }
 
     // Uncategorized docs（传 category 白名单时省略该段——未分类文档不属于任何被选分类）
-    const uncategorized: (DocSummary | DocSummarySlim)[] = [];
+    const uncategorized: (DocSummary | DocSummarySlim | DocSummaryCatalog)[] = [];
     if (!categories) {
       const uncategorizedDocs = docMap.get(null) || [];
       for (const doc of uncategorizedDocs) {
-        if (totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
+        if (!skipTruncation && totalTokenEstimate + overviewEntryTokens(doc) > maxTokens) {
           truncated = true;
           break;
         }
         totalTokenEstimate += overviewEntryTokens(doc);
-        uncategorized.push(toOverviewDocItem(doc, slim));
+        uncategorized.push(toOverviewDocItem(doc, mode));
       }
     }
 
@@ -1423,8 +1432,9 @@ export class DocSpaceService {
       ...(Object.keys(filters.appliedFilters).length > 0
         ? { appliedFilters: filters.appliedFilters }
         : {}),
-      // 条目形状由 slim 参数决定且同一响应内一致（categories/uncategorized 同为 slim 或同为全字段），
-      // 内部以联合类型装配避免双分支重复代码，此处收窄到联合返回类型
-    } as DocSpaceOverview | DocSpaceOverviewSlim;
+      // 条目形状由投影模式（catalog/slim/缺省全字段）决定且同一响应内一致
+      // （categories/uncategorized 同为同一种投影），内部以联合类型装配避免双分支重复代码，
+      // 此处收窄到联合返回类型
+    } as DocSpaceOverview | DocSpaceOverviewSlim | DocSpaceOverviewCatalog;
   }
 }

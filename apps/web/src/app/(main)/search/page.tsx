@@ -258,7 +258,18 @@ export default function SearchPage() {
               <MessageSquare className="h-4 w-4 text-primary" />
             </div>
             <div>
-              <span className="text-sm font-medium">{message.senderName}</span>
+              {/* 已删除降级（统一批 B）：灰化 + 「已删除」badge——独立结果列表密度低，
+                  常驻 badge 可接受（R16 分级） */}
+              <span
+                className={`text-sm font-medium ${message.senderDeletedAt ? 'opacity-60' : ''}`}
+              >
+                {message.senderName}
+              </span>
+              {message.senderDeletedAt && (
+                <Badge variant="secondary" className="ml-2 text-[10px]">
+                  {tGlobal('common.deleted')}
+                </Badge>
+              )}
               <span className="ml-2 text-xs text-muted-foreground">
                 {message.senderType === 'human'
                   ? t('sender.human')

@@ -232,6 +232,13 @@ export interface QueryTaskInput {
   limit?: number;
   /** 仅返回无阻塞的任务 */
   unblocked?: boolean;
+  /**
+   * 排序方式（opt-in，默认 createdAt 不变）：
+   * - createdAt：创建时间倒序（默认，web 看板分页依赖）
+   * - statusPriority：状态优先级 in_progress > todo > blocked > backlog > 其余
+   *   （review/done/archived 恒末位），次键 updatedAt DESC，第三键 id ASC 兜底稳定分页
+   */
+  sort?: 'createdAt' | 'statusPriority';
 }
 
 /**

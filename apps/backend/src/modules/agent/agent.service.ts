@@ -6,11 +6,18 @@
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/api-definition.md §5. Agents
  *
- * [踩坑索引] B-46(PATCH清空字段) B-47(topics返回null) D-3(controller预存失败)
+ * [踩坑索引] B-46(PATCH清空字段) B-47(topics返回null) D-3(controller预存失败) A3-1(remove事务吊销Key) A3-2(seatCount须jsonb路径)
  *
- * [铁律关联] #11(代理层透传) #12(文档联动)
+ * [铁律关联] #11(代理层透传) #12(文档联动) #23(jsonb查询集成覆盖)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   A3-1: remove() 若先软删后吊销 Key，revoke 失败会留下"agent 已删但 Key 仍活跃"的
+ *         半完成态。修复：事务包裹（先批量 revoke 后软删），revoke 失败整体回滚，
+ *         agent 未删可恢复。revokedReason='agent deleted' 为本次新增（resetKey 先例未设）。
+ *         见 plans/rictor-swamp-thing-hulkling.md R15
+ *   A3-2: deletion-impact 的 seatCount 必须 queryBuilder `config->>'bindActorId' = :id`
+ *         写法——findOne/find 嵌套 jsonb 对象条件生成整列等值（永不命中，RT-SEAT-1 同类），
+ *         mock 单测测不出 SQL 生成，需配打真实 PG 的 e2e。见 plans/rictor-swamp-thing-hulkling.md R13
  *   B-46: PATCH /agents/me 只传 description 时 name 被清空为 null。
  *         根因：Object.assign(agent, dto) 将 undefined 属性覆盖为 null。
  *         修复：显式字段判断 + 修复字段映射(config→modelConfig, avatar→avatarUrl)。
@@ -33,8 +40,14 @@ import * as crypto from 'crypto';
 import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import { AgentStatus, ErrorCode, ActorType } from '@agent-chamber/shared';
-import type { PaginatedResponse, Agent as AgentDto } from '@agent-chamber/shared';
+import type {
+  PaginatedResponse,
+  Agent as AgentDto,
+  AgentDeletionImpact,
+  TopicUnreadCount,
+} from '@agent-chamber/shared';
 import { CreateAgentDto, UpdateAgentDto, AgentHeartbeatDto, CreateAgentKeyDto } from './dto';
 
 @Injectable()
@@ -44,6 +57,8 @@ export class AgentService {
     private agentRepo: Repository<Agent>,
     @InjectRepository(ApiKey)
     private apiKeyRepo: Repository<ApiKey>,
+    @InjectRepository(RoundtableSeat)
+    private seatRepo: Repository<RoundtableSeat>,
   ) {}
 
   async findAll(query: {
@@ -307,6 +322,41 @@ export class AgentService {
     return all.slice(0, take);
   }
 
+  /**
+   * 跨 topic 未读消息计数（GET /agents/me/unread，plan forge-jubilee-robin.md WS-B）。
+   *
+   * 语义与 TopicService.getUnread（topic.service.ts:1241-1309）逐条对齐：
+   * - 无游标（last_read_message_id IS NULL）→ 该 topic 全量未删消息计数；
+   * - 游标消息已软删 → 锚点 join 落空（a.deleted_at IS NULL）→ 降级全量；
+   * - 自己发的消息计入（无 sender 过滤，与 getUnread 同语义）；
+   * - 仅统计 status IN ('invited','active') 的参与行（left 排除，me/topics 同口径）；
+   * - 已软删 topic 排除；只返回 unreadCount > 0 的 topic，最多 50 条
+   *   （按未读数 DESC、updated_at DESC 排序，截断安全）。
+   *
+   * 为什么裸 SQL：跨 topic 聚合 + 行值比较 (created_at, id) 一条 SQL 精确复刻
+   * getUnread 语义，避免 N+1 逐 topic 查询；行值比较在 DB 内做（微秒精度，
+   * 避免 JS Date 毫秒截断误算锚点自身，同 getUnread :1287 注释）。
+   *
+   * @param actorId 当前 actor id
+   * @returns TopicUnreadCount[]（无参与/全已读 → 空数组）
+   */
+  async findMyUnreadCounts(actorId: string): Promise<TopicUnreadCount[]> {
+    return this.agentRepo.manager.query(
+      `SELECT t.id AS "topicId", t.title AS "topicName", COUNT(m.id)::int AS "unreadCount"
+       FROM topic_participants tp
+       JOIN topics t ON t.id = tp.topic_id AND t.deleted_at IS NULL
+       LEFT JOIN messages a ON a.id = tp.last_read_message_id AND a.deleted_at IS NULL
+       LEFT JOIN messages m ON m.topic_id = tp.topic_id AND m.deleted_at IS NULL
+         AND (a.id IS NULL OR (m.created_at, m.id) > (a.created_at, a.id))
+       WHERE tp.participant_id = $1 AND tp.status IN ('invited','active')
+       GROUP BY t.id, t.title
+       HAVING COUNT(m.id) > 0
+       ORDER BY "unreadCount" DESC, t.updated_at DESC
+       LIMIT 50`,
+      [actorId],
+    ) as Promise<TopicUnreadCount[]>;
+  }
+
   async create(ownerId: string, dto: CreateAgentDto) {
     const actor = new Actor();
     actor.type = ActorType.AGENT;
@@ -364,12 +414,89 @@ export class AgentService {
     return { ...saved };
   }
 
+  /**
+   * 删除 Agent（软删 + 事务化吊销 API Key，统一批 A3-1，R15）
+   *
+   * 事务包裹两步，顺序**先 revoke 后软删**（revoke 失败时 agent 未删可恢复；
+   * 反序会留下"agent 已删但 Key 仍活跃"的半完成态）：
+   *   1. 批量吊销全部未吊销 Key（set revokedAt + revokedReason，对齐 resetKey 写法，
+   *      revokedReason 为本次新增——api_keys.revoked_reason 列早存在，resetKey 先例未设）；
+   *   2. 软删：agent.deletedAt setter 转发 actor，save 级联写 actors 表。
+   * revoke 失败 → 事务回滚，软删不发生。
+   *
+   * @param id agent id
+   * @returns true
+   * @throws NotFoundException agent 不存在或已软删（findOne 前置判空，事务外）
+   */
   async remove(id: string) {
     const agent = await this.findOne(id);
-    // 软删除标记在 actor 表上（agents 已不再持有 deleted_at）
-    agent.deletedAt = new Date();
-    await this.agentRepo.save(agent);
+    await this.agentRepo.manager.transaction(async (manager) => {
+      // 1. 批量吊销：先 revoke 后软删（R15），revokedReason 便于审计回溯删除动作
+      const now = new Date();
+      await manager
+        .createQueryBuilder()
+        .update(ApiKey)
+        .set({ revokedAt: now, revokedReason: 'agent deleted' })
+        .where('agent_id = :id AND revoked_at IS NULL', { id })
+        .execute();
+      // 2. 软删标记在 actor 表上（agents 已不再持有 deleted_at），save 级联写 actors
+      agent.deletedAt = now;
+      await manager.save(agent);
+    });
     return true;
+  }
+
+  /**
+   * 删除影响面查询（统一批 A3-2，R13：权限 = 与 DELETE 同权，调用者即删除者）
+   *
+   * 删除确认弹窗展示用，返回四项聚合计数：
+   * - openTaskCount：assignee = 该 agent 且 status 非 done/archived 的 tasks（未软删）
+   * - messageCount：该 agent 发送的消息数（未软删）
+   * - topicCount：participant status IN ('invited','active') 的话题数
+   * - seatCount：⚠️ 铁律 #23——roundtable_seats 的 bindActorId 在 jsonb config 内，
+   *   findOne/find 嵌套 jsonb 对象条件生成整列等值（永不命中），必须 queryBuilder
+   *   `config->>'bindActorId' = :id` 路径写法；status != 'removed' 对齐座位唯一约束
+   *   uq_roundtable_seats_topic_bind_actor（removed 软删豁免，移除后可重建）。
+   *
+   * @param id agent id（已软删/不存在 → findOne 抛 404，天然符合"已删 agent 无影响面可查"）
+   * @returns AgentDeletionImpact 四项计数
+   */
+  async getDeletionImpact(id: string): Promise<AgentDeletionImpact> {
+    // findOne 对软删 agent 抛 404（前置判空，铁律 #22）
+    await this.findOne(id);
+
+    // 前三个 count 走 raw SQL（参照 findAll :90-105 批量范式；单 agent 场景直接 COUNT）
+    const [openTaskCount, messageCount, topicCount] = await Promise.all([
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(id) as count FROM tasks
+         WHERE assignee_id = $1 AND status NOT IN ('done', 'archived') AND deleted_at IS NULL`,
+        [id],
+      ),
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(id) as count FROM messages
+         WHERE sender_id = $1 AND deleted_at IS NULL`,
+        [id],
+      ),
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(topic_id) as count FROM topic_participants
+         WHERE participant_id = $1 AND status IN ('invited', 'active')`,
+        [id],
+      ),
+    ]);
+
+    // seatCount：jsonb 路径必须 queryBuilder（铁律 #23，见方法头注释）
+    const seatCount = await this.seatRepo
+      .createQueryBuilder('seat')
+      .where("seat.config->>'bindActorId' = :id", { id })
+      .andWhere("seat.status != 'removed'")
+      .getCount();
+
+    return {
+      openTaskCount: parseInt(openTaskCount[0]?.count ?? '0', 10),
+      messageCount: parseInt(messageCount[0]?.count ?? '0', 10),
+      topicCount: parseInt(topicCount[0]?.count ?? '0', 10),
+      seatCount,
+    };
   }
 
   async resetKey(id: string) {

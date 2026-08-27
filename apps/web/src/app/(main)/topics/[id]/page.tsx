@@ -4,12 +4,12 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
-import type { Message, TopicParticipant, Board } from '@/types';
+import type { Message, Board } from '@/types';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
-import { confirm } from '@/lib/notify';
+import { confirm, toast } from '@/lib/notify';
 import { useEventPoll } from '@/lib/use-event-poll';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
@@ -25,16 +25,12 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
-import {
-  Sheet,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-  SheetFooter,
-} from '@/components/ui/sheet';
+import { Sheet, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
 // framer-motion：新消息进入动画（仅 opacity+transform，见 docs/ui-design-system.md §5）
 import { motion, useReducedMotion } from 'framer-motion';
 import { fadeSlideUp } from '@/lib/animations';
+import { MembersSheet } from '@/components/members/members-sheet';
+import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
 import { MessageBubble } from '@/components/topics/message-bubble';
 import { RoundtableMentionHint } from '@/components/topics/roundtable-mention-hint';
 import { PermissionRequestCard } from '@/components/topics/permission-request-card';
@@ -57,7 +53,6 @@ import {
   FolderKanban,
   Plus,
   X,
-  UserPlus,
 } from 'lucide-react';
 
 export default function TopicDetailPage() {
@@ -84,6 +79,7 @@ export default function TopicDetailPage() {
     senderId: string;
     senderName: string;
     senderAvatar?: string;
+    senderDeletedAt?: string | null;
   } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copiedContentId, setCopiedContentId] = useState<string | null>(null);
@@ -93,9 +89,6 @@ export default function TopicDetailPage() {
   const [relatedTab, setRelatedTab] = useState<'boards' | 'tasks' | 'docs'>('tasks');
   const [linkBoardOpen, setLinkBoardOpen] = useState(false);
   const [selectedBoardId, setSelectedBoardId] = useState<string>('');
-  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
-  /** 当前选中的待邀请用户 ID */
-  const [selectedUserId, setSelectedUserId] = useState('');
 
   const { data: topic, isLoading: topicLoading } = useQuery({
     queryKey: ['topics', 'detail', id],
@@ -227,12 +220,12 @@ export default function TopicDetailPage() {
     },
   });
 
-  /** 邀请 Agent 加入话题 */
+  /** 邀请 Agent 加入话题（R2 Promise 契约：页面层 allSettled 循环调用；
+      选择集已移交 MembersSheet 内部管理，onSuccess 只负责刷新详情） */
   const inviteAgentMutation = useMutation({
     mutationFn: (agentId: string) => Api.topics.inviteAgent(id, { agentId }),
-    onSuccess: (_, agentId) => {
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['topics', 'detail', id] });
-      setSelectedAgentIds((prev) => prev.filter((sid) => sid !== agentId));
     },
   });
 
@@ -244,12 +237,11 @@ export default function TopicDetailPage() {
     },
   });
 
-  /** 邀请人类用户加入话题 */
+  /** 邀请人类用户加入话题（R2 同 inviteAgentMutation：allSettled 循环，无选择集副作用） */
   const inviteUserMutation = useMutation({
     mutationFn: (userId: string) => Api.topics.inviteUser(id, { userId }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['topics', 'detail', id] });
-      setSelectedUserId('');
     },
   });
 
@@ -350,7 +342,14 @@ export default function TopicDetailPage() {
   const senderList = useMemo(() => {
     const map = new Map<
       string,
-      { senderId: string; senderName: string; senderAvatar?: string; senderType?: string }
+      {
+        senderId: string;
+        senderName: string;
+        senderAvatar?: string;
+        senderType?: string;
+        /** 发送者已删除信号（统一批 B）：非空 → 过滤 Sheet 灰化 + title 提示 */
+        senderDeletedAt?: string | null;
+      }
     >();
     allMessages.forEach((msg) => {
       if (!map.has(msg.senderId)) {
@@ -359,6 +358,7 @@ export default function TopicDetailPage() {
           senderName: msg.senderName,
           senderAvatar: msg.senderAvatar,
           senderType: msg.senderType,
+          senderDeletedAt: msg.deletedAt,
         });
       }
     });
@@ -441,6 +441,122 @@ export default function TopicDetailPage() {
     return (seatsData ?? []).filter((s) => s.status === 'active').map((s) => s.label);
   }, [isRoundtable, seatsData]);
 
+  // ── MembersSheet 数据装配（批次 C1：内联成员 Sheet → 共享组件；页面层负责
+  //    DTO → MemberItem 映射与权限 gate，组件纯受控不感知业务）──
+
+  /** 参与者管理权限闸（照抄原内联 Sheet 各 section 的 gate：平台 admin ｜ topic
+   *  创建者/owner 代理——体验层闸，后端同样 403） */
+  const canManage =
+    currentUser?.role === 'admin' ||
+    isCreatorOrOwner(topic?.creatorId, currentUser?.id, myAgentIds);
+
+  /** 活跃参与者 → MemberItem（role 归一：非 moderator 一律 member，与旧 Badge 取反一致） */
+  const memberItems = useMemo((): MemberItem[] => {
+    if (!topic) return [];
+    return (topic.participants ?? [])
+      .filter((p) => p.status === 'active')
+      .map((p) => ({
+        actorId: p.participantId,
+        name: p.name,
+        actorType: p.participantType,
+        role: p.role === 'moderator' ? 'moderator' : 'member',
+        avatarUrl: p.avatarUrl ?? undefined,
+        // 已删除信号透传（统一批 B）：软删 actor 带 deletedAt → member-row 灰化+badge
+        deletedAt: p.deletedAt ?? null,
+        status: 'active',
+        // 自己（移除自己=leave 有专门入口，误点报 400）与 topic 创建者（非 admin 移除
+        // 报 403）不渲染移除入口——照抄旧内联 UI 的行级排除（对所有 viewer 含 admin 生效）
+        canRemove: p.participantId !== currentUser?.id && p.participantId !== topic.creatorId,
+      }));
+  }, [topic, currentUser?.id]);
+
+  /** 已邀请 → MemberItem（status=invited，agent 与人类都含；invitedAgentIds 是
+   *  同一集合的派生字段（后端 dto 注释明示），旧 invitedAgentIds 兜底分支为死代码，
+   *  不重复展开；role='invited' 让副行显示「type · 已邀请」同旧 UI） */
+  const invitedItems = useMemo((): MemberItem[] => {
+    if (!topic) return [];
+    return (topic.participants ?? [])
+      .filter((p) => p.status === 'invited')
+      .map((p) => ({
+        actorId: p.participantId,
+        name: p.name,
+        actorType: p.participantType,
+        role: 'invited',
+        avatarUrl: p.avatarUrl ?? undefined,
+        // 已删除信号透传（统一批 B）：已邀请区同样降级渲染
+        deletedAt: p.deletedAt ?? null,
+        status: 'invited',
+      }));
+  }, [topic]);
+
+  /** 可邀请 agent 候选（照抄旧「添加邀请」checkbox 列表：全量 active agent 排除
+   *  已参与者（非 left）+ invitedAgentIds 兜底） */
+  const candidateItems = useMemo((): MemberItem[] => {
+    if (!topic) return [];
+    const involvedAgentIds = new Set(
+      (topic.participants ?? [])
+        .filter((p) => p.participantType === 'agent' && p.status !== 'left')
+        .map((p) => p.participantId),
+    );
+    (topic.invitedAgentIds ?? []).forEach((id) => {
+      if (!(topic.participants ?? []).some((p) => p.participantId === id)) {
+        involvedAgentIds.add(id);
+      }
+    });
+    return (agentsData ?? [])
+      .filter((a) => a.status === 'active' && !involvedAgentIds.has(a.id))
+      .map((a) => ({
+        actorId: a.id,
+        name: a.name,
+        actorType: 'agent',
+        role: 'member',
+        avatarUrl: a.avatarUrl ?? undefined,
+        status: 'active',
+      }));
+  }, [topic, agentsData]);
+
+  /** 可邀请人类（仅 private topic 传：排除已在 participants 的任何状态人类 +
+   *  当前用户；non-private 返回 undefined → 组件不渲染人类区） */
+  const humanCandidates = useMemo((): MemberItem[] | undefined => {
+    if (!topic || topic.visibility !== 'private') return undefined;
+    const participantUserIds = new Set(
+      (topic.participants ?? [])
+        .filter((p) => p.participantType === 'human')
+        .map((p) => p.participantId),
+    );
+    return (usersData?.items ?? [])
+      .filter((u) => !participantUserIds.has(u.id) && u.id !== currentUser?.id)
+      .map((u) => ({
+        actorId: u.id,
+        name: u.name,
+        actorType: 'human',
+        role: 'member',
+        avatarUrl: u.avatar ?? undefined,
+        status: 'active',
+      }));
+  }, [topic, usersData, currentUser]);
+
+  /** participantId → participantType 索引（移除/取消邀请按类型分发端点：agent →
+   *  remove-participant / uninvite-agent，human → uninvite-user——uninvite-agent
+   *  对非 agent id 会 404（后端校验 agent 存在性），必须按类型路由） */
+  const participantTypeById = useMemo(() => {
+    const map = new Map<string, 'human' | 'agent'>();
+    (topic?.participants ?? []).forEach((p) => map.set(p.participantId, p.participantType));
+    return map;
+  }, [topic]);
+
+  /** 圆桌兜底座位（bindActorId 不匹配任何活跃参与者——invited agent 预建座 / actor
+   *  离桌残留；M3 阶段 3 独立小组展示，管理员仍可移除清理；无此类座位零渲染） */
+  const leftSeats = useMemo(() => {
+    if (!isRoundtable || !topic) return [];
+    const activeParticipantIds = new Set(
+      (topic.participants ?? []).filter((p) => p.status === 'active').map((p) => p.participantId),
+    );
+    return (seatsData ?? []).filter(
+      (s) => s.config?.bindActorId && !activeParticipantIds.has(s.config.bindActorId),
+    );
+  }, [isRoundtable, topic, seatsData]);
+
   const handleSend = () => {
     if (!messageContent.trim()) return;
     sendMessageMutation.mutate(messageContent);
@@ -493,6 +609,62 @@ export default function TopicDetailPage() {
       </div>
     );
   }
+
+  // ── MembersSheet 差异化文案与回调（R2 邀请 Promise 契约 + 按类型分发）──
+
+  /** 差异化文案：复用页面现有 topics.participant.* key（invited 角色映射保持
+   *  旧已邀请区「type · 已邀请」副行文案） */
+  const memberLabels: MembersSheetLabels = {
+    title: t('participant.title'),
+    roleLabels: {
+      moderator: t('participant.moderator'),
+      member: t('participant.member'),
+      invited: t('participant.invited'),
+    },
+    typeLabels: {
+      human: t('participant.human'),
+      agent: t('participant.agent'),
+    },
+  };
+
+  /** R2 邀请提交（Promise 契约）：mutateAsync 循环 + allSettled——全成功 resolve
+   *  （组件切回主视图并清空选择）；任一失败 reject（组件留在邀请视图保留选择）+
+   *  失败汇总 toast（成功 N / 失败 M） */
+  const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
+    const mutation = kind === 'agent' ? inviteAgentMutation : inviteUserMutation;
+    const results = await Promise.allSettled(
+      actorIds.map((actorId) => mutation.mutateAsync(actorId)),
+    );
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    if (failed > 0) {
+      toast.error({
+        title: t('participant.inviteFailed', { succeeded, failed }),
+      });
+      throw new Error(`invite ${kind} partial failure: ${failed}/${results.length}`);
+    }
+  };
+
+  /** 移除活跃成员（组件 AlertDialog 确认后回调）：按类型分发端点与旧 UI 一致——
+   *  agent → removeParticipant；human → uninviteUser */
+  const handleRemoveMember = (actorId: string) => {
+    if (participantTypeById.get(actorId) === 'human') {
+      uninviteUserMutation.mutate(actorId);
+    } else {
+      removeParticipantMutation.mutate({ participantId: actorId });
+    }
+  };
+
+  /** 取消邀请（X）：agent → uninviteAgent；human → uninviteUser（防御性分发——
+   *  当前后端 invite-user 直落 active，invited 区理论只含 agent；按类型路由避免
+   *  误用 uninvite-agent 对用户 id 触发 AGENT_NOT_FOUND 404） */
+  const handleCancelInvite = (actorId: string) => {
+    if (participantTypeById.get(actorId) === 'human') {
+      uninviteUserMutation.mutate(actorId);
+    } else {
+      uninviteAgentMutation.mutate(actorId);
+    }
+  };
 
   const renderStatusActions = () => {
     const status = topic.status;
@@ -690,427 +862,65 @@ export default function TopicDetailPage() {
         }
       />
 
-      {/* Participants & Invite Sheet */}
-      <Sheet open={participantsOpen} onOpenChange={setParticipantsOpen}>
-        <SheetHeader>
-          <SheetTitle>{t('participant.title')}</SheetTitle>
-          <SheetDescription>
-            {(() => {
-              const participants = topic.participants || [];
-              const activeCount = participants.filter((p) => p.status === 'active').length;
-              const invitedCount =
-                participants.filter((p) => p.status === 'invited').length ||
-                (topic.invitedAgentIds || []).length;
-              return t('participant.summary', { count: activeCount, invited: invitedCount });
-            })()}
-          </SheetDescription>
-        </SheetHeader>
-
-        <div className="mt-6 space-y-6">
-          {/* 圆桌座位管理分区（v1.49.0，C2）：runner 在线状态 + 无在线 runner
-              指引（可复制启动命令）+ 建座入口；仅 kind='roundtable' 渲染，
-              canManage 与参与者管理同规（平台 admin ｜ topic 创建者/owner 代理） */}
-          {isRoundtable && (
-            <SeatManagement
-              topicId={id}
-              canManage={
-                currentUser?.role === 'admin' ||
-                isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
-              }
-              onExitGuide={() => setParticipantsOpen(false)}
-            />
-          )}
-
-          {/* 活跃参与者 */}
-          <div className="space-y-3">
-            <h3 className="text-sm font-medium">
-              {t('participant.activeList')}
-              {(() => {
-                const activeParticipants = (topic.participants || []).filter(
-                  (p) => p.status === 'active',
-                );
-                return activeParticipants.length ? ` (${activeParticipants.length})` : '';
-              })()}
-            </h3>
-            {(() => {
-              const activeParticipants = (topic.participants || []).filter(
-                (p) => p.status === 'active',
-              );
-              if (activeParticipants.length === 0) {
-                return (
-                  <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                    {t('participant.noActive')}
-                  </div>
-                );
-              }
-              return (
+      {/* 参与者与邀请（批次 C1：内联成员 Sheet → 共享 MembersSheet——信息架构
+          主视图 + 邀请二级视图；圆桌扩展经 topSlot（SeatManagement + 圆桌兜底座位组）
+          / renderRowExtra（agent 行 SeatBadges）保留；权限 gate 照抄旧各 section；
+          已邀请区仅管理视角可见——canManage 为假时不传 invited prop，组件即不渲染整区） */}
+      <MembersSheet
+        open={participantsOpen}
+        onOpenChange={setParticipantsOpen}
+        labels={memberLabels}
+        members={memberItems}
+        invited={canManage ? invitedItems : undefined}
+        candidates={candidateItems}
+        humanCandidates={humanCandidates}
+        capabilities={{ invite: canManage, remove: canManage, cancelInvite: canManage }}
+        onInvite={handleInvite}
+        onRemove={handleRemoveMember}
+        onCancelInvite={handleCancelInvite}
+        inviting={inviteAgentMutation.isPending || inviteUserMutation.isPending}
+        topSlot={
+          isRoundtable && (
+            <div className="space-y-3">
+              {/* 圆桌座位管理分区（v1.49.0，C2）：runner 在线状态 + 建座入口；
+                  canManage 与参与者管理同规（平台 admin ｜ topic 创建者/owner 代理） */}
+              <SeatManagement
+                topicId={id}
+                canManage={canManage}
+                onExitGuide={() => setParticipantsOpen(false)}
+              />
+              {/* 圆桌座位兜底组（M3 阶段 3 改版）：bindActorId 不匹配任何活跃
+                  参与者的座位（罕见：actor 已离桌/被移除，座位残留；invited agent
+                  预建座也在内）——独立小组展示，管理员仍可移除清理；无此类座位
+                  零渲染。随 C1 接入迁入 topSlot（组件无列表区底部槽位），位置由
+                  原成员列表底部改为 Sheet 顶部 */}
+              {leftSeats.length > 0 && (
                 <div className="space-y-2">
-                  {activeParticipants.map((p: TopicParticipant) => (
-                    <div
-                      key={p.participantId}
-                      className="flex items-center gap-3 rounded-lg border p-2.5"
-                    >
-                      <Avatar
-                        src={p.avatarUrl ?? undefined}
-                        fallback={p.name}
-                        size="sm"
-                        actorType={p.participantType}
-                        seed={p.participantId}
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium truncate">{p.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {p.participantType === 'human'
-                            ? t('participant.human')
-                            : t('participant.agent')}{' '}
-                          · {p.role || t('participant.member')}
-                        </p>
-                        {/* 圆桌座位 chip 组（M3 阶段 3 改版）：agent 行名下按
-                            config.bindActorId 归组渲染该 actor 的座位——label/status/
-                            主脑/三件套 + 管理员移除（SeatBadges 内部空座位零渲染）；
-                            未认领座位 chip 可点击打开连接向导模态框（2026-08-12，
-                            onExitGuide = 关闭参与者 Sheet，与 SeatManagement 同规）；
-                            仅 kind='roundtable' 渲染（seats 查询仅圆桌拉取）；
-                            canManage 与参与者管理同规：平台 admin ｜ topic 创建者/
-                            owner 代理（后端同样 403，前端是体验层闸） */}
-                        {isRoundtable && p.participantType === 'agent' && (
-                          <SeatBadges
-                            topicId={id}
-                            seats={(seatsData ?? []).filter(
-                              (s) => s.config?.bindActorId === p.participantId,
-                            )}
-                            canManage={
-                              currentUser?.role === 'admin' ||
-                              isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
-                            }
-                            onExitGuide={() => setParticipantsOpen(false)}
-                          />
-                        )}
-                      </div>
-                      <Badge variant="outline" className="text-[10px] shrink-0">
-                        {p.role === 'moderator'
-                          ? t('participant.moderator')
-                          : t('participant.member')}
-                      </Badge>
-                      {(currentUser?.role === 'admin' ||
-                        isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)) &&
-                        p.participantId !== currentUser?.id &&
-                        p.participantId !== topic.creatorId && (
-                          <button
-                            onClick={() =>
-                              p.participantType === 'human'
-                                ? uninviteUserMutation.mutate(p.participantId)
-                                : removeParticipantMutation.mutate({
-                                    participantId: p.participantId,
-                                  })
-                            }
-                            disabled={
-                              p.participantType === 'human'
-                                ? uninviteUserMutation.isPending
-                                : removeParticipantMutation.isPending
-                            }
-                            className="text-xs text-destructive hover:text-destructive/80 disabled:opacity-50"
-                          >
-                            {t('participant.remove')}
-                          </button>
-                        )}
-                    </div>
-                  ))}
-                  {/* 圆桌座位兜底组（M3 阶段 3 改版）：bindActorId 不匹配任何活跃
-                      参与者的座位（罕见：actor 已离桌/被移除，座位残留）——独立小组
-                      展示，管理员仍可移除清理；无此类座位零渲染 */}
-                  {isRoundtable &&
-                    (() => {
-                      const activeParticipantIds = new Set(
-                        (topic.participants || [])
-                          .filter((p) => p.status === 'active')
-                          .map((p) => p.participantId),
-                      );
-                      const leftSeats = (seatsData ?? []).filter(
-                        (s) =>
-                          s.config?.bindActorId && !activeParticipantIds.has(s.config.bindActorId),
-                      );
-                      if (leftSeats.length === 0) return null;
-                      return (
-                        <div className="space-y-2">
-                          <h4 className="text-xs font-medium text-muted-foreground">
-                            {t('seatManager.leftGroup')}
-                          </h4>
-                          <SeatBadges
-                            topicId={id}
-                            seats={leftSeats}
-                            canManage={
-                              currentUser?.role === 'admin' ||
-                              isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
-                            }
-                            onExitGuide={() => setParticipantsOpen(false)}
-                          />
-                        </div>
-                      );
-                    })()}
+                  <h4 className="text-xs font-medium text-muted-foreground">
+                    {t('seatManager.leftGroup')}
+                  </h4>
+                  <SeatBadges
+                    topicId={id}
+                    seats={leftSeats}
+                    canManage={canManage}
+                    onExitGuide={() => setParticipantsOpen(false)}
+                  />
                 </div>
-              );
-            })()}
-          </div>
-
-          {/* 已邀请 Agent */}
-          {(currentUser?.role === 'admin' ||
-            isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)) && (
-            <div className="space-y-3">
-              <h3 className="text-sm font-medium">
-                {t('participant.invitedList')}
-                {(() => {
-                  const invitedParticipants = (topic.participants || []).filter(
-                    (p) => p.status === 'invited',
-                  );
-                  const count = invitedParticipants.length || (topic.invitedAgentIds || []).length;
-                  return count ? ` (${count})` : '';
-                })()}
-              </h3>
-              {(() => {
-                // 优先展示 participants 中 status='invited' 的成员
-                const invitedParticipants = (topic.participants || []).filter(
-                  (p) => p.status === 'invited',
-                );
-                if (invitedParticipants.length > 0) {
-                  return (
-                    <div className="space-y-2">
-                      {invitedParticipants.map((p: TopicParticipant) => (
-                        <div
-                          key={p.participantId}
-                          className="flex items-center gap-3 rounded-lg border p-2.5"
-                        >
-                          <Avatar
-                            src={p.avatarUrl ?? undefined}
-                            fallback={p.name}
-                            size="sm"
-                            actorType={p.participantType}
-                            seed={p.participantId}
-                          />
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium truncate">{p.name}</p>
-                            <p className="text-xs text-muted-foreground">
-                              {p.participantType === 'human'
-                                ? t('participant.human')
-                                : t('participant.agent')}{' '}
-                              · {t('participant.invited')}
-                            </p>
-                          </div>
-                          <Badge variant="secondary" className="text-[10px] shrink-0">
-                            {t('participant.invited')}
-                          </Badge>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 shrink-0"
-                            isLoading={
-                              uninviteAgentMutation.isPending &&
-                              uninviteAgentMutation.variables === p.participantId
-                            }
-                            onClick={() => uninviteAgentMutation.mutate(p.participantId)}
-                          >
-                            <X className="h-4 w-4" />
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                }
-
-                // 兜底：invitedAgentIds 中尚未出现在 participants 的
-                const invitedAgentIds = topic.invitedAgentIds || [];
-                const participantIds = new Set(
-                  (topic.participants || []).map((p) => p.participantId),
-                );
-                const missingIds = invitedAgentIds.filter((id) => !participantIds.has(id));
-                const invitedAgents = (agentsData ?? []).filter((a) => missingIds.includes(a.id));
-                if (invitedAgents.length === 0) {
-                  return (
-                    <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                      {t('participant.noInvited')}
-                    </div>
-                  );
-                }
-                return (
-                  <div className="space-y-2">
-                    {invitedAgents.map((agent) => (
-                      <div
-                        key={agent.id}
-                        className="flex items-center gap-3 rounded-lg border p-2.5"
-                      >
-                        <Avatar fallback={agent.name} size="sm" actorType="agent" seed={agent.id} />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium truncate">{agent.name}</p>
-                          <p className="text-xs text-muted-foreground">
-                            {agent.status === 'active'
-                              ? t('participant.agentStatus.active')
-                              : agent.status === 'disabled'
-                                ? t('participant.agentStatus.disabled')
-                                : t('participant.agentStatus.pending')}
-                          </p>
-                        </div>
-                        <Badge variant="secondary" className="text-[10px] shrink-0">
-                          {t('participant.invited')}
-                        </Badge>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 shrink-0"
-                          isLoading={
-                            uninviteAgentMutation.isPending &&
-                            uninviteAgentMutation.variables === agent.id
-                          }
-                          onClick={() => uninviteAgentMutation.mutate(agent.id)}
-                        >
-                          <X className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                );
-              })()}
-            </div>
-          )}
-
-          {/* 添加邀请 */}
-          {(currentUser?.role === 'admin' ||
-            isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)) && (
-            <div className="space-y-3">
-              <h3 className="text-sm font-medium">{t('participant.addInvite')}</h3>
-              {(() => {
-                // 排除所有非 left 的参与者（active + invited）
-                const involvedAgentIds = new Set(
-                  (topic.participants || [])
-                    .filter(
-                      (p: TopicParticipant) => p.participantType === 'agent' && p.status !== 'left',
-                    )
-                    .map((p: TopicParticipant) => p.participantId),
-                );
-                // invitedAgentIds 兜底 —— 排除已在 participants 中的
-                (topic.invitedAgentIds || []).forEach((id) => {
-                  if (!(topic.participants || []).some((p) => p.participantId === id)) {
-                    involvedAgentIds.add(id);
-                  }
-                });
-                const availableAgents = (agentsData ?? []).filter(
-                  (a) => a.status === 'active' && !involvedAgentIds.has(a.id),
-                );
-                if (availableAgents.length === 0) {
-                  return (
-                    <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                      {t('participant.noAvailableAgents')}
-                    </div>
-                  );
-                }
-                return (
-                  <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
-                    {availableAgents.map((agent) => {
-                      const checked = selectedAgentIds.includes(agent.id);
-                      return (
-                        <label
-                          key={agent.id}
-                          className="flex cursor-pointer items-center gap-3 rounded-lg border p-2.5 hover:bg-muted/50 transition-colors"
-                        >
-                          <input
-                            type="checkbox"
-                            className="h-4 w-4 shrink-0"
-                            checked={checked}
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setSelectedAgentIds((prev) => [...prev, agent.id]);
-                              } else {
-                                setSelectedAgentIds((prev) => prev.filter((id) => id !== agent.id));
-                              }
-                            }}
-                          />
-                          <Avatar
-                            fallback={agent.name}
-                            size="sm"
-                            actorType="agent"
-                            seed={agent.id}
-                          />
-                          <span className="flex-1 text-sm truncate">{agent.name}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                );
-              })()}
-
-              {selectedAgentIds.length > 0 && (
-                <SheetFooter>
-                  <Button variant="outline" onClick={() => setSelectedAgentIds([])}>
-                    {tGlobal('common.cancel')}
-                  </Button>
-                  <Button
-                    isLoading={inviteAgentMutation.isPending}
-                    onClick={() => {
-                      selectedAgentIds.forEach((agentId) => {
-                        inviteAgentMutation.mutate(agentId);
-                      });
-                    }}
-                  >
-                    <UserPlus className="mr-1 h-4 w-4" />
-                    {t('participant.inviteAgents', { count: selectedAgentIds.length })}
-                  </Button>
-                </SheetFooter>
               )}
             </div>
-          )}
-
-          {/* 邀请用户（仅 Private Topic） */}
-          {topic.visibility === 'private' &&
-            (currentUser?.role === 'admin' ||
-              isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)) && (
-              <div className="space-y-3">
-                <h3 className="text-sm font-medium">{t('participant.inviteUser')}</h3>
-                {(() => {
-                  const participantUserIds = new Set(
-                    (topic.participants || [])
-                      .filter((p: TopicParticipant) => p.participantType === 'human')
-                      .map((p: TopicParticipant) => p.participantId),
-                  );
-                  const availableUsers = (usersData?.items ?? []).filter(
-                    (u) => !participantUserIds.has(u.id) && u.id !== currentUser?.id,
-                  );
-                  if (availableUsers.length === 0) {
-                    return (
-                      <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                        {t('participant.noUsers')}
-                      </div>
-                    );
-                  }
-                  return (
-                    <div className="space-y-2">
-                      <select
-                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                        value={selectedUserId}
-                        onChange={(e) => setSelectedUserId(e.target.value)}
-                      >
-                        <option value="">{t('participant.selectUser')}</option>
-                        {availableUsers.map((user) => (
-                          <option key={user.id} value={user.id}>
-                            {user.name}
-                          </option>
-                        ))}
-                      </select>
-                      {selectedUserId && (
-                        <Button
-                          isLoading={inviteUserMutation.isPending}
-                          onClick={() => inviteUserMutation.mutate(selectedUserId)}
-                          className="w-full"
-                        >
-                          <UserPlus className="mr-1 h-4 w-4" />
-                          {t('participant.invite')}
-                        </Button>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-        </div>
-      </Sheet>
+          )
+        }
+        renderRowExtra={(seat) =>
+          isRoundtable && seat.actorType === 'agent' ? (
+            <SeatBadges
+              topicId={id}
+              seats={(seatsData ?? []).filter((s) => s.config?.bindActorId === seat.actorId)}
+              canManage={canManage}
+              onExitGuide={() => setParticipantsOpen(false)}
+            />
+          ) : null
+        }
+      />
 
       {/* Filter Sheet */}
       <Sheet open={filterOpen} onOpenChange={setFilterOpen}>
@@ -1130,29 +940,38 @@ export default function TopicDetailPage() {
           >
             <span className="text-sm">{t('filter.all')}</span>
           </button>
-          {senderList.map((sender) => (
-            <button
-              key={sender.senderId}
-              onClick={() => {
-                setFilterSender(sender);
-                setFilterOpen(false);
-              }}
-              className={`w-full text-left flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
-                filterSender?.senderId === sender.senderId
-                  ? 'bg-primary text-primary-foreground'
-                  : 'hover:bg-muted'
-              }`}
-            >
-              <Avatar
-                src={sender.senderAvatar}
-                fallback={sender.senderName}
-                size="sm"
-                actorType={sender.senderType === 'agent' ? 'agent' : 'human'}
-                seed={sender.senderId}
-              />
-              <span className="text-sm">{sender.senderName}</span>
-            </button>
-          ))}
+          {senderList.map((sender) => {
+            // 已删除降级（统一批 B）：灰化 + title 提示，不加常驻 badge（高密度列表防噪音）
+            const senderDeleted = !!sender.senderDeletedAt;
+            return (
+              <button
+                key={sender.senderId}
+                onClick={() => {
+                  setFilterSender(sender);
+                  setFilterOpen(false);
+                }}
+                className={`w-full text-left flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+                  filterSender?.senderId === sender.senderId
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-muted'
+                }`}
+              >
+                <Avatar
+                  src={sender.senderAvatar}
+                  fallback={sender.senderName}
+                  size="sm"
+                  actorType={sender.senderType === 'agent' ? 'agent' : 'human'}
+                  seed={sender.senderId}
+                />
+                <span
+                  className={senderDeleted ? 'text-sm opacity-60' : 'text-sm'}
+                  title={senderDeleted ? t('message.deletedSenderTitle') : undefined}
+                >
+                  {sender.senderName}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </Sheet>
 
@@ -1460,6 +1279,7 @@ export default function TopicDetailPage() {
                   }`}
                 >
                   {msg.senderType !== 'system' && (
+                    // 已删除降级（统一批 B）：头像 hover 提示（senderName 灰化在气泡内）
                     <div className="shrink-0">
                       <Avatar
                         src={msg.senderAvatar}
@@ -1467,6 +1287,7 @@ export default function TopicDetailPage() {
                         size="sm"
                         actorType={msg.senderType === 'agent' ? 'agent' : 'human'}
                         seed={msg.senderId}
+                        title={msg.deletedAt ? t('message.deletedSenderTitle') : undefined}
                       />
                     </div>
                   )}

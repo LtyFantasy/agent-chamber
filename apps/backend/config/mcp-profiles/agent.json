@@ -1,8 +1,9 @@
 {
   "name": "Platform Agent (Worker)",
-  "description": "Agent 日常高频工具集，28 原子 + 15 语义 = 43 tools；全量管理类工具走 /mcp-full 或 REST+Skill 文档",
+  "description": "Agent 日常高频工具集，29 原子 + 15 语义 = 44 tools；全量管理类工具走 /mcp-full 或 REST+Skill 文档",
   "include": [
     "^agent_controller_get_me$",
+    "^agent_controller_get_my_unread$",
     "^topic_controller_find_all$",
     "^topic_controller_create$",
     "^topic_controller_find_one$",

@@ -53,6 +53,10 @@ const CSV_FILTER_MAX_LENGTH = 512;
  *   routesTruncated/routesTotal 标记）；显式 false 省略 routes 相关全部字段
  * - slim（v1.56）：缺省 false（全字段，向后兼容）；true 时每条 doc 只返回
  *   {path,title,summary,docType,tokenEstimate}（大空间瘦身，category 分组结构不变）
+ * - catalog（v1.66）：缺省 false；true 时每条 doc 只返回目录三键
+ *   {path,title,tokenEstimate} 且**豁免 maxTokens 对 doc 条目的截断**（目录完整性
+ *   契约，docsReturned === docsTotal 恒成立）；与过滤器正交组合（先过滤→再投影→
+ *   不截断）；与 slim 同给时 catalog 胜出
  */
 export class DocOverviewQueryDto {
   @IsOptional()
@@ -227,4 +231,35 @@ export class DocOverviewQueryDto {
     example: 'true',
   })
   slim?: boolean;
+
+  /**
+   * catalog 目录模式（v1.66，冷启动完整目录感知）：query 参数均为字符串，
+   * 用 @Transform 严格解析（对齐 slim 的惯例）：'true' → true、'false' → false、
+   * 缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：
+   * - 缺省视为 false（全字段，向后兼容）；显式 true 时每条 doc 只返回目录三键
+   *   {path,title,tokenEstimate}（比 slim 更瘦，category 由分组结构承载）
+   * - **豁免 maxTokens 对 doc 条目的截断**——目录完整性是该模式的契约
+   *   （docsReturned === docsTotal 恒成立；legend/routes 段行为不变）
+   * - 与现有过滤器（category/tag/type/excludeType/applySpaceDefaults 等）正交组合：
+   *   先过滤 → 再投影 → 不截断
+   * - 与 slim 同给时 catalog 胜出（更强投影）
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Lean catalog mode for cold-start directory awareness. Default false (full fields, ' +
+      "backward compatible); pass 'true' to project each doc to {path,title,tokenEstimate} " +
+      'and exempt doc entries from maxTokens truncation (directory completeness is the ' +
+      'contract; docsReturned === docsTotal). Wins over slim when both are passed.',
+    example: 'true',
+  })
+  catalog?: boolean;
 }

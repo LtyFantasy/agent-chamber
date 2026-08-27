@@ -1,6 +1,6 @@
 {
   "name": "@agent-chamber/roundtable-protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "圆桌模式共享契约包 —— 控制面信封/消息 payload/座位契约/注入消息体（纯类型 + 手写校验，零运行时依赖）",
   "main": "dist/index.js",

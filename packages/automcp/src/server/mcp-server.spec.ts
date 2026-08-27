@@ -169,9 +169,9 @@ describe('McpServer', () => {
       expect(res.status).toBe(200);
       expect(res.body.jsonrpc).toBe('2.0');
       expect(res.body.id).toBe(4);
-      // proxy 返回的 JSON text 经框架归一化自动补 structuredContent（text 原样保留）
+      // proxy 返回的 JSON text 经框架归一化收敛为单载荷：text 降为占位，数据在 structuredContent
       expect(res.body.result).toEqual({
-        content: [{ type: 'text', text: '{"id": "abc"}' }],
+        content: [{ type: 'text', text: '[structured]' }],
         structuredContent: { id: 'abc' },
       });
       expect(proxy.execute).toHaveBeenCalledWith(
@@ -618,8 +618,8 @@ describe('McpServer', () => {
         });
     }
 
-    it('custom 工具返回 JSON text → 自动填充 structuredContent（与 parse(text) 深度相等）且 text 原样保留', async () => {
-      const jsonText = JSON.stringify({ topics: [{ id: 't1' }], total: 1 }, null, 2);
+    it('custom 工具返回 JSON text → 收敛为单载荷（text 降为占位，structuredContent 与 parse(text) 深度相等）', async () => {
+      const jsonText = JSON.stringify({ topics: [{ id: 't1' }], total: 1 });
       server.registerCustomTools([
         makeCustomTool('json_tool', { content: [{ type: 'text', text: jsonText }] }),
       ]);
@@ -628,11 +628,11 @@ describe('McpServer', () => {
       const res = await callTool('json_tool');
 
       expect(res.status).toBe(200);
-      expect(res.body.result.content[0].text).toBe(jsonText);
+      expect(res.body.result.content).toEqual([{ type: 'text', text: '[structured]' }]);
       expect(res.body.result.structuredContent).toEqual(JSON.parse(jsonText));
     });
 
-    it('自动映射（proxy）工具 JSON 响应 → 同样自动填充', async () => {
+    it('自动映射（proxy）工具 JSON 响应 → 同样收敛', async () => {
       const jsonText = JSON.stringify([{ id: 'a' }, { id: 'b' }]);
       proxy.execute.mockResolvedValueOnce({ content: [{ type: 'text', text: jsonText }] });
       server.registerTools([makeMapping('list_items')]);
@@ -640,7 +640,7 @@ describe('McpServer', () => {
 
       const res = await callTool('list_items');
 
-      expect(res.body.result.content[0].text).toBe(jsonText);
+      expect(res.body.result.content).toEqual([{ type: 'text', text: '[structured]' }]);
       expect(res.body.result.structuredContent).toEqual(JSON.parse(jsonText));
     });
 
@@ -687,7 +687,7 @@ describe('McpServer', () => {
       expect(resStr.body.result.structuredContent).toBeUndefined();
     });
 
-    it('isError 错误信封（JSON）→ 同样填充 structuredContent（含 error:true）', async () => {
+    it('isError 错误信封（JSON）→ 原样不动（text 保留，不额外填充 structuredContent——错误双发留给 handler 自主，人类排障读 text）', async () => {
       const errorText = JSON.stringify({ error: true, code: 9002, message: 'conflict' });
       server.registerCustomTools([
         makeCustomTool('err_tool', {
@@ -701,11 +701,11 @@ describe('McpServer', () => {
 
       expect(res.body.result.isError).toBe(true);
       expect(res.body.result.content[0].text).toBe(errorText);
-      expect(res.body.result.structuredContent).toEqual(JSON.parse(errorText));
+      expect(res.body.result.structuredContent).toBeUndefined();
     });
 
-    it('超过 1MB 的 JSON text → 跳过填充', async () => {
-      // 构造 >1MB 的合法 JSON：真实触发长度阈值短路（而非 parse 失败跳过）
+    it('超过 1MB 的 JSON text → 无 cap 照常收敛（R1：取消 1MB 上限，消灭大响应 text-only 沉默分叉）', async () => {
+      // 构造 >1MB 的合法 JSON：新契约下无长度阈值，parse 成功即收敛
       const bigText = JSON.stringify({ data: 'x'.repeat(1024 * 1024) });
       expect(bigText.length).toBeGreaterThan(1024 * 1024);
       server.registerCustomTools([
@@ -715,7 +715,28 @@ describe('McpServer', () => {
 
       const res = await callTool('big_tool');
 
-      expect(res.body.result.content[0].text).toBe(bigText);
+      expect(res.body.result.content).toEqual([{ type: 'text', text: '[structured]' }]);
+      expect(res.body.result.structuredContent).toEqual(JSON.parse(bigText));
+    });
+
+    it('多块 content（未来 text+image 等）→ 原样不动（防静默吞块）', async () => {
+      const jsonText = JSON.stringify({ ok: true });
+      server.registerCustomTools([
+        makeCustomTool('multi_tool', {
+          content: [
+            { type: 'text', text: jsonText },
+            { type: 'text', text: 'second block' },
+          ],
+        }),
+      ]);
+      await server.start();
+
+      const res = await callTool('multi_tool');
+
+      expect(res.body.result.content).toEqual([
+        { type: 'text', text: jsonText },
+        { type: 'text', text: 'second block' },
+      ]);
       expect(res.body.result.structuredContent).toBeUndefined();
     });
   });

@@ -217,12 +217,15 @@ export function SeatPresenceBar({
             <div key={seat.id} className="relative inline-flex items-center gap-1">
               {/* chip：头像 + label + 主脑 Crown + presence badge；点击切换 Popover
                   （再次点击同一座位收起；点其他座位自动切换） */}
+              {/* 已删除降级（统一批 B）：xs 头像灰化不可辨，必须靠 chip title 提示
+                  （R16 钉死：title「绑定的 Agent 已删除」；座位 label 不动） */}
               <button
                 type="button"
                 data-testid={`seat-presence-chip-${seat.id}`}
                 aria-expanded={openSeatId === seat.id}
                 onClick={() => setOpenSeatId((cur) => (cur === seat.id ? null : seat.id))}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 bg-background/40 px-2 py-1 text-left transition-colors hover:bg-muted/50"
+                title={participant?.deletedAt ? t('seatPresence.boundAgentDeleted') : undefined}
               >
                 <Avatar
                   src={participant?.avatarUrl ?? undefined}
@@ -230,6 +233,7 @@ export function SeatPresenceBar({
                   size="xs"
                   actorType={participant?.participantType}
                   seed={participant?.participantId ?? seat.id}
+                  deleted={!!participant?.deletedAt}
                 />
                 <span className="shrink-0 text-xs font-medium text-foreground/80">
                   {seat.label}

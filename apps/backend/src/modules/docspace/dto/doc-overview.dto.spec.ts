@@ -244,4 +244,35 @@ describe('DocOverviewQueryDto', () => {
       },
     );
   });
+
+  describe('catalog transform（v1.66，对齐 slim 惯例）', () => {
+    it("parses 'true' as true (catalog 目录模式)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { catalog: 'true' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.catalog).toBe(true);
+    });
+
+    it("parses 'false' as false (全字段)", async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, { catalog: 'false' });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.catalog).toBe(false);
+    });
+
+    it('omitted → undefined (service 视为 false 全字段，向后兼容)', async () => {
+      const dto = plainToInstance(DocOverviewQueryDto, {});
+      expect(dto.catalog).toBeUndefined();
+    });
+
+    // 同 slim：格式错误直接 400，不静默当作 false
+    it.each(['1', '0', 'yes', 'TRUE', 'False', '', 'on'])(
+      "rejects '%s' (→ 400，格式错误不透传)",
+      async (value) => {
+        const dto = plainToInstance(DocOverviewQueryDto, { catalog: value });
+        const errors = await validate(dto);
+        expect(errors.some((e) => e.property === 'catalog')).toBe(true);
+      },
+    );
+  });
 });

@@ -125,7 +125,7 @@ async function main(): Promise<void> {
       serverInfo: { name: string; version: string };
     };
 
-    if (result.protocolVersion !== '2024-11-05') {
+    if (result.protocolVersion !== '2025-06-18') {
       throw new Error(`protocolVersion mismatch: ${result.protocolVersion}`);
     }
     if (result.serverInfo.name !== 'automcp') {
@@ -171,20 +171,18 @@ async function main(): Promise<void> {
 
     const result = res.data.result as {
       content: Array<{ type: string; text: string }>;
+      structuredContent?: { code: number; data: unknown };
       isError?: boolean;
     };
 
     if (result.isError === true) {
       throw new Error(`Tool call returned error: ${JSON.stringify(result.content)}`);
     }
-    if (result.content.length === 0) {
-      throw new Error('Tool call returned empty content');
-    }
-    // 验证返回的是有效的 JSON 数据（platform 的标准包装器格式）
-    const text = result.content[0].text;
-    const data = JSON.parse(text) as { code: number; data: unknown };
-    if (data.code !== 200) {
-      throw new Error(`Platform API returned code ${data.code}`);
+    // v1.66 新契约：JSON 成功响应收敛为单载荷——数据在 structuredContent，
+    // content 为 '[structured]' 占位（不再 parse text）
+    const data = result.structuredContent;
+    if (!data || data.code !== 200) {
+      throw new Error(`Platform API returned code ${data?.code}`);
     }
     return data;
   });
@@ -204,16 +202,17 @@ async function main(): Promise<void> {
 
     const result = res.data.result as {
       content: Array<{ type: string; text: string }>;
+      structuredContent?: { code: number; data: unknown };
       isError?: boolean;
     };
 
     if (result.isError === true) {
       throw new Error(`Tool call returned error: ${JSON.stringify(result.content)}`);
     }
-    const text = result.content[0].text;
-    const data = JSON.parse(text) as { code: number; data: unknown };
-    if (data.code !== 200) {
-      throw new Error(`Platform API returned code ${data.code}`);
+    // 同 Step 4：读 structuredContent（唯一数据载荷）
+    const data = result.structuredContent;
+    if (!data || data.code !== 200) {
+      throw new Error(`Platform API returned code ${data?.code}`);
     }
     return data;
   });

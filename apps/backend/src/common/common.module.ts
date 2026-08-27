@@ -20,17 +20,27 @@
  * =============================================================================
  */
 import { Global, Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
 import { ResourceValidator } from './resource-validator';
+import { ActorProfileService } from './services/actor-profile.service';
+import { Actor } from '../database/entities/actor.entity';
+import { Agent } from '../database/entities/agent.entity';
+import { User } from '../database/entities/user.entity';
 
 /**
  * 通用基础设施模块
  *
- * 以 @Global() 注册，使 ResourceValidator 等通用工具可在所有 Feature Module 中直接注入，
- * 避免每个业务模块重复导入。
+ * 以 @Global() 注册，使 ResourceValidator / ActorProfileService 等通用工具可在所有
+ * Feature Module 中直接注入，避免每个业务模块重复导入。
+ *
+ * ActorProfileService 需要 Actor/Agent/User 三个 repository（软删 actor 统一解析，
+ * 见 docs/spec.md §1 契约），故 forFeature 注册于此——不放 auth.module 是避免
+ * 认证模块与业务实体 repo 的循环依赖（统一批 A1 review R3 结论）。
  */
 @Global()
 @Module({
-  providers: [ResourceValidator],
-  exports: [ResourceValidator],
+  imports: [TypeOrmModule.forFeature([Actor, User, Agent])],
+  providers: [ResourceValidator, ActorProfileService],
+  exports: [ResourceValidator, ActorProfileService],
 })
 export class CommonModule {}

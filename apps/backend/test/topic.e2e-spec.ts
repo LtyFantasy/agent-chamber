@@ -214,6 +214,24 @@ describe('TopicController (e2e)', () => {
         avatarUrl: null,
       },
     ]);
+    // 统一批 A1：公共解析服务（actor-profile.service）改走 createQueryBuilder withDeleted 路径
+    mockRepos.Actor.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      getMany: jest
+        .fn()
+        .mockResolvedValue([
+          {
+            id: '00000000-0000-4000-8000-000000000005',
+            type: 'human',
+            displayName: 'Test User',
+            avatarUrl: null,
+            deletedAt: null,
+          },
+        ]),
+    });
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
     ]);
@@ -769,6 +787,24 @@ describe('TopicController (e2e)', () => {
         avatarUrl: null,
       },
     ]);
+    // 统一批 A1：公共解析服务（actor-profile.service）改走 createQueryBuilder withDeleted 路径
+    mockRepos.Actor.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      getMany: jest
+        .fn()
+        .mockResolvedValue([
+          {
+            id: '00000000-0000-4000-8000-000000000005',
+            type: 'human',
+            displayName: 'Test User',
+            avatarUrl: null,
+            deletedAt: null,
+          },
+        ]),
+    });
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },
     ]);
@@ -1091,6 +1127,17 @@ describe('TopicController (e2e)', () => {
     mockRepos.Agent.findOne = jest
       .fn()
       .mockResolvedValue({ id: '00000000-0000-4000-8000-000000000003', name: 'Bot-3' });
+    // 统一批 A2.5（R14）：写入口存在性校验收口 assertActorUsable（actor queryBuilder.getOne）
+    mockRepos.Actor.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      getOne: jest.fn().mockResolvedValue({
+        id: '00000000-0000-4000-8000-000000000003',
+        deletedAt: null,
+      }),
+    });
     // 无参与行 → 新建 editor+invited 行（inviteAgent 同款 mock 路径）
     mockRepos.TopicParticipant.findOne.mockResolvedValue(null);
     mockRepos.TopicParticipant.create.mockReturnValue({});

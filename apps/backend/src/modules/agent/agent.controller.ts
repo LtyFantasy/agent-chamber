@@ -6,11 +6,14 @@
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Agent)
  *   - 补充: docs/api-definition.md §5. Agents
  *
- * [踩坑索引] D5(权限盲区) AGENT-VISIBILITY(Agent可见性)
+ * [踩坑索引] D5(权限盲区) AGENT-VISIBILITY(Agent可见性) AGENT-FIELD-WHITELIST(白名单漏字段) A3-2(deletion-impact与DELETE同权)
  *
  * [铁律关联] #17(测试契约) #11(注释强制) #18(不变量检查)
  *
  * [详细踩坑]（最多 5 条）
+ *   A3-2: GET /agents/:id/deletion-impact 的权限必须是 ensureCan 'delete'（与 DELETE 同权，
+ *       调用者即删除者）——'read' 会向只读协作者泄露聚合计数（openTask/message/topic/seat）。
+ *       见 plans/rictor-swamp-thing-hulkling.md R13
  *   AGENT-VISIBILITY: 非 admin 用户 ownerId 过滤导致 Board/Task 中看不到其他用户 Agent 名称（显示 ?）。
  *       修复：非 admin 不再强制 ownerId 过滤，改为返回全部 Agent 并在 controller 层 pick 公开字段，
  *             过滤 webhookUrl/webhookSecret/systemPrompt/modelConfig/rateLimit 等敏感配置。
@@ -20,6 +23,10 @@
  *             findOne/update/remove/resetKey/toggle/stats/heartbeat/keys/createKey/revokeKey
  *             全部加 ensureCan(agent, actor, 'write') 检查。
  *       见 memory/2026-06-05.md、memory/2026-06-06.md
+ *   AGENT-FIELD-WHITELIST: 新增/重命名响应字段只改 service + DTO，忘同步 pickPublicAgentFields 白名单——
+ *       descriptionSnippet（2026-07-25, 339b64d）上线一个月实际不返回。
+ *       白名单是响应字段的最后一道裁剪：字段变更必须三处同改（service 产出 + 共享 DTO +
+ *       controller 白名单），并配 controller 层 spec 断言（service 层单测测不出白名单裁剪）。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -144,13 +151,15 @@ export class AgentController {
   /**
    * 从 Agent 对象中提取公开字段，过滤敏感配置信息。
    *
-   * 公开字段：id, name, avatarUrl, status, ownerId, ownerName, description, capabilities,
-   *          createdAt, topicCount, messageCount, apiKeyPrefix
+   * 公开字段：id, name, avatarUrl, status, ownerId, ownerName, description, descriptionSnippet,
+   *          capabilities, createdAt, topicCount, messageCount, apiKeyPrefix
    * 过滤字段：webhookUrl, webhookSecret, systemPrompt, modelConfig, rateLimit,
    *          webhookEvents, webhookTimeoutMs, webhookRetryMax
    *
    * topicCount / messageCount 为 service 层附加的统计字段，一并保留。
    * apiKeyPrefix 用于列表页展示，仅在当前用户为所有者时暴露。
+   * descriptionSnippet 为 service 层 findAll 剥离完整 description 后的摘要片段（列表场景）；
+   * create/findOne 等单条路径无该字段（值为 undefined，JSON 序列化时被丢弃，无副作用）。
    */
   private pickPublicAgentFields(agent: Record<string, unknown>) {
     return {
@@ -161,6 +170,7 @@ export class AgentController {
       ownerId: agent.ownerId,
       ownerName: agent.ownerName,
       description: agent.description,
+      descriptionSnippet: agent.descriptionSnippet,
       capabilities: agent.capabilities,
       createdAt: agent.createdAt,
       lastActiveAt: agent.lastActiveAt,
@@ -239,6 +249,22 @@ export class AgentController {
     @Query() query: { limit?: string | number },
   ) {
     return this.agentService.findMyActivities(actor.id, query);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('me/unread')
+  @ApiOperation({
+    summary: 'Get unread message counts across my topics',
+    description:
+      'Unread message counts per topic for the current agent (cross-topic, plan forge-jubilee-robin.md WS-B). ' +
+      'Semantics: only participation rows with status invited/active are counted (left rows excluded); ' +
+      'messages sent by myself ARE counted (the read cursor advances only via get_topic_digest default markRead=true or explicit mark_topic_read); ' +
+      'topics with unreadCount=0 are omitted; at most 50 topics, ordered by unreadCount DESC then topic updatedAt DESC; ' +
+      'the result is a snapshot at call time — get_topic_digest(markRead=true) resets these counts.',
+  })
+  @ApiResponse({ status: 200, description: 'Unread counts returned successfully' })
+  async getMyUnread(@CurrentActor() actor: UnifiedActor) {
+    return this.agentService.findMyUnreadCounts(actor.id);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -324,6 +350,27 @@ export class AgentController {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
     return this.agentService.toggle(id);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get(':id/deletion-impact')
+  @ApiOperation({
+    summary: 'Get agent deletion impact',
+    description:
+      'Get deletion impact counts (open tasks, messages, topics, roundtable seats) for the delete-confirmation dialog. ' +
+      'Permission = same as DELETE (caller is the one who would delete): aggregate counts are not exposed to read-only collaborators.',
+  })
+  @ApiParam({ name: 'id', description: 'Agent ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Deletion impact returned successfully' })
+  @ApiResponse({ status: 404, description: 'Agent not found or deleted' })
+  async getDeletionImpact(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const agent = await this.agentService.findOne(id);
+    // 与 DELETE 同权（R13）：调用者即删除者；'read' 会向只读协作者泄露聚合计数
+    await this.permService.ensureCan(agent, actor, 'delete');
+    return this.agentService.getDeletionImpact(id);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

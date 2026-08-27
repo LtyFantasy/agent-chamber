@@ -37,16 +37,6 @@ import type {
 import { HttpProxy } from '../proxy/http-proxy';
 
 /**
- * 自动填充 structuredContent 的 text 长度上限（1MB）
- *
- * rationale：超过该长度的 text 大概率是超大响应（如 export_doc_space 全空间导出），
- * 若再填充 structuredContent 等于把同一份数据序列化两遍（text 已 JSON 一次 +
- * structuredContent 再存一份），内存与传输开销翻倍，而消费端免二次 parse 的收益
- * 远小于成本，故超限跳过。
- */
-const MAX_STRUCTURED_CONTENT_TEXT_LENGTH = 1024 * 1024;
-
-/**
  * 尝试把 text 解析为结构化内容
  *
  * 仅 object / array 算结构化内容；scalar（'123'、'"str"'、'true'、'null'）不算——
@@ -69,33 +59,41 @@ function tryParseStructuredContent(text: string): unknown {
 }
 
 /**
- * 归一化 ToolCallResult：为 JSON text 自动填充 structuredContent
+ * 归一化 ToolCallResult（v1.66 新契约：JSON 响应只发 structuredContent，消灭双倍载荷）
  *
- * - handler 显式设置 structuredContent → 尊重不覆盖（为将来 outputSchema 校验/定制预留逃生门）
- * - 否则若 content[0].text 是 ≤1MB 的合法 JSON 且解析结果为 object/array → 填充
- * - 其余情况（非 JSON / scalar JSON / 超长 / 无 content）→ 原样返回
- *
- * text 原样保留（向后兼容：旧 client 仍读 text，新 client 免二次 JSON.parse）。
+ * 四分支规则：
+ * 1. handler 显式设置 structuredContent → 原样不动（逃生门，为将来 outputSchema 校验/定制预留）
+ * 2. isError === true → 原样不动（错误信封双发保留：错误响应小，双发成本可忽略，
+ *    且错误 text 的人类可读性对排障有价值）
+ * 3. content 恰好为单 text 块且 text 为合法 JSON、解析为 object/array → 填充
+ *    structuredContent，且 content 收敛为单条占位文本 `[{ type: 'text', text: '[structured]' }]`
+ *    ——text 只作"这是结构化响应"的固定标记（MCP 2025-06-18 schema 中 content 为
+ *    required，留占位块既合规又便于日志/抓包识别），数据唯一载荷在 structuredContent。
+ *    无大小上限（R1）：服务端本就已完成 JSON 序列化，多 parse 一次成本可忽略；
+ *    旧 1MB cap 会把大 JSON 响应退化为 text-only 沉默分叉，已删除。
+ * 4. 其余（多块 content / 非 JSON / scalar JSON / 无 content）→ 原样不动
+ *    （read_doc 的 markdown 原文等非结构化场景零影响）
  *
  * @param result - handler / proxy 返回的原始结果
  * @returns 归一化后的结果
  */
 function withStructuredContent(result: ToolCallResult): ToolCallResult {
-  if (result.structuredContent !== undefined) {
+  if (result.structuredContent !== undefined || result.isError === true) {
     return result;
   }
 
-  const text = result.content[0]?.text;
-  if (typeof text !== 'string' || text.length > MAX_STRUCTURED_CONTENT_TEXT_LENGTH) {
+  // 仅恰好单 text 块时收敛；多块 content（如未来 text+image）原样不动，防静默吞块
+  const content = result.content;
+  if (content.length !== 1) {
     return result;
   }
 
-  const parsed = tryParseStructuredContent(text);
+  const parsed = tryParseStructuredContent(content[0].text);
   if (parsed === undefined) {
     return result;
   }
 
-  return { ...result, structuredContent: parsed };
+  return { ...result, content: [{ type: 'text', text: '[structured]' }], structuredContent: parsed };
 }
 
 /**
@@ -327,8 +325,8 @@ export class McpServer {
   private handleInitialize(): InitializeResult {
     return {
       // 2025-06-18：structuredContent 字段的引入版本（2024-11-05 无此字段）。
-      // 声明新版本后，支持 structuredContent 的 client 可直接消费 result.structuredContent，
-      // 旧 client 仍读 text（向后兼容）。
+      // 声明新版本后，支持 structuredContent 的 client 直接消费 result.structuredContent
+      // （JSON 响应下它是唯一数据载荷，text 收敛为 '[structured]' 占位）。
       protocolVersion: '2025-06-18',
       capabilities: {
         tools: {
@@ -359,7 +357,8 @@ export class McpServer {
    * 处理 tools/call 请求
    *
    * 统一出口：所有路径（自动映射 / custom / 错误信封）都过 withStructuredContent
-   * 归一化——JSON text 自动补 structuredContent，text 原样保留。
+   * 归一化——JSON 成功响应收敛为单载荷（structuredContent 唯一数据 + text 占位
+   * '[structured]'），错误/非 JSON 响应原样不动。
    */
   private async handleToolsCall(
     req: Request,

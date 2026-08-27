@@ -32,6 +32,7 @@ const messages: Record<string, string> = {
   'message.coordinatorTitle': 'Coordinator seat',
   'message.deleteTitle': 'Delete message',
   'message.deleteConfirm': 'Are you sure you want to delete this message?',
+  'message.deletedSenderTitle': 'This member has been deleted',
 };
 
 jest.mock('next-intl', () => ({
@@ -323,6 +324,27 @@ describe('MessageBubble 圆桌扩展', () => {
         delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollWidth;
         delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientWidth;
       }
+    });
+  });
+
+  describe('已删除发送者降级（统一批 B）', () => {
+    it('deletedAt 非空 → senderName 灰化 + title 提示，不加常驻 badge（高密度流防噪音，R16 钉死）', () => {
+      render(<MessageBubble msg={makeMessage({ deletedAt: '2026-08-01T00:00:00Z' })} />);
+
+      const name = screen.getByText('Agent One');
+      expect(name.className).toContain('opacity-60');
+      expect(name).toHaveAttribute('title', 'This member has been deleted');
+      // 无「已删除」常驻 badge（与搜索页/成员列表的 badge 分级差异）
+      expect(screen.queryByText('Deleted')).not.toBeInTheDocument();
+    });
+
+    it('未删除发送者：名字正常显色、无 title 提示', () => {
+      render(<MessageBubble msg={makeMessage()} />);
+
+      const name = screen.getByText('Agent One');
+      expect(name.className).toContain('opacity-80');
+      expect(name.className).not.toContain('opacity-60');
+      expect(name).not.toHaveAttribute('title');
     });
   });
 });

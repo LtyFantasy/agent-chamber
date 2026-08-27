@@ -116,7 +116,10 @@ export const getDocsOverviewTool: CustomTool = {
       'verify filters took effect via the appliedFilters echo (e.g. excludeType=memory), and pass slim=true ' +
       'to shrink each doc entry to {path,title,summary,docType,tokenEstimate} — combined they keep the ' +
       'response well under typical MCP limits; embedded routes are always navigation-projected ' +
-      '(full route fields via list_doc_routes).',
+      '(full route fields via list_doc_routes). ' +
+      'LEAN CATALOG (v1.66): for cold-start directory awareness pass catalog=true — each doc entry shrinks to ' +
+      '{path,title,tokenEstimate} and maxTokens never truncates doc entries (directory completeness is the ' +
+      'contract; docsReturned === docsTotal), so the full map always fits; it wins over slim when both are passed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -183,6 +186,14 @@ export const getDocsOverviewTool: CustomTool = {
             'Optional: slim projection for large spaces (v1.56). Default false (full doc fields, ' +
             'backward compatible); pass true to project each doc entry to {path,title,summary,docType,' +
             'tokenEstimate} — category grouping is preserved. Embedded routes are always navigation-projected.',
+        },
+        catalog: {
+          type: 'boolean',
+          description:
+            'Optional: lean catalog mode (v1.66). Default false; pass true to project each doc entry to ' +
+            '{path,title,tokenEstimate} and exempt doc entries from maxTokens truncation (directory ' +
+            'completeness is the contract — docsReturned === docsTotal; ideal for cold-start directory ' +
+            'awareness of large spaces). Composes with the filters above; wins over slim when both are passed.',
         },
       },
       required: ['spaceName'],
@@ -264,6 +275,7 @@ export const getDocsOverviewTool: CustomTool = {
       'includeDescription',
       'includeRoutes',
       'slim',
+      'catalog',
     ] as const;
     const params: Record<string, unknown> = {};
     for (const key of filterKeys) {

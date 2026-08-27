@@ -4,6 +4,7 @@ import {
   IsUUID,
   IsArray,
   IsInt,
+  IsIn,
   Min,
   Max,
   ValidationOptions,
@@ -137,4 +138,20 @@ export class QueryTaskDto implements QueryTaskInput {
   @Type(() => Boolean)
   @ApiPropertyOptional({ description: 'Show only unblocked tasks', example: true })
   unblocked?: boolean;
+
+  /**
+   * 排序方式（opt-in，默认 createdAt 不变）：
+   * - createdAt：创建时间倒序（默认，web 看板分页依赖，前端不重排）
+   * - statusPriority：状态优先级 in_progress > todo > blocked > backlog > 其余
+   *   （review/done/archived 恒末位），次键 updatedAt DESC，第三键 id ASC 兜底稳定分页
+   */
+  @IsOptional()
+  @IsIn(['createdAt', 'statusPriority'])
+  @ApiPropertyOptional({
+    enum: ['createdAt', 'statusPriority'],
+    description:
+      'Sort order. createdAt (default): newest first. statusPriority: in_progress > todo > blocked > backlog > others (review/done/archived always last), then updatedAt DESC, then id ASC for stable pagination.',
+    example: 'statusPriority',
+  })
+  sort?: 'createdAt' | 'statusPriority';
 }

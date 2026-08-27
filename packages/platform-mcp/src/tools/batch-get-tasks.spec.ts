@@ -157,4 +157,88 @@ describe('batch_get_tasks', () => {
     // 应发 25 次 HTTP
     expect(request).toHaveBeenCalledTimes(25);
   });
+
+  it('slim 默认：白名单投影 + descriptionSnippet 截断（无 description 全文/commentCount）', async () => {
+    const request = mockRequest();
+    const longDesc = 'x'.repeat(500);
+    request.mockResolvedValueOnce({
+      id: 't1',
+      title: 'Task 1',
+      status: 'in_progress',
+      priority: 'p1',
+      labels: ['bug'],
+      boardId: 'b1',
+      listId: 'l1',
+      assigneeName: 'agent-a',
+      assigneeDeletedAt: null,
+      dueDate: '2026-09-01',
+      updatedAt: '2026-08-27T00:00:00Z',
+      description: longDesc,
+      commentCount: 3, // 应被剔除（findOne 运行时不产出）
+      customFields: { x: 1 }, // 应被剔除
+      list: { name: 'In Progress' }, // 应被剔除
+    });
+
+    const result = await batchGetTasksTool.handler(
+      { ids: ['550e8400-e29b-41d4-a716-446655440001'] },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    const task = body.items[0].task;
+    // 字段恰为白名单集 + descriptionSnippet/descriptionTruncated
+    expect(task).toEqual({
+      id: 't1',
+      title: 'Task 1',
+      status: 'in_progress',
+      priority: 'p1',
+      labels: ['bug'],
+      boardId: 'b1',
+      listId: 'l1',
+      assigneeName: 'agent-a',
+      assigneeDeletedAt: null,
+      dueDate: '2026-09-01',
+      updatedAt: '2026-08-27T00:00:00Z',
+      descriptionSnippet: 'x'.repeat(300),
+      descriptionTruncated: true,
+    });
+    // 无 description 全文、无 commentCount
+    expect(task.description).toBeUndefined();
+    expect(task.commentCount).toBeUndefined();
+  });
+
+  it('slim:false → 全文通道透传（含 description/commentCount）', async () => {
+    const request = mockRequest();
+    const full = {
+      id: 't1',
+      title: 'Task 1',
+      description: 'full text',
+      commentCount: 3,
+      customFields: { x: 1 },
+    };
+    request.mockResolvedValueOnce(full);
+
+    const result = await batchGetTasksTool.handler(
+      { ids: ['550e8400-e29b-41d4-a716-446655440001'], slim: false },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body.items[0].task).toEqual(full);
+  });
+
+  it('description ≤300 → 不打 descriptionTruncated', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({ id: 't1', description: 'short' });
+
+    const result = await batchGetTasksTool.handler(
+      { ids: ['550e8400-e29b-41d4-a716-446655440001'] },
+      ctx(),
+    );
+
+    const body = JSON.parse(result.content[0].text);
+    const task = body.items[0].task;
+    expect(task.descriptionSnippet).toBe('short');
+    expect(task.descriptionTruncated).toBeUndefined();
+  });
 });

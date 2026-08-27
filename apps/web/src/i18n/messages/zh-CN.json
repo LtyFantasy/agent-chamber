@@ -9,6 +9,7 @@
     "cancel": "取消",
     "confirm": "确认",
     "delete": "删除",
+    "deleted": "已删除",
     "edit": "编辑",
     "create": "创建",
     "search": "搜索",
@@ -219,29 +220,12 @@
     },
     "participant": {
       "title": "参与者与邀请",
-      "summary": "{count, plural, other {# 位参与者}} · {invited, plural, other {# 位已邀请}}",
-      "activeList": "活跃参与者",
-      "noActive": "暂无活跃参与者",
-      "invitedList": "已邀请",
-      "noInvited": "暂无已邀请 Agent",
-      "addInvite": "添加邀请",
-      "noAvailableAgents": "没有可邀请的活跃 Agent",
-      "inviteAgents": "邀请 {count} 个 Agent",
-      "inviteUser": "邀请用户",
-      "noUsers": "没有可邀请的用户",
-      "selectUser": "选择用户...",
-      "invite": "邀请",
       "human": "人类",
       "agent": "Agent",
       "member": "成员",
       "moderator": "主持人",
       "invited": "已邀请",
-      "remove": "移除",
-      "agentStatus": {
-        "active": "活跃",
-        "disabled": "已禁用",
-        "pending": "已待定"
-      }
+      "inviteFailed": "邀请结果：成功 {succeeded} 个，失败 {failed} 个"
     },
     "related": {
       "title": "关联资源",
@@ -286,7 +270,8 @@
       "allWakeTitle": "唤醒全部座位",
       "allWakeConfirm": "将唤醒全部 {count} 个座位，确认发送？",
       "coordinatorBadge": "主脑",
-      "coordinatorTitle": "主脑座位：调度指令以 topic 正文明说可观测"
+      "coordinatorTitle": "主脑座位：调度指令以 topic 正文明说可观测",
+      "deletedSenderTitle": "该成员已删除"
     },
     "permissionRequest": {
       "title": "{count} 项待审批",
@@ -376,7 +361,8 @@
       "recentActivity": "近况",
       "noActivity": "暂无近况",
       "silentCount": "沉默轮数：{count}",
-      "usage": "用量 {used}/{size} tokens"
+      "usage": "用量 {used}/{size} tokens",
+      "boundAgentDeleted": "绑定的 Agent 已删除"
     },
     "seatGuide": {
       "model": "runner 从装有 CLI 的机器拨出连接平台（不一定是部署平台那台），用所绑定 Agent 的 API Key 认领座位。",
@@ -617,19 +603,12 @@
       "title": "看板成员",
       "count": "{count} 成员",
       "permissions": "权限",
-      "descriptionWithTopic": "管理看板成员权限，编辑者可管理看板内容",
-      "descriptionWithoutTopic": "管理可以访问此看板的成员",
-      "label": "成员",
-      "noMembers": "暂无成员",
-      "privateOnlyCreator": "，私密看板仅创建者可访问",
       "human": "人类",
       "agent": "Agent",
       "editor": "编辑者",
       "member": "成员",
       "setEditor": "设为编辑者",
-      "addInvite": "添加邀请",
-      "noAvailableAgents": "没有可邀请的活跃 Agent",
-      "inviteAgents": "邀请 {count} 个 Agent"
+      "inviteFailed": "邀请结果：成功 {succeeded} 个，失败 {failed} 个"
     },
     "docs": {
       "bind": "文档",
@@ -734,19 +713,13 @@
     },
     "members": {
       "title": "空间成员",
-      "description": "编辑者可管理文档；成员可查看私密空间",
       "editor": "编辑者",
       "member": "成员",
-      "noMembers": "暂无成员",
-      "addInvite": "添加邀请",
-      "noAvailableAgents": "没有可用的活跃 Agent",
+      "human": "人类",
+      "agent": "Agent",
       "setEditor": "设为编辑者",
-      "remove": "移除",
       "actionFailed": "操作失败，请重试",
-      "transferCreator": "转让创建者",
-      "transferTitle": "转让创建者",
-      "transferConfirm": "将创建者转让给「{name}」？原创建者将失去全部权限（私密空间将无法访问），此操作不可逆。",
-      "transferConfirmButton": "确认转让",
+      "inviteFailed": "邀请结果：成功 {succeeded} 个，失败 {failed} 个",
       "transferSuccess": "创建者已转让",
       "transferFailed": "转让失败，请重试"
     },
@@ -980,6 +953,7 @@
     "createFailed": "创建失败，请重试",
     "table": {
       "name": "名称",
+      "description": "介绍",
       "owner": "所有者",
       "status": "状态",
       "apiKey": "API Key",
@@ -1006,7 +980,10 @@
     },
     "delete": {
       "title": "确认删除",
-      "description": "此操作不可撤销，确定要删除该 Agent 吗？"
+      "description": "此操作不可撤销，确定要删除该 Agent 吗？",
+      "impactSeat": "圆桌座位不会自动释放，删除后该 Agent 无法再发言",
+      "impactTasks": "未完成任务不会自动改派",
+      "noImpact": "该 Agent 无关联数据。删除后 API Key 立即吊销，此操作不可撤销"
     },
     "resetKey": {
       "title": "重置并查看 API Key",
@@ -1136,5 +1113,31 @@
     "subDownload": "下载此 SKILL.md",
     "footerHint": "该 Skill 用于指导 Agent 接入本平台，可公开访问。",
     "goToLogin": "去登录 →"
+  },
+  "members": {
+    "invite": "邀请成员",
+    "back": "返回",
+    "searchMembers": "搜索成员…",
+    "searchCandidates": "搜索…",
+    "selectedCount": "已选 {count} 个",
+    "inviteCount": "邀请 {count} 个",
+    "remove": "移除",
+    "removeConfirmTitle": "移除成员",
+    "removeConfirmDesc": "确定移除 {name} 吗？移除后将立即失去访问权限。",
+    "transferCreator": "转让创建者",
+    "transferConfirmTitle": "转让创建者",
+    "transferConfirmDesc": "确定将创建者转让给 {name} 吗？转让后你将失去创建者权限。",
+    "emptyTitle": "暂无成员",
+    "emptyDesc": "点击下方「邀请成员」添加第一位成员",
+    "candidatesEmpty": "所有 Agent 都已在成员中",
+    "humansEmpty": "没有可邀请的用户",
+    "invitedSection": "已邀请 ({count})",
+    "agentSection": "Agent 区",
+    "humanSection": "用户区",
+    "cancelInviteAria": "取消 {name} 的邀请",
+    "menuAria": "{name} 的成员操作",
+    "countSummary": "{count} 位成员",
+    "countSummaryWithInvited": "{count} 位成员 · {invited} 位已邀请",
+    "noSearchResults": "未找到匹配的成员"
   }
 }

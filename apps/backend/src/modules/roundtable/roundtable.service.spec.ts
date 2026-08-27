@@ -38,6 +38,7 @@ import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { RunnerRegistryService } from './runner-registry.service';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 // ─────────────────────────── 构造器 ───────────────────────────
 
@@ -158,7 +159,7 @@ describe('RoundtableService', () => {
   let runnerRepo: { findOne: jest.Mock; find: jest.Mock };
   let topicRepo: { findOne: jest.Mock };
   let messageRepo: { findOne: jest.Mock; find: jest.Mock };
-  let actorRepo: { findOne: jest.Mock };
+  let actorRepo: { findOne: jest.Mock; find: jest.Mock };
   let permReqRepo: {
     findOne: jest.Mock;
     find: jest.Mock;
@@ -177,6 +178,7 @@ describe('RoundtableService', () => {
   let permService: { ensureCan: jest.Mock };
   let registry: { sendToRunner: jest.Mock; isRunnerOnline: jest.Mock };
   let ownerProxy: { isOwnerProxy: jest.Mock };
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
 
   beforeEach(async () => {
     seatQb = {
@@ -194,7 +196,7 @@ describe('RoundtableService', () => {
     runnerRepo = { findOne: jest.fn(), find: jest.fn() };
     topicRepo = { findOne: jest.fn() };
     messageRepo = { findOne: jest.fn(), find: jest.fn() };
-    actorRepo = { findOne: jest.fn() };
+    actorRepo = { findOne: jest.fn(), find: jest.fn() };
     permReqRepo = {
       findOne: jest.fn(),
       find: jest.fn(),
@@ -214,6 +216,40 @@ describe('RoundtableService', () => {
     registry = { sendToRunner: jest.fn(), isRunnerOnline: jest.fn() };
     ownerProxy = { isOwnerProxy: jest.fn() };
 
+    // 统一批 A2：projectMessage 发送者解析委托 ActorProfileService。mock 直接以
+    // actorRepo.find 返回的 actors 行为准（name = displayName，deletedAt 透传），
+    // 行为等价（公共服务自身逻辑在 actor-profile.service.spec.ts 单独验证）。
+    // ⚠️ 必须在 createTestingModule 之前赋值——useValue 在对象字面量求值时取值。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        // 行类型显式化：jest.Mock 无泛型时返回推断为 {}，await 后直接访问字段会 TS 报错
+        const rows = (await actorRepo.find({} as any)) as Array<{
+          id: string;
+          type: ActorType;
+          displayName?: string | null;
+          avatarUrl?: string | null;
+          deletedAt?: Date | null;
+        }>;
+        const rowMap = new Map(rows.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const row = rowMap.get(id);
+          if (!row) continue; // 真孤儿不进 map
+          map.set(id, {
+            type: row.type,
+            name: row.displayName || 'System',
+            avatarUrl: row.avatarUrl ?? null,
+            description: null,
+            deletedAt: row.deletedAt ?? null,
+          });
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
+    };
+
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         RoundtableService,
@@ -228,6 +264,7 @@ describe('RoundtableService', () => {
         { provide: PermissionService, useValue: permService },
         { provide: RunnerRegistryService, useValue: registry },
         { provide: OwnerProxyService, useValue: ownerProxy },
+        { provide: ActorProfileService, useValue: mockActorProfileService },
       ],
     }).compile();
 
@@ -236,6 +273,10 @@ describe('RoundtableService', () => {
     messageRepo.findOne.mockResolvedValue(makeMessage());
     topicRepo.findOne.mockResolvedValue({ id: 'topic-1', title: '圆桌测试' });
     actorRepo.findOne.mockResolvedValue({ type: ActorType.AGENT, displayName: 'Test Agent' });
+    // 默认 actor 行（agent-1 → Test Agent）：projectMessage 走公共解析，与 findOne 默认同值
+    actorRepo.find.mockResolvedValue([
+      { id: 'agent-1', type: ActorType.AGENT, displayName: 'Test Agent' } as Actor,
+    ]);
     seatRepo.findOne.mockResolvedValue(makeSeat()); // flushPending / handleSeatEvent 命中
     seatQb.getOne.mockResolvedValue(null); // r17 冲突检查默认无既有座位（各用例按需覆盖）
     registry.sendToRunner.mockReturnValue(true);
@@ -333,7 +374,13 @@ describe('RoundtableService', () => {
     );
     expect(payload.body.batch.messages[0]).toEqual({
       id: 'msg-1',
-      from: { name: 'Test Agent', type: 'agent', seatLabel: null, coordinator: false },
+      from: {
+        name: 'Test Agent',
+        type: 'agent',
+        seatLabel: null,
+        coordinator: false,
+        deletedAt: null,
+      },
       ts: '2026-08-07T12:00:00.000Z',
       replyTo: null,
       content: 'hello',
@@ -350,6 +397,36 @@ describe('RoundtableService', () => {
 
   // ───────────────────── 注入埋点（1.54.0，0c567f8b）─────────────────────
   // ring.injectedAt / injectRetryCount / injectFailCount 三处埋点 + bumpInjectCounter 自吞。
+
+  it('软删 agent 消息注入：真名保留 + from.deletedAt 非空（统一批契约，原 sender-xxxx 兜底行为变更）', async () => {
+    const seat = makeSeat();
+    seatRepo.find.mockResolvedValue([seat]); // 注入触发器按 label 匹配座位
+    seatRepo.findOne.mockResolvedValue(seat);
+    seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
+    // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）；displayName 保留
+    actorRepo.find.mockResolvedValueOnce([
+      {
+        id: 'agent-1',
+        type: ActorType.AGENT,
+        displayName: 'Ghost Agent',
+        deletedAt: new Date('2024-06-01T00:00:00Z'),
+      } as Actor,
+    ]);
+
+    await service.onMessageCreated(makeEvent());
+
+    expect(registry.sendToRunner).toHaveBeenCalledTimes(1);
+    const payload = (registry.sendToRunner.mock.calls[0][1] as Envelope).payload as {
+      body: InjectBody;
+    };
+    expect(payload.body.batch.messages[0].from).toEqual({
+      name: 'Ghost Agent',
+      type: 'agent',
+      seatLabel: null,
+      coordinator: false,
+      deletedAt: '2024-06-01T00:00:00.000Z',
+    });
+  });
 
   it('persistDispatch 成功后 ring 新条目含 injectedAt（合法 ISO 字符串）且 lastInjectSeq 推进', async () => {
     const seat = makeSeat();
@@ -462,6 +539,7 @@ describe('RoundtableService', () => {
       type: 'agent',
       seatLabel: 'kimi-2',
       coordinator: true,
+      deletedAt: null,
     });
   });
 
@@ -2604,6 +2682,61 @@ describe('RoundtableService', () => {
         HUMAN_ACTOR,
       ),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  it('createSeat：bindActorId 指向已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+    topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't', creatorId: 'agent-1' });
+    permService.ensureCan.mockResolvedValue(undefined);
+    // 现状曾完全无存在性校验——软删 agent 会被绑进座位形成活配置错误；本批补
+    // assertActorUsable（bindActorId 必填时才校验，agent 缺省绑自己恒通过）
+    mockActorProfileService.assertActorUsable.mockRejectedValue(
+      new NotFoundException({
+        message: 'Agent not found or deleted',
+        code: ErrorCode.AGENT_NOT_FOUND,
+      }),
+    );
+
+    await expect(
+      service.createSeat(
+        {
+          topicId: 'topic-1',
+          label: 'kimi-1',
+          vendor: 'kimi',
+          cwd: '/tmp',
+          permissionMode: 'auto',
+          bindActorId: 'agent-deleted',
+        },
+        AGENT_ACTOR,
+      ),
+    ).rejects.toMatchObject({
+      response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+    });
+    // 校验失败不得落库
+    expect(seatRepo.save).not.toHaveBeenCalled();
+  });
+
+  it('createSeat：bindActorId 指向正常 agent → 通过（assertActorUsable 放行，对照用例）', async () => {
+    topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't', creatorId: 'agent-1' });
+    permService.ensureCan.mockResolvedValue(undefined);
+    seatQb.getOne.mockResolvedValue(null); // r17 冲突检查：无既有座位
+    const saved = makeSeat();
+    seatRepo.create.mockImplementation((input: unknown) => ({ ...saved, ...(input as object) }));
+    seatRepo.save.mockResolvedValue(saved);
+
+    const result = await service.createSeat(
+      {
+        topicId: 'topic-1',
+        label: 'kimi-1',
+        vendor: 'kimi',
+        cwd: '/tmp',
+        permissionMode: 'auto',
+        bindActorId: 'agent-1',
+      },
+      AGENT_ACTOR,
+    );
+
+    expect(mockActorProfileService.assertActorUsable).toHaveBeenCalledWith('agent-1');
+    expect(result).toBe(saved);
   });
 
   // ── r17 唯一座位约束（一 agent 一 topic 一 active 座位，docs/roundtable-design.md §12 r17）──

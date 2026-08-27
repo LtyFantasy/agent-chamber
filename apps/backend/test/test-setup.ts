@@ -51,7 +51,7 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
     findOne: jest.fn(),
     findOneBy: jest.fn(),
     findAndCount: jest.fn(),
-    findBy: jest.fn(),
+    findBy: jest.fn().mockResolvedValue([]),
     save: jest.fn((entity) => Promise.resolve(entity)),
     create: jest.fn((entity) => entity),
     delete: jest.fn(),
@@ -83,11 +83,14 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
         innerJoin: jest.fn().mockReturnThis(),
         innerJoinAndSelect: jest.fn().mockReturnThis(),
         addSelect: jest.fn().mockReturnThis(),
+        // 统一批 A1 公共解析服务（actor-profile.service.ts）依赖 withDeleted——
+        // mock e2e 链缺失会导致 resolveProfiles 500（topic/board/docspace e2e 回归源）
+        withDeleted: jest.fn().mockReturnThis(),
         setParameter: jest.fn().mockReturnThis(),
         setParameters: jest.fn().mockReturnThis(),
-        getManyAndCount: jest.fn(),
-        getMany: jest.fn(),
-        getOne: jest.fn(),
+        getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+        getMany: jest.fn().mockResolvedValue([]),
+        getOne: jest.fn().mockResolvedValue(null),
         getRawMany: jest.fn().mockResolvedValue([]),
         // 默认 resolve undefined，模拟空表 SUM 场景（service 端有 ?? '0' 兜底）
         getRawOne: jest.fn().mockResolvedValue(undefined),

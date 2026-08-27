@@ -144,6 +144,13 @@ export class TaskController {
     description: 'Return only unblocked tasks',
     type: Boolean,
   })
+  @ApiQuery({
+    name: 'sort',
+    required: false,
+    description:
+      'Sort order: createdAt (default, newest first) | statusPriority (in_progress > todo > blocked > backlog > others — review/done/archived always last; ties broken by updatedAt DESC then id ASC for stable pagination)',
+    enum: ['createdAt', 'statusPriority'],
+  })
   @ApiResponse({ status: 200, description: 'Paginated list of tasks' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   async findAll(@Query() query: QueryTaskDto, @CurrentActor() actor: UnifiedActor) {

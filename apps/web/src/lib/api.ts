@@ -37,6 +37,7 @@ import type {
   AgentActivity,
   AgentLeaderboardItem,
   AgentStats,
+  AgentDeletionImpact,
   UpdateUserProfileRequest,
   ChangePasswordRequest,
   AdminUser,
@@ -393,6 +394,9 @@ const agents = {
   },
   getById: (id: string) => apiRequest<AgentDetail>('GET', `/agents/${id}`),
   getStats: (id: string) => apiRequest<AgentStats>('GET', `/agents/${id}/stats`),
+  /** 删除影响面（统一批 B）：删除确认弹窗展示用——权限与 DELETE 同权（调用者即删除者） */
+  getDeletionImpact: (id: string) =>
+    apiRequest<AgentDeletionImpact>('GET', `/agents/${id}/deletion-impact`),
   create: (data: CreateAgentRequest) => apiRequest<Agent>('POST', '/agents', data),
   update: (id: string, data: UpdateAgentRequest) =>
     apiRequest<Agent>('PATCH', `/agents/${id}`, data),

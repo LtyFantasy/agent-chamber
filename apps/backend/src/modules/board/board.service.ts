@@ -10,11 +10,23 @@
  *         Service 只做业务：findById() + enrich()。见 memory/2026-06-05.md
  *   BoardDetail 与 tasks 解耦：findById 不再 join tasks，taskCount 通过 QueryBuilder 聚合。
  *
- * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行)
+ * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create/update补齐)
  *
  * [铁律关联] #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   A2.5b: 拦截只针对"新增引用"——removeEditor/uninviteAgent 回退
+ *       resourceValidator.exists（软删 agent 的 agents 行永在，移除=清理动作必须可用，
+ *       否则已删成员行永远无法清理）；create/update invitedAgentIds 补齐
+ *       assertActorUsable（create 一刀切；update 只拦 toAdd——存量含已删成员不拦，
+ *       set 语义全量替换否则永远无法保存）。2026-08-26 统一批 A2.5b 修正。
+ *   A2.5: 新增类写入口（addEditor/inviteAgent + create/update invitedAgentIds）走
+ *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND，
+ *       覆盖"从未存在"与"已删除"——契约 docs/spec.md §1 规则 6）。2026-08-26 统一批 A2.5。
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件所有 actor 投影（enrich 成员 / digest assignee）一律经 ActorProfileService
+ *       .resolveProfiles 取 deletedAt/type/name，禁止散落 queryBuilder 或自建 actors 查询
+ *       （收口见 common/services/actor-profile.service.ts，契约 docs/spec.md §1）。2026-08-26 统一批 A2。
  *   B-52: create() 历史上只给 invitedAgentIds 写成员行，creator 不落表——成员列表缺席
  *         + AccessQueryService 按成员表算可见性对 creator 不命中（4b1ddd1c）。修复：
  *         creator 落 role='editor' 且 invitedBy=null 行，invited 列表过滤 creator 防
@@ -74,6 +86,7 @@ import type {
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import { BoardList } from '../../database/entities/board-list.entity';
 import { Task } from '../../database/entities/task.entity';
 import { TaskService } from '../task/task.service';
@@ -132,75 +145,17 @@ export class BoardService {
     private seatRepo: Repository<RoundtableSeat>,
     @InjectRepository(Message)
     private messageRepo: Repository<Message>,
+    private readonly actorProfileService: ActorProfileService,
   ) {}
 
   /**
-   * 批量解析 Actor 类型
-   * participant_type / creator_type 等列即将删除，加载实体时该字段为 undefined，
-   * 需要通过 actors 表重新推导类型。
-   */
-  private async resolveActorTypes(actorIds: string[]): Promise<Map<string, ActorType>> {
-    const uniqueIds = [...new Set(actorIds)].filter(Boolean);
-    if (uniqueIds.length === 0) return new Map();
-    const actors = await this.actorRepo.find({ where: { id: In(uniqueIds) } });
-    return new Map(actors.map((a) => [a.id, a.type]));
-  }
-
-  /**
    * 批量聚合 Actor 公开信息（类型、显示名、头像、描述）
+   * 统一批 A1 收敛：委托 ActorProfileService（返回元素新增 deletedAt 信号；
+   * 软删 actor 解析出真名 + 真实 type，不再是 'Unknown'/被过滤——契约变更见
+   * docs/spec.md §1；真孤儿不进 map，由调用方兜底）。
    */
-  private async resolveActorProfiles(actorIds: string[]): Promise<
-    Map<
-      string,
-      {
-        type: ActorType;
-        name: string;
-        avatarUrl: string | null;
-        description: string | null;
-      }
-    >
-  > {
-    const typeMap = await this.resolveActorTypes(actorIds);
-    const humanIds = actorIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
-    const agentIds = actorIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
-
-    const [humans, agents] = await Promise.all([
-      humanIds.length > 0
-        ? this.userRepo.find({ where: { id: In(humanIds) }, relations: { actor: true } })
-        : Promise.resolve([] as User[]),
-      agentIds.length > 0
-        ? this.agentRepo.find({ where: { id: In(agentIds) }, relations: { actor: true } })
-        : Promise.resolve([] as Agent[]),
-    ]);
-
-    const humanMap = new Map(humans.map((u) => [u.id, u]));
-    const agentMap = new Map(agents.map((a) => [a.id, a]));
-
-    const result = new Map<
-      string,
-      { type: ActorType; name: string; avatarUrl: string | null; description: string | null }
-    >();
-    for (const id of actorIds) {
-      const type = typeMap.get(id);
-      if (type === ActorType.HUMAN) {
-        const user = humanMap.get(id);
-        result.set(id, {
-          type,
-          name: user?.displayName || user?.username || 'Unknown User',
-          avatarUrl: user?.avatarUrl ?? null,
-          description: null,
-        });
-      } else if (type === ActorType.AGENT) {
-        const agent = agentMap.get(id);
-        result.set(id, {
-          type,
-          name: agent?.name || 'Unknown Agent',
-          avatarUrl: agent?.avatarUrl ?? null,
-          description: agent?.description ?? null,
-        });
-      }
-    }
-    return result;
+  private async resolveActorProfiles(actorIds: string[]): Promise<Map<string, ActorProfile>> {
+    return this.actorProfileService.resolveProfiles(actorIds);
   }
 
   /** 原始查询：按 ID 查找 Board（含 lists，不再 join tasks），不做权限检查 */
@@ -298,9 +253,12 @@ export class BoardService {
       const profile = profileMap.get(m.actorId);
       return {
         id: m.actorId,
+        // 'Unknown' 兜底仅留真孤儿（actors 表无行，公共服务不进 map——R12）
         name: profile?.name || 'Unknown',
         type: (profile?.type === ActorType.HUMAN ? 'human' : 'agent') as 'human' | 'agent',
         avatarUrl: profile?.avatarUrl ?? null,
+        // 软删信号透传：非空 = 该成员已删除，name 仍可显示（契约 docs/spec.md §1）
+        deletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
         role: m.role as BoardMemberRole,
         invitedBy: m.invitedBy,
         createdAt: m.createdAt,
@@ -834,6 +792,9 @@ export class BoardService {
     const profileMap = await this.resolveActorProfiles([...new Set(allAssignees)]);
     const nameOf = (id: string | null | undefined): string | null =>
       id ? (profileMap.get(id)?.name ?? null) : null;
+    // 软删信号投影（契约 docs/spec.md §1）：非空 = assignee 已删除，assigneeName 仍显示
+    const deletedAtOf = (id: string | null | undefined): string | null =>
+      id ? (profileMap.get(id)?.deletedAt?.toISOString() ?? null) : null;
 
     // metrics：settings.metrics 透传不加工（report-metrics.mjs 上报的机器事实；无则 null）
     const metrics = (board.settings?.metrics as Record<string, unknown> | undefined) ?? null;
@@ -888,18 +849,30 @@ export class BoardService {
       docsTruncated ||
       versionsTruncated;
 
-    // 最终投影：剔除内部 assigneeId，统一填充 assigneeName
+    // 最终投影：剔除内部 assigneeId，统一填充 assigneeName + assigneeDeletedAt（软删信号）
     const projectRisk = (r: DigestRiskRow): BoardDigestRisk => {
       const { assigneeId, ...rest } = r;
-      return { ...rest, assigneeName: nameOf(assigneeId) };
+      return {
+        ...rest,
+        assigneeName: nameOf(assigneeId),
+        assigneeDeletedAt: deletedAtOf(assigneeId),
+      };
     };
     const projectOpen = (t: DigestTaskRow): BoardDigestOpenTask => {
       const { assigneeId, ...rest } = t;
-      return { ...rest, assigneeName: nameOf(assigneeId) };
+      return {
+        ...rest,
+        assigneeName: nameOf(assigneeId),
+        assigneeDeletedAt: deletedAtOf(assigneeId),
+      };
     };
     const projectDone = (t: DigestDoneRow): BoardDigestDoneTask => {
       const { assigneeId, ...rest } = t;
-      return { ...rest, assigneeName: nameOf(assigneeId) };
+      return {
+        ...rest,
+        assigneeName: nameOf(assigneeId),
+        assigneeDeletedAt: deletedAtOf(assigneeId),
+      };
     };
 
     return {
@@ -1026,13 +999,12 @@ export class BoardService {
         });
     }
 
-    // 批量校验 invitedAgentIds 中所有 Agent 真实存在，避免脏数据
+    // 批量校验 invitedAgentIds 中所有 Agent 存在且未软删（统一批 A2.5b：create 一刀切校验
+    // 全部 id——新增引用禁止指向已删 actor，契约 docs/spec.md §1 规则 6；与 topic create 对齐）
     const invitedAgentIds = dto.invitedAgentIds || [];
     if (invitedAgentIds.length > 0) {
-      await this.resourceValidator.existsMany(
-        this.agentRepo,
-        invitedAgentIds,
-        ErrorCode.AGENT_NOT_FOUND,
+      await Promise.all(
+        [...new Set(invitedAgentIds)].map((id) => this.actorProfileService.assertActorUsable(id)),
       );
     }
 
@@ -1113,14 +1085,6 @@ export class BoardService {
 
     // 处理 invitedAgentIds：set 语义操作 board_members 表
     if (dto.invitedAgentIds !== undefined) {
-      if (dto.invitedAgentIds.length > 0) {
-        await this.resourceValidator.existsMany(
-          this.agentRepo,
-          dto.invitedAgentIds,
-          ErrorCode.AGENT_NOT_FOUND,
-        );
-      }
-
       // 获取当前 role='member' 的成员（toRemove 用；editor 不在此集合，永不被移除）
       const currentMembers = await this.memberRepo.find({
         where: { boardId: id, role: BoardMemberRole.MEMBER },
@@ -1135,7 +1099,12 @@ export class BoardService {
       });
       const existingIds = new Set(existingAll.map((m) => m.actorId));
       const toAdd = [...new Set(dto.invitedAgentIds)].filter((aid) => !existingIds.has(aid));
+
+      // 只拦新增 id（统一批 A2.5b，R11 同款）：update 是 set 语义全量替换，存量成员行里的
+      // 已删 agent 不拦——否则存量含已删成员的话题永远无法保存。契约 docs/spec.md §1 规则 6
       if (toAdd.length > 0) {
+        await Promise.all(toAdd.map((aid) => this.actorProfileService.assertActorUsable(aid)));
+
         const newMembers = toAdd.map((actorId) =>
           this.memberRepo.create({
             boardId: id,
@@ -1208,8 +1177,8 @@ export class BoardService {
     if (!board)
       throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
 
-    // 校验 Agent 真实存在
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（统一批 A2.5：写入口统一拒绝已删 actor——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     // 查找是否已存在 board_members 行
     const existing = await this.memberRepo.findOne({
@@ -1266,7 +1235,8 @@ export class BoardService {
       });
     }
 
-    // 校验 Agent 真实存在
+    // 校验 Agent 真实存在（A2.5b：移除类入口不拦软删——软删 agent 的 agents 行永在，移除是
+    // 清理动作必须可用，否则已删成员行永远无法清理；完全不存在仍 404。拦截只针对新增引用）
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     // 查找 editor 行
@@ -1303,8 +1273,8 @@ export class BoardService {
     if (!board)
       throw new NotFoundException({ message: 'Board not found', code: ErrorCode.BOARD_NOT_FOUND });
 
-    // 校验 Agent 真实存在
-    await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
+    // 校验 Agent 存在且未软删（统一批 A2.5：写入口统一拒绝已删 actor——契约 docs/spec.md §1 规则 6）
+    await this.actorProfileService.assertActorUsable(agentId);
 
     // 检查是否已是成员/editor（通过 board_members 表）
     const existing = await this.memberRepo.findOne({
@@ -1353,7 +1323,8 @@ export class BoardService {
       });
     }
 
-    // 校验 Agent 真实存在
+    // 校验 Agent 真实存在（A2.5b：移除类入口不拦软删——软删 agent 的 agents 行永在，移除是
+    // 清理动作必须可用，否则已删成员行永远无法清理；完全不存在仍 404。拦截只针对新增引用）
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     // 查找 board_members 行

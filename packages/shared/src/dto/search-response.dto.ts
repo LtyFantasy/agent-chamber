@@ -39,6 +39,8 @@ export interface MessageSearchResult {
   senderType: string;
   /** 发送者名称，Service 层注入 */
   senderName: string;
+  /** 软删时间；非空 = 发送者已删除，senderName 仍可显示（历史归因保留） */
+  senderDeletedAt?: string | null;
   /** 消息类型 */
   type: string;
   /** 创建时间 */

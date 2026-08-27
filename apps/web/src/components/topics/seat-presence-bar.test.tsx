@@ -41,6 +41,7 @@ const messages: Record<string, string> = {
   'topics.seatPresence.noActivity': 'No recent activity',
   'topics.seatPresence.silentCount': 'Silent rounds: {count}',
   'topics.seatPresence.usage': 'Usage {used}/{size} tokens',
+  'topics.seatPresence.boundAgentDeleted': 'Bound agent has been deleted',
   'topics.seatManager.coordinator': 'Coordinator',
   'topics.seatManager.coordinatorTitle': 'Coordinator seat',
   'common.confirm': 'Confirm',
@@ -360,5 +361,47 @@ describe('SeatPresenceBar 顶部座位条', () => {
       container.querySelector('[data-testid="seat-presence-chip-seat-1"]') as Element,
     );
     expect(container.querySelector('[data-testid="seat-presence-popover"]')).toBeNull();
+  });
+
+  it('绑定的 Agent 已删除（统一批 B）：Avatar 灰化 + chip title 提示，座位 label 不动', () => {
+    // 参与者带 deletedAt（软删 agent 仍解析出真名 + 信号，A2 契约）
+    mockUseSeatPresence.mockReturnValue({
+      data: [
+        {
+          id: 'seat-9',
+          label: 'Seat Ghost',
+          status: 'active',
+          vendor: 'kimi',
+          runnerId: null,
+          config: { bindActorId: 'actor-9' },
+        },
+      ],
+    });
+    const deletedParticipants: TopicParticipant[] = [
+      {
+        participantId: 'actor-9',
+        participantType: 'agent',
+        name: 'Ghost Agent',
+        avatarUrl: null,
+        description: null,
+        role: 'member',
+        status: ParticipantStatus.ACTIVE,
+        deletedAt: '2026-08-01T00:00:00Z',
+      },
+    ];
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <QueryClientProvider client={queryClient}>
+        <SeatPresenceBar topicId={TOPIC_ID} enabled participants={deletedParticipants} canManage />
+      </QueryClientProvider>,
+    );
+
+    // xs 尺寸灰化不可辨 → chip title 提示是主要降级载体（R16 钉死）
+    const chip = container.querySelector('[data-testid="seat-presence-chip-seat-9"]') as Element;
+    expect(chip.getAttribute('title')).toBe('Bound agent has been deleted');
+    // Avatar 灰化（grayscale）且隐藏 Bot 角标（xs 本就无角标，灰度即降级信号）
+    expect(chip.querySelector('.grayscale')).not.toBeNull();
+    // 座位 label 不动（座位是存量配置，label 非 actor 身份）
+    expect(screen.getByText('Seat Ghost')).toBeInTheDocument();
   });
 });

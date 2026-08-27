@@ -62,6 +62,8 @@ export interface DocSpaceMemberDto {
   actorName?: string;
   /** 成员类型 */
   actorType?: 'human' | 'agent';
+  /** 软删时间；非空 = 该成员已删除，actorName 仍可显示（历史归因保留） */
+  deletedAt?: string | null;
   /** 角色：editor | member */
   role: string;
   /** 邀请者 Actor ID */
@@ -166,6 +168,23 @@ export interface DocSummarySlim {
   /** 文档类型 */
   docType?: string | null;
   /** Token 估算总量 */
+  tokenEstimate?: number;
+}
+
+/**
+ * 文档摘要 catalog 投影（v1.66，overview?catalog=true 专用）
+ *
+ * 只保留目录三键：{path, title, tokenEstimate}——tokenEstimate 是消费方决定
+ * "要不要 read_doc 读全文"的唯一预算依据（R3 保留理由）。summary/docType 等
+ * 一并省略（比 slim 更瘦）；目录完整性由服务端豁免 maxTokens 截断保证，
+ * category 归属由分组结构承载。
+ */
+export interface DocSummaryCatalog {
+  /** 文档路径 */
+  path: string;
+  /** 文档标题 */
+  title: string;
+  /** Token 估算总量（读全文的成本预算依据） */
   tokenEstimate?: number;
 }
 
@@ -655,6 +674,16 @@ export interface DocCategoryOverviewSlim extends Omit<DocCategoryOverview, 'docs
 }
 
 /**
+ * catalog 模式下的分类视图（v1.66，overview?catalog=true）
+ *
+ * 与 DocCategoryOverview 同构，仅 docs 元素换为 DocSummaryCatalog（三键）。
+ */
+export interface DocCategoryOverviewCatalog extends Omit<DocCategoryOverview, 'docs'> {
+  /** 本分类下的文档 catalog 条目列表（{path,title,tokenEstimate}） */
+  docs: DocSummaryCatalog[];
+}
+
+/**
  * DocSpace 概览 slim 变体（v1.56，overview?slim=true）
  *
  * 与 DocSpaceOverview 同构，仅 categories/uncategorized 的文档条目换为
@@ -667,6 +696,22 @@ export interface DocSpaceOverviewSlim
   categories: DocCategoryOverviewSlim[];
   /** 未分类文档（slim 条目） */
   uncategorized: DocSummarySlim[];
+}
+
+/**
+ * DocSpace 概览 catalog 变体（v1.66，overview?catalog=true）
+ *
+ * 与 DocSpaceOverview 同构，仅 categories/uncategorized 的文档条目换为
+ * DocSummaryCatalog（三键）。语义：catalog=true 时返回本形状（与 slim 同给时
+ * catalog 胜出）；缺省/false 返回 DocSpaceOverview（向后兼容）。
+ * 与 slim 的差异：catalog 豁免 maxTokens 对 doc 条目的截断（目录完整性是契约）。
+ */
+export interface DocSpaceOverviewCatalog
+  extends Omit<DocSpaceOverview, 'categories' | 'uncategorized'> {
+  /** 分类树（docs 为 catalog 三键条目） */
+  categories: DocCategoryOverviewCatalog[];
+  /** 未分类文档（catalog 三键条目） */
+  uncategorized: DocSummaryCatalog[];
 }
 
 // ─── Task-Doc Link ───────────────────────────────────────

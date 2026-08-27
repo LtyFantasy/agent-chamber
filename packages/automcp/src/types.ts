@@ -254,9 +254,10 @@ export interface ToolCallResult {
   /**
    * 结构化内容（可选，MCP 2025-06-18 协议引入）
    *
-   * handler 通常不设置——由框架层（McpServer.withStructuredContent）在 text 为
-   * 合法 JSON 时自动填充，消费端可免二次 JSON.parse；handler 显式设置时框架层
-   * 尊重不覆盖（为将来 outputSchema 校验/定制预留逃生门）。
+   * v1.66 新契约：JSON 成功响应由框架层（McpServer.withStructuredContent）收敛为
+   * 单载荷——structuredContent 是唯一数据，content 降为 `[{ type:'text',
+   * text:'[structured]' }]` 占位；handler 显式设置时框架层尊重不覆盖（逃生门），
+   * isError 错误信封原样不动（text + structuredContent 双发保留）。
    */
   structuredContent?: unknown;
 }

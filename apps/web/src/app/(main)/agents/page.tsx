@@ -22,7 +22,7 @@ import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth.store';
 import { UserRole } from '@/types';
 import { Plus, Power, Trash2, KeyRound, Pencil, Eye } from 'lucide-react';
-import type { Agent } from '@/types';
+import type { Agent, AgentDeletionImpact } from '@/types';
 
 const AGENT_STATUS_LABEL_KEY = {
   active: 'agents.status.active',
@@ -106,6 +106,29 @@ export default function AgentsPage() {
     },
   });
 
+  /** 删除影响面（统一批 B）：确认弹窗打开时拉取计数——提示是增强不是门禁：
+   *  接口失败（isError）→ 回退现文案不阻塞删除；弹窗关闭时 enabled=false 停止查询 */
+  const { data: deletionImpact, isError: deletionImpactFailed } = useQuery({
+    queryKey: ['agents', 'deletion-impact', deleteId],
+    queryFn: () => Api.agents.getDeletionImpact(deleteId as string),
+    enabled: !!deleteId,
+    staleTime: 30_000,
+  });
+
+  /** 删除影响面弹窗分支（统一批 B 四细则）：
+   *  ① seatCount>0 → 追加「圆桌座位不会自动释放…」提示；
+   *  ② openTaskCount>0 → 追加「未完成任务不会自动改派」提示；
+   *  ③ 四项全 0 → 简化文案（不展示"0 条"冗余列表）；
+   *  ④ 接口失败/加载中 → 回退现文案（提示是增强不是门禁） */
+  const deletionImpactResolved = deletionImpact && !deletionImpactFailed ? deletionImpact : null;
+  const hasAnyImpact =
+    !!deletionImpactResolved &&
+    deletionImpactResolved.seatCount +
+      deletionImpactResolved.openTaskCount +
+      deletionImpactResolved.messageCount +
+      deletionImpactResolved.topicCount >
+      0;
+
   const resetKeyMutation = useMutation({
     mutationFn: (id: string) => Api.agents.resetKey(id),
     onSuccess: (data) => {
@@ -186,6 +209,10 @@ export default function AgentsPage() {
                     <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">
                       {t('table.name')}
                     </th>
+                    {/* 介绍列：桌面专属（P1）——hover 在移动端不存在，移动端由名字下小字兜底，故 md 以下隐藏 */}
+                    <th className="hidden h-12 px-4 text-left align-middle font-medium text-muted-foreground md:table-cell">
+                      {t('table.description')}
+                    </th>
                     {isAdmin && (
                       <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">
                         {t('table.owner')}
@@ -229,11 +256,16 @@ export default function AgentsPage() {
                           />
                           <div>
                             <div className="font-medium">{agent.name}</div>
-                            <div className="text-xs text-muted-foreground">
+                            {/* 移动端兜底小字（P1）：桌面由介绍列接管，md 以下才显示 */}
+                            <div className="text-xs text-muted-foreground md:hidden">
                               {agent.descriptionSnippet}
                             </div>
                           </div>
                         </div>
+                      </td>
+                      {/* 介绍列单元格：桌面专属，snippet truncate + hover popover 懒加载完整介绍 */}
+                      <td className="hidden p-4 align-middle md:table-cell">
+                        <AgentDescriptionCell agent={agent} />
                       </td>
                       {isAdmin && <td className="p-4 align-middle">{agent.ownerName ?? '-'}</td>}
                       <td className="p-4 align-middle">
@@ -291,7 +323,12 @@ export default function AgentsPage() {
                           <Button variant="ghost" size="sm" onClick={() => setResetKeyId(agent.id)}>
                             <KeyRound className="h-4 w-4" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => setDeleteId(agent.id)}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            data-testid={`delete-agent-${agent.id}`}
+                            onClick={() => setDeleteId(agent.id)}
+                          >
                             <Trash2 className="h-4 w-4 text-destructive" />
                           </Button>
                         </div>
@@ -385,8 +422,20 @@ export default function AgentsPage() {
       <Dialog open={!!deleteId} onOpenChange={() => setDeleteId(null)}>
         <DialogHeader>
           <DialogTitle>{t('delete.title')}</DialogTitle>
-          <DialogDescription>{t('delete.description')}</DialogDescription>
+          {/* 删除影响面（统一批 B）：非全 0 保持原文案 + 下方追加提示列表；全 0 简化
+              文案；接口失败/加载中回退原文案（提示是增强不是门禁） */}
+          <DialogDescription>
+            {deletionImpactResolved && !hasAnyImpact
+              ? t('delete.noImpact')
+              : t('delete.description')}
+          </DialogDescription>
         </DialogHeader>
+        {deletionImpactResolved && hasAnyImpact && (
+          <ul className="-mt-1 list-disc space-y-1 px-6 text-sm text-muted-foreground">
+            {deletionImpactResolved.seatCount > 0 && <li>{t('delete.impactSeat')}</li>}
+            {deletionImpactResolved.openTaskCount > 0 && <li>{t('delete.impactTasks')}</li>}
+          </ul>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={() => setDeleteId(null)}>
             {tCommon('cancel')}
@@ -434,5 +483,43 @@ export default function AgentsPage() {
         </DialogFooter>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * 介绍列单元格（R1：表格行是 map 渲染，hooks 禁止写在 map 回调里，故提取为子组件）。
+ *
+ * 交互设计：
+ * - 常态：descriptionSnippet truncate（无 snippet 显 `-`）；
+ * - hover：懒加载完整 description（`['agents','detail',id]` 与详情页共享缓存），
+ *   加载完成前用 snippet 兜底；完整 description 为空时同样兜底 snippet/`-`
+ * - popover 纯 CSS group-hover（抄 boards 列名范式，实色 bg-popover 底）；
+ *   有意不用 pointer-events-none——R5 要求 overflow-y-auto 可滚动，必须允许鼠标进入 popover
+ *   （pointer-events-none 下滚动事件穿透，超长介绍无法看完）
+ */
+function AgentDescriptionCell({ agent }: { agent: Agent }) {
+  const [hovered, setHovered] = useState(false);
+  const { data: detail } = useQuery({
+    queryKey: ['agents', 'detail', agent.id],
+    queryFn: () => Api.agents.getById(agent.id),
+    // 仅 hover 时触发请求（懒加载）；5 分钟缓存：重复 hover 不重复请求
+    enabled: hovered,
+    staleTime: 5 * 60 * 1000,
+  });
+  // hover 且完整 description 已加载 → 用全文替换展示；未加载/为空 → snippet/`-` 兜底
+  const displayText = (hovered ? detail?.description : null) || agent.descriptionSnippet || '-';
+
+  return (
+    <span
+      className="group relative inline-block max-w-[220px] align-middle"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <span className="block truncate">{agent.descriptionSnippet || '-'}</span>
+      {/* popover 紧贴 trigger 顶部（top-full 无 gap）：鼠标移入时可滚动/选中文本而不触发 mouseleave 闪断 */}
+      <span className="absolute left-0 top-full z-50 hidden max-w-[320px] max-h-[300px] overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border/60 bg-popover px-2 pt-2 pb-1 text-xs font-normal text-popover-foreground shadow-lg group-hover:block">
+        {displayText}
+      </span>
+    </span>
   );
 }

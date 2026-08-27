@@ -149,7 +149,7 @@ describe('HttpProxy', () => {
           data: undefined,
         }),
       );
-      expect(result.content[0].text).toBe(JSON.stringify({ id: '123', name: 'Test' }, null, 2));
+      expect(result.content[0].text).toBe(JSON.stringify({ id: '123', name: 'Test' }));
       expect(result.isError).toBeUndefined();
     });
 
@@ -616,7 +616,7 @@ describe('HttpProxy', () => {
   });
 
   describe('响应格式化', () => {
-    it('should format object response as pretty JSON', async () => {
+    it('should format object response as compact JSON', async () => {
       mockedAxios.mockResolvedValueOnce({
         status: 200,
         statusText: 'OK',
@@ -625,10 +625,10 @@ describe('HttpProxy', () => {
 
       const result = await proxy.execute(makeMapping(), {});
 
-      expect(result.content[0].text).toBe('{\n  "items": [\n    1,\n    2,\n    3\n  ],\n  "total": 3\n}');
+      expect(result.content[0].text).toBe('{"items":[1,2,3],"total":3}');
     });
 
-    it('should format array response as pretty JSON', async () => {
+    it('should format array response as compact JSON', async () => {
       mockedAxios.mockResolvedValueOnce({
         status: 200,
         statusText: 'OK',
@@ -637,7 +637,7 @@ describe('HttpProxy', () => {
 
       const result = await proxy.execute(makeMapping(), {});
 
-      expect(result.content[0].text).toBe('[\n  {\n    "id": "1"\n  },\n  {\n    "id": "2"\n  }\n]');
+      expect(result.content[0].text).toBe('[{"id":"1"},{"id":"2"}]');
     });
 
     it('should return string response directly', async () => {

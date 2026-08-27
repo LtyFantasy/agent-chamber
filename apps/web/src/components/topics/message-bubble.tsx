@@ -283,7 +283,14 @@ export function MessageBubble({
             {tGlobal(cfg.labelKey as any)}
           </span>
         )}
-        <span className="text-xs font-medium opacity-80 truncate max-w-[120px] md:max-w-none">
+        {/* 已删除降级（统一批 B）：senderName 灰化 + title 提示——不加常驻 badge
+            （高密度消息流防噪音，R16 钉死） */}
+        <span
+          className={`text-xs font-medium truncate max-w-[120px] md:max-w-none ${
+            msg.deletedAt ? 'opacity-60' : 'opacity-80'
+          }`}
+          title={msg.deletedAt ? t('message.deletedSenderTitle') : undefined}
+        >
           {msg.senderName}
         </span>
         {/* 圆桌座位 badge：仅 backend 透传 seatLabel 时渲染；文案就是 label 本身

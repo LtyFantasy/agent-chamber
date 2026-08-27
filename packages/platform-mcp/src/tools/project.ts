@@ -5,6 +5,7 @@
  * [设计文档]
  *   - 主文档: docs/platform-mcp.md §2.3（get_topic_digest 契约）
  *   - 补充: 看板任务 fdc1851b（Batch F：MCP 语义工具 token 瘦身）
+ *   - 补充: plan forge-jubilee-robin（WS-C：truncateField 通用化抽取，C3/C4 共用）
  *
  * [踩坑索引] -
  *
@@ -31,6 +32,34 @@
 
 /** recent 消息 snippet 截断上限（字符）。超出截到此长度并标记 contentTruncated */
 export const SNIPPET_MAX_CHARS = 300;
+
+/**
+ * 通用字段截断（plan forge-jubilee-robin WS-C 从 projectMessage 提取，行为不变）。
+ *
+ * 语义：
+ * - slice 裸截断，无省略号
+ * - maxChars=0 是「不截断」哨兵，跳过
+ * - 仅 typeof string 的字段参与——无 content 的 task 型 activity 天然豁免
+ * - 标记命名统一 = `{field}Truncated`（content → contentTruncated），挂条目级
+ *
+ * @param obj      - 目标对象（原地修改）
+ * @param field    - 要截断的字段名
+ * @param maxChars - 截断上限（字符）；0 = 不截断返全文
+ */
+export function truncateField(
+  obj: Record<string, unknown>,
+  field: string,
+  maxChars: number,
+): void {
+  if (
+    maxChars !== 0 &&
+    typeof obj[field] === 'string' &&
+    (obj[field] as string).length > maxChars
+  ) {
+    obj[field] = (obj[field] as string).slice(0, maxChars);
+    obj[`${field}Truncated`] = true;
+  }
+}
 
 /** 消息投影保留的字段白名单（剔除 senderAvatar/topicId 等人类 UI / 冗余字段） */
 const MESSAGE_KEPT_FIELDS = [
@@ -68,14 +97,8 @@ export function projectMessage(
   // ≤maxChars 原样不加标记；maxChars=0 是「不截断」哨兵（get_topic_digest 的
   // maxContentLength=0 语义），跳过截断返全文。
   // 需要全文的 Agent 自行用原子工具 topic_controller_get_messages 翻页。
-  if (
-    truncate &&
-    maxChars !== 0 &&
-    typeof projected.content === 'string' &&
-    projected.content.length > maxChars
-  ) {
-    projected.content = projected.content.slice(0, maxChars);
-    projected.contentTruncated = true;
+  if (truncate) {
+    truncateField(projected, 'content', maxChars);
   }
 
   return projected;

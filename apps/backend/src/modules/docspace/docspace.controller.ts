@@ -468,7 +468,10 @@ export class DocSpaceController {
       'Large-space slimming (v1.56): slim=true projects each doc to {path,title,summary,docType,tokenEstimate} ' +
       '(category grouping preserved); embedded routes are always navigation-projected ' +
       '(intent/category/primaryDocId/primaryHeadingPath/codeEntry/health.codeEntryStatus — full fields via ' +
-      'GET /doc-spaces/:id/routes).',
+      'GET /doc-spaces/:id/routes). ' +
+      'Lean catalog mode (v1.66): catalog=true projects each doc to {path,title,tokenEstimate} and exempts doc ' +
+      'entries from maxTokens truncation (directory completeness is the contract; docsReturned === docsTotal), ' +
+      'composes orthogonally with the filters above, and wins over slim when both are passed.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Overview returned successfully' })

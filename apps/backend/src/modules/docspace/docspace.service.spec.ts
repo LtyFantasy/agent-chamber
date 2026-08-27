@@ -20,11 +20,13 @@ import {
   EventType,
   DocSummary,
   DocSummarySlim,
+  DocSummaryCatalog,
 } from '@agent-chamber/shared';
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { EventService } from '../event/event.service';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 describe('DocSpaceService', () => {
   let service: DocSpaceService;
@@ -43,6 +45,7 @@ describe('DocSpaceService', () => {
   let accessQuery: jest.Mocked<AccessQueryService>;
   let resourceValidator: { exists: jest.Mock; existsMany: jest.Mock };
   let eventService: { create: jest.Mock };
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
@@ -201,6 +204,63 @@ describe('DocSpaceService', () => {
 
     eventService = { create: jest.fn().mockResolvedValue(undefined) };
 
+    // 统一批 A1：resolveActorProfiles 收敛委托 ActorProfileService。mock 默认实现
+    // 复用三个 repo mock（actorRepo.find 取 type、user/agent repo 取 profile），
+    // 行为等价（公共服务自身逻辑在 actor-profile.service.spec.ts 单独验证）。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        const typeRows = await actorRepo.find({} as any);
+        const typeMap = new Map(typeRows.map((a) => [a.id, a.type]));
+        // A2：deletedAt 从 actor 行透传（对齐公共服务 withDeleted 行为），
+        // 软删用例通过 actorRepo.find 返回带 deletedAt 的行驱动
+        const actorRowMap = new Map(typeRows.map((a) => [a.id, a]));
+        const humanIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+        const agentIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+        const [humans, agents] = await Promise.all([
+          humanIds.length > 0 ? userRepo.find({} as any) : Promise.resolve([] as User[]),
+          agentIds.length > 0 ? agentRepo.find({} as any) : Promise.resolve([] as Agent[]),
+        ]);
+        const humanMap = new Map(humans.map((u) => [u.id, u]));
+        const agentMap = new Map(agents.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const type = typeMap.get(id);
+          const deletedAt = actorRowMap.get(id)?.deletedAt ?? null;
+          if (type === ActorType.HUMAN) {
+            const u = humanMap.get(id);
+            map.set(id, {
+              type,
+              name: u?.displayName || u?.username || 'Unknown User',
+              avatarUrl: u?.avatarUrl ?? null,
+              description: null,
+              deletedAt,
+            });
+          } else if (type === ActorType.AGENT) {
+            const a = agentMap.get(id);
+            map.set(id, {
+              type,
+              name: a?.name || 'Unknown Agent',
+              avatarUrl: a?.avatarUrl ?? null,
+              description: a?.description ?? null,
+              deletedAt,
+            });
+          } else if (type) {
+            map.set(id, {
+              type,
+              name: 'System',
+              avatarUrl: null,
+              description: null,
+              deletedAt,
+            });
+          }
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
+    };
+
     service = new DocSpaceService(
       spaceRepo,
       memberRepo,
@@ -217,6 +277,7 @@ describe('DocSpaceService', () => {
       accessQuery,
       resourceValidator as unknown as ResourceValidator,
       eventService as unknown as EventService,
+      mockActorProfileService as unknown as ActorProfileService,
     );
   });
 
@@ -403,15 +464,33 @@ describe('DocSpaceService', () => {
     });
 
     it('throws AGENT_NOT_FOUND when invitedAgentIds invalid', async () => {
-      resourceValidator.existsMany.mockRejectedValue(
+      // 统一批 A2.5b：create invitedAgentIds 校验改走 assertActorUsable（create 一刀切）
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
         new NotFoundException({
-          message: 'Some resources not found',
+          message: 'Agent not found or deleted',
           code: ErrorCode.AGENT_NOT_FOUND,
         }),
       );
       await expect(
         service.create(mockActor, { name: 'Test', invitedAgentIds: ['agent-missing'] }),
-      ).rejects.toMatchObject({ response: { code: ErrorCode.AGENT_NOT_FOUND } });
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+    });
+
+    it('create：已软删 agent 在 invitedAgentIds → 4xx AGENT_NOT_FOUND（统一批 A2.5b）', async () => {
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+      await expect(
+        service.create(mockActor, { name: 'Test', invitedAgentIds: ['agent-deleted'] }),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
     });
 
     it('creates initial member rows for invited agents', async () => {
@@ -603,6 +682,38 @@ describe('DocSpaceService', () => {
       const detail = await service.enrich(makeSpace());
       expect(detail.linkedTaskCount).toBe(0);
     });
+
+    it('软删 agent 成员：真名保留 + deletedAt 非空（统一批契约）', async () => {
+      memberRepo.find.mockResolvedValue([
+        {
+          spaceId: 'space-1',
+          actorId: 'agent-1',
+          role: 'editor',
+          invitedBy: 'user-1',
+          createdAt: new Date(),
+        } as DocSpaceMember,
+      ]);
+      // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）
+      actorRepo.find.mockResolvedValue([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+      agentRepo.find.mockResolvedValue([{ id: 'agent-1', name: 'Kimi', avatarUrl: null } as any]);
+      docRepo.createQueryBuilder.mockReturnValue(createMockQueryBuilder([], 0));
+      taskDocLinkRepo.createQueryBuilder.mockReturnValue(createMockQueryBuilder([], 0));
+
+      const detail = await service.enrich(makeSpace());
+      expect(detail.members).toHaveLength(1);
+      expect(detail.members![0]).toMatchObject({
+        actorId: 'agent-1',
+        actorName: 'Kimi',
+        actorType: 'agent',
+        deletedAt: '2024-06-01T00:00:00.000Z',
+      });
+    });
   });
 
   // ─── remove (cascade) ─────────────────────────────────────
@@ -677,6 +788,22 @@ describe('DocSpaceService', () => {
 
       await expect(service.inviteAgent('space-1', 'agent-1')).rejects.toThrow(ConflictException);
     });
+
+    it('inviteAgent：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.inviteAgent('space-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
+    });
   });
 
   describe('uninviteAgent', () => {
@@ -719,6 +846,25 @@ describe('DocSpaceService', () => {
       });
       expect(memberRepo.delete).not.toHaveBeenCalled();
     });
+
+    it('uninviteAgent：已软删 agent → 放行（移除类入口不拦，A2.5b 修正）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      // 软删 agent 的 agents 行永在 → resourceValidator.exists 放行（清理动作必须可用）
+      resourceValidator.exists.mockResolvedValue({ id: 'agent-deleted' } as Agent);
+      memberRepo.findOne.mockResolvedValue({
+        spaceId: 'space-1',
+        actorId: 'agent-deleted',
+        role: 'member',
+      } as DocSpaceMember);
+
+      await service.uninviteAgent('space-1', 'agent-deleted');
+
+      expect(memberRepo.delete).toHaveBeenCalledWith({
+        spaceId: 'space-1',
+        actorId: 'agent-deleted',
+      });
+    });
   });
 
   describe('addEditor', () => {
@@ -758,6 +904,22 @@ describe('DocSpaceService', () => {
       expect(memberRepo.create).toHaveBeenCalledWith(
         expect.objectContaining({ spaceId: 'space-1', actorId: 'agent-1', role: 'editor' }),
       );
+    });
+
+    it('addEditor：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const space = makeSpace();
+      spaceRepo.findOne.mockResolvedValue(space);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.addEditor('space-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
     });
   });
 
@@ -799,6 +961,24 @@ describe('DocSpaceService', () => {
       });
       // 守卫必须先于降级：成员行不被改写
       expect(memberRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('removeEditor：已软删 agent → 放行（移除类入口不拦，A2.5b 修正）', async () => {
+      const space = makeSpace(); // creatorId='user-1'
+      spaceRepo.findOne.mockResolvedValue(space);
+      // 软删 agent 的 agents 行永在 → resourceValidator.exists 放行（清理动作必须可用）
+      resourceValidator.exists.mockResolvedValue({ id: 'agent-deleted' } as Agent);
+      const editorRow = {
+        spaceId: 'space-1',
+        actorId: 'agent-deleted',
+        role: 'editor',
+      } as DocSpaceMember;
+      memberRepo.findOne.mockResolvedValue(editorRow);
+
+      await service.removeEditor('space-1', 'agent-deleted');
+
+      expect(editorRow.role).toBe('member');
+      expect(memberRepo.save).toHaveBeenCalledWith(editorRow);
     });
   });
 
@@ -2274,6 +2454,160 @@ describe('DocSpaceService', () => {
       const fullDocBytes = Buffer.byteLength(JSON.stringify(full.uncategorized), 'utf8');
       const slimDocBytes = Buffer.byteLength(JSON.stringify(slim.uncategorized), 'utf8');
       expect(slimDocBytes).toBeLessThan(fullDocBytes * 0.7);
+    });
+
+    // ─── v1.66 catalog 目录模式（冷启动完整目录感知：三键投影 + 豁免 maxTokens 截断） ────
+
+    it('catalog=true → doc 条目只含 3 键 {path,title,tokenEstimate}（分类与 uncategorized 同投影），category 分组结构不变', async () => {
+      const cats = [
+        makeCategory({ id: 'cat-1', slug: 'arch', name: '架构' }),
+        makeCategory({ id: 'cat-2', slug: 'ref', name: '参考' }),
+      ];
+      const docs = [
+        makeOverviewDoc({
+          id: 'd1',
+          categoryId: 'cat-1',
+          path: 'docs/architecture.md',
+          title: '架构',
+          summary: '架构摘要',
+          docType: 'guide',
+          tags: ['prod'],
+          source: 'native',
+          sourceSha: 'sha-1',
+          sectionCount: 3,
+          createdBy: 'user-1',
+        }),
+        makeOverviewDoc({
+          id: 'd2',
+          categoryId: null,
+          path: 'memory/2026-08-16.md',
+          title: '日记',
+          summary: '日记摘要',
+          docType: 'memory',
+          tags: [],
+          source: 'native',
+          sourceSha: null,
+          sectionCount: 1,
+          createdBy: 'user-1',
+        }),
+      ];
+      mockOverview(cats, docs);
+
+      const result = await service.getOverview('space-1', { catalog: true });
+      // category 分组结构保留（id/slug/name 等分类元数据不变）
+      expect(result.categories.map((c) => c.slug)).toEqual(['arch', 'ref']);
+      const catDoc = result.categories[0].docs[0];
+      expect(Object.keys(catDoc).sort()).toEqual(['path', 'title', 'tokenEstimate']);
+      expect(catDoc).toMatchObject({
+        path: 'docs/architecture.md',
+        title: '架构',
+        tokenEstimate: 100,
+      });
+      // uncategorized 段同款投影
+      const uncatDoc = result.uncategorized[0];
+      expect(Object.keys(uncatDoc).sort()).toEqual(['path', 'title', 'tokenEstimate']);
+      // catalog 比 slim 更瘦：summary/docType 也剔除；非目录字段一律剔除
+      expect(catDoc).not.toHaveProperty('summary');
+      expect(catDoc).not.toHaveProperty('docType');
+      expect(catDoc).not.toHaveProperty('id');
+      expect(catDoc).not.toHaveProperty('tags');
+    });
+
+    it('catalog 豁免 maxTokens 截断（同一数据：缺省模式 truncated=true，catalog 全量 + docsReturned===docsTotal）', async () => {
+      // 3 条 500 字 CJK summary（≈500 token/条）——缺省模式下 maxTokens=1000 必截断
+      const docs = Array.from({ length: 3 }, (_, i) =>
+        makeOverviewDoc({ id: `d${i}`, summary: '摘'.repeat(500) }),
+      );
+      mockOverview([], docs);
+
+      const plain = await service.getOverview('space-1', { maxTokens: 1000 });
+      expect(plain.truncated).toBe(true);
+      expect(plain.uncategorized.length).toBeLessThan(3);
+
+      const catalog = await service.getOverview('space-1', {
+        maxTokens: 1000,
+        catalog: true,
+      });
+      expect(catalog.truncated).toBe(false);
+      expect(catalog.uncategorized.length).toBe(3);
+      // 截断豁免契约：catalog 下 returned === total 恒成立
+      expect(catalog.docsReturned).toBe(3);
+      expect(catalog.docsTotal).toBe(3);
+    });
+
+    it('catalog 与过滤器正交组合（先过滤 → 再投影 → 不截断）', async () => {
+      const docs = [
+        makeOverviewDoc({
+          id: 'd1',
+          docType: 'memory',
+          path: 'memory/2026-08-16.md',
+          title: '日记',
+        }),
+        makeOverviewDoc({
+          id: 'd2',
+          docType: 'guide',
+          path: 'docs/architecture.md',
+          title: '架构',
+        }),
+        makeOverviewDoc({ id: 'd3', docType: 'reference', path: 'docs/api.md', title: 'API' }),
+      ];
+      mockOverview([], docs);
+
+      const result = await service.getOverview('space-1', {
+        excludeType: 'memory',
+        maxTokens: 1,
+        catalog: true,
+      });
+      // 过滤照常生效（memory 剔除），目录完整性仍保证（1 token 预算也不截断）
+      const paths = (result.uncategorized as DocSummaryCatalog[]).map((d) => d.path);
+      expect(paths).toEqual(['docs/architecture.md', 'docs/api.md']);
+      expect(result.truncated).toBe(false);
+      expect(result.docsReturned).toBe(2);
+      expect(result.docsTotal).toBe(2);
+      expect(Object.keys(result.uncategorized[0]).sort()).toEqual([
+        'path',
+        'title',
+        'tokenEstimate',
+      ]);
+    });
+
+    it('catalog=true + slim=true 同给 → catalog 胜出（三键投影）', async () => {
+      const docs = [makeOverviewDoc({ id: 'd1', path: 'docs/a.md', title: 'A' })];
+      mockOverview([], docs);
+
+      const result = await service.getOverview('space-1', { slim: true, catalog: true });
+      expect(Object.keys(result.uncategorized[0]).sort()).toEqual([
+        'path',
+        'title',
+        'tokenEstimate',
+      ]);
+    });
+
+    it('catalog 缺省/显式 false → doc 条目全字段（向后兼容，与 slim 缺省同语义）', async () => {
+      const docs = [
+        makeOverviewDoc({
+          id: 'd1',
+          path: 'docs/a.md',
+          title: 'A',
+          summary: '摘要',
+          docType: 'guide',
+          tags: ['prod'],
+          source: 'native',
+          sourceSha: 'sha-1',
+          sectionCount: 3,
+          createdBy: 'user-1',
+        }),
+      ];
+      mockOverview([], docs);
+
+      const byDefault = await service.getOverview('space-1');
+      const explicit = await service.getOverview('space-1', { catalog: false });
+      const defaultKeys = Object.keys(byDefault.uncategorized[0]);
+      const explicitKeys = Object.keys(explicit.uncategorized[0]);
+      expect(defaultKeys).toEqual(explicitKeys);
+      expect(defaultKeys).toContain('id');
+      expect(defaultKeys).toContain('summary');
+      expect(defaultKeys).toContain('tags');
     });
   });
 

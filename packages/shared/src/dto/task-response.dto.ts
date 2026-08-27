@@ -19,6 +19,8 @@ export interface TaskSummary {
   assigneeType?: string | null;
   /** 分配对象名称 */
   assigneeName?: string | null;
+  /** 软删时间；非空 = 该 assignee 已删除，assigneeName 仍可显示（历史归因保留） */
+  assigneeDeletedAt?: string | null;
   /** 排序位置 */
   position?: number;
   /** 截止日期 */
@@ -29,6 +31,12 @@ export interface TaskSummary {
   milestoneId?: string | null;
   /** 所属看板 ID（由 list.boardId 推断，非数据库直接字段） */
   boardId?: string | null;
+  /** 所属列 ID（Task 实体直接列；findAll 白名单显式输出，消除类型↔运行时漂移） */
+  listId?: string | null;
+  /** 所属看板名称（由 list→board join 部分水合派生） */
+  boardName?: string | null;
+  /** 所属列名称（由 list join 部分水合派生） */
+  listName?: string | null;
   /** 关联话题 ID */
   topicId?: string | null;
   /** 是否有阻塞项 */
@@ -170,6 +178,8 @@ export interface Activity {
   actorId: string;
   /** 执行者名称 */
   actorName: string;
+  /** 软删时间；非空 = 执行者已删除，actorName 仍可显示（历史归因保留） */
+  actorDeletedAt?: string | null;
   /** 详情 */
   details?: Record<string, unknown>;
   /** 创建时间 */

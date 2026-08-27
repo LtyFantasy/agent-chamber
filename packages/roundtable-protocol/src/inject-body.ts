@@ -82,6 +82,13 @@ export interface InjectBodyMessage {
      * 仅座位发言时有意义，2026-08-07 用户拍板）
      */
     coordinator: boolean;
+    /**
+     * 发送者软删时间（ISO 8601 字符串；未删除为 null，2026-08-26 统一批新增）。
+     * 非空 = 该发送者已从平台删除——名字仍可显示（历史归因保留），但消费方不得
+     * 再 @、邀请或改派该 actor（写接口会拒绝，见 docs/spec.md §1 契约）。
+     * r3 冻结"只增不改"：本字段为可选新增，旧消息体（无此键）解析仍通过。
+     */
+    deletedAt?: string | null;
   };
   /** 消息时间戳（ISO 8601 字符串，如 2026-08-07T12:00:00Z） */
   ts: string;

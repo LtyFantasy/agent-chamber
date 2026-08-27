@@ -5,10 +5,11 @@
  * [设计文档]
  *   - 主文档: .kimi/plans/miss-martian-polaris-superboy.md §Step 4
  *   - 补充: .kimi/plans/miss-martian-polaris-superboy.md §核心映射规则
+ *   - 补充: plan forge-jubilee-robin（WS-C2' C5：成功+错误路径紧凑序列化，去 pretty-print）
  *
  * [踩坑索引] -
  *
- * [铁律关联] #7(编译优先) #11(注释强制)
+ * [铁律关联] #7(编译优先) #11(注释强制) #17(测试契约)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
  *   -
@@ -363,7 +364,7 @@ export class HttpProxy {
         if (body.data !== undefined && body.data !== null) {
           normalized.details = body.data;
         }
-        return JSON.stringify(normalized, null, 2);
+        return JSON.stringify(normalized);
       }
     }
 
@@ -374,7 +375,7 @@ export class HttpProxy {
   /**
    * 格式化响应数据为文本
    *
-   * - object / array → JSON.stringify(data, null, 2)
+   * - object / array → JSON.stringify(data)（紧凑，省 token；Agent 可 JSON.parse）
    * - string / number / boolean → 直接转为 string
    *
    * @param data - HTTP 响应数据
@@ -386,7 +387,7 @@ export class HttpProxy {
     }
 
     if (typeof data === 'object') {
-      return JSON.stringify(data, null, 2);
+      return JSON.stringify(data);
     }
 
     return String(data);

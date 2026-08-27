@@ -30,10 +30,14 @@ import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 function createMockRepo<T extends ObjectLiteral>() {
   const qb = {
+    leftJoin: jest.fn().mockReturnThis(),
     leftJoinAndSelect: jest.fn().mockReturnThis(),
+    addSelect: jest.fn().mockReturnThis(),
+    addOrderBy: jest.fn().mockReturnThis(),
     where: jest.fn().mockReturnThis(),
     andWhere: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
@@ -157,6 +161,7 @@ describe('TaskService', () => {
   let mockDocSpaceRepo: jest.Mocked<Repository<DocSpace>>;
   let mockDocSpacePolicy: { can: jest.Mock };
   let mockEventService: { create: jest.Mock };
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
 
   beforeEach(async () => {
     mockTaskRepo = createMockRepo<Task>();
@@ -198,6 +203,66 @@ describe('TaskService', () => {
           return entities;
         },
       ),
+    };
+
+    // 统一批 A2：assignee/活动执行者解析委托 ActorProfileService。mock 默认实现
+    // 复用三个 repo mock（actorRepo.find 取 type、user/agent repo 取 profile），
+    // 行为等价（公共服务自身逻辑在 actor-profile.service.spec.ts 单独验证）。
+    // deletedAt 从 actor 行透传——软删用例通过 actorRepo.find 返回带 deletedAt 的行驱动。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        const typeRows = await mockActorRepo.find({ where: { id: In(uniqueIds) } } as any);
+        const typeMap = new Map(typeRows.map((a) => [a.id, a.type]));
+        const actorRowMap = new Map(typeRows.map((a) => [a.id, a]));
+        const humanIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+        const agentIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+        const [humans, agents] = await Promise.all([
+          humanIds.length > 0
+            ? mockUserRepo.findBy({ id: In(humanIds) } as any)
+            : Promise.resolve([] as User[]),
+          agentIds.length > 0
+            ? mockAgentRepo.findBy({ id: In(agentIds) } as any)
+            : Promise.resolve([] as Agent[]),
+        ]);
+        const humanMap = new Map(humans.map((u) => [u.id, u]));
+        const agentMap = new Map(agents.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const type = typeMap.get(id);
+          const deletedAt = actorRowMap.get(id)?.deletedAt ?? null;
+          if (type === ActorType.HUMAN) {
+            const u = humanMap.get(id);
+            map.set(id, {
+              type,
+              name: u?.displayName || u?.username || 'Unknown User',
+              avatarUrl: u?.avatarUrl ?? null,
+              description: null,
+              deletedAt,
+            });
+          } else if (type === ActorType.AGENT) {
+            const a = agentMap.get(id);
+            map.set(id, {
+              type,
+              name: a?.name || 'Unknown Agent',
+              avatarUrl: a?.avatarUrl ?? null,
+              description: a?.description ?? null,
+              deletedAt,
+            });
+          } else if (type) {
+            map.set(id, {
+              type,
+              name: 'System',
+              avatarUrl: null,
+              description: null,
+              deletedAt,
+            });
+          }
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
     };
 
     // DataSource mock：transaction 默认透传回调
@@ -244,6 +309,7 @@ describe('TaskService', () => {
         { provide: AccessQueryService, useValue: mockAccessQuery },
         { provide: ResourceValidator, useValue: mockResourceValidator },
         { provide: DataSource, useValue: mockDataSource },
+        { provide: ActorProfileService, useValue: mockActorProfileService },
       ],
     }).compile();
 
@@ -251,6 +317,28 @@ describe('TaskService', () => {
     jest.clearAllMocks();
     // 默认返回空依赖，避免 findOne 中的依赖查询报错（必须在 clearAllMocks 之后设置）
     mockDepRepo.find.mockResolvedValue([]);
+    // Actor 类型统一由 actors 表推导；默认实现根据 ID 前缀返回类型（user-/agent-），
+    // 未命中的 id 视为真孤儿（不进 map，由调用方兜底）
+    mockActorRepo.find.mockImplementation(async (options: any) => {
+      const ids: string[] = options?.where?.id?.value ?? [];
+      return ids.map((id) => {
+        if (id.startsWith('user-')) return { id, type: ActorType.HUMAN } as Actor;
+        if (id.startsWith('agent-')) return { id, type: ActorType.AGENT } as Actor;
+        return { id, type: ActorType.SYSTEM } as Actor;
+      });
+    });
+    mockUserRepo.findBy.mockImplementation(async (criteria: any) => {
+      const ids: string[] = criteria?.id?.value ?? [];
+      return ids
+        .filter((id) => id === 'user-1')
+        .map((id) => ({ id, displayName: 'Alice', username: 'alice', avatarUrl: null }) as User);
+    });
+    mockAgentRepo.findBy.mockImplementation(async (criteria: any) => {
+      const ids: string[] = criteria?.id?.value ?? [];
+      return ids
+        .filter((id) => id === 'agent-1')
+        .map((id) => ({ id, name: 'Kimi', avatarUrl: null }) as Agent);
+    });
   });
 
   describe('findAll', () => {
@@ -262,8 +350,11 @@ describe('TaskService', () => {
       const result = await service.findAll({});
 
       expect(mockTaskRepo.createQueryBuilder).toHaveBeenCalledWith('task');
-      expect(qb.leftJoinAndSelect).toHaveBeenCalledWith('task.list', 'list');
-      expect(qb.leftJoinAndSelect).toHaveBeenCalledWith('list.board', 'board');
+      // WS-A 扁平化：leftJoinAndSelect 整行水合 → leftJoin + addSelect 部分列
+      expect(qb.leftJoin).toHaveBeenCalledWith('task.list', 'list');
+      expect(qb.addSelect).toHaveBeenCalledWith(['list.id', 'list.name', 'list.boardId']);
+      expect(qb.leftJoin).toHaveBeenCalledWith('list.board', 'board');
+      expect(qb.addSelect).toHaveBeenCalledWith(['board.id', 'board.name', 'board.topicId']);
       expect(qb.where).toHaveBeenCalledWith('task.deleted_at IS NULL');
       expect(qb.orderBy).toHaveBeenCalledWith('task.createdAt', 'DESC');
       expect(qb.skip).toHaveBeenCalledWith(0);
@@ -321,11 +412,18 @@ describe('TaskService', () => {
 
       const result = await service.findAll({});
 
-      expect(mockAgentRepo.findBy).toHaveBeenCalledWith({ id: In(['agent-1', 'user-1']) });
-      expect(mockUserRepo.findBy).toHaveBeenCalledWith({ id: In(['agent-1', 'user-1']) });
+      // 统一批 A2：assignee 解析改走公共 ActorProfileService——actors 主查询一次 IN 批次，
+      // agent/user 补查按类型过滤后各自查（不再全量交叉查）
+      expect(mockActorRepo.find).toHaveBeenCalledWith({
+        where: { id: In(['agent-1', 'user-1']) },
+      });
+      expect(mockAgentRepo.findBy).toHaveBeenCalledWith({ id: In(['agent-1']) });
+      expect(mockUserRepo.findBy).toHaveBeenCalledWith({ id: In(['user-1']) });
       expect(result.items[0].assigneeName).toBe('Kimi');
+      expect(result.items[0].assigneeDeletedAt).toBeNull();
       expect(result.items[1].assigneeName).toBe('Alice');
       expect(result.items[2].assigneeName).toBeNull();
+      expect(result.items[2].assigneeDeletedAt).toBeNull();
     });
 
     it('should handle findAll with no assignees', async () => {
@@ -338,6 +436,28 @@ describe('TaskService', () => {
       expect(mockAgentRepo.findBy).not.toHaveBeenCalled();
       expect(mockUserRepo.findBy).not.toHaveBeenCalled();
       expect(result.items[0].assigneeName).toBeNull();
+    });
+
+    it('软删 assignee：真名保留 + assigneeDeletedAt 非空（统一批契约）', async () => {
+      const items = [createMockTask({ assigneeId: 'agent-1', assigneeType: ActorType.AGENT })];
+      const qb = mockTaskRepo.createQueryBuilder();
+      (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
+      // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+
+      const result = await service.findAll({});
+
+      expect(result.items[0]).toMatchObject({
+        assigneeId: 'agent-1',
+        assigneeName: 'Kimi',
+        assigneeDeletedAt: '2024-06-01T00:00:00.000Z',
+      });
     });
 
     it('should filter by boardId via list join', async () => {
@@ -492,7 +612,7 @@ describe('TaskService', () => {
       expect(qb.andWhere).toHaveBeenCalledWith('board.topic_id = :topicId', { topicId: 'topic-1' });
     });
 
-    it('should leftJoinSelect list.board for topicId derivation', async () => {
+    it('should leftJoin list.board for topicId derivation', async () => {
       const items = [createMockTask()];
       const qb = mockTaskRepo.createQueryBuilder();
       (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
@@ -500,7 +620,104 @@ describe('TaskService', () => {
       await service.findAll({});
 
       // Batch 3: findAll 新增 list.board join 以派生 topicId + topicId 过滤
-      expect(qb.leftJoinAndSelect).toHaveBeenCalledWith('list.board', 'board');
+      // WS-A 扁平化：join 保留（WHERE 过滤依赖），select 改为部分列
+      expect(qb.leftJoin).toHaveBeenCalledWith('list.board', 'board');
+      expect(qb.addSelect).toHaveBeenCalledWith(['board.id', 'board.name', 'board.topicId']);
+    });
+
+    it('should assemble items via explicit whitelist without nested entities', async () => {
+      const items = [
+        createMockTask({
+          list: {
+            id: 'list-1',
+            name: 'To Do',
+            boardId: 'board-1',
+            board: { id: 'board-1', name: 'My Board', topicId: 'topic-1' },
+          } as unknown as BoardList,
+        }),
+      ];
+      const qb = mockTaskRepo.createQueryBuilder();
+      (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
+
+      const result = await service.findAll({});
+
+      // WS-A 扁平化：白名单组装，嵌套实体键一律不出现
+      expect(result.items[0]).not.toHaveProperty('list');
+      expect(result.items[0]).not.toHaveProperty('board');
+      expect(result.items[0]).not.toHaveProperty('dependencies');
+      expect(result.items[0]).not.toHaveProperty('dependents');
+      expect(result.items[0]).not.toHaveProperty('description');
+      // 扁平字段：listId 显式列出 + boardName/listName 从部分水合 join 派生
+      expect(result.items[0]).toMatchObject({
+        listId: 'list-1',
+        boardId: 'board-1',
+        topicId: 'topic-1',
+        boardName: 'My Board',
+        listName: 'To Do',
+      });
+    });
+
+    it('should fall back to null for list-derived fields when list is missing', async () => {
+      const items = [createMockTask()]; // list 默认 null
+      const qb = mockTaskRepo.createQueryBuilder();
+      (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
+
+      const result = await service.findAll({});
+
+      expect(result.items[0]).toMatchObject({
+        listId: 'list-1', // Task 实体直接列，与 join 无关
+        boardId: null,
+        topicId: null,
+        boardName: null,
+        listName: null,
+      });
+    });
+
+    it('should order by status priority CASE with updatedAt/id tie-breakers when sort=statusPriority', async () => {
+      const items = [createMockTask()];
+      const qb = mockTaskRepo.createQueryBuilder();
+      (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
+
+      await service.findAll({ sort: 'statusPriority' });
+
+      // 权重序：in_progress > todo > blocked > backlog > 其余（review/done/archived 恒末位）。
+      // CASE 经 addSelect 命名列（TypeORM 对含 "." 的 orderBy 键按 alias.property 解析，
+      // 表达式必须走 addSelect+别名模式；别名全小写防 PG 大小写折叠），orderBy 引用别名
+      expect(qb.addSelect).toHaveBeenCalledWith(
+        expect.stringContaining("WHEN 'in_progress' THEN 0"),
+        'status_priority_order',
+      );
+      expect(qb.addSelect).toHaveBeenCalledWith(
+        expect.stringContaining("WHEN 'todo' THEN 1"),
+        'status_priority_order',
+      );
+      expect(qb.addSelect).toHaveBeenCalledWith(
+        expect.stringContaining("WHEN 'blocked' THEN 2"),
+        'status_priority_order',
+      );
+      expect(qb.addSelect).toHaveBeenCalledWith(
+        expect.stringContaining("WHEN 'backlog' THEN 3"),
+        'status_priority_order',
+      );
+      expect(qb.addSelect).toHaveBeenCalledWith(
+        expect.stringContaining('ELSE 4 END'),
+        'status_priority_order',
+      );
+      expect(qb.orderBy).toHaveBeenCalledWith('status_priority_order', 'ASC');
+      // 次键 updatedAt DESC + 第三键 id ASC 兜底稳定分页
+      expect(qb.addOrderBy).toHaveBeenCalledWith('task.updatedAt', 'DESC');
+      expect(qb.addOrderBy).toHaveBeenCalledWith('task.id', 'ASC');
+    });
+
+    it('should keep default createdAt DESC ordering when sort is omitted', async () => {
+      const items = [createMockTask()];
+      const qb = mockTaskRepo.createQueryBuilder();
+      (qb.getManyAndCount as jest.Mock).mockResolvedValue([items, 1]);
+
+      await service.findAll({});
+
+      expect(qb.orderBy).toHaveBeenCalledWith('task.createdAt', 'DESC');
+      expect(qb.addOrderBy).not.toHaveBeenCalled();
     });
   });
 
@@ -763,6 +980,47 @@ describe('TaskService', () => {
       expect(result).toEqual(
         expect.objectContaining({ assigneeId: 'agent-1', assigneeType: ActorType.AGENT }),
       );
+    });
+
+    it('create assigneeId：指向已软删 agent → 4xx AGENT_NOT_FOUND（统一批 A2.5）', async () => {
+      const dto = {
+        title: 'Agent Task',
+        boardId: 'board-1',
+        listId: 'list-1',
+        assigneeId: 'agent-deleted',
+      };
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('create assigneeId：指向已软删 user → 同样 4xx AGENT_NOT_FOUND（任意 actor type）', async () => {
+      const dto = {
+        title: 'Agent Task',
+        boardId: 'board-1',
+        listId: 'list-1',
+        assigneeId: 'user-deleted',
+      };
+      mockBoardRepo.findOne.mockResolvedValue({ id: 'board-1', topicId: 'topic-1' } as Board);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.create(dto, 'creator-1', ActorType.HUMAN)).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
     });
 
     it('should update lastActiveAt when agent creates a task', async () => {
@@ -1421,6 +1679,39 @@ describe('TaskService', () => {
       expect(result.assigneeType).toBe('human');
     });
 
+    it('update assigneeId：指向已软删 agent → 4xx AGENT_NOT_FOUND（统一批 A2.5）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.update('task-1', { assigneeId: 'agent-deleted' })).rejects.toMatchObject(
+        {
+          response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+        },
+      );
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('update assigneeId：指向已软删 user → 同样 4xx AGENT_NOT_FOUND（任意 actor type）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.update('task-1', { assigneeId: 'user-deleted' })).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+    });
+
     it('should clear assigneeType when assigneeId set to empty', async () => {
       const task = createMockTask({ assigneeId: 'user-1', assigneeType: ActorType.HUMAN });
       mockTaskRepo.findOne.mockResolvedValue(task);
@@ -1916,16 +2207,56 @@ describe('TaskService', () => {
       expect(result.assigneeType).toBeNull();
     });
 
-    it('should throw USER_NOT_FOUND when assigneeId actor does not exist', async () => {
+    it('should throw AGENT_NOT_FOUND when assigneeId actor does not exist', async () => {
       const task = createMockTask();
       mockTaskRepo.findOne.mockResolvedValue(task);
-      mockActorRepo.findOne.mockResolvedValue(null);
+      // 统一批 A2.5（R14）：错误码由 USER_NOT_FOUND 统一为 AGENT_NOT_FOUND——"从未存在"
+      // 与"已删除"消费方正确动作相同，单一语义
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
 
       await expect(service.assign('task-1', { assigneeId: 'user-missing' })).rejects.toThrow(
         NotFoundException,
       );
       await expect(service.assign('task-1', { assigneeId: 'user-missing' })).rejects.toMatchObject({
-        response: { code: ErrorCode.USER_NOT_FOUND },
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+    });
+
+    it('assign：指向已软删 agent → 4xx AGENT_NOT_FOUND（统一批 A2.5）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.assign('task-1', { assigneeId: 'agent-deleted' })).rejects.toMatchObject(
+        {
+          response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+        },
+      );
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('assign：指向已软删 user → 同样 4xx AGENT_NOT_FOUND（assertActorUsable 覆盖任意 actor type）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.assign('task-1', { assigneeId: 'user-deleted' })).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
       });
     });
 
@@ -2026,7 +2357,8 @@ describe('TaskService', () => {
         taskId: 'task-1',
         authorId: 'user-1',
         authorType: 'human',
-        authorName: null,
+        // 统一批 A2：authorName 经公共解析注入（回退链 displayName 优先）
+        authorName: 'Alice',
         content: 'New comment',
       });
       expect(mockCommentRepo.save).toHaveBeenCalledWith(createdComment);
@@ -2054,7 +2386,8 @@ describe('TaskService', () => {
         order: { createdAt: 'DESC' },
         take: 50,
       });
-      expect(result).toEqual(activities);
+      // 统一批 A2：注入 actorName（公共解析，user-1 → Alice）+ actorDeletedAt（未删 null）
+      expect(result).toEqual([{ ...activities[0], actorName: 'Alice', actorDeletedAt: null }]);
     });
 
     it('should apply explicit limit parameter', async () => {
@@ -2079,6 +2412,25 @@ describe('TaskService', () => {
         order: { createdAt: 'DESC' },
         take: 200,
       });
+    });
+
+    it('软删执行者：actorName 真名保留 + actorDeletedAt 非空（前端不再 fallback 裸 UUID）', async () => {
+      const activities = [createMockTaskActivity({ actorId: 'agent-1' })];
+      mockActivityRepo.find.mockResolvedValue(activities);
+      // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+
+      const result = await service.getActivities('task-1');
+
+      expect(result).toEqual([
+        { ...activities[0], actorName: 'Kimi', actorDeletedAt: '2024-06-01T00:00:00.000Z' },
+      ]);
     });
 
     it('should use default limit 50 when limit is not a number', async () => {

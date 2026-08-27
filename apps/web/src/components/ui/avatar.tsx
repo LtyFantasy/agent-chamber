@@ -69,6 +69,12 @@ interface AvatarProps extends React.HTMLAttributes<HTMLDivElement> {
    */
   actorType?: 'human' | 'agent';
   /**
+   * 已删除降级标记（统一批 B）：true 时整头像灰化（grayscale + 半透明）并隐藏
+   * Bot 身份角标——"身份已失效"的视觉语义，与名字灰化/badge 配套使用。
+   * 消费方依据投影 DTO 的 deletedAt 非空传 true。
+   */
+  deleted?: boolean;
+  /**
    * 确定性底色种子（调用方传 actor id）。无 src 时按 `seed ?? fallback`
    * hash 到 AVATAR_PALETTE；不传则退化到按 fallback 文本 hash，仍保证确定性。
    */
@@ -82,6 +88,7 @@ function Avatar({
   fallback,
   size = 'md',
   actorType,
+  deleted = false,
   seed,
   ...props
 }: AvatarProps) {
@@ -112,7 +119,7 @@ function Avatar({
     lg: 'h-2.5 w-2.5',
     xl: 'h-2.5 w-2.5',
   };
-  const showBadge = actorType === 'agent' && size !== 'xs';
+  const showBadge = actorType === 'agent' && size !== 'xs' && !deleted;
 
   const fallbackText = fallback
     ? fallback
@@ -130,8 +137,13 @@ function Avatar({
   return (
     <div className={cn('relative shrink-0', sizes[size], className)} {...props}>
       <div
-        className="flex h-full w-full items-center justify-center overflow-hidden rounded-full bg-muted font-medium text-muted-foreground"
-        // 无 src 时用确定性调色板底色 + 近白首字母；有 src 时保持 muted 底作图片加载垫层
+        // 已删除灰化（统一批 B）：grayscale + opacity-50——身份失效的低饱和视觉；
+        // deleted 同时隐藏 Bot 角标；无 src 时用确定性调色板底色 + 近白首字母，
+        // 有 src 时保持 muted 底作图片加载垫层
+        className={cn(
+          'flex h-full w-full items-center justify-center overflow-hidden rounded-full bg-muted font-medium text-muted-foreground',
+          deleted && 'opacity-50 grayscale',
+        )}
         style={
           resolvedSrc ? undefined : { backgroundColor: paletteColor, color: 'hsl(210 40% 96%)' }
         }

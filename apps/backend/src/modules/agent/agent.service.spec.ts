@@ -10,6 +10,7 @@ import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import { AgentStatus, ActorType } from '@agent-chamber/shared';
 
 jest.mock('crypto', () => ({
@@ -55,6 +56,10 @@ function createMockRepo<T extends ObjectLiteral>() {
       getManyAndCount: jest.fn(),
       getMany: jest.fn(),
       getOne: jest.fn(),
+      getCount: jest.fn(),
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      execute: jest.fn(),
     })),
   } as unknown as jest.Mocked<Repository<T>>;
 }
@@ -122,6 +127,7 @@ describe('AgentService', () => {
   let service: AgentService;
   let mockAgentRepo: jest.Mocked<Repository<Agent>>;
   let mockApiKeyRepo: jest.Mocked<Repository<ApiKey>>;
+  let mockSeatRepo: jest.Mocked<Repository<RoundtableSeat>>;
 
   beforeEach(async () => {
     // NestJS module-token-factory uses crypto.createHash to generate module tokens.
@@ -139,12 +145,14 @@ describe('AgentService', () => {
 
     mockAgentRepo = createMockRepo<Agent>();
     mockApiKeyRepo = createMockRepo<ApiKey>();
+    mockSeatRepo = createMockRepo<RoundtableSeat>();
 
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         AgentService,
         { provide: getRepositoryToken(Agent), useValue: mockAgentRepo },
         { provide: getRepositoryToken(ApiKey), useValue: mockApiKeyRepo },
+        { provide: getRepositoryToken(RoundtableSeat), useValue: mockSeatRepo },
       ],
     }).compile();
 
@@ -671,10 +679,35 @@ describe('AgentService', () => {
   });
 
   describe('remove', () => {
-    it('should soft remove an agent', async () => {
+    /**
+     * 事务包裹 revoke+软删（统一批 A3-1，R15）：
+     * - 事务内先批量 revoke 后软删（revoke 失败时 agent 未删可恢复）；
+     * - revokedReason='agent deleted' 写入断言（resetKey 先例未设，本次新增）；
+     * - revoke 失败 → 事务回滚，软删不发生。
+     */
+    function mockTransactionAndRevoke() {
+      // manager.transaction 直接执行回调，回调收到同一 manager mock（事务内 createQueryBuilder 用 manager 的）
+      (mockAgentRepo.manager as unknown as { transaction: jest.Mock }).transaction = jest.fn(
+        async (cb: (m: typeof mockAgentRepo.manager) => Promise<unknown>) =>
+          cb(mockAgentRepo.manager),
+      );
+      const revokeQb = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      };
+      // 事务回调内用的是 manager.createQueryBuilder()（EntityManager 快速 update 写法）
+      (mockAgentRepo.manager as unknown as { createQueryBuilder: jest.Mock }).createQueryBuilder =
+        jest.fn().mockReturnValue(revokeQb);
+      return revokeQb;
+    }
+
+    it('should revoke keys then soft delete inside a transaction (order: revoke before soft-delete)', async () => {
       const agent = createMockAgent();
       mockAgentRepo.findOne.mockResolvedValue(agent);
       mockAgentRepo.save.mockResolvedValue(agent);
+      const revokeQb = mockTransactionAndRevoke();
 
       const result = await service.remove('agent-1');
 
@@ -682,15 +715,116 @@ describe('AgentService', () => {
         where: { id: 'agent-1' },
         relations: { actor: true },
       });
+      // 事务包裹断言
+      expect(mockAgentRepo.manager.transaction).toHaveBeenCalled();
+      // 先 revoke 后软删（R15 顺序断言）——事务回调内 save 走 manager.save
+      expect(revokeQb.execute.mock.invocationCallOrder[0]).toBeLessThan(
+        (mockAgentRepo.manager.save as jest.Mock).mock.invocationCallOrder[0],
+      );
       expect(agent.actor.deletedAt).toBeInstanceOf(Date);
-      expect(mockAgentRepo.save).toHaveBeenCalledWith(agent);
+      expect(mockAgentRepo.manager.save).toHaveBeenCalledWith(agent);
       expect(result).toBe(true);
+    });
+
+    it('should write revokedReason "agent deleted" when revoking keys', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockAgentRepo.save.mockResolvedValue(agent);
+      const revokeQb = mockTransactionAndRevoke();
+
+      await service.remove('agent-1');
+
+      // resetKey 先例只设 revokedAt，revokedReason 为 A3-1 新增（便于审计回溯删除动作）
+      expect(revokeQb.set).toHaveBeenCalledWith({
+        revokedAt: expect.any(Date),
+        revokedReason: 'agent deleted',
+      });
+      expect(revokeQb.where).toHaveBeenCalledWith('agent_id = :id AND revoked_at IS NULL', {
+        id: 'agent-1',
+      });
+    });
+
+    it('should NOT soft delete when revoke fails (transaction rollback)', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      const revokeQb = mockTransactionAndRevoke();
+      revokeQb.execute.mockRejectedValueOnce(new Error('db down'));
+
+      await expect(service.remove('agent-1')).rejects.toThrow('db down');
+      // 事务内 revoke 抛错 → 回调中断，save（软删）从未执行
+      expect(mockAgentRepo.manager.save).not.toHaveBeenCalled();
+      expect(agent.actor.deletedAt).toBeNull();
     });
 
     it('should throw NotFoundException when agent not found', async () => {
       mockAgentRepo.findOne.mockResolvedValue(null);
 
       await expect(service.remove('not-found')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('getDeletionImpact', () => {
+    it('should return four counts (open tasks / messages / topics / seats)', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      // 前三个 count 走 raw SQL，依次返回 openTask / message / topic
+      (mockAgentRepo.manager.query as jest.Mock)
+        .mockResolvedValueOnce([{ count: '3' }])
+        .mockResolvedValueOnce([{ count: '7' }])
+        .mockResolvedValueOnce([{ count: '2' }]);
+      // seatCount 走 queryBuilder jsonb 路径（铁律 #23）
+      const seatQb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(1),
+      };
+      mockSeatRepo.createQueryBuilder.mockReturnValue(
+        seatQb as unknown as SelectQueryBuilder<RoundtableSeat>,
+      );
+
+      const result = await service.getDeletionImpact('agent-1');
+
+      expect(result).toEqual({ openTaskCount: 3, messageCount: 7, topicCount: 2, seatCount: 1 });
+      // 计数口径断言：task 排除 done/archived + 未软删；message 未软删；participant 仅 invited/active
+      const sqls = (mockAgentRepo.manager.query as jest.Mock).mock.calls.map(
+        (c: [string, unknown[]]) => c[0] as string,
+      );
+      expect(sqls[0]).toContain("status NOT IN ('done', 'archived')");
+      expect(sqls[0]).toContain('deleted_at IS NULL');
+      expect(sqls[1]).toContain('deleted_at IS NULL');
+      expect(sqls[2]).toContain("status IN ('invited', 'active')");
+      // ⚠️ jsonb 路径必须 queryBuilder config->>'bindActorId'（findOne 嵌套条件整列等值永不命中）
+      expect(mockSeatRepo.createQueryBuilder).toHaveBeenCalledWith('seat');
+      expect(seatQb.where).toHaveBeenCalledWith("seat.config->>'bindActorId' = :id", {
+        id: 'agent-1',
+      });
+      expect(seatQb.andWhere).toHaveBeenCalledWith("seat.status != 'removed'");
+    });
+
+    it('should return zero counts when no traces exist', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      (mockAgentRepo.manager.query as jest.Mock).mockResolvedValue([{ count: '0' }]);
+      const seatQb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(0),
+      };
+      mockSeatRepo.createQueryBuilder.mockReturnValue(
+        seatQb as unknown as SelectQueryBuilder<RoundtableSeat>,
+      );
+
+      const result = await service.getDeletionImpact('agent-1');
+      expect(result).toEqual({ openTaskCount: 0, messageCount: 0, topicCount: 0, seatCount: 0 });
+    });
+
+    it('should throw NotFoundException for a soft-deleted / missing agent (findOne 404)', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getDeletionImpact('not-found')).rejects.toThrow(NotFoundException);
+      // findOne 失败即短路，不执行任何计数查询
+      expect(mockAgentRepo.manager.query).not.toHaveBeenCalled();
+      expect(mockSeatRepo.createQueryBuilder).not.toHaveBeenCalled();
     });
   });
 
@@ -904,6 +1038,46 @@ describe('AgentService', () => {
 
       await expect(service.revokeKey('not-found')).rejects.toThrow(NotFoundException);
       expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({ where: { id: 'not-found' } });
+    });
+  });
+
+  describe('findMyUnreadCounts', () => {
+    it('should return mapped unread counts from raw SQL (plan WS-B)', async () => {
+      (mockAgentRepo.manager.query as jest.Mock).mockResolvedValue([
+        { topicId: 'topic-1', topicName: 'T1', unreadCount: 3 },
+        { topicId: 'topic-2', topicName: 'T2', unreadCount: 1 },
+      ]);
+
+      const result = await service.findMyUnreadCounts('agent-1');
+
+      expect(result).toEqual([
+        { topicId: 'topic-1', topicName: 'T1', unreadCount: 3 },
+        { topicId: 'topic-2', topicName: 'T2', unreadCount: 1 },
+      ]);
+      const [sql, params] = (mockAgentRepo.manager.query as jest.Mock).mock.calls[0] as [
+        string,
+        unknown[],
+      ];
+      // 参数绑定：participant_id = $1
+      expect(params).toEqual(['agent-1']);
+      // 关键谓词（对照 getUnread 语义，plan WS-B SQL 逐字）：
+      expect(sql).toContain('tp.participant_id = $1');
+      expect(sql).toContain("tp.status IN ('invited','active')"); // left 参与行排除
+      expect(sql).toContain('t.deleted_at IS NULL'); // 已删 topic 排除
+      expect(sql).toContain('a.deleted_at IS NULL'); // 游标消息软删 → 锚点落空 → 全量
+      expect(sql).toContain('(m.created_at, m.id) > (a.created_at, a.id)'); // 行值比较 after 语义
+      expect(sql).toContain('HAVING COUNT(m.id) > 0'); // 只返 unreadCount>0
+      expect(sql).toContain('LIMIT 50');
+      // 自己发的计入：无 sender 过滤（与 getUnread 同语义）
+      expect(sql).not.toContain('sender_id');
+    });
+
+    it('should return empty array when no participation rows', async () => {
+      (mockAgentRepo.manager.query as jest.Mock).mockResolvedValue([]);
+
+      const result = await service.findMyUnreadCounts('agent-1');
+
+      expect(result).toEqual([]);
     });
   });
 });

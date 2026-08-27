@@ -6,11 +6,16 @@
  *   - 主文档: docs/architecture.md §3.2.6 (全文搜索)
  *   - 补充: docs/architecture.md §7.2 (统一权限模型)
  *
- * [踩坑索引] B-50(列表权限过滤) D5(统一权限重构) B-55(QueryBuilder orderBy select 风险)
+ * [踩坑索引] B-50(列表权限过滤) D5(统一权限重构) B-55(QueryBuilder orderBy select 风险) R1(公共解析收口)
  *
  * [铁律关联] #4(文档优先) #9(代理层透传) #17(测试契约) #6(文档联动)
  *
  * [详细踩坑]（最多 5 条）
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件消息 sender 解析一律经 ActorProfileService.resolveProfiles（含 deletedAt/
+ *       type/name），真孤儿不进 map 由调用方兜底 'System'；禁止散落 queryBuilder 或自建
+ *       agents/users 查询（收口见 common/services/actor-profile.service.ts，契约 docs/spec.md
+ *       §1）。2026-08-26 统一批 A2。
  *   B-55: searchMessages/searchTasks 中 skip/take + innerJoin + orderBy('rank')，
  *          若未 addSelect rank 会触发 TypeORM 0.3.30 distinctAlias 类错误。
  *          当前已显式 addSelect ts_rank(...) AS rank；单测锁住该约束防回归。
@@ -41,6 +46,7 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocSearchService } from '../docspace/doc-search.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AccessQueryService } from '../../common/services/access-query.service';
+import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { SearchQueryDto, SearchType } from './dto';
 import type { PaginatedResponse, DocSearchHitWithSpace } from '@agent-chamber/shared';
 
@@ -65,6 +71,8 @@ export interface MessageSearchResult {
   senderType: string;
   /** 发送者名称，Service 层注入 */
   senderName: string;
+  /** 软删时间；非空 = 发送者已删除，senderName 仍可显示（历史归因保留，契约 docs/spec.md §1） */
+  senderDeletedAt?: string | null;
   /** 消息类型 */
   type: string;
   /** 创建时间 */
@@ -151,6 +159,7 @@ export class SearchService {
     private docRepo: Repository<Doc>,
     private accessQuery: AccessQueryService,
     private docSearchService: DocSearchService,
+    private actorProfileService: ActorProfileService,
   ) {}
 
   /**
@@ -239,7 +248,7 @@ export class SearchService {
 
     // 4. 批量解析发送者信息（一次查询完成，避免 N+1）
     const senderIds = [...new Set(entities.map((e) => e.senderId))];
-    const { nameMap, typeMap } = await this.resolveSenderInfo(senderIds);
+    const { nameMap, typeMap, deletedAtMap } = await this.resolveSenderInfo(senderIds);
 
     // 5. 显式构造摘要对象（禁止 spread entity，防止 content/metadata/mentions 等字段泄露）
     const items: MessageSearchResult[] = entities.map((entity) => ({
@@ -248,6 +257,9 @@ export class SearchService {
       senderId: entity.senderId,
       senderType: typeMap.get(entity.senderId) ?? 'system',
       senderName: nameMap.get(entity.senderId) ?? 'System',
+      // 软删信号：非空 = 发送者已删除，senderName 仍可显示（契约 docs/spec.md §1）；
+      // 真孤儿（不进 map）兜底 null
+      senderDeletedAt: deletedAtMap.get(entity.senderId) ?? null,
       type: entity.type,
       createdAt: entity.createdAt,
       contentSnippet: entity.content.slice(0, 200),
@@ -417,45 +429,33 @@ export class SearchService {
   /**
    * 批量解析发送者信息（一次查询完成，避免 N+1）
    *
-   * 分别查询 Agent 表和 User 表，构建 senderId → name/type 的映射。
-   * 既不在 Agent 也不在 User 表中的 senderId 视为 system。
+   * 统一批 A2：改走公共 ActorProfileService（withDeleted 覆盖软删 actor——软删 sender
+   * 解析出真名 + 真实类型 + deletedAt，不再是 'System'；真孤儿不进 map，由调用方
+   * 以 'System'/'system' 兜底）。
    *
    * @param senderIds 去重后的发送者 ID 列表
-   * @returns nameMap（senderId → 显示名称）和 typeMap（senderId → 'human' | 'agent' | 'system'）
+   * @returns nameMap（senderId → 显示名称）、typeMap（senderId → 'human' | 'agent' | 'system'）、
+   *          deletedAtMap（senderId → 软删 ISO 时间戳或 null）
    */
-  private async resolveSenderInfo(
-    senderIds: string[],
-  ): Promise<{ nameMap: Map<string, string>; typeMap: Map<string, string> }> {
+  private async resolveSenderInfo(senderIds: string[]): Promise<{
+    nameMap: Map<string, string>;
+    typeMap: Map<string, string>;
+    deletedAtMap: Map<string, string | null>;
+  }> {
     const nameMap = new Map<string, string>();
     const typeMap = new Map<string, string>();
+    const deletedAtMap = new Map<string, string | null>();
 
-    if (senderIds.length === 0) return { nameMap, typeMap };
+    if (senderIds.length === 0) return { nameMap, typeMap, deletedAtMap };
 
-    // 并行查询 Agent 和 User 表
-    const [agents, users] = await Promise.all([
-      this.agentRepo.findBy({ id: In(senderIds) }),
-      this.userRepo.findBy({ id: In(senderIds) }),
-    ]);
-
-    for (const agent of agents) {
-      nameMap.set(agent.id, agent.name);
-      typeMap.set(agent.id, 'agent');
+    const profileMap = await this.actorProfileService.resolveProfiles(senderIds);
+    for (const [id, profile] of profileMap) {
+      nameMap.set(id, profile.name);
+      typeMap.set(id, profile.type);
+      deletedAtMap.set(id, profile.deletedAt ? profile.deletedAt.toISOString() : null);
     }
 
-    for (const user of users) {
-      nameMap.set(user.id, user.displayName || user.username || 'Unknown User');
-      typeMap.set(user.id, 'human');
-    }
-
-    // 既不是 Agent 也不是 User 的，回退为 system
-    for (const id of senderIds) {
-      if (!typeMap.has(id)) {
-        nameMap.set(id, 'System');
-        typeMap.set(id, 'system');
-      }
-    }
-
-    return { nameMap, typeMap };
+    return { nameMap, typeMap, deletedAtMap };
   }
 
   /**

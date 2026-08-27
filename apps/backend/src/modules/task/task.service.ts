@@ -6,11 +6,20 @@
  *   - 主文档: docs/architecture.md §3.2.3 (Board / Task)
  *   - 补充: docs/api-definition.md §7. Tasks, docs/spec.md §3.2 TaskStatus
  *
- * [踩坑索引] B-50(列表权限过滤) B-50-EVT(任务事件boardId) B-42(单对象返回null) B-49(softDelete500) B-3(completedAt缺失) B-4(move到不存在的list) D5(权限迁移) P1-1(findOne载荷瘦身) Batch1-P2(milestone绑定校验) Batch3(topicId下线)
+ * [踩坑索引] B-50(列表权限过滤) B-50-EVT(任务事件boardId) B-42(单对象返回null) B-49(softDelete500) B-3(completedAt缺失) B-4(move到不存在的list) D5(权限迁移) P1-1(findOne载荷瘦身) Batch1-P2(milestone绑定校验) Batch3(topicId下线) R1(公共解析收口) A2.5(assignee须usable) WS-A(orderBy表达式坑)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #7(测试绑定) #9(代理层透传)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   A2.5: create/update/assign 的 assigneeId 统一走 ActorProfileService.assertActorUsable
+ *       （存在+未软删两态，404 AGENT_NOT_FOUND）。assign 原 USER_NOT_FOUND 错误码语义误导
+ *       （actorRepo 已挡软删但码说 user），本批统一为 AGENT_NOT_FOUND——消费方对"未存在"
+ *       与"已删除"的正确动作相同，不值得双码。契约 docs/spec.md §1 规则 6。2026-08-26 统一批 A2.5。
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件所有 actor 投影（findAll/findOne assignee、getActivities 执行者、评论
+ *       authorName）一律经 ActorProfileService.resolveProfiles 取 deletedAt/type/name，禁止
+ *       散落 queryBuilder 或自建 actors 查询（收口见 common/services/actor-profile.service.ts，
+ *       契约 docs/spec.md §1）。2026-08-26 统一批 A2。
  *   B-50: Task / Milestone 列表接口无 actor 权限过滤，无参数时返回全平台数据；
  *         修复：findAll 接收 actor，Service 层通过 list.boardId IN 过滤可访问 Board，
  *         空白名单直接返回空分页，返回 item 填充 boardId/topicId。见 Plan §3.1。
@@ -33,6 +42,11 @@
  *   Batch1-P2: create/update task 时 milestoneId 非空新增两道校验——存在性（404/7000）+ 同
  *         board（409/9001），根治之前无校验导致撞 PG FK 变 500 的 bug。见
  *         .kimi/plan-batch1-milestone-board.md §2 D-B1-4。
+ *   WS-A: findAll 排序表达式坑——TypeORM 对含 "." 的 orderBy 键按 alias.property 解析，
+ *         CASE 表达式直接传 orderBy 会 findAliasByName 抛错；addSelect 命名列 + orderBy
+ *         别名可绕开，但别名必须全小写（getManyAndCount 回捞主查询不 escape orderBy 键，
+ *         大写别名被 PG 折叠成小写报 column does not exist，真 PG e2e 实测）。
+ *         见 plan forge-jubilee-robin.md Workstream A。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -89,12 +103,15 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
+import { ActorProfileService } from '../../common/services/actor-profile.service';
 import type { PaginatedResponse, TaskSummary } from '@agent-chamber/shared';
 import type { TaskDocLinkItem } from '@agent-chamber/shared';
 
 export interface TaskWithBlockers extends Task {
   blockers?: TaskDependency[];
   assigneeName?: string | null;
+  /** 软删信号：非空 = assignee 已删除，assigneeName 仍可显示（契约 docs/spec.md §1） */
+  assigneeDeletedAt?: string | null;
 }
 
 /**
@@ -172,6 +189,7 @@ export class TaskService {
     @InjectRepository(DocSpace)
     private docSpaceRepo: Repository<DocSpace>,
     private readonly docSpacePolicy: DocSpacePolicy,
+    private readonly actorProfileService: ActorProfileService,
   ) {}
 
   /**
@@ -217,8 +235,13 @@ export class TaskService {
 
     const qb = this.taskRepo
       .createQueryBuilder('task')
-      .leftJoinAndSelect('task.list', 'list')
-      .leftJoinAndSelect('list.board', 'board')
+      // 部分水合 join（WS-A 扁平化）：只 select 需要的列，避免整行 list/board 实体
+      // 泄漏进响应。join 本身必须保留——accessibleBoardIds/boardId/topicId 的 WHERE
+      // 过滤只依赖 join 不依赖 select（plan 调查结论 1 已核实）。
+      .leftJoin('task.list', 'list')
+      .addSelect(['list.id', 'list.name', 'list.boardId'])
+      .leftJoin('list.board', 'board')
+      .addSelect(['board.id', 'board.name', 'board.topicId'])
       .where('task.deleted_at IS NULL');
 
     if (accessibleBoardIds) {
@@ -290,33 +313,70 @@ export class TaskService {
       );
     }
 
-    qb.orderBy('task.createdAt', 'DESC')
-      .skip((page - 1) * pageSize)
-      .take(pageSize);
+    if (query.sort === 'statusPriority') {
+      // 状态优先级排序（opt-in）：in_progress > todo > blocked > backlog > 其余
+      // （review/done/archived 恒末位）。CASE 权重越小越靠前；updatedAt DESC 次键 +
+      // id ASC 第三键兜底稳定分页（PG 不保证无主序时跨页稳定，plan 架构师修订）。
+      // ⚠️ TypeORM 对含 "." 的 orderBy 键按 alias.property 解析（CASE 表达式会被误
+      // split 抛错），故 CASE 经 addSelect 命名列 + orderBy 别名。别名必须全小写：
+      // getManyAndCount 回捞实体的主查询把 orderBy 键原样拼 SQL（不 escape），
+      // 大写别名会被 PG 折叠成小写导致 "column does not exist"（真 PG 实测）。
+      qb.addSelect(
+        `CASE task.status
+          WHEN 'in_progress' THEN 0
+          WHEN 'todo' THEN 1
+          WHEN 'blocked' THEN 2
+          WHEN 'backlog' THEN 3
+          ELSE 4 END`,
+        'status_priority_order',
+      )
+        .orderBy('status_priority_order', 'ASC')
+        .addOrderBy('task.updatedAt', 'DESC')
+        .addOrderBy('task.id', 'ASC');
+    } else {
+      // 默认排序：创建时间倒序（web 看板分页依赖，前端不重排，一字不动）
+      qb.orderBy('task.createdAt', 'DESC');
+    }
+    qb.skip((page - 1) * pageSize).take(pageSize);
 
     const [items, total] = await qb.getManyAndCount();
 
-    // 批量查询所有 assignee 的名称，避免 N+1
+    // 批量解析 assignee 档案（统一批 A2：走公共 ActorProfileService——withDeleted 覆盖
+    // 软删 actor，回退链统一 agents.name || displayName，避免 N+1，保持 IN 批次形态）
     const assigneeIds = items.map((t) => t.assigneeId).filter(Boolean) as string[];
     const uniqueIds = [...new Set(assigneeIds)];
-
-    const [agents, users] = await Promise.all([
-      uniqueIds.length > 0 ? this.agentRepo.findBy({ id: In(uniqueIds) }) : Promise.resolve([]),
-      uniqueIds.length > 0 ? this.userRepo.findBy({ id: In(uniqueIds) }) : Promise.resolve([]),
-    ]);
-
-    const nameMap = new Map<string, string>();
-    agents.forEach((a) => nameMap.set(a.id, a.name));
-    users.forEach((u) => nameMap.set(u.id, u.displayName || u.username || '未知用户'));
+    const profileMap =
+      uniqueIds.length > 0 ? await this.actorProfileService.resolveProfiles(uniqueIds) : new Map();
 
     const enrichedItems = items.map((task) => {
-      const { description: _desc, ...plain } = this.toPlain(task);
+      const profile = task.assigneeId ? profileMap.get(task.assigneeId) : undefined;
       return {
-        ...plain,
+        // 显式白名单组装（WS-A 扁平化，不再 spread 实体）：只暴露 TaskSummary 契约
+        // 字段，杜绝 list/board/dependencies/dependents 等嵌套实体泄漏进响应。
+        // hasBlockers/commentCount/activityCount 在 findAll 路径从不产出，不在白名单。
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        priority: task.priority,
+        assigneeId: task.assigneeId,
+        assigneeType: task.assigneeType,
+        assigneeName: profile?.name ?? null,
+        // 软删信号：非空 = assignee 已删除，assigneeName 仍可显示（契约 docs/spec.md §1）
+        assigneeDeletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
+        position: task.position,
+        dueDate: task.dueDate,
+        labels: task.labels,
+        milestoneId: task.milestoneId,
+        // listId 是 Task 实体直接列（task.entity.ts:35），必须显式列出
+        listId: task.listId,
         // Task 不存储 boardId/topicId，从已 join 的 list→board 推断
         boardId: task.list?.boardId ?? null,
         topicId: task.list?.board?.topicId ?? null,
-        assigneeName: task.assigneeId ? nameMap.get(task.assigneeId) || null : null,
+        // 部分水合 join 列（leftJoin+addSelect）：list.name / board.name
+        boardName: task.list?.board?.name ?? null,
+        listName: task.list?.name ?? null,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
       };
     });
 
@@ -420,8 +480,13 @@ export class TaskService {
     delete plainRecord.comments;
     delete plainRecord.activities;
     if (plain.assigneeId) {
-      const assigneeType = await this.resolveActorType(plain.assigneeId);
-      plain.assigneeName = await this.resolveActorName(plain.assigneeId, assigneeType);
+      // 统一批 A2：公共解析一次拿 name + type + deletedAt（替代原 resolveActorType +
+      // resolveActorName 两次查询；withDeleted 覆盖软删 assignee，信号透传）
+      const profile = (await this.actorProfileService.resolveProfiles([plain.assigneeId])).get(
+        plain.assigneeId,
+      );
+      plain.assigneeName = profile?.name ?? null;
+      plain.assigneeDeletedAt = profile?.deletedAt ? profile.deletedAt.toISOString() : null;
     }
     // Task 不存储 boardId/topicId，从 list→board 派生填充（Batch 3：topic_id 列已物理删除）
     const taskList = await this.boardListRepo.findOne({
@@ -533,6 +598,12 @@ export class TaskService {
 
     // 未指定负责人时，默认将任务分配给创建者，避免出现"无主任务"导致创建者无法继续操作
     const assigneeId = dto.assigneeId?.trim() || actorId || null;
+    // 统一批 A2.5（R10/R14）：assigneeId 非空时断言 actor 存在且未软删——新指派指向
+    // 已删 actor = 活配置错误，写接口统一 4xx AGENT_NOT_FOUND（契约 docs/spec.md §1 规则 6；
+    // assignee 可以是 human，assertActorUsable 覆盖任意 actor type）
+    if (assigneeId) {
+      await this.actorProfileService.assertActorUsable(assigneeId);
+    }
     const assigneeType = assigneeId ? await this.resolveActorType(assigneeId) : null;
 
     // statusName 必须在铺入 taskRepo.create 前剔除，否则 TypeORM 会把它当实体列写入（unknown column）
@@ -756,6 +827,10 @@ export class TaskService {
     }
 
     if (effectiveAssigneeId !== undefined) {
+      // 统一批 A2.5（R10/R14）：新指派/换人时断言 actor 存在且未软删（null/'' 取消分配不校验）
+      if (effectiveAssigneeId) {
+        await this.actorProfileService.assertActorUsable(effectiveAssigneeId);
+      }
       task.assigneeId = effectiveAssigneeId;
       task.assigneeType = task.assigneeId ? await this.resolveActorType(task.assigneeId) : null;
     }
@@ -1219,14 +1294,11 @@ export class TaskService {
     const task = await this.findOne(id);
     const oldAssigneeId = task.assigneeId;
     if (dto.assigneeId) {
-      // 校验被指派的 Actor 真实存在，避免幽灵分配（Phase 2）
-      const actor = await this.resourceValidator.exists(
-        this.actorRepo,
-        dto.assigneeId,
-        ErrorCode.USER_NOT_FOUND,
-      );
+      // 统一批 A2.5（R14）：校验被指派 actor 存在且未软删——错误码由 USER_NOT_FOUND 统一为
+      // AGENT_NOT_FOUND（"从未存在"与"已删除"消费方正确动作相同，单一语义，契约 docs/spec.md §1）
+      await this.actorProfileService.assertActorUsable(dto.assigneeId);
       task.assigneeId = dto.assigneeId;
-      task.assigneeType = actor.type;
+      task.assigneeType = (await this.resolveActorType(dto.assigneeId)) ?? null;
     } else {
       task.assigneeId = null;
       task.assigneeType = null;
@@ -1262,24 +1334,18 @@ export class TaskService {
     });
   }
 
+  /**
+   * 解析 Actor 显示名（统一批 A2：走公共 ActorProfileService——withDeleted 覆盖软删
+   * actor，回退链 agents.name || displayName；真孤儿返回 null）
+   * @param actorId 待解析的 actor id
+   * @param _actorType 兼容旧签名保留（解析不再依赖调用方传入的类型，actors 表自证）
+   */
   private async resolveActorName(
     actorId: string,
-    actorType?: ActorType | null,
+    _actorType?: ActorType | null,
   ): Promise<string | null> {
-    try {
-      const type = actorType ?? (await this.resolveActorType(actorId));
-      if (type === ActorType.AGENT) {
-        const agent = await this.agentRepo.findOne({ where: { id: actorId } });
-        return agent?.name ?? null;
-      }
-      if (type === ActorType.HUMAN) {
-        const user = await this.userRepo.findOne({ where: { id: actorId } });
-        return user?.displayName || user?.username || null;
-      }
-      return null;
-    } catch {
-      return null;
-    }
+    const profile = (await this.actorProfileService.resolveProfiles([actorId])).get(actorId);
+    return profile?.name ?? null;
   }
 
   async addComment(id: string, authorId: string, authorType: ActorType, dto: AddCommentDto) {
@@ -1305,17 +1371,31 @@ export class TaskService {
   }
 
   /**
-   * 获取任务活动日志列表。
+   * 获取任务活动日志列表（统一批 A2：批量注入 actorName + actorDeletedAt——现状前端
+   * fallback 显示裸 UUID，软删执行者也能解析出真名；真孤儿 actorName 为 null 由消费方兜底）。
    * @param id 任务 ID
    * @param limit 返回条数上限，默认 50，静默钳制到 [1, 200]
    */
   async getActivities(id: string, limit?: number) {
     const parsed = +(limit ?? 50);
     const safeLimit = isNaN(parsed) ? 50 : Math.min(200, Math.max(1, parsed));
-    return this.activityRepo.find({
+    const activities = await this.activityRepo.find({
       where: { taskId: id },
       order: { createdAt: 'DESC' },
       take: safeLimit,
+    });
+    const actorIds = [...new Set(activities.map((a) => a.actorId).filter(Boolean))];
+    const profileMap =
+      actorIds.length > 0 ? await this.actorProfileService.resolveProfiles(actorIds) : new Map();
+    return activities.map((a) => {
+      const profile = a.actorId ? profileMap.get(a.actorId) : undefined;
+      return {
+        ...a,
+        // 注入执行者真名（含软删 actor——withDeleted 查询），真孤儿 null
+        actorName: profile?.name ?? null,
+        // 软删信号：非空 = 执行者已删除，actorName 仍可显示（契约 docs/spec.md §1）
+        actorDeletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
+      };
     });
   }
 

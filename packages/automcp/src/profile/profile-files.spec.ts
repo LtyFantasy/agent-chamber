@@ -9,13 +9,14 @@ import { matchesAnyPattern } from '../mapper/tool-mapper';
  */
 describe('mcp-profiles (agent.json / full.json 防回归)', () => {
   /**
-   * agent.json（worker profile）include 全量 28 条正则的快照清单。
+   * agent.json（worker profile）include 全量 29 条正则的快照清单。
    *
    * 与 apps/backend/config/mcp-profiles/agent.json 逐字一致（有序断言，JSON 数组顺序即文件顺序）。
-   * 任何新增/删除/改写正则都会使快照断言失败——比旧的"长度 28 + 抽查 5 个"更防回归。
+   * 任何新增/删除/改写正则都会使快照断言失败——比旧的"长度 29 + 抽查 5 个"更防回归。
    */
   const AGENT_INCLUDE_SNAPSHOT: string[] = [
     '^agent_controller_get_me$',
+    '^agent_controller_get_my_unread$',
     '^topic_controller_find_all$',
     '^topic_controller_create$',
     '^topic_controller_find_one$',
@@ -104,13 +105,13 @@ describe('mcp-profiles (agent.json / full.json 防回归)', () => {
   }
 
   describe('agent.json（worker profile）', () => {
-    it('should keep exactly 28 include rules', async () => {
+    it('should keep exactly 29 include rules', async () => {
       const include = await loadInclude('agent');
 
-      expect(include).toHaveLength(28);
+      expect(include).toHaveLength(29);
     });
 
-    it('should match full 28-rule include snapshot (逐字防回归)', async () => {
+    it('should match full 29-rule include snapshot (逐字防回归)', async () => {
       const include = await loadInclude('agent');
 
       // 有序快照：任何一条正则被改坏（删除/改写/新增）都会在此失败

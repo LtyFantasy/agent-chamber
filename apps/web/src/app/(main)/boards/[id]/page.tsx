@@ -11,7 +11,7 @@ import remarkGfm from 'remark-gfm';
 import { Api } from '@/lib/api';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
-import { confirm } from '@/lib/notify';
+import { confirm, toast } from '@/lib/notify';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -24,16 +24,11 @@ import {
 } from '@/components/ui/dialog';
 import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
-import {
-  Sheet,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-  SheetFooter,
-} from '@/components/ui/sheet';
-import { Avatar } from '@/components/ui/avatar';
+import { Sheet } from '@/components/ui/sheet';
 import { useAuthStore } from '@/stores/auth.store';
 import { TaskDetailPanel } from '@/components/tasks/task-detail-panel';
+import { MembersSheet } from '@/components/members/members-sheet';
+import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
 import {
   ArrowLeft,
   Plus,
@@ -45,7 +40,6 @@ import {
   X,
   Flag,
   Users,
-  UserPlus,
   FileText,
   BookOpen,
   Settings,
@@ -73,6 +67,13 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { BoardListSummary, TaskSummary, TaskDetail, Agent, Milestone } from '@/types';
+// 任务卡视觉映射与徽章行（统一批 B 抽取自本页：SortableTask/DragOverlay 共用，独立可测）
+import {
+  TaskCardBadges,
+  priorityColors,
+  statusLabelKeys,
+  statusStyles,
+} from '@/components/tasks/task-card-badges';
 
 /**
  * mutation 错误统一提示（范式照抄 docs/[id]/page.tsx alertMutationError）：
@@ -84,102 +85,10 @@ const alertMutationError = (fallback: string) => (err: unknown) => {
 };
 
 // ──────────────────────────────────────────────
-// 任务卡视觉映射 — 新色板状态色/优先级色（docs/ui-design-system.md §2.2：
-// 半透明语义色底 + 亮阶文字，禁止亮主题 -100/-800 硬编码）。
-// 提升到模块作用域：SortableTask 与 DragOverlay 拖拽预览共用，防配色漂移。
+// 任务卡视觉映射（statusStyles/statusLabelKeys/priorityColors）与 TaskCardBadges
+// 已抽取至 components/tasks/task-card-badges.tsx（统一批 B）——SortableTask 与
+// DragOverlay 拖拽预览共用，防配色漂移；独立文件可脱离页面重依赖单独测试。
 // ──────────────────────────────────────────────
-const priorityColors: Record<string, string> = {
-  p3: 'bg-muted/50 text-muted-foreground',
-  p2: 'bg-blue-500/15 text-blue-300',
-  p1: 'bg-orange-500/15 text-orange-300',
-  p0: 'bg-red-500/15 text-red-300',
-};
-
-/** 任务状态 icon key 映射（供 tGlobal 翻译） */
-const statusLabelKeys: Record<string, string> = {
-  done: 'tasks.status.done',
-  blocked: 'tasks.status.blocked',
-  in_progress: 'tasks.status.in_progress',
-  review: 'tasks.status.review',
-  backlog: 'tasks.status.backlog',
-  todo: 'tasks.status.todo',
-  archived: 'tasks.status.archived',
-};
-
-/** 任务状态对应的视觉样式：左侧 2px 状态色边条 + 状态徽章色 */
-const statusStyles: Record<string, { border: string; labelColor: string }> = {
-  done: {
-    border: 'border-l-2 border-l-emerald-400',
-    labelColor: 'text-emerald-300 bg-emerald-500/15',
-  },
-  blocked: {
-    border: 'border-l-2 border-l-red-400',
-    labelColor: 'text-red-300 bg-red-500/15',
-  },
-  in_progress: {
-    border: 'border-l-2 border-l-blue-400',
-    labelColor: 'text-blue-300 bg-blue-500/15',
-  },
-  review: {
-    border: 'border-l-2 border-l-violet-400',
-    labelColor: 'text-violet-300 bg-violet-glow/15',
-  },
-  backlog: {
-    border: 'border-l-2 border-l-slate-500',
-    labelColor: 'text-muted-foreground bg-muted/50',
-  },
-  todo: {
-    border: 'border-l-2 border-l-slate-500',
-    labelColor: 'text-muted-foreground bg-muted/50',
-  },
-  archived: {
-    border: 'border-l-2 border-l-slate-600 opacity-60',
-    labelColor: 'text-muted-foreground bg-muted/40',
-  },
-};
-
-// ──────────────────────────────────────────────
-// TaskCardBadges — 任务卡徽章行（状态/优先级/负责人/阻塞）。
-// SortableTask 与 DragOverlay 拖拽预览共用的纯展示片段，无逻辑。
-// ──────────────────────────────────────────────
-function TaskCardBadges({ task, hasBlockers }: { task: TaskSummary; hasBlockers?: boolean }) {
-  const tGlobal = useTranslations();
-  const statusKey = statusLabelKeys[task.status] || 'tasks.status.todo';
-  const statusColor = (statusStyles[task.status] || statusStyles.todo).labelColor;
-  return (
-    <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-      {/* 状态标签 */}
-      <span
-        className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusColor}`}
-      >
-        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-        {tGlobal(statusKey as any)}
-      </span>
-      {task.priority && (
-        <span
-          className={`inline-block rounded px-1.5 py-0.5 text-xs font-medium ${priorityColors[task.priority] || ''}`}
-        >
-          {task.priority}
-        </span>
-      )}
-      {task.assigneeName && (
-        <span className="inline-flex items-center rounded bg-indigo-500/15 px-1.5 py-0.5 text-xs font-medium text-indigo-300">
-          {task.assigneeName.slice(0, 8)}
-        </span>
-      )}
-      {hasBlockers && (
-        <span
-          className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300"
-          title={tGlobal('tasks.hasBlockers')}
-        >
-          <Lock className="h-3 w-3 mr-0.5" />
-          {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-          {tGlobal('tasks.status.blocked' as any)}
-        </span>
-      )}
-    </div>
-  );
-}
 
 // ──────────────────────────────────────────────
 // SortableTask — 可拖拽的任务卡片
@@ -1051,7 +960,6 @@ export default function BoardDetailPage() {
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [labelFilter, setLabelFilter] = useState<string>('');
   const [inviteSheetOpen, setInviteSheetOpen] = useState(false);
-  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
   /** Docs 徽章：无绑定空间时 creator/admin 可新建绑定空间 */
   const [docsDialogOpen, setDocsDialogOpen] = useState(false);
   const [docsSpaceName, setDocsSpaceName] = useState('');
@@ -1320,11 +1228,12 @@ export default function BoardDetailPage() {
     },
   });
 
+  /** 邀请 Agent 加入看板（R2 Promise 契约：页面层 allSettled 循环调用；
+      选择集已移交 MembersSheet 内部管理，onSuccess 只负责刷新详情） */
   const inviteAgentMutation = useMutation({
     mutationFn: (agentId: string) => Api.boards.inviteAgent(id, { agentId }),
-    onSuccess: (_, agentId) => {
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
-      setSelectedAgentIds((prev) => prev.filter((sid) => sid !== agentId));
     },
   });
 
@@ -1348,6 +1257,110 @@ export default function BoardDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
     },
   });
+
+  // ── MembersSheet 数据装配（批次 C2：内联成员 Sheet → 共享组件；页面层负责
+  //    DTO → MemberItem 映射与权限 gate，组件纯受控不感知业务）──
+
+  /** 成员管理权限闸（照抄旧内联 Sheet 各 section 的 gate：平台 admin ｜ 看板
+   *  创建者/owner 代理——体验层闸，后端同样 403；与页面级 canManage（内容管理，
+   *  含 editor 成员）区分，勿混用） */
+  const canManageMembers =
+    currentUser?.role === 'admin' ||
+    isCreatorOrOwner(board?.creatorId, currentUser?.id, myAgentIds);
+
+  /** 活跃成员 → MemberItem（board.members 已按 DTO 投影：id/name/type/role；
+   *  行级移除排除照抄旧 UI——所有行（含自己/创建者）都显示操作入口，不设
+   *  canRemove（缺省跟随 capabilities.remove），创建者行由后端 409 守卫兜底
+   *  （既存行为，重构不改行为）） */
+  const memberItems = useMemo((): MemberItem[] => {
+    if (!board) return [];
+    return (board.members ?? []).map((m) => ({
+      actorId: m.id,
+      name: m.name,
+      actorType: m.type,
+      role: m.role,
+      avatarUrl: m.avatarUrl ?? undefined,
+      // 已删除信号透传（统一批 B）：软删 actor 带 deletedAt → member-row 灰化+badge
+      deletedAt: m.deletedAt ?? null,
+      status: 'active',
+    }));
+  }, [board]);
+
+  /** 可邀请 agent 候选（照抄旧「添加邀请」checkbox 列表：全量 active agent 排除
+   *  现有成员；board 无 invited 概念，无需兜底集合） */
+  const candidateItems = useMemo((): MemberItem[] => {
+    if (!board) return [];
+    const memberIds = new Set((board.members ?? []).map((m) => m.id));
+    return (agentsData ?? [])
+      .filter((a: Agent) => a.status === 'active' && !memberIds.has(a.id))
+      .map((a) => ({
+        actorId: a.id,
+        name: a.name,
+        actorType: 'agent',
+        role: 'member',
+        avatarUrl: a.avatarUrl ?? undefined,
+        status: 'active',
+      }));
+  }, [board, agentsData]);
+
+  /** member id → role 索引（移除分发按角色路由：editor → removeEditor /
+   *  member → uninviteAgent，照抄旧 UI 行内判断） */
+  const memberRoleById = useMemo(() => {
+    const map = new Map<string, string>();
+    (board?.members ?? []).forEach((m) => map.set(m.id, m.role));
+    return map;
+  }, [board]);
+
+  /** 差异化文案：复用页面现有 boards.members.* key（title/角色/类别） */
+  const memberLabels: MembersSheetLabels = {
+    title: t('members.title'),
+    roleLabels: {
+      editor: t('members.editor'),
+      member: t('members.member'),
+    },
+    typeLabels: {
+      human: t('members.human'),
+      agent: t('members.agent'),
+    },
+  };
+
+  /** R2 邀请提交（Promise 契约）：mutateAsync 循环 + allSettled——全成功 resolve
+   *  （组件切回主视图并清空选择）；任一失败 reject（组件留在邀请视图保留选择）+
+   *  失败汇总 toast（成功 N / 失败 M）。board 无人类候选，kind 恒为 'agent'，
+   *  非 agent 防御性短路（不 resolve 也不 reject） */
+  const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
+    if (kind !== 'agent') return;
+    const results = await Promise.allSettled(
+      actorIds.map((actorId) => inviteAgentMutation.mutateAsync(actorId)),
+    );
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    if (failed > 0) {
+      toast.error({
+        title: t('members.inviteFailed', { succeeded, failed }),
+      });
+      throw new Error(`invite agent partial failure: ${failed}/${results.length}`);
+    }
+  };
+
+  /** 移除活跃成员（组件 AlertDialog 确认后回调）：照抄旧 UI 按角色分发——
+   *  editor 行 → removeEditor（后端语义 = 完全移除）；member 行 → uninviteAgent */
+  const handleRemoveMember = (actorId: string) => {
+    if (memberRoleById.get(actorId) === 'editor') {
+      removeEditorMutation.mutate(actorId);
+    } else {
+      uninviteAgentMutation.mutate(actorId);
+    }
+  };
+
+  /** 升降级（主脑裁决 A）：board 仅单向升级 member → editor（addEditor）；
+   *  editor → member 降级后端无 demote 端点（removeEditor = 完全移除非降级），
+   *  故 changeRole 配置只含 fromRole='member' 一项，此回调只接 'editor' */
+  const handleChangeRole = (actorId: string, newRole: string) => {
+    if (newRole === 'editor') {
+      addEditorMutation.mutate(actorId);
+    }
+  };
 
   const reorderListsMutation = useMutation({
     mutationFn: (lists: { id: string; position: number }[]) =>
@@ -1967,183 +1980,30 @@ export default function BoardDetailPage() {
         </DialogFooter>
       </Dialog>
 
-      {/* 看板成员 Sheet */}
-      <Sheet open={inviteSheetOpen} onOpenChange={setInviteSheetOpen}>
-        <SheetHeader>
-          <SheetTitle>{t('members.title')}</SheetTitle>
-          <SheetDescription>
-            {board.topicId
-              ? t('members.descriptionWithTopic')
-              : t('members.descriptionWithoutTopic')}
-          </SheetDescription>
-        </SheetHeader>
-
-        <div className="mt-6 space-y-6">
-          {/* 统一成员列表 */}
-          <div className="space-y-3">
-            <h3 className="text-sm font-medium">
-              {t('members.label')}
-              {board.members?.length ? ` (${board.members.length})` : ''}
-            </h3>
-            {(() => {
-              const members = board.members ?? [];
-              if (members.length === 0) {
-                return (
-                  <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                    {t('members.noMembers')}
-                    {board.visibility === 'private' && t('members.privateOnlyCreator')}
-                  </div>
-                );
-              }
-              const isAdminOrCreator =
-                currentUser?.role === 'admin' ||
-                isCreatorOrOwner(board.creatorId, currentUser?.id, myAgentIds);
-
-              return (
-                <div className="space-y-2">
-                  {members.map((member) => (
-                    <div
-                      key={member.id}
-                      className="flex items-center gap-3 rounded-lg border p-2.5"
-                    >
-                      <Avatar
-                        src={member.avatarUrl ?? undefined}
-                        fallback={member.name}
-                        size="sm"
-                        actorType={member.type}
-                        seed={member.id}
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium truncate">{member.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {member.type === 'human' ? t('members.human') : t('members.agent')} ·{' '}
-                          {member.role === 'editor' ? t('members.editor') : t('members.member')}
-                        </p>
-                      </div>
-                      <Badge variant="outline" className="text-[10px] shrink-0">
-                        {member.role === 'editor' ? t('members.editor') : t('members.member')}
-                      </Badge>
-                      {isAdminOrCreator && (
-                        <>
-                          {member.role === 'member' && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 shrink-0 text-xs"
-                              isLoading={
-                                addEditorMutation.isPending &&
-                                addEditorMutation.variables === member.id
-                              }
-                              onClick={() => addEditorMutation.mutate(member.id)}
-                            >
-                              {t('members.setEditor')}
-                            </Button>
-                          )}
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 shrink-0"
-                            isLoading={
-                              (member.role === 'editor' &&
-                                removeEditorMutation.isPending &&
-                                removeEditorMutation.variables === member.id) ||
-                              (member.role === 'member' &&
-                                uninviteAgentMutation.isPending &&
-                                uninviteAgentMutation.variables === member.id)
-                            }
-                            onClick={() => {
-                              if (member.role === 'editor') {
-                                removeEditorMutation.mutate(member.id);
-                              } else {
-                                uninviteAgentMutation.mutate(member.id);
-                              }
-                            }}
-                          >
-                            <X className="h-4 w-4" />
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              );
-            })()}
-          </div>
-
-          {/* 添加邀请 */}
-          {(currentUser?.role === 'admin' ||
-            isCreatorOrOwner(board.creatorId, currentUser?.id, myAgentIds)) && (
-            <div className="space-y-3">
-              <h3 className="text-sm font-medium">{t('members.addInvite')}</h3>
-              {(() => {
-                const memberIds = new Set((board.members ?? []).map((m) => m.id));
-                const availableAgents = (agentsData ?? []).filter(
-                  (a: Agent) => a.status === 'active' && !memberIds.has(a.id),
-                );
-                if (availableAgents.length === 0) {
-                  return (
-                    <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                      {t('members.noAvailableAgents')}
-                    </div>
-                  );
-                }
-                return (
-                  <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
-                    {availableAgents.map((agent: Agent) => {
-                      const checked = selectedAgentIds.includes(agent.id);
-                      return (
-                        <label
-                          key={agent.id}
-                          className="flex cursor-pointer items-center gap-3 rounded-lg border p-2.5 hover:bg-muted/50 transition-colors"
-                        >
-                          <input
-                            type="checkbox"
-                            className="h-4 w-4 shrink-0"
-                            checked={checked}
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setSelectedAgentIds((prev) => [...prev, agent.id]);
-                              } else {
-                                setSelectedAgentIds((prev) => prev.filter((id) => id !== agent.id));
-                              }
-                            }}
-                          />
-                          <Avatar
-                            fallback={agent.name}
-                            size="sm"
-                            actorType="agent"
-                            seed={agent.id}
-                          />
-                          <span className="flex-1 text-sm truncate">{agent.name}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                );
-              })()}
-
-              {selectedAgentIds.length > 0 && (
-                <SheetFooter>
-                  <Button variant="outline" onClick={() => setSelectedAgentIds([])}>
-                    {tGlobal('common.cancel')}
-                  </Button>
-                  <Button
-                    isLoading={inviteAgentMutation.isPending}
-                    onClick={() => {
-                      selectedAgentIds.forEach((agentId) => {
-                        inviteAgentMutation.mutate(agentId);
-                      });
-                    }}
-                  >
-                    <UserPlus className="mr-1 h-4 w-4" />
-                    {t('members.inviteAgents', { count: selectedAgentIds.length })}
-                  </Button>
-                </SheetFooter>
-              )}
-            </div>
-          )}
-        </div>
-      </Sheet>
+      {/* 看板成员管理（批次 C2：内联成员 Sheet → 共享 MembersSheet——信息架构
+          主视图 + 邀请二级视图；权限 gate 照抄旧各 section（平台 admin ｜ 看板
+          创建者/owner 代理）；board 无 invited 区、无人类候选，不传
+          invited/humanCandidates；升降级仅单向升级 member→editor（后端
+          removeEditor = 完全移除非降级，主脑裁决 A）；行级 gate 照抄旧 UI——
+          所有行显示操作（canRemove 不设），创建者行由后端 409 守卫兜底 */}
+      <MembersSheet
+        open={inviteSheetOpen}
+        onOpenChange={setInviteSheetOpen}
+        labels={memberLabels}
+        members={memberItems}
+        candidates={candidateItems}
+        capabilities={{
+          invite: canManageMembers,
+          remove: canManageMembers,
+          changeRole: canManageMembers
+            ? [{ fromRole: 'member', toRole: 'editor', label: t('members.setEditor') }]
+            : [],
+        }}
+        onInvite={handleInvite}
+        onRemove={handleRemoveMember}
+        onChangeRole={handleChangeRole}
+        inviting={inviteAgentMutation.isPending}
+      />
 
       {/* Docs 徽章：新建绑定本看板的文档空间 */}
       <Dialog open={docsDialogOpen} onOpenChange={setDocsDialogOpen}>

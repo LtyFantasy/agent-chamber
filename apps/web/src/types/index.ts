@@ -147,6 +147,8 @@ export type {
   DashboardStats,
   AgentActivity,
   AgentLeaderboardItem,
+  // 删除影响面（GET /agents/:id/deletion-impact，统一批 B）
+  AgentDeletionImpact,
   AuditLog,
   ApiLogListResponse,
   // DocSpace 响应类型

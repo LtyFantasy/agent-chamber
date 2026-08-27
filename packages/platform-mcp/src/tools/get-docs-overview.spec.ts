@@ -311,6 +311,32 @@ describe('get_docs_overview', () => {
     expect(overviewCall[2].params).toEqual({ slim: true });
   });
 
+  it('catalog=true 透传（v1.66 lean catalog 目录模式参数）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', catalog: true }, ctx());
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ catalog: true });
+  });
+
+  it('catalog=false 原样透传（缺省语义交给后端，显式传参不吞掉）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({ spaceId: 'sp-1', spaceName: 'My Docs' });
+
+    await getDocsOverviewTool.handler({ spaceName: 'My Docs', catalog: false }, ctx());
+
+    const overviewCall = request.mock.calls[1];
+    expect(overviewCall[2].params).toEqual({ catalog: false });
+  });
+
   it('未传过滤参数 → 空 params（不携带多余键）', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({

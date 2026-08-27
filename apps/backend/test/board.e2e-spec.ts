@@ -185,14 +185,28 @@ describe('BoardController (e2e)', () => {
   });
 
   it('GET /boards/:id/lists/:listId/tasks defaults to backlog and in_progress', async () => {
-    const activeTask = makeTask({ id: 'task-active', status: TaskStatus.BACKLOG });
+    // 部分水合形状（leftJoin+addSelect 后 list/board 只含选中列）
+    const hydratedList = {
+      id: listId,
+      name: 'To Do',
+      boardId,
+      board: { id: boardId, name: 'My Board', topicId: null },
+    };
+    const activeTask = makeTask({
+      id: 'task-active',
+      status: TaskStatus.BACKLOG,
+      list: hydratedList,
+    });
     const doneTask = makeTask({ id: 'task-done', status: TaskStatus.DONE });
 
     mockRepos.Board.findOne.mockResolvedValue(makeBoard([makeList()]));
     mockRepos.BoardList.findOne.mockResolvedValue(makeList());
     mockAccessQueryBuilder();
     mockRepos.Task.createQueryBuilder.mockReturnValue({
+      leftJoin: jest.fn().mockReturnThis(),
       leftJoinAndSelect: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
@@ -210,6 +224,12 @@ describe('BoardController (e2e)', () => {
         expect(res.body.data.items).toHaveLength(1);
         expect(res.body.data.items[0]).toHaveProperty('id', 'task-active');
         expect(res.body.data.items[0]).toHaveProperty('status', TaskStatus.BACKLOG);
+        // WS-A 扁平化：item 无嵌套实体键，含扁平 listId/boardName/listName
+        expect(res.body.data.items[0]).not.toHaveProperty('list');
+        expect(res.body.data.items[0]).not.toHaveProperty('board');
+        expect(res.body.data.items[0]).toHaveProperty('listId', listId);
+        expect(res.body.data.items[0]).toHaveProperty('boardName', 'My Board');
+        expect(res.body.data.items[0]).toHaveProperty('listName', 'To Do');
       });
   });
 
@@ -221,7 +241,10 @@ describe('BoardController (e2e)', () => {
     mockRepos.BoardList.findOne.mockResolvedValue(makeList());
     mockAccessQueryBuilder();
     mockRepos.Task.createQueryBuilder.mockReturnValue({
+      leftJoin: jest.fn().mockReturnThis(),
       leftJoinAndSelect: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      addOrderBy: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
@@ -620,6 +643,18 @@ describe('BoardController (e2e)', () => {
     mockRepos.Task.save.mockImplementation(async (t: any) => ({ ...t, id: task.id }));
     mockRepos.TaskActivity.save.mockResolvedValue({});
     mockRepos.Event.save.mockResolvedValue({});
+    // 统一批 A2.5（R10/R14）：task create 未指定 assignee 时默认 assign 给创建者（actor），
+    // assertActorUsable 走 actor queryBuilder.getOne——必须 mock 否则 404 AGENT_NOT_FOUND
+    mockRepos.Actor.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      getOne: jest.fn().mockResolvedValue({
+        id: '00000000-0000-4000-8000-000000000005',
+        deletedAt: null,
+      }),
+    });
 
     return request(app.getHttpServer())
       .post('/tasks/batch')

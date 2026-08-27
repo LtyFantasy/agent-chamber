@@ -217,4 +217,377 @@ describe('get_my_briefing', () => {
     // 紧凑序列化（无 pretty-print 缩进）
     expect(result.content[0].text).not.toContain('\n  ');
   });
+
+  // ==================== WS-C：两段式编排 + 12 字段投影 + unread/blockers 降级 ====================
+  // ⚠️ mock 链按调用顺序消费：me → tasks → activities → unread → blockers（两段式后顺序对齐）
+
+  it('WS-C：activeTasks 12 字段白名单投影（无 description/list/board/customFields/position 等多余键）', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1', name: 'Test' }) // me
+      .mockResolvedValueOnce({
+        // tasks（含应被剔除的多余键 + 分页信封）
+        items: [
+          {
+            id: 't1',
+            title: 'Task 1',
+            status: 'in_progress',
+            priority: 'p1',
+            labels: ['bug'],
+            boardId: 'b1',
+            boardName: 'Board A',
+            listId: 'l1',
+            listName: 'List A',
+            dueDate: '2026-09-01',
+            updatedAt: '2026-08-27T00:00:00.000Z',
+            description: 'should not leak',
+            list: { id: 'l1', name: 'List A', board: { id: 'b1', name: 'Board A' } },
+            board: { id: 'b1', name: 'Board A' },
+            customFields: { foo: 1 },
+            position: 3,
+            assigneeId: 'agent-1',
+            createdAt: '2026-08-01T00:00:00.000Z',
+          },
+        ],
+        total: 1,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      })
+      .mockResolvedValueOnce([{ id: 'a1', content: 'hi' }]) // activities
+      .mockResolvedValueOnce([]) // unread
+      .mockResolvedValueOnce({ t1: false }); // blockers
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    // 12 字段白名单：多余键全部剔除
+    expect(body.activeTasks.items[0]).toEqual({
+      id: 't1',
+      title: 'Task 1',
+      status: 'in_progress',
+      priority: 'p1',
+      labels: ['bug'],
+      boardId: 'b1',
+      boardName: 'Board A',
+      listId: 'l1',
+      listName: 'List A',
+      dueDate: '2026-09-01',
+      updatedAt: '2026-08-27T00:00:00.000Z',
+      hasBlockers: false,
+    });
+    // 分页信封其余键被砍掉，只留 {items, total}
+    expect(Object.keys(body.activeTasks).sort()).toEqual(['items', 'total']);
+  });
+
+  it('WS-C：hasBlockers 从 blockers map 正确合并（true/false/缺失）', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [{ id: 't1' }, { id: 't2' }, { id: 't3' }], total: 3 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce({ t1: true, t2: false }); // t3 缺失
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.activeTasks.items[0].hasBlockers).toBe(true);
+    expect(body.activeTasks.items[1].hasBlockers).toBe(false);
+    // map 缺失的 id 不补 false（未知 ≠ 无 blocker）
+    expect(body.activeTasks.items[2].hasBlockers).toBeUndefined();
+  });
+
+  it('WS-C：blockers 是 GET 且 params.ids 为逗号分隔 csv', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [{ id: 't1' }, { id: 't2' }, { id: 't3' }], total: 3 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce({ t1: true, t2: false, t3: false });
+
+    await getMyBriefingTool.handler({}, ctx());
+
+    const blockersCall = request.mock.calls.find(
+      ([, path]: any[]) => path === '/tasks/blockers/batch',
+    );
+    expect(blockersCall[0]).toBe('GET');
+    expect(blockersCall[2].params.ids).toBe('t1,t2,t3');
+  });
+
+  it('WS-C：blockers 失败降级 → hasBlockers undefined 且整体不挂', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [{ id: 't1', title: 'T' }], total: 1 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new PlatformApiError({ status: 500, message: 'boom' }));
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.activeTasks.items[0].id).toBe('t1');
+    expect(body.activeTasks.items[0].hasBlockers).toBeUndefined();
+  });
+
+  it('WS-C：空 items 跳过 blockers 请求', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(request.mock.calls.some((c: any[]) => c[1] === '/tasks/blockers/batch')).toBe(false);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.activeTasks).toEqual({ items: [], total: 0 });
+  });
+
+  it('WS-C：unreadCounts 正常合并', async () => {
+    const request = mockRequest();
+    const unread = [
+      { topicId: 'tp1', topicName: 'Topic One', unreadCount: 3 },
+      { topicId: 'tp2', topicName: 'Topic Two', unreadCount: 1 },
+    ];
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(unread);
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.unreadCounts).toEqual(unread);
+  });
+
+  it('WS-C：unread 404/失败 → 响应无 unreadCounts 键且整体不挂', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([{ id: 'a1' }])
+      .mockRejectedValueOnce(new PlatformApiError({ status: 404, message: 'Not Found' }));
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.unreadCounts).toBeUndefined();
+    expect(body.me.id).toBe('agent-1');
+    expect(body.recentActivities).toEqual([{ id: 'a1' }]);
+  });
+
+  // ==================== WS-C：recentActivities content 截断 ====================
+
+  it('WS-C：activity content >300 → 截断到 300 + contentTruncated；≤300 原样不加标记', async () => {
+    const request = mockRequest();
+    const longContent = 'x'.repeat(500);
+    const shortContent = 'y'.repeat(300);
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([
+        { id: 'a1', content: longContent },
+        { id: 'a2', content: shortContent },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.recentActivities[0].content).toBe('x'.repeat(300));
+    expect(body.recentActivities[0].contentTruncated).toBe(true);
+    expect(body.recentActivities[1].content).toBe(shortContent);
+    expect(body.recentActivities[1].contentTruncated).toBeUndefined();
+  });
+
+  it('WS-C：maxContentLength=1000 → 500 字符不截断；1500 字符截到 1000 + contentTruncated', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([
+        { id: 'a1', content: 'a'.repeat(500) },
+        { id: 'a2', content: 'b'.repeat(1500) },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({ maxContentLength: 1000 }, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.recentActivities[0].content).toBe('a'.repeat(500));
+    expect(body.recentActivities[0].contentTruncated).toBeUndefined();
+    expect(body.recentActivities[1].content).toBe('b'.repeat(1000));
+    expect(body.recentActivities[1].contentTruncated).toBe(true);
+  });
+
+  it('WS-C：maxContentLength=0 → 不截断返全文、不加 contentTruncated', async () => {
+    const request = mockRequest();
+    const longContent = 'c'.repeat(500);
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([{ id: 'a1', content: longContent }])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({ maxContentLength: 0 }, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.recentActivities[0].content).toBe(longContent);
+    expect(body.recentActivities[0].contentTruncated).toBeUndefined();
+  });
+
+  it('WS-C：maxContentLength 负数/非数字 → 按缺省 300 截断', async () => {
+    const request = mockRequest();
+    const longContent = 'd'.repeat(500);
+
+    // 场景 1：负数
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([{ id: 'a1', content: longContent }])
+      .mockResolvedValueOnce([]);
+
+    const r1 = await getMyBriefingTool.handler({ maxContentLength: -5 }, ctx());
+    const b1 = JSON.parse(r1.content[0].text);
+    expect(b1.recentActivities[0].content).toBe('d'.repeat(300));
+    expect(b1.recentActivities[0].contentTruncated).toBe(true);
+
+    // 场景 2：非数字（字符串）
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([{ id: 'a1', content: longContent }])
+      .mockResolvedValueOnce([]);
+
+    const r2 = await getMyBriefingTool.handler({ maxContentLength: 'abc' }, ctx());
+    const b2 = JSON.parse(r2.content[0].text);
+    expect(b2.recentActivities[0].content).toBe('d'.repeat(300));
+    expect(b2.recentActivities[0].contentTruncated).toBe(true);
+  });
+
+  it('WS-C：maxContentLength 超 50000 → 钳到 50000', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([{ id: 'a1', content: 'e'.repeat(50001) }])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({ maxContentLength: 999999 }, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.recentActivities[0].content).toBe('e'.repeat(50000));
+    expect(body.recentActivities[0].contentTruncated).toBe(true);
+  });
+
+  it('WS-C：无 content 的 task 型 activity 不打 contentTruncated', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([
+        { id: 'a1', type: 'task', taskId: 't1', createdAt: '2026-08-27T00:00:00.000Z' },
+      ])
+      .mockResolvedValueOnce([]);
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.recentActivities[0].contentTruncated).toBeUndefined();
+    expect(body.recentActivities[0].taskId).toBe('t1');
+  });
+
+  // ==================== WS-C：sort 参数 + limits 钳制 ====================
+
+  it('WS-C：/tasks 请求带 sort=statusPriority', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await getMyBriefingTool.handler({}, ctx());
+
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
+    expect(tasksCall[2].params.sort).toBe('statusPriority');
+  });
+
+  it('WS-C：taskLimit/activityLimit 钳制 1~50（超出钳到边界）', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await getMyBriefingTool.handler({ taskLimit: 100, activityLimit: 0 }, ctx());
+
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
+    expect(tasksCall[2].params.pageSize).toBe(50);
+    const actCall = request.mock.calls.find(([, path]: any[]) => path === '/agents/me/activities');
+    expect(actCall[2].params.limit).toBe(1);
+  });
+
+  it('WS-C：taskLimit/activityLimit 非数字 → 回退缺省（20/10）', async () => {
+    const request = mockRequest();
+    request
+      .mockResolvedValueOnce({ id: 'agent-1' })
+      .mockResolvedValueOnce({ items: [], total: 0 })
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await getMyBriefingTool.handler({ taskLimit: 'abc', activityLimit: 'xyz' }, ctx());
+
+    const tasksCall = request.mock.calls.find(([, path]: any[]) => path === '/tasks');
+    expect(tasksCall[2].params.pageSize).toBe(20);
+    const actCall = request.mock.calls.find(([, path]: any[]) => path === '/agents/me/activities');
+    expect(actCall[2].params.limit).toBe(10);
+  });
+
+  // ==================== WS-C：尺寸回归 ====================
+
+  it('WS-C：尺寸回归——20 任务 + 10 动态 → 序列化 < 15000 字符', async () => {
+    const request = mockRequest();
+    const tasks = Array.from({ length: 20 }, (_, i) => ({
+      id: `task-${i}-${'0'.repeat(28)}`,
+      title: `Task ${i}: ${'x'.repeat(20)}`,
+      status: 'in_progress',
+      priority: 'p1',
+      labels: ['bug', 'combat'],
+      boardId: `board-${i}-${'0'.repeat(26)}`,
+      boardName: `Board ${i}`,
+      listId: `list-${i}-${'0'.repeat(27)}`,
+      listName: `List ${i}`,
+      dueDate: '2026-09-01',
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    }));
+    const activities = Array.from({ length: 10 }, (_, i) => ({
+      id: `act-${i}`,
+      type: 'chat',
+      content: `Activity ${i}: ${'y'.repeat(80)}`,
+      createdAt: '2026-08-27T00:00:00.000Z',
+    }));
+
+    request
+      .mockResolvedValueOnce({ id: 'agent-1', name: 'Test Agent', description: 'd'.repeat(200) })
+      .mockResolvedValueOnce({ items: tasks, total: 20 })
+      .mockResolvedValueOnce(activities)
+      .mockResolvedValueOnce([{ topicId: 'tp1', topicName: 'Topic One', unreadCount: 3 }])
+      .mockResolvedValueOnce(Object.fromEntries(tasks.map((t) => [t.id, false])));
+
+    const result = await getMyBriefingTool.handler({}, ctx());
+
+    expect(result.content[0].text.length).toBeLessThan(15000);
+  });
 });

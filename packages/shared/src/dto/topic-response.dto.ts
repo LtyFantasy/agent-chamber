@@ -20,6 +20,8 @@ export interface TopicParticipant {
   status: ParticipantStatus;
   /** 最近一次实际激活（加入）时间；受邀（invited）时为空，激活时写入，重新加入时刷新 */
   joinedAt?: string | Date | null;
+  /** 软删时间；非空 = 该 actor 已删除，name 仍可显示（历史归因保留） */
+  deletedAt?: string | null;
 }
 
 /**
@@ -135,6 +137,8 @@ export interface Message {
   createdAt: string | Date;
   /** 编辑时间 */
   editedAt?: string | Date;
+  /** 软删时间；非空 = 发送者已删除，senderName 仍可显示（历史归因保留） */
+  deletedAt?: string | null;
 }
 
 /**

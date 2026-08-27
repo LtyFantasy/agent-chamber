@@ -29,6 +29,7 @@ import { SelectQueryBuilder } from 'typeorm';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { TaskService } from '../task/task.service';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import { FindListTasksQueryDto } from './dto';
 
 describe('BoardService', () => {
@@ -50,6 +51,7 @@ describe('BoardService', () => {
   let milestoneRepo: jest.Mocked<Repository<Milestone>>;
   let seatRepo: jest.Mocked<Repository<RoundtableSeat>>;
   let messageRepo: jest.Mocked<Repository<Message>>;
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
 
   beforeEach(() => {
     accessQuery = {
@@ -186,6 +188,64 @@ describe('BoardService', () => {
       })),
     } as unknown as jest.Mocked<Repository<Message>>;
 
+    // 统一批 A1：resolveActorProfiles 收敛委托 ActorProfileService。mock 默认实现
+    // 复用三个 repo mock（actorRepo.find 取 type、user/agent repo 取 profile），
+    // 使既有用例经 repo mock 驱动的行为与断言无需逐条改写（公共服务自身逻辑
+    // 在 actor-profile.service.spec.ts 单独验证，本 mock 只模拟行为等价）。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        const typeRows = await actorRepo.find({} as any);
+        const typeMap = new Map(typeRows.map((a) => [a.id, a.type]));
+        // A2：deletedAt 从 actor 行透传（对齐公共服务 withDeleted 行为），
+        // 软删用例通过 actorRepo.find 返回带 deletedAt 的行驱动
+        const actorRowMap = new Map(typeRows.map((a) => [a.id, a]));
+        const humanIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+        const agentIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+        const [humans, agents] = await Promise.all([
+          humanIds.length > 0 ? userRepo.find({} as any) : Promise.resolve([] as User[]),
+          agentIds.length > 0 ? agentRepo.find({} as any) : Promise.resolve([] as Agent[]),
+        ]);
+        const humanMap = new Map(humans.map((u) => [u.id, u]));
+        const agentMap = new Map(agents.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const type = typeMap.get(id);
+          const deletedAt = actorRowMap.get(id)?.deletedAt ?? null;
+          if (type === ActorType.HUMAN) {
+            const u = humanMap.get(id);
+            map.set(id, {
+              type,
+              name: u?.displayName || u?.username || 'Unknown User',
+              avatarUrl: u?.avatarUrl ?? null,
+              description: null,
+              deletedAt,
+            });
+          } else if (type === ActorType.AGENT) {
+            const a = agentMap.get(id);
+            map.set(id, {
+              type,
+              name: a?.name || 'Unknown Agent',
+              avatarUrl: a?.avatarUrl ?? null,
+              description: a?.description ?? null,
+              deletedAt,
+            });
+          } else if (type) {
+            map.set(id, {
+              type,
+              name: 'System',
+              avatarUrl: null,
+              description: null,
+              deletedAt,
+            });
+          }
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
+    };
+
     service = new BoardService(
       boardRepo,
       listRepo,
@@ -204,6 +264,7 @@ describe('BoardService', () => {
       milestoneRepo,
       seatRepo,
       messageRepo,
+      mockActorProfileService as unknown as ActorProfileService,
     );
   });
 
@@ -377,6 +438,7 @@ describe('BoardService', () => {
           name: 'Kimi',
           type: 'agent',
           avatarUrl: 'https://a.com/1.png',
+          deletedAt: null,
           role: BoardMemberRole.EDITOR,
           invitedBy: 'creator-1',
           createdAt: expect.any(Date),
@@ -386,6 +448,7 @@ describe('BoardService', () => {
           name: 'DeepSeek',
           type: 'agent',
           avatarUrl: 'https://a.com/2.png',
+          deletedAt: null,
           role: BoardMemberRole.MEMBER,
           invitedBy: 'creator-1',
           createdAt: expect.any(Date),
@@ -410,6 +473,44 @@ describe('BoardService', () => {
       agentRepo.find.mockResolvedValue([]);
       const result = await service.enrich(board);
       expect(result.members![0]).toMatchObject({ id: 'agent-missing', name: 'Unknown Agent' });
+    });
+
+    it('软删 agent 成员：真名保留 + deletedAt 非空（统一批契约）', async () => {
+      const board = makeBoard({
+        settings: { visibility: Visibility.OPEN },
+      });
+      memberRepo.find.mockResolvedValue([
+        {
+          boardId: 'board-1',
+          actorId: 'agent-1',
+          role: BoardMemberRole.MEMBER,
+          invitedBy: 'creator-1',
+          createdAt: new Date(),
+        } as BoardMember,
+      ]);
+      // 软删行：actors 带 deletedAt（withDeleted 语义经 mock 透传）
+      actorRepo.find.mockResolvedValue([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+      agentRepo.find.mockResolvedValue([
+        {
+          id: 'agent-1',
+          name: 'Kimi',
+          avatarUrl: null,
+          status: 'active',
+          description: null,
+        } as any,
+      ]);
+      const result = await service.enrich(board);
+      expect(result.members![0]).toMatchObject({
+        id: 'agent-1',
+        name: 'Kimi',
+        deletedAt: '2024-06-01T00:00:00.000Z',
+      });
     });
   });
 
@@ -784,9 +885,10 @@ describe('BoardService', () => {
         id: 'topic-1',
         settings: { visibility: Visibility.OPEN },
       } as unknown as Topic);
-      resourceValidator.existsMany.mockRejectedValue(
+      // 统一批 A2.5b：create invitedAgentIds 校验改走 assertActorUsable（create 一刀切）
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
         new NotFoundException({
-          message: 'Some resources not found',
+          message: 'Agent not found or deleted',
           code: ErrorCode.AGENT_NOT_FOUND,
         }),
       );
@@ -797,7 +899,32 @@ describe('BoardService', () => {
           topicId: 'topic-1',
           invitedAgentIds: ['agent-missing'],
         } as any),
-      ).rejects.toMatchObject({ response: { code: ErrorCode.AGENT_NOT_FOUND } });
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+    });
+
+    it('create：已软删 agent 在 invitedAgentIds → 4xx AGENT_NOT_FOUND（统一批 A2.5b）', async () => {
+      topicRepo.findOne.mockResolvedValue({
+        id: 'topic-1',
+        settings: { visibility: Visibility.OPEN },
+      } as unknown as Topic);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(
+        service.create('user-1', ActorType.HUMAN, {
+          name: 'New Board',
+          invitedAgentIds: ['agent-deleted'],
+        } as any),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
     });
 
     it('writes creator membership row with editor role and null invitedBy (4b1ddd1c)', async () => {
@@ -817,7 +944,7 @@ describe('BoardService', () => {
 
     it('filters creator out of invitedAgentIds — single editor row, no PK conflict', async () => {
       boardRepo.save.mockImplementation(async (b: any) => ({ ...b, id: 'board-new' }));
-      resourceValidator.existsMany.mockResolvedValue([]);
+      // A2.5b：create 校验走 assertActorUsable（默认放行）；受邀 agent-1 照常落成员行
 
       await service.create('user-1', ActorType.HUMAN, {
         name: 'New Board',
@@ -855,16 +982,66 @@ describe('BoardService', () => {
     it('throws AGENT_NOT_FOUND when invitedAgentIds contains non-existent agent', async () => {
       const board = makeBoard();
       boardRepo.findOne.mockResolvedValue(board);
-      resourceValidator.existsMany.mockRejectedValue(
+      // A2.5b：update 只拦 toAdd——空成员表时全部 id 都是新增
+      memberRepo.find.mockResolvedValue([]);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
         new NotFoundException({
-          message: 'Some resources not found',
+          message: 'Agent not found or deleted',
           code: ErrorCode.AGENT_NOT_FOUND,
         }),
       );
 
       await expect(
         service.update('board-1', { invitedAgentIds: ['agent-missing'] } as any),
-      ).rejects.toMatchObject({ response: { code: ErrorCode.AGENT_NOT_FOUND } });
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+    });
+
+    it('update：存量含已删 agent → 放行（只拦新增，A2.5b/R11 对偶）', async () => {
+      const board = makeBoard();
+      boardRepo.findOne.mockResolvedValue(board);
+      memberRepo.find
+        // 第一次调用：currentMembers（role='member'）
+        .mockResolvedValueOnce([
+          {
+            boardId: 'board-1',
+            actorId: 'agent-deleted',
+            role: BoardMemberRole.MEMBER,
+          } as BoardMember,
+        ])
+        // 第二次调用：existingAll（任意 role）
+        .mockResolvedValueOnce([{ actorId: 'agent-deleted' }] as BoardMember[]);
+
+      await service.update('board-1', { invitedAgentIds: ['agent-deleted'] } as any);
+
+      // 存量 id 不触发校验、不新增、不删除——set 语义全量替换不得拦存量已删成员
+      expect(mockActorProfileService.assertActorUsable).not.toHaveBeenCalled();
+      expect(memberRepo.create).not.toHaveBeenCalled();
+      expect(memberRepo.delete).not.toHaveBeenCalled();
+    });
+
+    it('update：新增 id 含已删 agent → 4xx AGENT_NOT_FOUND（A2.5b/R11 对偶）', async () => {
+      const board = makeBoard();
+      boardRepo.findOne.mockResolvedValue(board);
+      memberRepo.find
+        .mockResolvedValueOnce([
+          { boardId: 'board-1', actorId: 'agent-old', role: BoardMemberRole.MEMBER } as BoardMember,
+        ])
+        .mockResolvedValueOnce([{ actorId: 'agent-old' }] as BoardMember[]);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(
+        service.update('board-1', { invitedAgentIds: ['agent-old', 'agent-deleted'] } as any),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
     });
 
     it('does not downgrade editor when invitedAgentIds includes an editor', async () => {
@@ -959,13 +1136,34 @@ describe('BoardService', () => {
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
-      resourceValidator.exists.mockRejectedValue(
-        new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
+      // 统一批 A2.5：存在性校验改走 assertActorUsable
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(service.inviteAgent('board-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
       });
+    });
+
+    it('inviteAgent：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
+      boardRepo.findOne.mockResolvedValue(board);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.inviteAgent('board-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
+      expect(memberRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -1026,12 +1224,32 @@ describe('BoardService', () => {
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
+      // 统一批 A2.5b：移除类入口回退 resourceValidator.exists（软删 agent 不拦）
       resourceValidator.exists.mockRejectedValue(
         new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
       );
 
       await expect(service.uninviteAgent('board-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
+      });
+    });
+
+    it('uninviteAgent：已软删 agent → 放行（移除类入口不拦，A2.5b 修正）', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
+      boardRepo.findOne.mockResolvedValue(board);
+      // 软删 agent 的 agents 行永在 → resourceValidator.exists 放行（清理动作必须可用）
+      resourceValidator.exists.mockResolvedValue({ id: 'agent-deleted' } as Agent);
+      memberRepo.findOne.mockResolvedValue({
+        boardId: 'board-1',
+        actorId: 'agent-deleted',
+        role: BoardMemberRole.MEMBER,
+      } as BoardMember);
+
+      await service.uninviteAgent('board-1', 'agent-deleted');
+
+      expect(memberRepo.delete).toHaveBeenCalledWith({
+        boardId: 'board-1',
+        actorId: 'agent-deleted',
       });
     });
   });
@@ -1082,13 +1300,34 @@ describe('BoardService', () => {
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
-      resourceValidator.exists.mockRejectedValue(
-        new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
+      // 统一批 A2.5：存在性校验改走 assertActorUsable
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(service.addEditor('board-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
       });
+    });
+
+    it('addEditor：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
+      boardRepo.findOne.mockResolvedValue(board);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.addEditor('board-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(memberRepo.create).not.toHaveBeenCalled();
+      expect(memberRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -1152,12 +1391,33 @@ describe('BoardService', () => {
     it('throws AGENT_NOT_FOUND when agent does not exist', async () => {
       const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
       boardRepo.findOne.mockResolvedValue(board);
+      // 统一批 A2.5b：移除类入口回退 resourceValidator.exists（软删 agent 不拦）
       resourceValidator.exists.mockRejectedValue(
         new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
       );
 
       await expect(service.removeEditor('board-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
+      });
+    });
+
+    it('removeEditor：已软删 agent → 放行（移除类入口不拦，A2.5b 修正）', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } }); // creatorId='creator-1'
+      boardRepo.findOne.mockResolvedValue(board);
+      // 软删 agent 的 agents 行永在 → resourceValidator.exists 放行（清理动作必须可用）
+      resourceValidator.exists.mockResolvedValue({ id: 'agent-deleted' } as Agent);
+      memberRepo.findOne.mockResolvedValue({
+        boardId: 'board-1',
+        actorId: 'agent-deleted',
+        role: BoardMemberRole.EDITOR,
+      } as BoardMember);
+
+      await service.removeEditor('board-1', 'agent-deleted');
+
+      expect(memberRepo.delete).toHaveBeenCalledWith({
+        boardId: 'board-1',
+        actorId: 'agent-deleted',
+        role: BoardMemberRole.EDITOR,
       });
     });
   });
@@ -1382,7 +1642,7 @@ describe('BoardService', () => {
       ]);
       // priorityDistribution：open 任务内存聚合（含 0 值形状稳定；t1=P0、t2=P2）
       expect(result.priorityDistribution.open).toEqual({ p0: 1, p1: 0, p2: 1, p3: 0 });
-      // nextUp：open 任务 priority 序 + assigneeName 解析
+      // nextUp：open 任务 priority 序 + assigneeName 解析（assigneeDeletedAt 未删为 null）
       expect(result.nextUp).toEqual([
         {
           id: 't1',
@@ -1390,6 +1650,7 @@ describe('BoardService', () => {
           priority: Priority.P0,
           status: TaskStatus.TODO,
           assigneeName: 'Kimi',
+          assigneeDeletedAt: null,
         },
         {
           id: 't2',
@@ -1397,9 +1658,10 @@ describe('BoardService', () => {
           priority: Priority.P2,
           status: TaskStatus.TODO,
           assigneeName: 'Kimi',
+          assigneeDeletedAt: null,
         },
       ]);
-      // risks：labels bug 命中；assigneeName 解析
+      // risks：labels bug 命中；assigneeName 解析（assigneeDeletedAt 未删为 null）
       expect(result.risks).toEqual([
         {
           id: 't1',
@@ -1408,6 +1670,7 @@ describe('BoardService', () => {
           status: TaskStatus.TODO,
           labels: ['bug'],
           assigneeName: 'Kimi',
+          assigneeDeletedAt: null,
         },
       ]);
       expect(result.recentDone).toHaveLength(2);

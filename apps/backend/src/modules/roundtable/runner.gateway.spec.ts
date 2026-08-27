@@ -34,6 +34,7 @@ import { Agent } from '../../database/entities/agent.entity';
 import { TopicService } from '../topic/topic.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 const VALID_KEY = 'ask_test_gateway_key_123';
 
@@ -92,7 +93,10 @@ function createMocks() {
     },
     topicRepo: { findOne: jest.fn(async () => ({ id: 'topic-1', title: '圆桌测试' })) },
     messageRepo: { findOne: jest.fn(), find: jest.fn() },
-    actorRepo: { findOne: jest.fn() },
+    actorRepo: {
+      findOne: jest.fn(),
+      find: jest.fn(async (_criteria: unknown) => []),
+    },
     apiKeyRepo: {
       // 默认实现（有效 key）在 buildApp 中统一设置（保持 jest.fn 无类型约束，便于
       // 坏 key 测试 mockResolvedValueOnce(null)）
@@ -199,6 +203,41 @@ describe('RunnerGateway (integration, real ws client)', () => {
         RunnerRegistryService,
         RoundtableService,
         ApiKeyAuthService,
+        // 统一批 A2：RoundtableService 依赖 ActorProfileService（projectMessage 公共解析）。
+        // mock 以 actorRepo.find 行为准（默认空 → 真孤儿，注入路径不解析名字也不报错）。
+        {
+          provide: ActorProfileService,
+          useValue: {
+            resolveProfiles: jest.fn(
+              async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+                const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+                const map = new Map<string, ActorProfile>();
+                if (uniqueIds.length === 0) return map;
+                const rows = (await mocks.actorRepo.find({} as any)) as Array<{
+                  id: string;
+                  type: ActorType;
+                  displayName?: string | null;
+                  avatarUrl?: string | null;
+                  deletedAt?: Date | null;
+                }>;
+                const rowMap = new Map(rows.map((a) => [a.id, a]));
+                for (const id of uniqueIds) {
+                  const row = rowMap.get(id);
+                  if (!row) continue;
+                  map.set(id, {
+                    type: row.type,
+                    name: row.displayName || 'System',
+                    avatarUrl: row.avatarUrl ?? null,
+                    description: null,
+                    deletedAt: row.deletedAt ?? null,
+                  });
+                }
+                return map;
+              },
+            ),
+            assertActorUsable: jest.fn().mockResolvedValue(undefined),
+          },
+        },
         { provide: getRepositoryToken(RoundtableRunner), useValue: mocks.runnerRepo },
         { provide: getRepositoryToken(RoundtableSeat), useValue: mocks.seatRepo },
         { provide: getRepositoryToken(RoundtablePermissionRequest), useValue: mocks.permReqRepo },

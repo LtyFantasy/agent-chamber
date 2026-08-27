@@ -5,9 +5,10 @@ import { AgentController } from './agent.controller';
 import { Agent } from '../../database/entities/agent.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { User } from '../../database/entities/user.entity';
+import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Agent, ApiKey, User])],
+  imports: [TypeOrmModule.forFeature([Agent, ApiKey, User, RoundtableSeat])],
   providers: [AgentService],
   controllers: [AgentController],
   exports: [AgentService],

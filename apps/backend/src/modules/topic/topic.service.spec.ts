@@ -38,6 +38,7 @@ import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ResourceValidator } from '../../common/resource-validator';
+import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
 function createMockRepo<T extends ObjectLiteral>() {
   return {
@@ -180,6 +181,7 @@ describe('TopicService', () => {
   let mockDataSource: jest.Mocked<DataSource>;
   let mockIdempotencyRepo: jest.Mocked<Repository<IdempotencyRecord>>;
   let mockEntityManager: { getRepository: jest.Mock; query: jest.Mock };
+  let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
 
   beforeEach(async () => {
     mockTopicRepo = createMockRepo<Topic>();
@@ -213,6 +215,69 @@ describe('TopicService', () => {
           return entities;
         },
       ),
+    };
+
+    // 统一批 A1：resolveActorProfiles 收敛委托 ActorProfileService。mock 默认实现
+    // 复用三个 repo mock（actorRepo.find 取 type、user/agent repo 取 profile），
+    // 使既有用例经 repo mock 驱动的行为与断言无需逐条改写（公共服务自身逻辑
+    // 在 actor-profile.service.spec.ts 单独验证，本 mock 只模拟行为等价）。
+    // ⚠️ 必须在 createTestingModule 之前赋值——useValue 在对象字面量求值时取值。
+    mockActorProfileService = {
+      resolveProfiles: jest.fn(async (actorIds: string[]): Promise<Map<string, ActorProfile>> => {
+        const uniqueIds = [...new Set(actorIds)].filter(Boolean);
+        const map = new Map<string, ActorProfile>();
+        if (uniqueIds.length === 0) return map;
+        const typeRows = await mockActorRepo.find({ where: { id: In(uniqueIds) } } as any);
+        const typeMap = new Map(typeRows.map((a) => [a.id, a.type]));
+        // A2：deletedAt 从 actor 行透传（对齐公共服务 withDeleted 行为），
+        // 软删用例通过 mockActorRepo.find 返回带 deletedAt 的行驱动
+        const actorRowMap = new Map(typeRows.map((a) => [a.id, a]));
+        const humanIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.HUMAN);
+        const agentIds = uniqueIds.filter((id) => typeMap.get(id) === ActorType.AGENT);
+        const [humans, agents] = await Promise.all([
+          humanIds.length > 0
+            ? mockUserRepo.findBy({ id: In(humanIds) } as any)
+            : Promise.resolve([] as User[]),
+          agentIds.length > 0
+            ? mockAgentRepo.findBy({ id: In(agentIds) } as any)
+            : Promise.resolve([] as Agent[]),
+        ]);
+        const humanMap = new Map(humans.map((u) => [u.id, u]));
+        const agentMap = new Map(agents.map((a) => [a.id, a]));
+        for (const id of uniqueIds) {
+          const type = typeMap.get(id);
+          const deletedAt = actorRowMap.get(id)?.deletedAt ?? null;
+          if (type === ActorType.HUMAN) {
+            const u = humanMap.get(id);
+            map.set(id, {
+              type,
+              name: u?.displayName || 'Unknown User',
+              avatarUrl: u?.avatarUrl ?? null,
+              description: null,
+              deletedAt,
+            });
+          } else if (type === ActorType.AGENT) {
+            const a = agentMap.get(id);
+            map.set(id, {
+              type,
+              name: a?.name || 'Unknown Agent',
+              avatarUrl: a?.avatarUrl ?? null,
+              description: a?.description ?? null,
+              deletedAt,
+            });
+          } else if (type) {
+            map.set(id, {
+              type,
+              name: 'System',
+              avatarUrl: null,
+              description: null,
+              deletedAt,
+            });
+          }
+        }
+        return map;
+      }),
+      assertActorUsable: jest.fn().mockResolvedValue(undefined),
     };
 
     // DataSource mock：transaction 默认透传回调
@@ -258,6 +323,7 @@ describe('TopicService', () => {
         { provide: OwnerProxyService, useValue: mockOwnerProxy },
         { provide: ResourceValidator, useValue: mockResourceValidator },
         { provide: DataSource, useValue: mockDataSource },
+        { provide: ActorProfileService, useValue: mockActorProfileService },
       ],
     }).compile();
 
@@ -572,12 +638,40 @@ describe('TopicService', () => {
       mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-new' }));
       mockParticipantRepo.create.mockReturnValue(createMockParticipant());
       mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+      // 统一批 A2.5：create 一刀切校验全部 id——存在性校验改走 assertActorUsable
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
 
       await expect(service.create('user-1', ActorType.HUMAN, dto as any)).rejects.toThrow(
         NotFoundException,
       );
       await expect(service.create('user-1', ActorType.HUMAN, dto as any)).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
+      });
+    });
+
+    it('create：invitedAgentIds 含已软删 agent → 4xx AGENT_NOT_FOUND（统一批 A2.5 规则 6）', async () => {
+      const dto = {
+        title: 'New Topic',
+        invitedAgentIds: ['agent-deleted'],
+      };
+      mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-new' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant());
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant());
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.create('user-1', ActorType.HUMAN, dto as any)).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
       });
     });
 
@@ -783,9 +877,17 @@ describe('TopicService', () => {
       await expect(service.update('topic-1', { title: 'X' })).rejects.toThrow(BadRequestException);
     });
 
-    it('should throw AGENT_NOT_FOUND when invitedAgentIds contains non-existent agent', async () => {
+    it('should throw AGENT_NOT_FOUND when invitedAgentIds contains new non-existent agent', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.find.mockResolvedValue([]); // 无存量参与者行 → agent-missing 属新增 id
+      // 统一批 A2.5（R11）：update 只拦新增 id；新增 id 存在性校验走 assertActorUsable
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
 
       await expect(
         service.update('topic-1', { invitedAgentIds: ['agent-missing'] }),
@@ -795,15 +897,52 @@ describe('TopicService', () => {
       ).rejects.toMatchObject({ response: { code: ErrorCode.AGENT_NOT_FOUND } });
     });
 
+    // ── R11 对偶用例（统一批 A2.5）：update 是完整替换语义——存量 id 放行、新增 id 拦截 ──
+
+    it('R11①：invitedAgentIds 含存量已删 agent（已在 participants 表，left 状态）→ 放行保存', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+      mockParticipantRepo.find
+        // 第一次：currentInvited（status='invited'）——不含 left 行
+        .mockResolvedValueOnce([])
+        // 第二次：existingRows（任意状态）——已删 agent 是 left 存量行
+        .mockResolvedValueOnce([
+          { participantId: 'agent-deleted', status: ParticipantStatus.LEFT },
+        ] as TopicParticipant[]);
+
+      await service.update('topic-1', { invitedAgentIds: ['agent-deleted'] });
+
+      // 存量 id 跳过软删校验（未调用 assertActorUsable），topic 正常保存
+      expect(mockActorProfileService.assertActorUsable).not.toHaveBeenCalled();
+      expect(mockTopicRepo.save).toHaveBeenCalledWith(topic);
+    });
+
+    it('R11②：invitedAgentIds 含新增已删 agent（participants 表无行）→ 4xx AGENT_NOT_FOUND', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.find.mockResolvedValue([]); // 无存量行
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(
+        service.update('topic-1', { invitedAgentIds: ['agent-deleted'] }),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      // 校验失败不得落任何 invited 行
+      expect(mockParticipantRepo.create).not.toHaveBeenCalled();
+      expect(mockTopicRepo.save).not.toHaveBeenCalled();
+    });
+
     it('should not downgrade existing active/left participants when invitedAgentIds includes them', async () => {
       // review 回归：save 按 PK upsert，toAdd 不排除已有行会把 active/left 覆盖降级为 invited
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
-      mockAgentRepo.findBy.mockResolvedValue([
-        { id: 'agent-active' },
-        { id: 'agent-left' },
-        { id: 'agent-new' },
-      ] as any);
       mockParticipantRepo.find
         // 第一次调用：currentInvited（status='invited'）
         .mockResolvedValueOnce([
@@ -838,6 +977,9 @@ describe('TopicService', () => {
       expect(mockParticipantRepo.remove).toHaveBeenCalledWith([
         expect.objectContaining({ participantId: 'agent-invited' }),
       ]);
+      // 统一批 A2.5（R11）：存量 id（active/left）跳过软删校验，仅新增 id 走 assertActorUsable
+      expect(mockActorProfileService.assertActorUsable).toHaveBeenCalledTimes(1);
+      expect(mockActorProfileService.assertActorUsable).toHaveBeenCalledWith('agent-new');
     });
 
     it('update：config.kind 忽略（创建后不可变），config.wakePolicy 合并进 settings', async () => {
@@ -1113,6 +1255,69 @@ describe('TopicService', () => {
       });
       expect(result.nextCursor).toBe('msg-1');
       expect(result.hasMore).toBe(false);
+    });
+
+    it('软删 agent 消息：真名保留 + senderType=agent + deletedAt 非空（统一批契约，原归 System 行为变更）', async () => {
+      const msg = createMockMessage({
+        id: 'msg-1',
+        senderId: 'agent-1',
+        senderType: ActorType.AGENT,
+      });
+      const qbMock = createMockQueryBuilder([msg], 1);
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      // 软删 agent：actors 行带 deletedAt（withDeleted 语义经 mock 透传）
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+      ]);
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Bot-1', avatarUrl: null } as Agent,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+
+      expect(result.messages[0]).toMatchObject({
+        senderId: 'agent-1',
+        senderType: 'agent',
+        senderName: 'Bot-1',
+        deletedAt: '2024-06-01T00:00:00.000Z',
+      });
+    });
+
+    it('软删 user 消息：真名保留 + senderType=human + deletedAt 非空', async () => {
+      const msg = createMockMessage({
+        id: 'msg-1',
+        senderId: 'user-1',
+        senderType: ActorType.HUMAN,
+      });
+      const qbMock = createMockQueryBuilder([msg], 1);
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          type: ActorType.HUMAN,
+          deletedAt: new Date('2024-07-01T00:00:00Z'),
+        } as Actor,
+      ]);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+
+      expect(result.messages[0]).toMatchObject({
+        senderId: 'user-1',
+        senderType: 'human',
+        senderName: 'Alice',
+        deletedAt: '2024-07-01T00:00:00.000Z',
+      });
     });
 
     it('should passthrough seatLabel on history messages (metadata.seatLabel single key only)', async () => {
@@ -1695,11 +1900,11 @@ describe('TopicService', () => {
       const savedMessage = createMockMessage(dto);
       mockMessageRepo.create.mockReturnValue(createdMessage);
       mockMessageRepo.save.mockResolvedValue(savedMessage);
-      mockUserRepo.findOne.mockResolvedValue({
-        id: 'user-1',
-        displayName: 'Test User',
-        avatarUrl: null,
-      } as unknown as User);
+      // 统一批 A2：buildMessageResponse 走公共解析（mockActorProfileService 内部以
+      // userRepo.findBy 取 profile），替代原 userRepo.findOne
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'user-1', displayName: 'Test User', avatarUrl: null } as User,
+      ]);
 
       const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, dto);
 
@@ -1743,6 +1948,11 @@ describe('TopicService', () => {
       mockMessageRepo.create.mockReturnValue(createdMessage);
       mockMessageRepo.save.mockResolvedValue(savedMessage);
       mockUserRepo.findOne.mockResolvedValue(null);
+      // 统一批 A2：buildMessageResponse 走公共解析（agentRepo.findBy 取 profile）
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Agent One', avatarUrl: 'https://example.com/agent.png' } as Agent,
+      ]);
+      // sendMessage 的 lastActiveAt 更新仍走 agentRepo.findOne（独立路径）
       mockAgentRepo.findOne.mockResolvedValue({
         id: 'agent-1',
         name: 'Agent One',
@@ -1803,11 +2013,9 @@ describe('TopicService', () => {
       const savedMessage = createMockMessage(dto);
       mockMessageRepo.create.mockReturnValue(createMockMessage(dto));
       mockMessageRepo.save.mockResolvedValue(savedMessage);
-      mockUserRepo.findOne.mockResolvedValue({
-        id: 'user-1',
-        displayName: 'Test User',
-        avatarUrl: null,
-      } as unknown as User);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'user-1', displayName: 'Test User', avatarUrl: null } as User,
+      ]);
 
       const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, dto);
 
@@ -1832,11 +2040,9 @@ describe('TopicService', () => {
       });
       mockMessageRepo.create.mockReturnValue(createdMessage);
       mockMessageRepo.save.mockResolvedValue(savedMessage);
-      mockUserRepo.findOne.mockResolvedValue({
-        id: 'user-1',
-        displayName: 'Human User',
-        avatarUrl: null,
-      } as unknown as User);
+      mockUserRepo.findBy.mockResolvedValue([
+        { id: 'user-1', displayName: 'Human User', avatarUrl: null } as User,
+      ]);
 
       await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, dto);
 
@@ -2062,7 +2268,7 @@ describe('TopicService', () => {
         entityType: 'message',
         entityId: 'msg-idem-1',
       } as IdempotencyRecord);
-      mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
+      mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
 
       const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
         content: 'Hello',
@@ -2091,7 +2297,7 @@ describe('TopicService', () => {
       mockMessageRepo.create.mockReturnValue(savedMsg);
       mockMessageRepo.save.mockResolvedValue(savedMsg);
       mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-9' } as IdempotencyRecord);
-      mockAgentRepo.findOne.mockResolvedValue({ name: 'Bot' } as Agent);
+      mockAgentRepo.findBy.mockResolvedValue([{ id: 'agent-1', name: 'Bot' } as Agent]);
 
       // 传入未归一化的 SYSTEM：写库值必须与无 key 路径一致（归一化为 AGENT）
       await service.sendMessage('topic-1', 'agent-1', ActorType.SYSTEM, {
@@ -2131,7 +2337,7 @@ describe('TopicService', () => {
         senderId: 'user-1',
       });
       mockMessageRepo.findOne.mockResolvedValue(existingMsg);
-      mockUserRepo.findOne.mockResolvedValue({ displayName: 'Alice' } as User);
+      mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
 
       const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
         content: 'Hello',
@@ -2832,13 +3038,36 @@ describe('TopicService', () => {
       const topic = createMockTopic({ settings: { invitedAgentIds: [] } });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(null);
-      mockResourceValidator.exists.mockRejectedValue(
-        new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
+      // 统一批 A2.5：存在性校验改走 assertActorUsable（"从未存在"与"已删除"统一 404）
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(service.inviteAgent('topic-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
       });
+    });
+
+    it('inviteAgent：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const topic = createMockTopic({ settings: { invitedAgentIds: [] } });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.inviteAgent('topic-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      // 校验失败不得写 participant 行
+      expect(mockParticipantRepo.create).not.toHaveBeenCalled();
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -3048,13 +3277,33 @@ describe('TopicService', () => {
     it('agent 不存在 → 404 AGENT_NOT_FOUND', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
-      mockResourceValidator.exists.mockRejectedValue(
-        new NotFoundException({ message: 'Agent not found', code: ErrorCode.AGENT_NOT_FOUND }),
+      // 统一批 A2.5：存在性校验改走 assertActorUsable
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
       );
 
       await expect(service.addEditor('topic-1', 'agent-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.AGENT_NOT_FOUND },
       });
+    });
+
+    it('addEditor：已软删 agent → 4xx AGENT_NOT_FOUND + message 断言（统一批 A2.5）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockActorProfileService.assertActorUsable.mockRejectedValue(
+        new NotFoundException({
+          message: 'Agent not found or deleted',
+          code: ErrorCode.AGENT_NOT_FOUND,
+        }),
+      );
+
+      await expect(service.addEditor('topic-1', 'agent-deleted')).rejects.toMatchObject({
+        response: { code: ErrorCode.AGENT_NOT_FOUND, message: 'Agent not found or deleted' },
+      });
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -3472,6 +3721,92 @@ describe('TopicService', () => {
       });
       // 哨兵行保留在 DB（公告通道需要）：服务不写库，topic.participants 原样
       expect(topic.participants).toHaveLength(3);
+    });
+
+    it('软删 agent 与软删 user 重现于参与者列表：真名保留 + deletedAt 非空（R12 契约）', async () => {
+      const topic = createMockTopic({
+        participants: [
+          createMockParticipant({
+            participantId: 'agent-1',
+            participantType: ActorType.AGENT,
+            status: ParticipantStatus.ACTIVE,
+          }),
+          createMockParticipant({
+            participantId: 'user-1',
+            participantType: ActorType.HUMAN,
+            status: ParticipantStatus.ACTIVE,
+          }),
+        ],
+      });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+      // 软删行：withDeleted 语义经 mock 透传（deletedAt 非空）
+      mockActorRepo.find.mockResolvedValueOnce([
+        {
+          id: 'agent-1',
+          type: ActorType.AGENT,
+          deletedAt: new Date('2024-06-01T00:00:00Z'),
+        } as Actor,
+        {
+          id: 'user-1',
+          type: ActorType.HUMAN,
+          deletedAt: new Date('2024-07-01T00:00:00Z'),
+        } as Actor,
+      ]);
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      // 软删 actor 不再被过滤（原实现 actors 查询软删过滤 → 漏判），真名 + deletedAt 重现
+      expect(result.participants).toHaveLength(2);
+      expect(result.participants![0]).toMatchObject({
+        participantId: 'agent-1',
+        participantType: 'agent',
+        name: 'Bot-1',
+        deletedAt: '2024-06-01T00:00:00.000Z',
+      });
+      expect(result.participants![1]).toMatchObject({
+        participantId: 'user-1',
+        participantType: 'human',
+        name: 'Alice',
+        deletedAt: '2024-07-01T00:00:00.000Z',
+      });
+    });
+
+    it('真孤儿参与者被过滤（R12：公共服务不进 map，过滤条件显式挡孤儿）', async () => {
+      const topic = createMockTopic({
+        participants: [
+          createMockParticipant({
+            participantId: 'user-1',
+            status: ParticipantStatus.ACTIVE,
+          }),
+          // actors 表无行的真孤儿：不得以 'Unknown Actor' 混入成员面板
+          createMockParticipant({
+            participantId: 'orphan-1',
+            status: ParticipantStatus.ACTIVE,
+          }),
+        ],
+      });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockBoardRepo.find.mockResolvedValue([]);
+      mockBoardRepo.count.mockResolvedValue(0);
+      mockTaskRepo.createQueryBuilder
+        .mockReturnValueOnce(createTaskQb({ getMany: [] }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }))
+        .mockReturnValueOnce(createTaskQb({ getCount: 0 }));
+      // actors 无 orphan-1 行（真孤儿不进 map）
+      mockActorRepo.find.mockResolvedValueOnce([{ id: 'user-1', type: ActorType.HUMAN } as Actor]);
+
+      const result = await service.findOneWithParticipants('topic-1');
+
+      expect(result.participants).toHaveLength(1);
+      expect(result.participants![0].participantId).toBe('user-1');
     });
   });
 

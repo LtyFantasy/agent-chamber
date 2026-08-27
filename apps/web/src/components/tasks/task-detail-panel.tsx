@@ -865,8 +865,12 @@ export function TaskDetailPanel({
                   <div key={a.id} className="flex gap-2">
                     <div className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
                     <div className="space-y-0.5">
+                      {/* 活动 actor（统一批 B）：actorName 已由后端注入（A2），去掉裸
+                          UUID fallback；actorDeletedAt 非空 → 灰化（快照语义评论不动） */}
                       <p className="text-sm">
-                        <span className="font-medium">{a.actorName || a.actorId}</span>{' '}
+                        <span className={`font-medium ${a.actorDeletedAt ? 'opacity-60' : ''}`}>
+                          {a.actorName}
+                        </span>{' '}
                         {a.action === 'created' && t('activity.action.created')}
                         {a.action === 'updated' && t('activity.action.updated')}
                         {a.action === 'moved' && t('activity.action.moved')}

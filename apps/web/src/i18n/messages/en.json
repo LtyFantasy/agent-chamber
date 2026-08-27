@@ -9,6 +9,7 @@
     "cancel": "Cancel",
     "confirm": "Confirm",
     "delete": "Delete",
+    "deleted": "Deleted",
     "edit": "Edit",
     "create": "Create",
     "search": "Search",
@@ -219,29 +220,12 @@
     },
     "participant": {
       "title": "Participants & Invitations",
-      "summary": "{count, plural, one {# participant} other {# participants}} · {invited, plural, one {# invited} other {# invited}}",
-      "activeList": "Active participants",
-      "noActive": "No active participants",
-      "invitedList": "Invited",
-      "noInvited": "No invited agents",
-      "addInvite": "Add invitation",
-      "noAvailableAgents": "No available active agents",
-      "inviteAgents": "Invite {count, plural, one {# agent} other {# agents}}",
-      "inviteUser": "Invite user",
-      "noUsers": "No available users",
-      "selectUser": "Select user...",
-      "invite": "Invite",
       "human": "Human",
       "agent": "Agent",
       "member": "Member",
       "moderator": "Moderator",
       "invited": "Invited",
-      "remove": "Remove",
-      "agentStatus": {
-        "active": "Active",
-        "disabled": "Disabled",
-        "pending": "Pending"
-      }
+      "inviteFailed": "Invite result: {succeeded} succeeded, {failed} failed"
     },
     "related": {
       "title": "Related resources",
@@ -286,7 +270,8 @@
       "allWakeTitle": "Wake all seats",
       "allWakeConfirm": "This will wake all {count} seats. Send anyway?",
       "coordinatorBadge": "Coordinator",
-      "coordinatorTitle": "Coordinator seat: dispatch instructions are observable in topic messages"
+      "coordinatorTitle": "Coordinator seat: dispatch instructions are observable in topic messages",
+      "deletedSenderTitle": "This member has been deleted"
     },
     "permissionRequest": {
       "title": "{count, plural, one {# pending approval} other {# pending approvals}}",
@@ -376,7 +361,8 @@
       "recentActivity": "Recent activity",
       "noActivity": "No recent activity",
       "silentCount": "Silent rounds: {count}",
-      "usage": "Usage {used}/{size} tokens"
+      "usage": "Usage {used}/{size} tokens",
+      "boundAgentDeleted": "Bound agent has been deleted"
     },
     "seatGuide": {
       "model": "A runner dials into the platform from the machine where its CLI is installed — not necessarily the machine hosting the platform — and claims seats with the bound agent's API key.",
@@ -617,19 +603,12 @@
       "title": "Board members",
       "count": "{count} members",
       "permissions": "Permissions",
-      "descriptionWithTopic": "Manage board member permissions. Editors can manage board content.",
-      "descriptionWithoutTopic": "Manage who can access this board",
-      "label": "Members",
-      "noMembers": "No members",
-      "privateOnlyCreator": ", private boards are only accessible to the creator",
       "human": "Human",
       "agent": "Agent",
       "editor": "Editor",
       "member": "Member",
       "setEditor": "Set as editor",
-      "addInvite": "Add invitation",
-      "noAvailableAgents": "No available active agents",
-      "inviteAgents": "Invite {count, plural, one {# agent} other {# agents}}"
+      "inviteFailed": "Invite result: {succeeded} succeeded, {failed} failed"
     },
     "docs": {
       "bind": "Docs",
@@ -734,19 +713,13 @@
     },
     "members": {
       "title": "Members",
-      "description": "Editors can manage docs; members can view private spaces",
       "editor": "Editor",
       "member": "Member",
-      "noMembers": "No members",
-      "addInvite": "Add invitation",
-      "noAvailableAgents": "No available active agents",
+      "human": "Human",
+      "agent": "Agent",
       "setEditor": "Set as editor",
-      "remove": "Remove",
       "actionFailed": "Operation failed, please try again",
-      "transferCreator": "Transfer creator",
-      "transferTitle": "Transfer creator",
-      "transferConfirm": "Transfer the creator role to \"{name}\"? The current creator loses all permissions (including read access to PRIVATE spaces). This action cannot be undone.",
-      "transferConfirmButton": "Transfer",
+      "inviteFailed": "Invite result: {succeeded} succeeded, {failed} failed",
       "transferSuccess": "Creator transferred",
       "transferFailed": "Transfer failed, please retry"
     },
@@ -980,6 +953,7 @@
     "createFailed": "Creation failed. Please try again.",
     "table": {
       "name": "Name",
+      "description": "Description",
       "owner": "Owner",
       "status": "Status",
       "apiKey": "API Key",
@@ -1006,7 +980,10 @@
     },
     "delete": {
       "title": "Confirm deletion",
-      "description": "This action is irreversible. Are you sure you want to delete this Agent?"
+      "description": "This action is irreversible. Are you sure you want to delete this Agent?",
+      "impactSeat": "Roundtable seats are not auto-released; this Agent cannot speak after deletion",
+      "impactTasks": "Open tasks are not auto-reassigned",
+      "noImpact": "This Agent has no associated data. Its API Key will be revoked immediately. This action is irreversible."
     },
     "resetKey": {
       "title": "Reset and View API Key",
@@ -1136,5 +1113,31 @@
     "subDownload": "Download SKILL.md",
     "footerHint": "This Skill is used to guide Agents to integrate with this platform. Publicly accessible.",
     "goToLogin": "Go to Login →"
+  },
+  "members": {
+    "invite": "Invite members",
+    "back": "Back",
+    "searchMembers": "Search members…",
+    "searchCandidates": "Search…",
+    "selectedCount": "Selected {count}",
+    "inviteCount": "Invite {count}",
+    "remove": "Remove",
+    "removeConfirmTitle": "Remove member",
+    "removeConfirmDesc": "Remove {name}? They will lose access immediately.",
+    "transferCreator": "Transfer creator",
+    "transferConfirmTitle": "Transfer creator",
+    "transferConfirmDesc": "Transfer the creator role to {name}? You will lose creator permissions afterwards.",
+    "emptyTitle": "No members yet",
+    "emptyDesc": "Tap \"Invite members\" below to add the first member.",
+    "candidatesEmpty": "All agents are already members",
+    "humansEmpty": "No users available to invite",
+    "invitedSection": "Invited ({count})",
+    "agentSection": "Agents",
+    "humanSection": "Humans",
+    "cancelInviteAria": "Cancel invitation for {name}",
+    "menuAria": "Actions for {name}",
+    "countSummary": "{count} members",
+    "countSummaryWithInvited": "{count} members · {invited} invited",
+    "noSearchResults": "No matching members"
   }
 }

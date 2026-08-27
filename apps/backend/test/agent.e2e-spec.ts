@@ -165,7 +165,17 @@ describe('AgentController (e2e)', () => {
       status: 'active',
       actor: { status: 'active', deletedAt: null },
     });
-    mockRepos.Agent.softRemove.mockResolvedValue({});
+    mockRepos.Agent.save.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000002',
+      name: 'Test Agent',
+    });
+    // 统一批 A3-1：remove() 事务内 manager.createQueryBuilder().update(ApiKey) 批量吊销
+    mockRepos.Agent.manager.createQueryBuilder.mockReturnValue({
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue(undefined),
+    });
 
     return request(app.getHttpServer())
       .delete('/agents/00000000-0000-4000-8000-000000000002')
@@ -229,6 +239,28 @@ describe('AgentController (e2e)', () => {
         // ResponseInterceptor reads statusCode before NestJS sets the default 201 for POST
         expect(res.body.code).toBe(200);
         expect(res.body.data).toHaveProperty('apiKey');
+      });
+  });
+
+  it('GET /agents/me/unread - success (route smoke, plan WS-B)', async () => {
+    // 路由注册 + guard + controller → service 链路 smoke：manager.query 返回
+    // 未读计数行，断言响应透传（SQL 语义由 agent-unread.e2e-spec.ts 真 PG 覆盖）。
+    // test-setup 的共享 managerMock 无 query 方法，此处按需补上
+    mockRepos.Agent.manager.query = jest
+      .fn()
+      .mockResolvedValue([
+        { topicId: '00000000-0000-4000-8000-000000000001', topicName: 'T1', unreadCount: 3 },
+      ]);
+
+    return request(app.getHttpServer())
+      .get('/agents/me/unread')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toEqual([
+          { topicId: '00000000-0000-4000-8000-000000000001', topicName: 'T1', unreadCount: 3 },
+        ]);
       });
   });
 });

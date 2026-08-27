@@ -7,12 +7,16 @@
  *   - 补充: docs/roundtable-design.md §7 (安全边界: runner 用普通 agent API Key 拨出,
  *     WS 握手认证与 HTTP guard 共用本服务)
  *
- * [踩坑索引]
+ * [踩坑索引] A3-1b(actor.deletedAt死代码)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #20(契约即设计)
  *
  * [详细踩坑]（最多 5 条）
- *   （暂无）
+ *   A3-1b: `agent.actor?.deletedAt` 检查是死代码——Actor.deletedAt 是 @DeleteDateColumn
+ *         ({ select: false })，正常 findOne 恒 undefined；软删 agent 的拦截语义实际由
+ *         actor 行被 eager LEFT JOIN 软删过滤（agent.actor = null → status 检查失败）承担。
+ *         2026-08-26 统一批 A3-1b 删除该分支（revokedReason 见 agent.service.ts A3-1）。
+ *         见 plans/rictor-swamp-thing-hulkling.md §2 R1
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -105,7 +109,11 @@ export class ApiKeyAuthService {
       relations: { actor: true },
     });
 
-    if (!agent || agent.actor?.deletedAt) {
+    // ⚠️ 死代码清理（统一批 A3-1b）：此处只判 !agent——actor.deletedAt 是 select:false
+    // 列，正常 findOne 恒 undefined，原 deletedAt 检查永不命中；软删 agent 的拦截语义
+    // 由下方 status 检查兜底承担：actor 行被 eager LEFT JOIN 软删过滤 → agent.actor = null
+    // → actor.status !== ACTIVE → AGENT_DISABLED 拒绝（另，A3-1 起软删已事务化吊销全部 Key）。
+    if (!agent) {
       throw new UnauthorizedException({
         message: 'Agent not found',
         code: ErrorCode.AGENT_NOT_FOUND,

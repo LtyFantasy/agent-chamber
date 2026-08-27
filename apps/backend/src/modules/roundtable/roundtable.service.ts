@@ -17,11 +17,19 @@
  *     / §12 r17 (一 agent 一 topic 一 active 座位唯一约束: createSeat 业务检查 409 +
  *     部分唯一索引 uq_roundtable_seats_topic_bind_actor 兜底, removed 软删豁免可重建)
  *
- * [踩坑索引] RT-BATCH-1(封批即冻结) RT-BATCH-2(定时器随 offline 清理) RT-BATCH-3(replayGap 覆盖不到未派发消息) RT-ROUTE-1(system 不唤醒防礼貌循环) RT-ROUTE-2(唤醒不可达只 park 不开窗) RT-VALVE-1(触发公告在跨过阈值那 turn+节流) RT-VALVE-2(人类判定走 actor 表, senderType/actorType 是内存字段) RT-VALVE-3(暂停只闸新唤醒, FIFO 存量照发) RT-DEBT-1(游标蛙跳: 失败 seq 精确留档, dedup 放行) RT-DEBT-2(无界增长: chunk 缓冲上限 + 两侧对账裁剪) RT-DEBT-3(auto-join 公告幂等) RT-ANNOUNCE-1(公告正文 tool 摘要 title 优先) RT-SEAT-1(jsonb 嵌套 findOne 生成整列等值, 路径提取须 queryBuilder) RT-PERM-2(审批幂等键须带 status=pending, requestId 跨会话归零撞键) TOPIC-PERM(write放宽后座位/裁决须creator收口)
+ * [踩坑索引] RT-BATCH-1(封批即冻结) RT-BATCH-2(定时器随 offline 清理) RT-BATCH-3(replayGap 覆盖不到未派发消息) RT-ROUTE-1(system 不唤醒防礼貌循环) RT-ROUTE-2(唤醒不可达只 park 不开窗) RT-VALVE-1(触发公告在跨过阈值那 turn+节流) RT-VALVE-2(人类判定走 actor 表, senderType/actorType 是内存字段) RT-VALVE-3(暂停只闸新唤醒, FIFO 存量照发) RT-DEBT-1(游标蛙跳: 失败 seq 精确留档, dedup 放行) RT-DEBT-2(无界增长: chunk 缓冲上限 + 两侧对账裁剪) RT-DEBT-3(auto-join 公告幂等) RT-ANNOUNCE-1(公告正文 tool 摘要 title 优先) RT-SEAT-1(jsonb 嵌套 findOne 生成整列等值, 路径提取须 queryBuilder) RT-PERM-2(审批幂等键须带 status=pending, requestId 跨会话归零撞键) TOPIC-PERM(write放宽后座位/裁决须creator收口) R1(公共解析收口) A2.5(座位bindActorId须usable)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #17(测试契约) #20(契约即设计) #21(双层校验)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   A2.5: createSeat 的 bindActorId 必须存在且未软删（现状曾完全无存在性校验——软删
+ *       agent 会被绑进座位形成活配置错误）。统一走 ActorProfileService.assertActorUsable
+ *       （404 AGENT_NOT_FOUND，契约 docs/spec.md §1 规则 6）。2026-08-26 统一批 A2.5。
+ *   R1: Actor.deletedAt 是 @DeleteDateColumn({ select: false })——withDeleted 只解除过滤不选
+ *       列。本文件 projectMessage 发送者投影一律经 ActorProfileService.resolveProfiles
+ *       （withDeleted 覆盖软删 actor，真名保留 + from.deletedAt 信号透传，r3 冻结"只增不改"
+ *       合规）；禁止散落 actorRepo 自查询（旧实现 findOne 过滤软删 → sender-xxxx 裸 ID 兜底）。
+ *       收口见 common/services/actor-profile.service.ts，契约 docs/spec.md §1。2026-08-26 统一批 A2。
  *   TOPIC-PERM: v1.46 TopicPolicy.write 放宽给 editor 参与方——roundtable 内两处
  *               ensureCan(topic,'write') 调用点（createSeat / resolvePermissionRequest）
  *               若不同步收口，editor 将获得建座位/裁决权限请求的能力（属成员管理/治理
@@ -102,6 +110,7 @@ import { Event } from '../../database/entities/event.entity';
 import { TopicService } from '../topic/topic.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
+import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { RunnerRegistryService } from './runner-registry.service';
 import {
@@ -396,6 +405,7 @@ export class RoundtableService {
     private readonly permService: PermissionService,
     private readonly registry: RunnerRegistryService,
     private readonly ownerProxy: OwnerProxyService,
+    private readonly actorProfileService: ActorProfileService,
   ) {}
 
   // ─────────────────────────── 座位 CRUD（M1 最小 REST） ───────────────────────────
@@ -438,6 +448,10 @@ export class RoundtableService {
         code: ErrorCode.VALIDATION_ERROR,
       });
     }
+    // 统一批 A2.5（R14）：bindActorId 指向的 actor 必须存在且未软删——现状完全无存在性
+    // 校验，软删 agent 会被绑进座位形成活配置错误（契约 docs/spec.md §1 规则 6）。
+    // agent 创建者缺省绑自己（认证层已挡软删，恒通过）；人类显式指定时同样校验。
+    await this.actorProfileService.assertActorUsable(bindActorId);
     // r17 唯一座位约束（docs/roundtable-design.md §12 r17：一 agent 一 topic 只能有一个
     // active 座位；removed 软删豁免——移除后可重建）：同 topic + 同 bindActorId 且
     // status != 'removed' 的座位已存在 → 409（铁律 #21/#22 业务存在性检查在 Service 层）。
@@ -1635,16 +1649,20 @@ export class RoundtableService {
   }
 
   /**
-   * 消息 → 注入体单条投影（InjectBodyMessage，r3 冻结字段）
+   * 消息 → 注入体单条投影（InjectBodyMessage，r3 冻结字段，只增不改）
    * - 座位发言（metadata.seatLabel 非空）：name = 对应座位 label，coordinator = 该座位标记
-   * - 人类/系统发言：name = actor.displayName（缺省截断 id），coordinator = false
-   * - from.type = actor.type（human/agent/system 与 r3 冻结枚举同值）
+   * - 人类/系统发言：name = actor 真名（统一批 A2 改走公共解析——withDeleted 覆盖软删
+   *   actor，真名保留 + deletedAt 信号透传；原 actorRepo.findOne 过滤软删 → 软删 sender
+   *   落入 `sender-xxxx` 裸 ID 兜底，已修），coordinator = false
+   * - from.type = actor.type（human/agent/system 与 r3 冻结枚举同值；真孤儿兜底 'agent'）
    */
   private async projectMessage(seat: RoundtableSeat, message: Message): Promise<InjectBodyMessage> {
     const seatLabel =
       typeof message.metadata?.seatLabel === 'string' ? message.metadata.seatLabel : null;
-    // 发送者身份投影（actors 表：type + displayName；agent.id == actor.id，PK=FK 惯例）
-    const actor = await this.actorRepo.findOne({ where: { id: message.senderId } });
+    // 发送者身份投影（公共解析：actors withDeleted + agents.name 回退链，R1/R9）
+    const profile = (await this.actorProfileService.resolveProfiles([message.senderId])).get(
+      message.senderId,
+    );
     let name: string;
     let coordinator = false;
     if (seatLabel) {
@@ -1654,12 +1672,19 @@ export class RoundtableService {
       name = labelSeat?.label ?? seatLabel;
       coordinator = labelSeat?.coordinator ?? false;
     } else {
-      name = actor?.displayName ?? `sender-${message.senderId.slice(0, 8)}`;
+      name = profile?.name ?? `sender-${message.senderId.slice(0, 8)}`;
     }
-    const fromType: InjectFromType = (actor?.type as InjectFromType) ?? 'agent';
+    const fromType: InjectFromType = (profile?.type as InjectFromType) ?? 'agent';
     return {
       id: message.id,
-      from: { name, type: fromType, seatLabel, coordinator },
+      from: {
+        name,
+        type: fromType,
+        seatLabel,
+        coordinator,
+        // 软删信号（r3 冻结"只增不改"合规）：非空 = 发送者已删除，name 仍可显示
+        deletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
+      },
       ts: (message.createdAt ?? new Date()).toISOString(),
       replyTo: message.replyToId ?? null,
       content: message.content,

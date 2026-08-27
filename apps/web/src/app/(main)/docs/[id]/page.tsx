@@ -11,7 +11,6 @@ import Link from 'next/link';
 import {
   AlertTriangle,
   ArrowLeft,
-  ArrowLeftRight,
   BookOpen,
   Check,
   CheckCircle,
@@ -50,13 +49,15 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
-import { Sheet, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
+import { Sheet, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { DocSummary, DocSearchHit } from '@/types';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
 import { DocEditor } from '@/components/docs/doc-editor';
 import { BatchUploadDialog } from '@/components/docs/batch-upload-dialog';
 import { isExternalHref, resolveDocPath, PLATFORM_DOC_LINK_RE } from '@/components/docs/doc-link';
 import { confirm, toast } from '@/lib/notify';
+import { MembersSheet } from '@/components/members/members-sheet';
+import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
 import { buildPathTree, PathTreeView } from './sidebar-tree';
 
 /** 左栏视图模式 localStorage key（同 login 页 auth:last-email 先例；SSR 无 localStorage，挂载后校正） */
@@ -457,10 +458,11 @@ export default function DocSpaceDetailPage() {
     void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
   };
 
+  /** 邀请 Agent 加入空间（R2 Promise 契约：页面层 allSettled 循环调用；
+      选择集已移交 MembersSheet 内部管理，onSuccess 只负责刷新详情） */
   const inviteMutation = useMutation({
     mutationFn: (agentId: string) => Api.docs.inviteAgent(spaceId, agentId),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('members.actionFailed')),
   });
   const uninviteMutation = useMutation({
     mutationFn: (actorId: string) => Api.docs.uninviteAgent(spaceId, actorId),
@@ -487,20 +489,99 @@ export default function DocSpaceDetailPage() {
     onError: alertMutationError(t('members.transferFailed')),
   });
 
-  /**
-   * 转让 creator 危险操作闸门（R5）：
-   * confirm 文案明示「原创建者将失去全部权限（含 PRIVATE 空间读权限）」不可逆；
-   * 确认后走 transferCreatorMutation（成功即 invalidateSpace 重拉成员/creator）。
-   */
-  const handleTransferCreator = async (actorId: string, actorName: string) => {
-    const ok = await confirm({
-      title: t('members.transferTitle'),
-      description: t('members.transferConfirm', { name: actorName }),
-      confirmText: t('members.transferConfirmButton'),
-      cancelText: tGlobal('common.cancel'),
-      confirmVariant: 'danger',
-    });
-    if (!ok) return;
+  // ── MembersSheet 数据装配（批次 C3：内联成员 Sheet → 共享组件；页面层负责
+  //    DTO → MemberItem 映射与权限 gate，组件纯受控不感知业务）──
+
+  /** 活跃成员 → MemberItem（DocSpaceMemberDto：actorId/actorName/actorType/role；
+   *  DTO 无 avatarUrl 字段 → 不传，Avatar 按 actorId 确定性底色兜底；行级排除
+   *  照抄旧 UI——所有行（含自己/创建者行）都显示操作入口，不设 canRemove
+   *  （缺省跟随 capabilities.remove），转让给自己/创建者行移除等后端注定拒绝
+   *  的操作由后端 409/403 守卫兜底（既存行为，重构不改行为）） */
+  const memberItems = useMemo((): MemberItem[] => {
+    if (!space) return [];
+    return (space.members ?? []).map((m) => ({
+      actorId: m.actorId,
+      name: m.actorName || m.actorId,
+      actorType: m.actorType ?? 'agent',
+      role: m.role,
+      // 已删除信号透传（统一批 B）：软删 actor 带 deletedAt → member-row 灰化+badge
+      deletedAt: m.deletedAt ?? null,
+      status: 'active',
+    }));
+  }, [space]);
+
+  /** 可邀请 agent 候选（照抄旧「添加邀请」checkbox 列表：全量 active agent 排除
+   *  现有成员；docs 无 invited 概念，无需兜底集合） */
+  const candidateItems = useMemo((): MemberItem[] => {
+    if (!space) return [];
+    const memberIds = new Set((space.members ?? []).map((m) => m.actorId));
+    return (agentsData ?? [])
+      .filter((a) => a.status === 'active' && !memberIds.has(a.id))
+      .map((a) => ({
+        actorId: a.id,
+        name: a.name,
+        actorType: 'agent',
+        role: 'member',
+        avatarUrl: a.avatarUrl ?? undefined,
+        status: 'active',
+      }));
+  }, [space, agentsData]);
+
+  /** 差异化文案：复用页面现有 docs.members.* key（title/角色/类别） */
+  const memberLabels: MembersSheetLabels = {
+    title: t('members.title'),
+    roleLabels: {
+      editor: t('members.editor'),
+      member: t('members.member'),
+    },
+    typeLabels: {
+      human: t('members.human'),
+      agent: t('members.agent'),
+    },
+  };
+
+  /** R2 邀请提交（Promise 契约）：mutateAsync 循环 + allSettled——全成功 resolve
+   *  （组件切回主视图并清空选择）；任一失败 reject（组件留在邀请视图保留选择）+
+   *  失败汇总 toast（成功 N / 失败 M）。docs 无人类候选，kind 恒为 'agent'，
+   *  非 agent 防御性短路 */
+  const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
+    if (kind !== 'agent') return;
+    const results = await Promise.allSettled(
+      actorIds.map((actorId) => inviteMutation.mutateAsync(actorId)),
+    );
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    if (failed > 0) {
+      toast.error({
+        title: t('members.inviteFailed', { succeeded, failed }),
+      });
+      throw new Error(`invite agent partial failure: ${failed}/${results.length}`);
+    }
+  };
+
+  /** 移除活跃成员（组件 AlertDialog 确认后回调）：docs 的 removeEditor 是降级
+   *  （editor → member 保行）非移除，移除唯一出口是 uninviteAgent——照抄旧 UI
+   *  X 按钮对所有行（含 editor 行）一律 uninviteMutation，与角色无关 */
+  const handleRemoveMember = (actorId: string) => {
+    uninviteMutation.mutate(actorId);
+  };
+
+  /** 升降级（docs 双向）：toRole==='editor' → addEditor（升级 member → editor）；
+   *  toRole==='member' → removeEditor（后端语义 = 降级 editor → member，保行不删，
+   *  与 board 的完全移除相反——docspace.service.ts removeEditor 注释明示
+   *  "Demote: editor → member (never delete the row)"） */
+  const handleChangeRole = (actorId: string, newRole: string) => {
+    if (newRole === 'editor') {
+      addEditorMutation.mutate(actorId);
+    } else {
+      removeEditorMutation.mutate(actorId);
+    }
+  };
+
+  /** 转让创建者（组件 AlertDialog 二次确认后回调；成功 toast 与重拉详情都在
+   *  transferCreatorMutation 内——v1.45 DOCSPACE-PERM creator-only，后端
+   *  409/404/403 语义由后端保证；旧页面层 confirm 确认流废弃，统一组件确认流） */
+  const handleTransferCreator = (actorId: string) => {
     transferCreatorMutation.mutate(actorId);
   };
   const createCategoryMutation = useMutation({
@@ -612,12 +693,6 @@ export default function DocSpaceDetailPage() {
     selectDoc(hit.docId);
     setSearchQuery('');
   };
-
-  /** 可邀请 Agent：active 且尚未是成员 */
-  const memberActorIds = new Set(members.map((m) => m.actorId));
-  const availableAgents = (agentsData ?? []).filter(
-    (a) => a.status === 'active' && !memberActorIds.has(a.id),
-  );
 
   if (spaceLoading) {
     return <Loading />;
@@ -1048,6 +1123,8 @@ export default function DocSpaceDetailPage() {
           <Button variant="outline" size="sm" onClick={() => setMembersSheetOpen(true)}>
             <Users className="mr-1 h-4 w-4" />
             {t('members.title')}
+            {/* 入口计数（批次 C3）：成员数 > 0 时补 (N)，与 board 入口按钮同规 */}
+            {members.length > 0 ? ` (${members.length})` : ''}
           </Button>
           {canManage && (
             <Button variant="outline" size="sm" onClick={() => setCategoriesOpen(true)}>
@@ -1275,96 +1352,36 @@ export default function DocSpaceDetailPage() {
         </Sheet>
       )}
 
-      {/* 成员管理 Sheet（复用 board 成员管理模式：成员列表 + 邀请 Agent checkbox） */}
-      <Sheet open={membersSheetOpen} onOpenChange={setMembersSheetOpen}>
-        <SheetHeader>
-          <SheetTitle>{t('members.title')}</SheetTitle>
-          <SheetDescription>{t('members.description')}</SheetDescription>
-        </SheetHeader>
-        <div className="mt-4 space-y-4">
-          <div className="space-y-2">
-            {members.length === 0 ? (
-              <p className="text-sm text-muted-foreground">{t('members.noMembers')}</p>
-            ) : (
-              members.map((m) => (
-                <div key={m.actorId} className="flex items-center justify-between gap-2">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate text-sm">{m.actorName || m.actorId}</span>
-                    <Badge variant={m.role === 'editor' ? 'default' : 'secondary'}>
-                      {m.role === 'editor' ? t('members.editor') : t('members.member')}
-                    </Badge>
-                  </div>
-                  {/* 行操作（转让/升降级/移除）全是 creator-only 端点，editor 看到必 403——gate 提升为 isOwnerLike（同邀请块收敛） */}
-                  {isOwnerLike && (
-                    <div className="flex shrink-0 items-center gap-1">
-                      <button
-                        onClick={() => handleTransferCreator(m.actorId, m.actorName || m.actorId)}
-                        className="text-muted-foreground transition-colors hover:text-destructive"
-                        title={t('members.transferCreator')}
-                      >
-                        <ArrowLeftRight className="h-3.5 w-3.5" />
-                      </button>
-                      {m.role === 'editor' ? (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 text-xs"
-                          onClick={() => removeEditorMutation.mutate(m.actorId)}
-                        >
-                          {t('members.member')}
-                        </Button>
-                      ) : (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 text-xs"
-                          onClick={() => addEditorMutation.mutate(m.actorId)}
-                        >
-                          {t('members.setEditor')}
-                        </Button>
-                      )}
-                      <button
-                        onClick={() => uninviteMutation.mutate(m.actorId)}
-                        className="text-muted-foreground transition-colors hover:text-destructive"
-                        title={t('members.remove')}
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-
-          {/* 邀请 Agent（checkbox 列表，isOwnerLike 可见——后端 invite 是 creator-only，editor 看到必 403） */}
-          {isOwnerLike && (
-            <div className="border-t border-border/50 pt-3">
-              <p className="mb-2 text-sm font-medium">{t('members.addInvite')}</p>
-              {availableAgents.length === 0 ? (
-                <p className="text-xs text-muted-foreground">{t('members.noAvailableAgents')}</p>
-              ) : (
-                <div className="space-y-1">
-                  {availableAgents.map((agent) => (
-                    <label
-                      key={agent.id}
-                      className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-sm transition-colors hover:bg-accent"
-                    >
-                      <input
-                        type="checkbox"
-                        onChange={(e) => {
-                          if (e.target.checked) inviteMutation.mutate(agent.id);
-                        }}
-                      />
-                      <span className="flex-1 truncate">{agent.name}</span>
-                    </label>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </Sheet>
+      {/* 成员管理（批次 C3：内联成员 Sheet → 共享 MembersSheet——信息架构主视图 +
+          邀请二级视图；权限 gate 照抄旧各 section（isOwnerLike：平台 admin ｜ 空间
+          创建者/owner 代理——invite/移除/升降级/转让全是 creator-only 端点，
+          editor 看到必 403）；docs 无 invited 区、无人类候选，不传 invited/
+          humanCandidates；升降级双向（docs removeEditor = 降级保行，与 board 的
+          完全移除相反）；行级 gate 照抄旧 UI——所有行显示操作（canRemove 不设），
+          创建者行/转让给自己由后端 409 守卫兜底 */}
+      <MembersSheet
+        open={membersSheetOpen}
+        onOpenChange={setMembersSheetOpen}
+        labels={memberLabels}
+        members={memberItems}
+        candidates={candidateItems}
+        capabilities={{
+          invite: isOwnerLike,
+          remove: isOwnerLike,
+          changeRole: isOwnerLike
+            ? [
+                { fromRole: 'member', toRole: 'editor', label: t('members.setEditor') },
+                { fromRole: 'editor', toRole: 'member', label: t('members.member') },
+              ]
+            : [],
+          transferCreator: isOwnerLike,
+        }}
+        onInvite={handleInvite}
+        onRemove={handleRemoveMember}
+        onChangeRole={handleChangeRole}
+        onTransferCreator={handleTransferCreator}
+        inviting={inviteMutation.isPending}
+      />
 
       {/* 分类管理 Dialog（canManage：增/改名/删） */}
       {/* 空间图例只读弹窗（v1.43.1-dev）：markdown 渲染查看；编辑入口在空间设置 */}
