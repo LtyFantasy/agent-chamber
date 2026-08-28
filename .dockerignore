@@ -28,11 +28,13 @@ coverage
 .git
 .gitnexus
 
-# 运行时噪音与部署备份
-logs
+# 运行时噪音与部署备份（仅仓库根级目录：裸名 logs/backups 在 .dockerignore 里匹配任意深度，
+# 曾把 apps/web/src/app/(main)/logs/（/logs 活动日志页面）排出构建上下文，镜像内路由缺失但构建不报错——
+# 2026-08-28 chamber v1.69.0 从零冒烟实测抓到，与 oss-export logs 排除同型 bug）
+/logs
+/backups
 *.log
 *.pid
-backups
 
 # 工程文档：运维/架构文档不进镜像
 # 例外：docs/integrations（圆桌四厂商对接指南）必须进构建上下文——
