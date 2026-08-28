@@ -7,8 +7,10 @@ coverage/
 tsconfig.tsbuildinfo
 .eslintcache
 
-# 运行时
-logs/
+# 运行时（/logs 锚定仓库根级——裸名 logs/ 匹配任意深度同名目录，
+# 会把 apps/web/src/app/(main)/logs/（/logs 活动日志页面）挡在 git 之外，
+# 本地 build/test 正常但快照仓丢页面；2026-08-28 v1.69.0 冒烟三连抓的第三处同型 bug）
+/logs
 *.log
 *.pid
 
