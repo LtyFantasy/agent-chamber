@@ -33,12 +33,14 @@ import {
   ErrorCode,
   ParticipantStatus,
   Visibility,
+  AuditAction,
 } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+import { AuditService } from '../audit/audit.service';
 
 function createMockRepo<T extends ObjectLiteral>() {
   return {
@@ -182,6 +184,7 @@ describe('TopicService', () => {
   let mockIdempotencyRepo: jest.Mocked<Repository<IdempotencyRecord>>;
   let mockEntityManager: { getRepository: jest.Mock; query: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     mockTopicRepo = createMockRepo<Topic>();
@@ -279,6 +282,7 @@ describe('TopicService', () => {
       }),
       assertActorUsable: jest.fn().mockResolvedValue(undefined),
     };
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
     // DataSource mock：transaction 默认透传回调
     mockDataSource = {
@@ -324,6 +328,7 @@ describe('TopicService', () => {
         { provide: ResourceValidator, useValue: mockResourceValidator },
         { provide: DataSource, useValue: mockDataSource },
         { provide: ActorProfileService, useValue: mockActorProfileService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -553,7 +558,12 @@ describe('TopicService', () => {
     it('should create topic and add creator as participant', async () => {
       const dto = { title: 'New Topic', description: 'Desc', type: 'discussion' };
       const createdTopic = createMockTopic(dto);
-      const savedTopic = createMockTopic({ ...dto, id: 'topic-new' });
+      const savedTopic = createMockTopic({
+        ...dto,
+        id: 'topic-new',
+        // visibility 走 settings jsonb（service 组装），插桩 newData 白名单断言用
+        settings: { visibility: 'open' },
+      });
       const createdParticipant = createMockParticipant({
         topicId: savedTopic.id,
         role: 'moderator',
@@ -592,6 +602,15 @@ describe('TopicService', () => {
         joinedAt: expect.any(Date), // creator 即 active，显式写 joinedAt
       });
       expect(mockParticipantRepo.save).toHaveBeenCalledWith(createdParticipant);
+      // 审计（Phase 2）：create → CREATE + topic；actor=creator；newData 白名单
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'topic',
+        entityId: 'topic-new',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-new', title: 'New Topic', visibility: 'open' },
+        source: 'api',
+      });
       expect(result).toEqual(savedTopic);
     });
 
@@ -982,6 +1001,28 @@ describe('TopicService', () => {
       expect(mockActorProfileService.assertActorUsable).toHaveBeenCalledWith('agent-new');
     });
 
+    it('v1.69 D3：update invitedAgentIds 新建 invited 行 → 受邀时刻游标初始化', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+      mockParticipantRepo.find
+        .mockResolvedValueOnce([]) // currentInvited
+        .mockResolvedValueOnce([]); // existingRows
+      mockParticipantRepo.create.mockImplementation((x) => x as TopicParticipant);
+      mockParticipantRepo.save.mockResolvedValue({} as TopicParticipant);
+      mockMessageRepo.findOne.mockResolvedValue({ id: 'msg-latest' } as Message);
+
+      await service.update('topic-1', { invitedAgentIds: ['agent-new'] });
+
+      expect(mockParticipantRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          participantId: 'agent-new',
+          status: ParticipantStatus.INVITED,
+          lastReadMessageId: 'msg-latest',
+        }),
+      );
+    });
+
     it('update：config.kind 忽略（创建后不可变），config.wakePolicy 合并进 settings', async () => {
       // kind 不可变语义：normal↔roundtable 互转在 M2 推迟清单，update 收到的 kind
       // 一律丢弃——存量 seat 归属与会话层规则开关都依赖创建时的 kind
@@ -1083,6 +1124,34 @@ describe('TopicService', () => {
         participantId: 'user-2',
         joinedAt: savedParticipant.joinedAt,
       });
+      // 审计（Phase 2）：join → CREATE + topic_participant；actor 缺省=participantId（自己加入）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'topic_participant',
+        entityId: 'user-2',
+        actorId: 'user-2',
+        newData: { topicId: 'topic-1', participantId: 'user-2' },
+        source: 'api',
+      });
+    });
+
+    it('should use operatorActorId when provided (invite-user, decision 8)', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      mockParticipantRepo.create.mockReturnValue(
+        createMockParticipant({ participantId: 'user-9' }),
+      );
+      mockParticipantRepo.save.mockResolvedValue(
+        createMockParticipant({ participantId: 'user-9' }),
+      );
+
+      await service.join('topic-1', 'user-9', ActorType.HUMAN, 'admin-1');
+
+      // actor=操作者（admin），非被邀请者
+      expect(mockAuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ entityId: 'user-9', actorId: 'admin-1' }),
+      );
     });
 
     it('should reactivate existing participant', async () => {
@@ -1136,6 +1205,70 @@ describe('TopicService', () => {
       expect(invitedParticipant.joinedAt).toBeInstanceOf(Date);
       expect(mockParticipantRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({ joinedAt: expect.any(Date) }),
+      );
+    });
+
+    it('v1.69 D2：新行 join → 游标初始化为当前最新消息（未读=加入后增量）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      const createdParticipant = createMockParticipant({ participantId: 'user-2', role: 'member' });
+      mockParticipantRepo.create.mockReturnValue(createdParticipant);
+      mockParticipantRepo.save.mockResolvedValue(createdParticipant);
+      mockMessageRepo.findOne.mockResolvedValue({ id: 'msg-latest' } as Message);
+
+      await service.join('topic-1', 'user-2', ActorType.HUMAN);
+
+      // 全序 (created_at DESC, id DESC) LIMIT 1 取锚点
+      expect(mockMessageRepo.findOne).toHaveBeenCalledWith({
+        where: { topicId: 'topic-1' },
+        order: { createdAt: 'DESC', id: 'DESC' },
+        select: ['id'],
+      });
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ lastReadMessageId: 'msg-latest' }),
+      );
+    });
+
+    it('v1.69 D2：invited 行激活时游标为 null → 同步初始化', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const invitedParticipant = createMockParticipant({
+        participantId: 'agent-2',
+        participantType: ActorType.AGENT,
+        status: ParticipantStatus.INVITED,
+        joinedAt: null,
+        lastReadMessageId: null,
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(invitedParticipant);
+      mockParticipantRepo.save.mockResolvedValue(invitedParticipant);
+      mockMessageRepo.findOne.mockResolvedValue({ id: 'msg-latest' } as Message);
+
+      await service.join('topic-1', 'agent-2', ActorType.AGENT);
+
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ lastReadMessageId: 'msg-latest' }),
+      );
+    });
+
+    it('v1.69 D2：re-join 保留非 null 游标（离开期间消息仍计未读）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      const existingParticipant = createMockParticipant({
+        participantId: 'user-2',
+        status: ParticipantStatus.LEFT,
+        leftAt: new Date(),
+        lastReadMessageId: 'msg-before-left',
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
+      mockParticipantRepo.save.mockResolvedValue(existingParticipant);
+
+      await service.join('topic-1', 'user-2', ActorType.HUMAN);
+
+      // 游标非 null → 不查最新消息、不覆盖
+      expect(mockMessageRepo.findOne).not.toHaveBeenCalled();
+      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ lastReadMessageId: 'msg-before-left' }),
       );
     });
 
@@ -1920,6 +2053,16 @@ describe('TopicService', () => {
       expect(mockMessageRepo.save).toHaveBeenCalledWith(createdMessage);
       // topic 统计由 DB trigger trg_topics_message_stats 维护，应用层不写
       expect(mockTopicRepo.save).not.toHaveBeenCalled();
+      // 审计（Phase 2）：sendMessage → CREATE + message（service 层，覆盖圆桌经路）；
+      // newData 契约 {messageId, topicId, topicTitle}——content 黑名单不入
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'message',
+        entityId: 'msg-1',
+        actorId: 'user-1',
+        newData: { messageId: 'msg-1', topicId: 'topic-1', topicTitle: 'Test Topic' },
+        source: 'api',
+      });
       expect(result).toEqual({
         id: savedMessage.id,
         topicId: savedMessage.topicId,
@@ -2226,11 +2369,14 @@ describe('TopicService', () => {
       expect(sql).toContain('INSERT INTO topic_participants');
       expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
       expect(sql).toContain('CASE WHEN topic_participants.status IN');
+      // v1.69 发送即已读：SET 子句含 last_read_message_id 单调推进（含旧锚点软删逃生口）
+      expect(sql).toContain('last_read_message_id');
+      expect(sql).toContain('NOT EXISTS');
       // SET 子句中不得出现 role（moderator 不被降级为 member）
       expect(sql).not.toContain('SET role');
       expect(sql).not.toMatch(/role\s*=/);
-      // 参数 = (topicId, senderId)
-      expect(params).toEqual(['topic-1', 'user-1']);
+      // 参数 = (topicId, senderId, 新消息 id)——v1.69 发送即已读：$3 推进发送者游标
+      expect(params).toEqual(['topic-1', 'user-1', 'msg-1']);
     });
 
     it('should auto-join via atomic conditional upsert SQL inside idempotency transaction', async () => {
@@ -2251,8 +2397,10 @@ describe('TopicService', () => {
       expect(mockEntityManager.query).toHaveBeenCalledTimes(1);
       const [sql, params] = mockEntityManager.query.mock.calls[0];
       expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
+      expect(sql).toContain('last_read_message_id');
       expect(sql).not.toMatch(/role\s*=/);
-      expect(params).toEqual(['topic-1', 'user-1']);
+      // 参数 = (topicId, senderId, 新消息 id)——v1.69 发送即已读（同事务内可见）
+      expect(params).toEqual(['topic-1', 'user-1', 'msg-idem-sql']);
     });
 
     it('should send message with idempotency key and write idempotency record', async () => {
@@ -2284,6 +2432,18 @@ describe('TopicService', () => {
           clientRequestId: 'req-msg-001',
           entityType: 'message',
           entityId: 'msg-idem-1',
+        }),
+      );
+      // 审计（Phase 2）：幂等键路径真实写成功后记一次（非 replay）
+      expect(mockAuditService.log).toHaveBeenCalledTimes(1);
+      expect(mockAuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: AuditAction.CREATE,
+          entityType: 'message',
+          entityId: 'msg-idem-1',
+          actorId: 'user-1',
+          newData: { messageId: 'msg-idem-1', topicId: 'topic-1', topicTitle: 'Test Topic' },
+          source: 'api',
         }),
       );
       // 返回无 idempotentReplay 标记
@@ -2346,6 +2506,8 @@ describe('TopicService', () => {
 
       expect(result).toHaveProperty('idempotentReplay', true);
       expect(result.id).toBe('msg-existing-1');
+      // 审计（Phase 2）：幂等 replay 不重复记（决策 2）——replay 路径零审计
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it('should rethrow non-idempotency 23505 error for sendMessage', async () => {
@@ -2917,9 +3079,35 @@ describe('TopicService', () => {
         participantId: 'agent-1',
         role: 'member',
         status: ParticipantStatus.INVITED,
+        // v1.69 D3：受邀时刻游标初始化；mock 无消息 → null
+        lastReadMessageId: null,
       });
       expect(mockParticipantRepo.save).toHaveBeenCalled();
       expect(result).toEqual(topic);
+    });
+
+    it('v1.69 D3：受邀时刻游标初始化（邀请前历史不计未读）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      const newParticipant = createMockParticipant({
+        participantId: 'agent-1',
+        participantType: ActorType.AGENT,
+        status: ParticipantStatus.INVITED,
+      });
+      mockParticipantRepo.create.mockReturnValue(newParticipant);
+      mockParticipantRepo.save.mockResolvedValue(newParticipant);
+      mockMessageRepo.findOne.mockResolvedValue({ id: 'msg-latest' } as Message);
+
+      await service.inviteAgent('topic-1', 'agent-1');
+
+      expect(mockParticipantRepo.create).toHaveBeenCalledWith({
+        topicId: 'topic-1',
+        participantId: 'agent-1',
+        role: 'member',
+        status: ParticipantStatus.INVITED,
+        lastReadMessageId: 'msg-latest',
+      });
     });
 
     it('should throw NotFoundException when topic not found', async () => {
@@ -3014,6 +3202,7 @@ describe('TopicService', () => {
         participantId: 'agent-1',
         role: 'member',
         status: ParticipantStatus.INVITED,
+        lastReadMessageId: null,
       });
 
       const newParticipant2 = createMockParticipant({
@@ -3030,6 +3219,7 @@ describe('TopicService', () => {
         participantId: 'agent-2',
         role: 'member',
         status: ParticipantStatus.INVITED,
+        lastReadMessageId: null,
       });
       expect(result).toEqual(topic);
     });
@@ -3168,6 +3358,8 @@ describe('TopicService', () => {
         participantType: ActorType.AGENT,
         role: 'editor',
         status: ParticipantStatus.INVITED,
+        // v1.69 D3：受邀时刻游标初始化；mock 无消息 → null
+        lastReadMessageId: null,
       });
       expect(mockParticipantRepo.save).toHaveBeenCalledWith(newParticipant);
       expect(result).toEqual(topic);
@@ -3822,6 +4014,15 @@ describe('TopicService', () => {
         where: { id: 'msg-1', topicId: 'topic-1' },
       });
       expect(mockMessageRepo.softRemove).toHaveBeenCalledWith(message);
+      // 审计（Phase 2）：DELETE + message；newData 白名单 {messageId, topicId}（无 content）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'message',
+        entityId: 'msg-1',
+        actorId: 'agent-1',
+        newData: { messageId: 'msg-1', topicId: 'topic-1' },
+        source: 'api',
+      });
       expect(result).toEqual({ messageId: 'msg-1', deleted: true });
     });
 

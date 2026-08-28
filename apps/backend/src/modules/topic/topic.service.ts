@@ -6,14 +6,23 @@
  *   - 主文档: docs/api-definition.md §6.11
  *   - 补充: docs/architecture.md §3.2.2 (Topic / Message), docs/spec.md §3.2 MessageType
  *   - 圆桌: docs/roundtable-design.md §6/§7（seatLabel 单键透传 / wakePolicy effective 派生）
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（sendMessageInternal 是
+ *     全仓唯一 messageRepo.create 点，roundtable 经它写系统消息 → service 层插桩决策 2；
+ *     幂等 replay 不重复记；newData 白名单 {messageId, topicId, topicTitle}，content 黑名单）
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(发送即已读+join/邀请游标初始化)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   UNREAD-CURSOR: 游标只在 markAsRead/digest 推进——自己发的消息计入自己未读、
+ *       join/邀请后全历史未读（2026-08-28 Kimi-Kairos 反馈采纳）。修复（v1.69）：
+ *       发送即已读（AUTO_JOIN_SQL $3 单调推进，含旧锚点软删 NOT EXISTS 逃生口，
+ *       与 markAsRead 防回退语义对齐）+ join/邀请建行游标初始化（re-join 保留原
+ *       游标=离开期间未读）；行值比较全部 DB 内完成（E3-fix 精度教训）。
+ *       见 .kimi/plans/unread-cursor-semantics.md。
  *   A2.5: 写入口（inviteAgent/addEditor/create/update 的 invitedAgentIds）统一走
  *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND）。
  *       ⚠️ R11: update 的 invitedAgentIds 是完整替换语义，一刀切校验会让「存量含已删
@@ -102,6 +111,8 @@ import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '@agent-chamber/shared';
 
 /**
  * sendMessage 自动 join 的原子条件 upsert（v1.40 joinedAt 语义修复）。
@@ -122,15 +133,36 @@ import { ActorProfileService, ActorProfile } from '../../common/services/actor-p
  * 不会触发 PK (topic_id, participant_id) 冲突 23505（禁止 find/save
  * 的读-改-写竞态）。事件一致性：本路径只发 NEW_MESSAGE，不新增
  * AGENT_JOINED 事件（隐式激活不广播加入事件，与历史行为一致）。
+ *
+ * 发送即已读（v1.69 未读游标语义修正，Kimi-Kairos 反馈采纳）：$3 = 本次
+ * 新消息 id，发送者自己的 last_read_message_id 随发送单调推进——
+ * 自己发的消息不再计入自己未读（IM 通用语义）。INSERT 分支（首发消息的
+ * 新参与者）游标直接落 $3，无历史洪水。ON CONFLICT 四分支 CASE：
+ * ① 游标 NULL → 推进；② 旧锚点消息已软删（NOT EXISTS 逃生口，与
+ * markAsRead「rows 为空 → 允许推进」语义对齐，否则行值比较得 NULL 落入
+ * ELSE，悬空游标永不自愈 = 永久全量未读）→ 推进；③ DB 内行值比较
+ * (created_at, id) 严格更新 → 推进（沿用 markAsRead 精度教训：禁止
+ * JS Date 比较，微秒精度只在 DB 内可靠）；④ ELSE 保留旧值（防同一
+ * 发送者并发两条消息时游标回退）。仅推进发送者本人行，不影响其他参与者。
  */
 const AUTO_JOIN_PARTICIPANT_SQL = `
-  INSERT INTO topic_participants (topic_id, participant_id, role, status, joined_at)
-  VALUES ($1, $2, 'member', 'active', now())
+  INSERT INTO topic_participants (topic_id, participant_id, role, status, joined_at, last_read_message_id)
+  VALUES ($1, $2, 'member', 'active', now(), $3)
   ON CONFLICT (topic_id, participant_id) DO UPDATE SET
     status = CASE WHEN topic_participants.status IN ('invited', 'left')
                   THEN 'active' ELSE topic_participants.status END,
     joined_at = CASE WHEN topic_participants.status IN ('invited', 'left')
-                     THEN now() ELSE topic_participants.joined_at END
+                     THEN now() ELSE topic_participants.joined_at END,
+    last_read_message_id = CASE
+      WHEN topic_participants.last_read_message_id IS NULL THEN $3
+      WHEN NOT EXISTS (SELECT 1 FROM messages o
+                       WHERE o.id = topic_participants.last_read_message_id
+                         AND o.deleted_at IS NULL) THEN $3
+      WHEN (SELECT (n.created_at, n.id) FROM messages n WHERE n.id = $3)
+         > (SELECT (o.created_at, o.id) FROM messages o
+            WHERE o.id = topic_participants.last_read_message_id) THEN $3
+      ELSE topic_participants.last_read_message_id
+    END
 `;
 
 @Injectable()
@@ -158,6 +190,7 @@ export class TopicService {
     private readonly dataSource: DataSource,
     private readonly ownerProxy: OwnerProxyService,
     private readonly actorProfileService: ActorProfileService,
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -412,6 +445,23 @@ export class TopicService {
       });
       const savedTopic = (await this.topicRepo.save(topic)) as unknown as Topic;
 
+      // 审计（Phase 2）：CREATE + topic；actor=creator；newData 白名单
+      // {topicId, title, visibility?}（决策 6；description/agenda/settings 不入）
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'topic',
+        entityId: savedTopic.id,
+        actorId: creatorId,
+        newData: {
+          topicId: savedTopic.id,
+          title: savedTopic.title,
+          ...(savedTopic.settings?.visibility !== undefined && {
+            visibility: savedTopic.settings.visibility,
+          }),
+        },
+        source: 'api',
+      });
+
       // Add creator as participant（creator 即 active，显式写 joinedAt；
       // DB DEFAULT NOW() 已移除，active 行必须由应用写入 joinedAt）
       const participant = this.participantRepo.create({
@@ -501,6 +551,23 @@ export class TopicService {
         return { savedTopic: saved };
       });
 
+      // 审计（Phase 2）：幂等键路径的真实写成功后记（replay 分支不记——决策 2
+      // 「幂等 replay 不重复记」）；载荷与无幂等键路径一致
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'topic',
+        entityId: savedTopic.id,
+        actorId: creatorId,
+        newData: {
+          topicId: savedTopic.id,
+          title: savedTopic.title,
+          ...(savedTopic.settings?.visibility !== undefined && {
+            visibility: savedTopic.settings.visibility,
+          }),
+        },
+        source: 'api',
+      });
+
       return savedTopic;
     } catch (err: unknown) {
       const pgErr = err as { code?: string; constraint?: string };
@@ -564,12 +631,15 @@ export class TopicService {
       // New IDs not in current: insert invited rows（有意不写 joinedAt，激活时才写入）
       const toAdd = [...newSet].filter((aid) => !currentSet.has(aid) && !existingIds.has(aid));
       if (toAdd.length > 0) {
+        // 未读游标初始化（v1.69 D3）：受邀时刻起算未读，邀请前历史不计
+        const inviteAnchor = await this.findLatestMessageId(id);
         const rows = toAdd.map((agentId) =>
           this.participantRepo.create({
             topicId: id,
             participantId: agentId,
             role: TopicParticipantRole.MEMBER,
             status: ParticipantStatus.INVITED,
+            lastReadMessageId: inviteAnchor,
           }),
         );
         await this.participantRepo.save(rows);
@@ -616,7 +686,26 @@ export class TopicService {
     return this.topicRepo.save(topic);
   }
 
-  async join(topicId: string, participantId: string, participantType: ActorType) {
+  /**
+   * 加入话题（参与者激活：invited→active / left→re-join / 新行创建）
+   *
+   * 审计分层（plan shadowcat-sunspot-catwoman 决策 2）：join 有内部调用方
+   * （roundtable 的 ensureSeatActorJoined / sendSystemMessage 复用本通道，均带
+   * isActiveParticipant 幂等前置——仅在真实加入时触发）→ service 层插桩，
+   * controller 层会漏掉圆桌全部自动加入。
+   *
+   * @param topicId 话题 ID
+   * @param participantId 加入者 actor ID
+   * @param participantType 加入者类型（human/agent/system）
+   * @param operatorActorId 操作者 actor ID（审计用；invite-user 场景=操作 admin/creator，
+   *                        缺省 = participantId——自己加入/圆桌自动加入语义正确）
+   */
+  async join(
+    topicId: string,
+    participantId: string,
+    participantType: ActorType,
+    operatorActorId?: string,
+  ) {
     const topic = await this.topicRepo.findOne({ where: { id: topicId } });
     if (!topic)
       throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
@@ -645,6 +734,14 @@ export class TopicService {
         joinedAt: new Date(),
       });
     }
+
+    // 未读游标初始化（v1.69 未读游标语义修正 D2）：激活时游标为 null
+    // （全新行 / legacy invited·left 行）→ 初始化为当前最新消息，未读只反映
+    // "加入之后"的增量，历史考古走消息分页/搜索；游标非 null（re-join 或
+    // invite 时已初始化）→ 保留——离开/受邀期间的消息仍是未读，信号语义正确。
+    if (tp.lastReadMessageId == null) {
+      tp.lastReadMessageId = await this.findLatestMessageId(topicId);
+    }
     await this.participantRepo.save(tp);
 
     await this.eventService.create({
@@ -657,7 +754,34 @@ export class TopicService {
       payload: { participantId, joinedAt: tp.joinedAt },
     });
 
+    // 审计（Phase 2）：CREATE + topic_participant；actor=操作者（invite-user 由
+    // controller 传操作 admin/creator，缺省=participantId）；newData {topicId, participantId}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'topic_participant',
+      entityId: participantId,
+      actorId: operatorActorId ?? participantId,
+      newData: { topicId, participantId },
+      source: 'api',
+    });
+
     return { topicId, participantId, joinedAt: tp.joinedAt };
+  }
+
+  /**
+   * 查话题当前最新消息 id（全序 created_at DESC, id DESC LIMIT 1），无消息返回 null。
+   *
+   * 用途（v1.69 未读游标语义修正）：参与者行创建/激活时的游标初始化——
+   * join / inviteAgent / addEditor / update invitedAgentIds 四处复用，
+   * 语义统一为「未读 = 进入房间之后的增量」。
+   */
+  private async findLatestMessageId(topicId: string): Promise<string | null> {
+    const latest = await this.messageRepo.findOne({
+      where: { topicId },
+      order: { createdAt: 'DESC', id: 'DESC' },
+      select: ['id'],
+    });
+    return latest?.id ?? null;
   }
 
   /**
@@ -765,6 +889,17 @@ export class TopicService {
       actorId: participantId,
       actorType: participantType,
       payload: { participantId, removedBy: actorId, leftAt: tp.leftAt },
+    });
+
+    // 审计（Phase 2）：DELETE + topic_participant（kick）；actor=操作者（actorId 参数，
+    // service 层插桩）；newData {topicId, participantId}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic_participant',
+      entityId: participantId,
+      actorId,
+      newData: { topicId, participantId },
+      source: 'api',
     });
 
     return { topicId, participantId, leftAt: tp.leftAt };
@@ -1073,12 +1208,24 @@ export class TopicService {
 
         // 自动 join（事务内，原子条件 upsert 防 PK 冲突 23505；
         // 不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释）
-        await manager.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId]);
+        // $3=savedMsg.id：发送即已读，发送者游标推进到本条消息（同事务内可见）
+        await manager.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId, savedMsg.id]);
 
         // topic 统计（message_count / last_message_at）由 DB trigger
         // trg_topics_message_stats 维护，应用层不写，避免双写。
 
         return { saved: savedMsg };
+      });
+
+      // 审计（Phase 2）：幂等键路径的真实写成功后记（replay 分支不记——决策 2
+      // 「幂等 replay 不重复记」）；载荷与 sendMessageInternal 一致
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'message',
+        entityId: saved.id,
+        actorId: senderId,
+        newData: { messageId: saved.id, topicId, topicTitle: topic.title },
+        source: 'api',
       });
 
       // 事务成功后执行副作用（更新 Agent 活跃时间、触发事件）
@@ -1156,9 +1303,23 @@ export class TopicService {
     const savedRaw = await this.messageRepo.save(message);
     const saved = Array.isArray(savedRaw) ? savedRaw[0] : savedRaw;
 
+    // 审计（Phase 2）：CREATE + message；service 层（本方法是全仓唯一
+    // messageRepo.create 点，roundtable 经它写座位/系统消息——controller 层会漏掉
+    // 圆桌全部写，plan 决策 2）；newData 契约 = {messageId, topicId, topicTitle(快照)}
+    // ——content 显式黑名单（决策 6），正文永不入审计
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'message',
+      entityId: saved.id,
+      actorId: senderId,
+      newData: { messageId: saved.id, topicId, topicTitle: topic.title },
+      source: 'api',
+    });
+
     // --- 4. 自动 join（原子条件 upsert 防并发 PK 冲突 23505；
     //         不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释） ---
-    await this.participantRepo.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId]);
+    // $3=saved.id：发送即已读，发送者游标推进到本条消息
+    await this.participantRepo.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId, saved.id]);
 
     // --- 5. topic 统计由 DB trigger trg_topics_message_stats 维护，应用层不写 ---
 
@@ -1479,6 +1640,18 @@ export class TopicService {
       });
     }
     await this.messageRepo.softRemove(message);
+
+    // 审计（Phase 2）：DELETE + message；actor=删除者（sender 本人）；newData 白名单
+    // {messageId, topicId}（决策 6——content 黑名单不入）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'message',
+      entityId: messageId,
+      actorId,
+      newData: { messageId, topicId },
+      source: 'api',
+    });
+
     return { messageId, deleted: true };
   }
 
@@ -1529,11 +1702,13 @@ export class TopicService {
       await this.participantRepo.save(tp);
     } else {
       // No row: insert new invited row（有意不写 joinedAt，激活时才写入）
+      // 未读游标初始化（v1.69 D3）：受邀时刻起算未读，邀请前历史不计
       const newTp = this.participantRepo.create({
         topicId: id,
         participantId: agentId,
         role: TopicParticipantRole.MEMBER,
         status: ParticipantStatus.INVITED,
+        lastReadMessageId: await this.findLatestMessageId(id),
       });
       await this.participantRepo.save(newTp);
     }
@@ -1605,12 +1780,14 @@ export class TopicService {
     } else {
       // 无行：新建 editor + invited 行（D4：invited 未 join 的 editor 可直接编辑，
       // 与 hasTopicAccess 的 invited+active 语义一致，不强制先 join）
+      // 未读游标初始化（v1.69 D3）：受邀时刻起算未读，邀请前历史不计
       const newTp = this.participantRepo.create({
         topicId: id,
         participantId: agentId,
         participantType: ActorType.AGENT,
         role: TopicParticipantRole.EDITOR,
         status: ParticipantStatus.INVITED,
+        lastReadMessageId: await this.findLatestMessageId(id),
       });
       await this.participantRepo.save(newTp);
     }

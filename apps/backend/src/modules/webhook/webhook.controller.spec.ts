@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import { Test, TestingModule } from '@nestjs/testing';
 import { WebhookController } from './webhook.controller';
 import { WebhookService } from './webhook.service';
+import { AuditService } from '../audit/audit.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { ROLES_KEY } from '../../common/decorators/roles.decorator';
@@ -10,17 +11,22 @@ import { UserRole } from '@agent-chamber/shared';
 describe('WebhookController', () => {
   let controller: WebhookController;
   let service: typeof mockService;
+  let auditService: { log: jest.Mock };
 
   const mockService = {
     findAll: jest.fn(),
     findOne: jest.fn(),
     test: jest.fn(),
   };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   beforeEach(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [WebhookController],
-      providers: [{ provide: WebhookService, useValue: mockService }],
+      providers: [
+        { provide: WebhookService, useValue: mockService },
+        { provide: AuditService, useValue: mockAuditService },
+      ],
     })
       .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
@@ -30,6 +36,7 @@ describe('WebhookController', () => {
 
     controller = moduleRef.get<WebhookController>(WebhookController);
     service = moduleRef.get<WebhookService>(WebhookService) as unknown as typeof service;
+    auditService = moduleRef.get<AuditService>(AuditService) as unknown as { log: jest.Mock };
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -61,8 +68,17 @@ describe('WebhookController', () => {
       const result = { success: true, message: 'Webhook test simulated', log: { id: 'wh-test' } };
       service.test.mockResolvedValue(result);
 
-      expect(await controller.test(dto)).toBe(result);
+      expect(await controller.test(dto, 'admin-1')).toBe(result);
       expect(service.test).toHaveBeenCalledWith(dto);
+      // 审计（Phase 2）：CREATE + webhook_delivery；newData 只记域名部分，payload 不入
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'webhook_delivery',
+        entityId: 'wh-test',
+        actorId: 'admin-1',
+        newData: { deliveryId: 'wh-test', targetUrl: 'example.com' },
+        source: 'api',
+      });
     });
   });
 

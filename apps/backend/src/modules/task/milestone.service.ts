@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.3 (Board / Task)
  *   - 补充: docs/api-definition.md §7.22-7.26 Milestones、docs/spec.md §3.2 MilestoneStatus
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（milestone CRUD 实住
+ *     task 模块；service 层插桩——四方法均带 actor 参数且实体已加载，newData 白名单
+ *     {milestoneId, name, version?, status?}，决策 6）
  *
  * [踩坑索引] B-50(列表权限过滤) 方案A(creatorId 自管权限) 去嵌套tasks(响应精简) Batch1(topic→board+P2校验) B1-Release(状态机+deployed端点)
  *
@@ -64,6 +67,8 @@ import {
 } from './dto';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '@agent-chamber/shared';
 
 /**
  * Release 专属态（version 非空里程碑可落；普通里程碑禁落）。
@@ -119,6 +124,7 @@ export class MilestoneService {
     private readonly accessQuery: AccessQueryService,
     private readonly resourceValidator: ResourceValidator,
     private readonly permService: PermissionService,
+    private readonly auditService: AuditService,
   ) {}
 
   async create(dto: CreateMilestoneDto, actor: UnifiedActor) {
@@ -164,7 +170,26 @@ export class MilestoneService {
     // CreateMilestoneDto 未声明该字段，多传会被 400 拒绝。
     const milestone = this.milestoneRepo.create({ ...dto, status, creatorId: actor.id });
     try {
-      return await this.milestoneRepo.save(milestone);
+      const saved = await this.milestoneRepo.save(milestone);
+      // 审计（Phase 2）：CREATE + milestone；service 层（actor 参数现成）；
+      // newData 白名单 {milestoneId, name, version?, status?}（决策 6；body/deployMeta 不入）
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'milestone',
+        entityId: saved.id,
+        actorId: actor.id,
+        newData: {
+          milestoneId: saved.id,
+          name: saved.name,
+          ...(saved.version !== undefined &&
+            saved.version !== null && {
+              version: saved.version,
+            }),
+          ...(saved.status !== undefined && { status: saved.status }),
+        },
+        source: 'api',
+      });
+      return saved;
     } catch (err: unknown) {
       // 同 board 内 version 重复 → 部分唯一索引 23505 → 409（不同 board 同 version 不受影响）
       throw this.translateVersionConflict(err);
@@ -389,7 +414,23 @@ export class MilestoneService {
       milestone.verifiedAt = new Date();
     }
     try {
-      return await this.milestoneRepo.save(milestone);
+      const saved = await this.milestoneRepo.save(milestone);
+      // 审计（Phase 2）：UPDATE + milestone；newData 白名单 {milestoneId, name?,
+      // version?, status?}（决策 6；body/deployMeta 不入）
+      await this.auditService.log({
+        action: AuditAction.UPDATE,
+        entityType: 'milestone',
+        entityId: saved.id,
+        actorId: actor.id,
+        newData: {
+          milestoneId: saved.id,
+          ...(dto.name !== undefined && { name: saved.name }),
+          ...(dto.version !== undefined && { version: saved.version }),
+          ...(dto.status !== undefined && { status: saved.status }),
+        },
+        source: 'api',
+      });
+      return saved;
     } catch (err: unknown) {
       // 同 board 内 version 重复（补挂/改 version 触发唯一索引）→ 409
       throw this.translateVersionConflict(err);
@@ -498,6 +539,16 @@ export class MilestoneService {
 
     try {
       const saved = await this.milestoneRepo.save(milestone);
+      // 审计（Phase 2）：UPDATE + milestone（deployed 端点）；newData 白名单
+      // {milestoneId, name, status: deployed}（决策 6；deployMeta 不入）
+      await this.auditService.log({
+        action: AuditAction.UPDATE,
+        entityType: 'milestone',
+        entityId: saved.id,
+        actorId: actor.id,
+        newData: { milestoneId: saved.id, name: saved.name, status: MilestoneStatus.DEPLOYED },
+        source: 'api',
+      });
       // 响应 = 详情投影（同 findOne：含 stats，含 deployMeta/body 全量）
       const stats = await this.getStats(saved.id);
       return { ...saved, stats };
@@ -547,6 +598,15 @@ export class MilestoneService {
     await this.taskRepo.update({ milestoneId: id }, { milestoneId: null });
 
     await this.milestoneRepo.remove(milestone);
+    // 审计（Phase 2）：DELETE + milestone；newData 白名单 {milestoneId, name}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'milestone',
+      entityId: id,
+      actorId: actor.id,
+      newData: { milestoneId: id, name: milestone.name },
+      source: 'api',
+    });
     return true;
   }
 }

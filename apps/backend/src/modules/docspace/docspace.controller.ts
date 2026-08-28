@@ -5,7 +5,11 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.3 (W2 空间/分类/成员 API)
-
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（space/member 写操作
+ *     controller 层插桩决策 2——service 方法均无 actor 参数且仅 controller 调用；
+ *     createCategory 在 service 层（importBundle 内部调用）；importBundle 不单独记
+ *     （批量回导，构成写各自落行）；entityType=doc_space/doc_space_member）
+ *
  * [踩坑索引] OWNER-PROXY(creator硬校验+owner代理) DOCSPACE-PERM(update字段级分权+creator转让)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #21(双层校验) #22(findOne必须判空)
@@ -69,7 +73,8 @@ import {
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { DocSpace } from '../../database/entities/doc-space.entity';
-import { ErrorCode, UserRole } from '@agent-chamber/shared';
+import { ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('DocSpaces')
 @Controller('doc-spaces')
@@ -80,6 +85,7 @@ export class DocSpaceController {
     private readonly boardService: BoardService,
     private readonly permService: PermissionService,
     private readonly ownerProxy: OwnerProxyService,
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -123,7 +129,18 @@ export class DocSpaceController {
       await this.permService.ensureCan(board, actor, 'read');
     }
 
-    return this.docSpaceService.create(actor, dto);
+    const result = await this.docSpaceService.create(actor, dto);
+    // 审计（Phase 2）：CREATE + doc_space；controller 层（create 无 actor 参数，
+    // 决策 2）；newData 白名单 {spaceId, name}（决策 6——description/settings 不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_space',
+      entityId: result.id,
+      actorId: actor.id,
+      newData: { spaceId: result.id, name: result.name },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -229,7 +246,21 @@ export class DocSpaceController {
       await this.permService.ensureCan(board, actor, 'read');
     }
 
-    return this.docSpaceService.update(id, dto);
+    const result = await this.docSpaceService.update(id, dto);
+    // 审计（Phase 2）：UPDATE + doc_space；newData 白名单 {spaceId, name?}（决策 6
+    // ——description/overviewFilter/settings 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_space',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        spaceId: id,
+        ...(dto.name !== undefined && { name: dto.name }),
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -256,7 +287,18 @@ export class DocSpaceController {
   ) {
     const space = await this.docSpaceService.findById(id);
     await this.permService.ensureCan(space, actor, 'write');
-    return this.docSpaceService.updateRepoManifest(id, dto);
+    const result = await this.docSpaceService.updateRepoManifest(id, dto);
+    // 审计（Phase 2）：UPDATE + doc_space（repo-manifest）；newData 白名单
+    // {spaceId, name}（决策 6——manifest 文件清单不入，可能巨大）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_space',
+      entityId: id,
+      actorId: actor.id,
+      newData: { spaceId: id, name: space.name },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -281,7 +323,17 @@ export class DocSpaceController {
       });
     }
 
-    return this.docSpaceService.remove(id, actor);
+    const result = await this.docSpaceService.remove(id, actor);
+    // 审计（Phase 2）：DELETE + doc_space；newData 白名单 {spaceId, name}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'doc_space',
+      entityId: id,
+      actorId: actor.id,
+      newData: { spaceId: id, name: space.name },
+      source: 'api',
+    });
+    return result;
   }
 
   // ─── Members ────────────────────────────────────────────────
@@ -308,7 +360,18 @@ export class DocSpaceController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.docSpaceService.inviteAgent(id, dto.agentId);
+    const result = await this.docSpaceService.inviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + doc_space_member（invite-agent）；controller 层
+    // （inviteAgent 无 actor 参数，决策 2）；newData {spaceId, actorId}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_space_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { spaceId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -333,7 +396,17 @@ export class DocSpaceController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.docSpaceService.uninviteAgent(id, dto.agentId);
+    const result = await this.docSpaceService.uninviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + doc_space_member（uninvite-agent）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'doc_space_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { spaceId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -358,7 +431,18 @@ export class DocSpaceController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.docSpaceService.addEditor(id, dto.agentId);
+    const result = await this.docSpaceService.addEditor(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + doc_space_member（add-editor——新建 editor 行或
+    // member→editor 升级均属「授予 editor 角色」写入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_space_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { spaceId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -383,7 +467,17 @@ export class DocSpaceController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.docSpaceService.removeEditor(id, dto.agentId);
+    const result = await this.docSpaceService.removeEditor(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + doc_space_member（remove-editor）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'doc_space_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { spaceId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -425,6 +519,16 @@ export class DocSpaceController {
     }
 
     const updated = await this.docSpaceService.transferCreator(id, dto.newCreatorId);
+    // 审计（Phase 2）：UPDATE + doc_space（transfer-creator）；newData 白名单
+    // {spaceId, newCreatorId}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_space',
+      entityId: id,
+      actorId: actor.id,
+      newData: { spaceId: id, newCreatorId: dto.newCreatorId },
+      source: 'api',
+    });
     // 返回 enrich 后的 space（与 findOne 同款响应形状，前端 invalidate 后可直读）
     return this.docSpaceService.enrich(updated);
   }

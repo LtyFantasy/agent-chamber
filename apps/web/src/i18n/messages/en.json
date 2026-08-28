@@ -31,6 +31,7 @@
     "search": "Search",
     "settings": "Settings",
     "monitoring": "Monitoring",
+    "logs": "Activity Logs",
     "skill": "Skill",
     "openMenu": "Open menu",
     "closeMenu": "Close menu",
@@ -878,6 +879,57 @@
       "entityId": "Entity ID",
       "actor": "Actor",
       "ipAddress": "IP Address"
+    }
+  },
+  "logs": {
+    "title": "Activity Logs",
+    "description": "Query platform write operations by actor, entity, action and time range",
+    "scope": {
+      "admin": "Admin view: all actors",
+      "restricted": "Restricted: {count} actor(s) visible",
+      "scopeHint": "Self + owned agents (incl. deleted) for non-admin users"
+    },
+    "filter": {
+      "actor": "Actor",
+      "actorPlaceholder": "All actors",
+      "actorSearchPlaceholder": "Search user or agent…",
+      "actorEmpty": "No matching actors",
+      "actorClear": "Clear actor filter",
+      "actorAgentHint": "agent",
+      "entityType": "Entity type",
+      "entityTypeAll": "All types",
+      "action": "Action",
+      "actionAll": "All actions",
+      "timeRange": "Time range",
+      "timePresets": {
+        "1h": "Last 1 hour",
+        "24h": "Last 24 hours",
+        "7d": "Last 7 days",
+        "custom": "Custom"
+      },
+      "from": "From",
+      "to": "To",
+      "reset": "Reset"
+    },
+    "table": {
+      "title": "Logs",
+      "time": "Time",
+      "actor": "Actor",
+      "action": "Action",
+      "entity": "Entity",
+      "ip": "IP address",
+      "expand": "View details"
+    },
+    "systemActor": "System",
+    "deletedActor": "deleted",
+    "unknownActor": "Unknown",
+    "noLogs": "No logs",
+    "noLogsDesc": "No activity logs match the current filters. Note: logging is best-effort — an empty result does not mean nothing happened.",
+    "pagination": "Page {page} / {totalPages}, {pageSize} per page, {total} total",
+    "detail": {
+      "diff": "Diff",
+      "newData": "New data",
+      "oldData": "Old data"
     }
   },
   "search": {

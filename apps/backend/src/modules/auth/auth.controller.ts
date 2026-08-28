@@ -5,6 +5,8 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/api-definition.md §3. Auth
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（register 的审计
+ *     actor=操作 admin 从 controller 传入）
  *
  * [踩坑索引] （暂无重大踩坑）
  *
@@ -26,6 +28,8 @@ import { AuthService } from './auth.service';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
 import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { CurrentActor } from '../../common/decorators/current-actor.decorator';
+import { UnifiedActor } from '../../common/types/actor.types';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
@@ -63,8 +67,9 @@ export class AuthController {
   @ApiResponse({ status: 403, description: 'Forbidden — admin only' })
   @ApiResponse({ status: 409, description: 'Email already registered' })
   @ApiResponse({ status: 429, description: 'Rate limit exceeded (5 req/min per IP)' })
-  async register(@Body() dto: RegisterDto) {
-    return this.authService.register(dto);
+  async register(@Body() dto: RegisterDto, @CurrentActor() actor: UnifiedActor) {
+    // 审计 actor=操作 admin（决策 8，从 controller 传入 service）
+    return this.authService.register(dto, actor?.id);
   }
 
   @Public()

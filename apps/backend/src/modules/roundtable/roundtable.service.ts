@@ -81,6 +81,7 @@ import {
   ParticipantStatus,
   PaginatedResponse,
   UserRole,
+  AuditAction,
 } from '@agent-chamber/shared';
 import {
   RULE_HEADER_VERSION,
@@ -112,6 +113,7 @@ import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { AuditService } from '../audit/audit.service';
 import { RunnerRegistryService } from './runner-registry.service';
 import {
   CreateSeatDto,
@@ -406,6 +408,7 @@ export class RoundtableService {
     private readonly registry: RunnerRegistryService,
     private readonly ownerProxy: OwnerProxyService,
     private readonly actorProfileService: ActorProfileService,
+    private readonly auditService: AuditService,
   ) {}
 
   // ─────────────────────────── 座位 CRUD（M1 最小 REST） ───────────────────────────
@@ -508,6 +511,21 @@ export class RoundtableService {
     // 天然免疫递归。失败不阻断建座（记日志；join 失败=座位仍创建，私密桌发言受限
     // 会在运行期暴露）。
     await this.ensureSeatActorJoined(topic, saved.label, bindActorId);
+    // 审计（Phase 2）：CREATE + roundtable_seat；service 层（actor 参数现成）；
+    // newData 白名单 {seatId, topicId, label, bindActorId}（决策 6——config 不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'roundtable_seat',
+      entityId: saved.id,
+      actorId: actor.id,
+      newData: {
+        seatId: saved.id,
+        topicId: saved.topicId,
+        label: saved.label,
+        bindActorId,
+      },
+      source: 'api',
+    });
     return saved;
   }
 
@@ -702,6 +720,16 @@ export class RoundtableService {
     seat.runnerId = null;
     const saved = await this.seatRepo.save(seat);
     this.logger.log(`座位已移除: seat ${seat.id}（${label}）topic ${seat.topicId}`);
+    // 审计（Phase 2）：DELETE + roundtable_seat（软删 status=removed）；幂等重复
+    // DELETE 提前返回不记；newData 白名单 {seatId, topicId, label}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'roundtable_seat',
+      entityId: seat.id,
+      actorId: actor.id,
+      newData: { seatId: seat.id, topicId: seat.topicId, label },
+      source: 'api',
+    });
     // topic 系统公告（fire-and-forget + 内部自吞，与 emitReceipt 同精神）
     void this.announceSeatRemoved(seat.topicId, label);
     return saved;
@@ -810,6 +838,16 @@ export class RoundtableService {
     } else {
       this.logger.warn(`seat.cancel: seat ${seat.id} 未绑定 runner，下行跳过`);
     }
+    // 审计（Phase 2）：UPDATE + roundtable_seat（cancel——治理动作，不落库但打断
+    // 在跑会话，属真实写语义）；newData 白名单 {seatId, topicId}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'roundtable_seat',
+      entityId: seat.id,
+      actorId: actor.id,
+      newData: { seatId: seat.id, topicId: seat.topicId },
+      source: 'api',
+    });
     return { accepted: true, seatId: seat.id };
   }
 
@@ -1013,6 +1051,21 @@ export class RoundtableService {
     // topic 公告（fire-and-forget + 内部自吞；裁决公告天然 once-per-request，不节流）
     const actorName = actor.name?.trim() ? actor.name : `user-${actor.id.slice(0, 8)}`;
     void this.announceVerdict(request.topicId, seat?.label ?? request.seatId, status, actorName);
+    // 审计（Phase 2）：UPDATE + roundtable_request（审批裁决）；newData 白名单
+    // {requestId, seatId, topicId, status}（决策 6——options/verdictOptionId 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'roundtable_request',
+      entityId: request.id,
+      actorId: actor.id,
+      newData: {
+        requestId: request.id,
+        seatId: request.seatId,
+        topicId: request.topicId,
+        status,
+      },
+      source: 'api',
+    });
     return saved;
   }
 

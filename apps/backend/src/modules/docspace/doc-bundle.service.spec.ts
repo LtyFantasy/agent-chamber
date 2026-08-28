@@ -13,6 +13,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { ActorType, ErrorCode, Visibility } from '@agent-chamber/shared';
 import { DocSpaceService } from './docspace.service';
+import { AuditService } from '../audit/audit.service';
 import { DocService } from './doc.service';
 import { DocRouteService } from './doc-route.service';
 import { DocBundleService } from './doc-bundle.service';
@@ -23,6 +24,7 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 
 const mockActor = { id: 'actor-0001', type: ActorType.HUMAN };
+const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
 function makeSpace(overrides: Partial<DocSpace> = {}): DocSpace {
   return {
@@ -366,12 +368,16 @@ describe('DocBundleService', () => {
 
       // 阶段① categories：创建
       expect(result.categories.summary).toEqual({ total: 1, created: 1, updated: 0, failed: 0 });
-      expect(docspaceService.createCategory).toHaveBeenCalledWith('space-1', {
-        name: 'Arch',
-        slug: 'arch',
-        description: null,
-        sortOrder: 0,
-      });
+      expect(docspaceService.createCategory).toHaveBeenCalledWith(
+        'space-1',
+        {
+          name: 'Arch',
+          slug: 'arch',
+          description: null,
+          sortOrder: 0,
+        },
+        'actor-0001',
+      );
       // 阶段② docs：batchUpsert 收 bundle docs（category/tags 原样透传）
       expect(result.docs.summary).toEqual({
         total: 1,
@@ -443,12 +449,16 @@ describe('DocBundleService', () => {
       // 先导入一次（update 路径）
       const r1 = await service.importBundle('space-1', makeBundle(), mockActor);
       expect(r1.categories.summary).toEqual({ total: 1, created: 0, updated: 1, failed: 0 });
-      expect(docspaceService.updateCategory).toHaveBeenCalledWith('cat-existing', {
-        name: 'Arch',
-        slug: 'arch',
-        description: null,
-        sortOrder: 0,
-      });
+      expect(docspaceService.updateCategory).toHaveBeenCalledWith(
+        'cat-existing',
+        {
+          name: 'Arch',
+          slug: 'arch',
+          description: null,
+          sortOrder: 0,
+        },
+        'actor-0001',
+      );
       expect(docspaceService.createCategory).not.toHaveBeenCalled();
 
       // 歧义：同名两条 → 该条 failed，批次继续（docs/routes 不受影响）
@@ -517,6 +527,7 @@ describe('DocBundleService', () => {
           primaryDocId: 'doc-1',
           codeEntry: 'apps/backend/src/',
         }),
+        'actor-0001',
       );
       expect(docRouteService.create).not.toHaveBeenCalled();
 

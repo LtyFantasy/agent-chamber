@@ -19,6 +19,7 @@ import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import { Message } from '../../database/entities/message.entity';
 import { TaskModule } from '../task/task.module';
 import { EventModule } from '../event/event.module';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { EventModule } from '../event/event.module';
     ]),
     TaskModule,
     EventModule,
+    AuditModule,
   ],
   providers: [BoardService],
   controllers: [BoardController],

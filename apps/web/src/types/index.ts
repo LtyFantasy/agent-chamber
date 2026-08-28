@@ -58,6 +58,13 @@ export { UserRole } from '@agent-chamber/shared';
 
 // 枚举类型
 export { MessageType, BoardMemberRole, ParticipantStatus } from '@agent-chamber/shared';
+// 活动日志（GET /activity-logs，活动日志系统 Phase 4 web 页）
+export type {
+  ActivityLogItem,
+  ActivityLogListResponse,
+  ActivityLogQuery,
+} from '@agent-chamber/shared';
+export { AuditAction } from '@agent-chamber/shared';
 
 // DocSpace Input DTO
 export type {

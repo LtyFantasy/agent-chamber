@@ -67,6 +67,7 @@ import type { RouteHealthService } from '../src/modules/docspace/route-health.se
 import type { AccessQueryService } from '../src/common/services/access-query.service';
 import { ActorProfileService } from '../src/common/services/actor-profile.service';
 import type { ResourceValidator } from '../src/common/resource-validator';
+import type { AuditService } from '../src/modules/audit/audit.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -164,6 +165,11 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       ds.getRepository(Agent),
       ds.getRepository(User),
     );
+    // 统一批 A2：DocSpaceService/DocRouteService 构造新增 auditService（本套件断言不触达
+    // 审计行，log 打桩防 createCategory/update 等写路径抛错）
+    const auditServiceStub = {
+      log: jest.fn().mockResolvedValue(undefined),
+    } as unknown as AuditService;
 
     docspaceService = new DocSpaceService(
       ds.getRepository(DocSpace),
@@ -182,6 +188,7 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       resourceValidatorStub,
       eventStub,
       actorProfileService,
+      auditServiceStub,
     );
     docService = new DocService(
       ds.getRepository(Doc),
@@ -199,6 +206,7 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       ds.getRepository(DocRoute),
       ds.getRepository(Doc),
       docService,
+      auditServiceStub,
     );
     bundleService = new DocBundleService(
       docspaceService,

@@ -27,6 +27,7 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { EventService } from '../event/event.service';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+import { AuditService } from '../audit/audit.service';
 
 describe('DocSpaceService', () => {
   let service: DocSpaceService;
@@ -46,6 +47,7 @@ describe('DocSpaceService', () => {
   let resourceValidator: { exists: jest.Mock; existsMany: jest.Mock };
   let eventService: { create: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const nonAdminActor = { id: 'user-2', type: ActorType.HUMAN, role: UserRole.EDITOR };
@@ -278,6 +280,7 @@ describe('DocSpaceService', () => {
       resourceValidator as unknown as ResourceValidator,
       eventService as unknown as EventService,
       mockActorProfileService as unknown as ActorProfileService,
+      mockAuditService as unknown as AuditService,
     );
   });
 

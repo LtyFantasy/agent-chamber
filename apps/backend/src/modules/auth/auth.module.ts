@@ -35,6 +35,7 @@ import { ApiKey } from '../../database/entities/api-key.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { ApiKeyGuard } from '../../common/guards/api-key.guard';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AuditModule } from '../audit/audit.module';
 
 @Global()
 @Module({
@@ -49,6 +50,8 @@ import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
       }),
       inject: [ConfigService],
     }),
+    // 活动日志插桩（plan shadowcat-sunspot-catwoman 决策 8）：login/logout/register
+    AuditModule,
   ],
   providers: [
     AuthService,

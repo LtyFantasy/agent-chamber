@@ -56,9 +56,10 @@ import { recheckDocLinkHealthTool } from './tools/recheck-doc-link-health';
 import { patchDocMetadataTool } from './tools/patch-doc-metadata';
 import { appendDocTool } from './tools/append-doc';
 import { patchTaskDescriptionTool } from './tools/patch-task-description';
+import { getMyActivityTool } from './tools/get-my-activity';
 
 /**
- * 32 个业务语义化高层 MCP tools
+ * 33 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号；新工具追加在尾部，不打乱既有编号）：
@@ -96,7 +97,12 @@ import { patchTaskDescriptionTool } from './tools/patch-task-description';
  * ㉜ patch_task_description
  * （消费者反馈批 5bc4a570：任务描述局部 patch——match 模式精确串替换 + 乐观锁
  * （expectedDescriptionHash）+ 幂等键，多 Agent 并发改描述首选通道；
- * 对应 REST PATCH /tasks/:id/description）
+ * 对应 REST PATCH /tasks/:id/description）→
+ * ㉝ get_my_activity
+ * （活动日志系统 Phase 3（plan shadowcat-sunspot-catwoman）：查询当前 actor 的
+ * 审计时间线——自证「我的 key 做了什么」；entityType/action/from/to 过滤 +
+ * limit 默认 20 clamp [1,50]；响应带 total/hasNext 指导翻页；防误导两句
+ * （覆盖起点 + 空结果≠未发生）固化在 description；对应 REST GET /activity-logs）
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -131,4 +137,5 @@ export const customTools: CustomTool[] = [
   patchDocMetadataTool,
   appendDocTool,
   patchTaskDescriptionTool,
+  getMyActivityTool,
 ];

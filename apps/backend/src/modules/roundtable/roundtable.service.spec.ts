@@ -37,6 +37,7 @@ import { TopicService } from '../topic/topic.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { RunnerRegistryService } from './runner-registry.service';
+import { AuditService } from '../audit/audit.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 
@@ -179,6 +180,7 @@ describe('RoundtableService', () => {
   let registry: { sendToRunner: jest.Mock; isRunnerOnline: jest.Mock };
   let ownerProxy: { isOwnerProxy: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   beforeEach(async () => {
     seatQb = {
@@ -252,6 +254,7 @@ describe('RoundtableService', () => {
 
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
+        { provide: AuditService, useValue: mockAuditService },
         RoundtableService,
         { provide: getRepositoryToken(RoundtableSeat), useValue: seatRepo },
         { provide: getRepositoryToken(RoundtableRunner), useValue: runnerRepo },
@@ -2638,6 +2641,15 @@ describe('RoundtableService', () => {
         lastInjectSeq: '0',
       }),
     );
+    // 审计（Phase 2）：CREATE + roundtable_seat
+    expect(mockAuditService.log).toHaveBeenCalledWith({
+      action: 'create',
+      entityType: 'roundtable_seat',
+      entityId: saved.id,
+      actorId: 'agent-1',
+      newData: { seatId: saved.id, topicId: 'topic-1', label: 'kimi-1', bindActorId: 'agent-1' },
+      source: 'api',
+    });
   });
 
   it('createSeat：显式 batchWindowMs → 原样落 config（0=直通 M1 行为）', async () => {

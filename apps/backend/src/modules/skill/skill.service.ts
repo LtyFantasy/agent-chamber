@@ -11,7 +11,8 @@
  * [铁律关联] #4(文档优先) #10(工具优先) #17(测试契约)
  *
  * [详细踩坑]（最多 5 条）
- *   1. frontmatter `internal: true` = 项目内部 Skill（如 agent-code-hooks），
+ *   1. frontmatter `internal: true` = 项目内部 Skill（历史例：agent-code-hooks，
+ *      2026-08-28 退役，接替者 agent-code-doc-hooks 为公开分发），
  *      列表过滤 + 全部直访端点（详情/raw/subs）统一 404，勿只过滤 findAll——
  *      否则 `/skills/:name/subs` 子路径端点可绕过
  *
@@ -44,7 +45,8 @@ const SKILL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
  * 并向 Controller 提供列表/详情/子 Skill/原始内容四种能力。
  *
  * 分发边界：
- * - frontmatter `internal: true` 的 Skill 为项目内部 Skill（如 agent-code-hooks，
+ * - frontmatter `internal: true` 的 Skill 为项目内部 Skill（历史例：agent-code-hooks，
+ *   2026-08-28 退役；现行 agent-code-doc-hooks 公开分发并随 chamber 发布携带），
  *   仅服务本仓开发流程），不参与对外分发——列表过滤 + 所有直访端点统一 404
  *   （与不存在的 Skill 同响应，不泄露其存在性）。
  *

@@ -20,6 +20,7 @@ import { AgentStatus, ActorType } from '@agent-chamber/shared';
 import { buildEnvelope } from '@agent-chamber/roundtable-protocol';
 import { RunnerGateway } from './runner.gateway';
 import { RunnerRegistryService } from './runner-registry.service';
+import { AuditService } from '../audit/audit.service';
 import { RoundtableService } from './roundtable.service';
 import { ApiKeyAuthService } from '../../common/services/api-key-auth.service';
 import { RoundtableRunner } from '../../database/entities/roundtable-runner.entity';
@@ -139,6 +140,7 @@ describe('RunnerGateway (integration, real ws client)', () => {
   let app: INestApplication;
   let port: number;
   let mocks: MockSet;
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
   /** buildApp 创建的测试模块（M4b-1：cancel 下行信封测试经 service 直调触发，断言信封经真实 ws 到达） */
   let moduleRef: TestingModule;
 
@@ -199,6 +201,7 @@ describe('RunnerGateway (integration, real ws client)', () => {
     });
     const moduleRefBuilt: TestingModule = await Test.createTestingModule({
       providers: [
+        { provide: AuditService, useValue: mockAuditService },
         RunnerGateway,
         RunnerRegistryService,
         RoundtableService,

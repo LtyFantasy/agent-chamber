@@ -4,13 +4,22 @@ import { TopicService } from './topic.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { TopicStatus, ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
+import {
+  TopicStatus,
+  ActorType,
+  UserRole,
+  ErrorCode,
+  Visibility,
+  AuditAction,
+} from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 describe('TopicController', () => {
   let controller: TopicController;
   let service: typeof mockService;
   let permService: typeof mockPermService;
   let ownerProxy: { isOwnerProxy: jest.Mock };
+  let auditService: { log: jest.Mock };
 
   // admin（全局 bypass，沿用历史 mockActor 语义）
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
@@ -50,6 +59,8 @@ describe('TopicController', () => {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
 
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [TopicController],
@@ -60,6 +71,7 @@ describe('TopicController', () => {
           provide: OwnerProxyService,
           useValue: { isOwnerProxy: jest.fn().mockResolvedValue(false) },
         },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -74,6 +86,7 @@ describe('TopicController', () => {
     ownerProxy = module.get<OwnerProxyService>(OwnerProxyService) as unknown as {
       isOwnerProxy: jest.Mock;
     };
+    auditService = module.get<AuditService>(AuditService) as unknown as { log: jest.Mock };
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -138,6 +151,15 @@ describe('TopicController', () => {
       expect(await controller.update('topic-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'write');
       expect(service.update).toHaveBeenCalledWith('topic-1', dto);
+      // 审计（Phase 2）：UPDATE + topic；newData 白名单（title 变更）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', title: 'Updated Topic' },
+        source: 'api',
+      });
     });
 
     // ─── 字段级分权（D3，v1.46 TOPIC-PERM：内容字段 policy write / 结构字段 creator-only）───
@@ -242,6 +264,15 @@ describe('TopicController', () => {
       expect(await controller.remove('topic-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'delete');
       expect(service.remove).toHaveBeenCalledWith('topic-1');
+      // 审计（Phase 2）：DELETE + topic；newData {topicId, title}
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', title: undefined },
+        source: 'api',
+      });
     });
   });
 
@@ -254,6 +285,15 @@ describe('TopicController', () => {
 
       expect(await controller.close('topic-1', mockActor)).toBe(result);
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.CLOSED);
+      // 审计（Phase 2）：close 无专门枚举 → UPDATE + topic
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', status: TopicStatus.CLOSED },
+        source: 'api',
+      });
     });
 
     it('editor（非 creator 非 admin）close → 403（结构端点收口代表用例）', async () => {
@@ -278,6 +318,15 @@ describe('TopicController', () => {
 
       expect(await controller.pause('topic-1', mockActor)).toBe(result);
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.PAUSED);
+      // 审计（Phase 2）：PAUSE_TOPIC 专用枚举
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.PAUSE_TOPIC,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', status: TopicStatus.PAUSED },
+        source: 'api',
+      });
     });
   });
 
@@ -290,6 +339,15 @@ describe('TopicController', () => {
 
       expect(await controller.resume('topic-1', mockActor)).toBe(result);
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.ACTIVE);
+      // 审计（Phase 2）：RESUME_TOPIC 专用枚举
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.RESUME_TOPIC,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', status: TopicStatus.ACTIVE },
+        source: 'api',
+      });
     });
   });
 
@@ -302,6 +360,15 @@ describe('TopicController', () => {
 
       expect(await controller.archive('topic-1', mockActor)).toBe(result);
       expect(service.changeStatus).toHaveBeenCalledWith('topic-1', TopicStatus.ARCHIVED);
+      // 审计（Phase 2）：archive 无专门枚举 → UPDATE + topic
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', status: TopicStatus.ARCHIVED },
+        source: 'api',
+      });
     });
   });
 
@@ -344,6 +411,15 @@ describe('TopicController', () => {
 
       expect(await controller.leave('topic-1', mockActor)).toBe(result);
       expect(service.leave).toHaveBeenCalledWith('topic-1', mockActor.id, mockActor.type);
+      // 审计（Phase 2）：leave → DELETE + topic_participant；actor=自己
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'topic_participant',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', participantId: 'user-1' },
+        source: 'api',
+      });
     });
   });
 
@@ -449,6 +525,15 @@ describe('TopicController', () => {
 
       expect(await controller.updateAgenda('topic-1', dto, mockActor)).toBe(result);
       expect(service.updateAgenda).toHaveBeenCalledWith('topic-1', dto);
+      // 审计（Phase 2）：UPDATE + topic；agenda 不入白名单 → 只记 {topicId, title}
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'topic',
+        entityId: 'topic-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', title: undefined },
+        source: 'api',
+      });
     });
   });
 
@@ -462,6 +547,15 @@ describe('TopicController', () => {
 
       expect(await controller.inviteAgent('topic-1', dto, mockActor)).toBe(result);
       expect(service.inviteAgent).toHaveBeenCalledWith('topic-1', 'agent-1');
+      // 审计（Phase 2）：invite-agent → CREATE + topic_participant；actor=操作者
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'topic_participant',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', participantId: 'agent-1' },
+        source: 'api',
+      });
     });
 
     it('editor（非 creator 非 admin）invite-agent → 403（成员管理收口代表用例）', async () => {
@@ -500,6 +594,15 @@ describe('TopicController', () => {
 
       expect(await controller.uninviteAgent('topic-1', dto, mockActor)).toBe(result);
       expect(service.uninviteAgent).toHaveBeenCalledWith('topic-1', 'agent-1');
+      // 审计（Phase 2）：uninvite-agent → DELETE + topic_participant
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'topic_participant',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', participantId: 'agent-1' },
+        source: 'api',
+      });
     });
   });
 
@@ -512,7 +615,8 @@ describe('TopicController', () => {
       service.join.mockResolvedValue(result);
 
       expect(await controller.inviteUser('topic-1', dto, mockActor)).toBe(result);
-      expect(service.join).toHaveBeenCalledWith('topic-1', 'user-2', ActorType.HUMAN);
+      // 审计在 service join 层（决策 2）；invite-user 传 operatorActorId=操作者（决策 8）
+      expect(service.join).toHaveBeenCalledWith('topic-1', 'user-2', ActorType.HUMAN, 'user-1');
     });
   });
 
@@ -526,6 +630,15 @@ describe('TopicController', () => {
 
       expect(await controller.uninviteUser('topic-1', dto, mockActor)).toBe(result);
       expect(service.uninviteUser).toHaveBeenCalledWith('topic-1', 'user-2');
+      // 审计（Phase 2）：uninvite-user → DELETE + topic_participant
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'topic_participant',
+        entityId: 'user-2',
+        actorId: 'user-1',
+        newData: { topicId: 'topic-1', participantId: 'user-2' },
+        source: 'api',
+      });
     });
   });
 
@@ -541,6 +654,15 @@ describe('TopicController', () => {
 
       expect(await controller.addEditor('topic-1', dto, creatorActor)).toBe(result);
       expect(service.addEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+      // 审计（Phase 2）：add-editor → CREATE + topic_participant（与 invite 同族）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'topic_participant',
+        entityId: 'agent-2',
+        actorId: 'creator-1',
+        newData: { topicId: 'topic-1', participantId: 'agent-2' },
+        source: 'api',
+      });
     });
 
     it('admin bypass：admin 可提升 editor', async () => {
@@ -579,6 +701,15 @@ describe('TopicController', () => {
 
       expect(await controller.removeEditor('topic-1', dto, creatorActor)).toBe(result);
       expect(service.removeEditor).toHaveBeenCalledWith('topic-1', 'agent-2');
+      // 审计（Phase 2）：remove-editor → DELETE + topic_participant（与 uninvite 同族）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.DELETE,
+        entityType: 'topic_participant',
+        entityId: 'agent-2',
+        actorId: 'creator-1',
+        newData: { topicId: 'topic-1', participantId: 'agent-2' },
+        source: 'api',
+      });
     });
 
     it('admin bypass：admin 可撤销 editor', async () => {

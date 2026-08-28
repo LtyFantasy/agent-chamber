@@ -11,7 +11,8 @@ import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
-import { AgentStatus, ActorType } from '@agent-chamber/shared';
+import { AgentStatus, ActorType, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 jest.mock('crypto', () => ({
   randomBytes: jest.fn(() => ({ toString: jest.fn(() => 'mocked_random_string') })),
@@ -128,6 +129,7 @@ describe('AgentService', () => {
   let mockAgentRepo: jest.Mocked<Repository<Agent>>;
   let mockApiKeyRepo: jest.Mocked<Repository<ApiKey>>;
   let mockSeatRepo: jest.Mocked<Repository<RoundtableSeat>>;
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     // NestJS module-token-factory uses crypto.createHash to generate module tokens.
@@ -146,6 +148,7 @@ describe('AgentService', () => {
     mockAgentRepo = createMockRepo<Agent>();
     mockApiKeyRepo = createMockRepo<ApiKey>();
     mockSeatRepo = createMockRepo<RoundtableSeat>();
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
@@ -153,6 +156,7 @@ describe('AgentService', () => {
         { provide: getRepositoryToken(Agent), useValue: mockAgentRepo },
         { provide: getRepositoryToken(ApiKey), useValue: mockApiKeyRepo },
         { provide: getRepositoryToken(RoundtableSeat), useValue: mockSeatRepo },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -1030,7 +1034,31 @@ describe('AgentService', () => {
       expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({ where: { id: 'key-1' } });
       expect(key.revokedAt).toBeInstanceOf(Date);
       expect(mockApiKeyRepo.save).toHaveBeenCalledWith(key);
+      // 审计（Phase 2）：DELETE + api_key；service 层（key 实体含 agentId/keyPrefix）；
+      // actor 缺省 = key.agentId
+      expect(mockAuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: AuditAction.DELETE,
+          entityType: 'api_key',
+          entityId: 'key-1',
+          actorId: 'agent-1',
+          newData: { keyId: 'key-1', keyPrefix: 'ask_mock', agentId: 'agent-1' },
+          source: 'api',
+        }),
+      );
       expect(result).toBe(true);
+    });
+
+    it('should use operatorActorId when provided (decision 8)', async () => {
+      const key = createMockApiKey();
+      mockApiKeyRepo.findOne.mockResolvedValue(key);
+      mockApiKeyRepo.save.mockResolvedValue(key);
+
+      await service.revokeKey('key-1', 'admin-1');
+
+      expect(mockAuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ entityId: 'key-1', actorId: 'admin-1' }),
+      );
     });
 
     it('should throw NotFoundException when key not found', async () => {
@@ -1038,6 +1066,8 @@ describe('AgentService', () => {
 
       await expect(service.revokeKey('not-found')).rejects.toThrow(NotFoundException);
       expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({ where: { id: 'not-found' } });
+      // 失败路径不记审计
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
   });
 

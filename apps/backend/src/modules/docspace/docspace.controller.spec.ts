@@ -3,6 +3,7 @@ import { DocSpaceController } from './docspace.controller';
 import { DocSpaceService } from './docspace.service';
 import { DocBundleService } from './doc-bundle.service';
 import { PermissionService } from '../../common/services/permission.service';
+import { AuditService } from '../audit/audit.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { BoardService } from '../board/board.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
@@ -44,6 +45,7 @@ describe('DocSpaceController', () => {
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   const mockBoardService = {
     findById: jest.fn(),
@@ -61,6 +63,7 @@ describe('DocSpaceController', () => {
       providers: [
         { provide: DocSpaceService, useValue: mockService },
         { provide: PermissionService, useValue: mockPermService },
+        { provide: AuditService, useValue: mockAuditService },
         { provide: BoardService, useValue: mockBoardService },
         {
           provide: OwnerProxyService,

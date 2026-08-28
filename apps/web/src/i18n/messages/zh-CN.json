@@ -31,6 +31,7 @@
     "search": "搜索",
     "settings": "设置",
     "monitoring": "监控",
+    "logs": "活动日志",
     "skill": "Skill",
     "openMenu": "打开菜单",
     "closeMenu": "关闭菜单",
@@ -878,6 +879,57 @@
       "entityId": "实体ID",
       "actor": "操作者",
       "ipAddress": "IP地址"
+    }
+  },
+  "logs": {
+    "title": "活动日志",
+    "description": "按执行者、实体、动作与时间范围查询平台写操作记录",
+    "scope": {
+      "admin": "管理员视角：可见全部执行者",
+      "restricted": "受限视角：可见 {count} 个执行者",
+      "scopeHint": "非管理员可见自己 + 名下 agent（含已删除）"
+    },
+    "filter": {
+      "actor": "执行者",
+      "actorPlaceholder": "全部执行者",
+      "actorSearchPlaceholder": "搜索用户或 agent…",
+      "actorEmpty": "没有匹配的执行者",
+      "actorClear": "清除执行者筛选",
+      "actorAgentHint": "agent",
+      "entityType": "实体类型",
+      "entityTypeAll": "全部类型",
+      "action": "动作",
+      "actionAll": "全部动作",
+      "timeRange": "时间范围",
+      "timePresets": {
+        "1h": "最近 1 小时",
+        "24h": "最近 24 小时",
+        "7d": "最近 7 天",
+        "custom": "自定义"
+      },
+      "from": "开始时间",
+      "to": "结束时间",
+      "reset": "重置"
+    },
+    "table": {
+      "title": "日志列表",
+      "time": "时间",
+      "actor": "执行者",
+      "action": "动作",
+      "entity": "实体",
+      "ip": "IP 地址",
+      "expand": "查看详情"
+    },
+    "systemActor": "系统",
+    "deletedActor": "已删除",
+    "unknownActor": "未知",
+    "noLogs": "暂无日志",
+    "noLogsDesc": "当前筛选条件下没有活动日志。注意：日志为尽力记录——空结果不代表未发生操作。",
+    "pagination": "第 {page} / {totalPages} 页，每页 {pageSize} 条，共 {total} 条",
+    "detail": {
+      "diff": "变更差异",
+      "newData": "变更后数据",
+      "oldData": "变更前数据"
     }
   },
   "search": {

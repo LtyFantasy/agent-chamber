@@ -24,7 +24,13 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocService } from './doc.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { CreateDocRouteDto, UpdateDocRouteDto } from './dto';
-import { DocRouteCodeEntryType, ErrorCode, PaginatedResponse } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
+import {
+  DocRouteCodeEntryType,
+  ErrorCode,
+  PaginatedResponse,
+  AuditAction,
+} from '@agent-chamber/shared';
 
 /**
  * codeEntry 格式校验（铁律 #21 业务校验层）：
@@ -77,6 +83,7 @@ export class DocRouteService {
     @InjectRepository(Doc)
     private readonly docRepo: Repository<Doc>,
     private readonly docService: DocService,
+    private readonly auditService: AuditService,
   ) {}
 
   // ─── CRUD ───────────────────────────────────────────────────
@@ -189,7 +196,19 @@ export class DocRouteService {
       sortOrder: dto.sortOrder ?? 0,
       createdBy: actor.id,
     });
-    return this.routeRepo.save(route);
+    const saved = await this.routeRepo.save(route);
+    // 审计（Phase 2）：CREATE + doc_route；service 层（importBundle 的 importRoutes
+    // 内部调用本方法——批量回导不单独记，构成写各自落行，决策 2）；newData 白名单
+    // {routeId, spaceId, intent}（决策 6——doc 引用/codeEntry 不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_route',
+      entityId: saved.id,
+      actorId: actor.id,
+      newData: { routeId: saved.id, spaceId, intent: saved.intent },
+      source: 'api',
+    });
+    return saved;
   }
 
   /**
@@ -199,8 +218,11 @@ export class DocRouteService {
    * codeEntry 时重跑——dto 与现有值合并成完整视图后整体校验（"只改 headingPath"也能用现有
    * primaryDocId 验证归属，杜绝半校验漏洞）。只改 intent/category/sortOrder 不触发校验，
    * 避免"doc 后续编辑致 headingPath 悬空（批次 C 范围）"阻塞纯排序调整。
+   *
+   * @param operatorActorId 操作者 actor id（审计用；importBundle 回导时传 bundle 操作者，
+   *                        缺省 = 无（系统/批量路径兜底 null））
    */
-  async update(id: string, dto: UpdateDocRouteDto): Promise<DocRoute> {
+  async update(id: string, dto: UpdateDocRouteDto, operatorActorId?: string): Promise<DocRoute> {
     const route = await this.findById(id);
 
     const refsChanged =
@@ -240,7 +262,22 @@ export class DocRouteService {
     if (dto.codeEntryType !== undefined) route.codeEntryType = dto.codeEntryType;
     if (dto.sortOrder !== undefined) route.sortOrder = dto.sortOrder;
 
-    return this.routeRepo.save(route);
+    const saved = await this.routeRepo.save(route);
+    // 审计（Phase 2）：UPDATE + doc_route；service 层（importRoutes 内部调用，
+    // 决策 2）；newData 白名单 {routeId, spaceId, intent?}（决策 6——doc 引用不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_route',
+      entityId: saved.id,
+      actorId: operatorActorId ?? null,
+      newData: {
+        routeId: saved.id,
+        spaceId: saved.spaceId,
+        ...(dto.intent !== undefined && { intent: saved.intent }),
+      },
+      source: 'api',
+    });
+    return saved;
   }
 
   /** 删除路由（硬删——路由是纯策展元数据，无审计/事件契约）。不存在 → 404。 */

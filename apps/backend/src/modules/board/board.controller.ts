@@ -7,6 +7,9 @@
  *   - 补充: PROJECT.md §1.5.2 可见性继承规则
  *   - 任务分页: docs/api-definition.md §7（Boards/Tasks 分页与字段精简契约，v1.16.0）
  *   新增 GET /boards/:id/lists 与 /boards/:id/lists/:listId/tasks；findOne 不再返回 tasks。
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（board 写操作全量记，
+ *     controller 层插桩决策 2——service 方法均无 actor 参数且仅 controller 调用；
+ *     member 增删用 CREATE/DELETE + board_member；metrics 只记键名列表不入全量值）
  *
  * [踩坑索引] D5(权限迁移) B-51(admin-403显式检查) B-45(reorder返回null) B-41(列表页任务统计) B-50(列表权限过滤) OWNER-PROXY(update+成员4端点视同creator) TOPIC-PERM(update结构字段显式403替代静默剥离)
  *
@@ -79,7 +82,8 @@ import {
   UpdateBoardMetricsDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { ErrorCode, UserRole } from '@agent-chamber/shared';
+import { ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Boards')
 @Controller('boards')
@@ -88,6 +92,7 @@ export class BoardController {
     private readonly boardService: BoardService,
     private readonly permService: PermissionService,
     private readonly ownerProxy: OwnerProxyService,
+    private readonly auditService: AuditService,
   ) {}
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -115,7 +120,25 @@ export class BoardController {
   @ApiOperation({ summary: 'Create board', description: 'Create a new board' })
   @ApiResponse({ status: 201, description: 'Board created successfully' })
   async create(@CurrentActor() actor: UnifiedActor, @Body() dto: CreateBoardDto) {
-    return this.boardService.create(actor.id, actor.type, dto);
+    const result = await this.boardService.create(actor.id, actor.type, dto);
+    // 审计（Phase 2）：CREATE + board；controller 层（create 无 actor 参数，决策 2）；
+    // newData 白名单 {boardId, name, visibility?}（决策 6；description/settings 不入）。
+    // result 为 reload 查询（findOne），防御性判空——创建已成功，reload 失败属异常
+    if (result) {
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'board',
+        entityId: result.id,
+        actorId: actor.id,
+        newData: {
+          boardId: result.id,
+          name: result.name,
+          ...(dto.visibility !== undefined && { visibility: dto.visibility }),
+        },
+        source: 'api',
+      });
+    }
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -223,7 +246,18 @@ export class BoardController {
   ) {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.updateMetrics(id, dto.metrics);
+    const result = await this.boardService.updateMetrics(id, dto.metrics);
+    // 审计（Phase 2）：UPDATE + board（metrics）；newData 只记更新的键名列表
+    // （决策 6——metrics 全量值不入，机器事实可能含敏感基线）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'board',
+      entityId: id,
+      actorId: actor.id,
+      newData: { boardId: id, metricsKeys: Object.keys(dto.metrics) },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -297,7 +331,22 @@ export class BoardController {
       }
     }
 
-    return this.boardService.update(id, dto);
+    const result = await this.boardService.update(id, dto);
+    // 审计（Phase 2）：UPDATE + board；controller 层（update 无 actor 参数，决策 2）；
+    // newData 白名单 {boardId, name?, visibility?}（决策 6；description/settings 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'board',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        boardId: id,
+        ...(dto.name !== undefined && { name: dto.name }),
+        ...(dto.visibility !== undefined && { visibility: dto.visibility }),
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -308,7 +357,17 @@ export class BoardController {
   async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'delete');
-    return this.boardService.remove(id);
+    await this.boardService.remove(id);
+    // 审计（Phase 2）：DELETE + board；newData 白名单 {boardId, name}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'board',
+      entityId: id,
+      actorId: actor.id,
+      newData: { boardId: id, name: board.name },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -335,7 +394,18 @@ export class BoardController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.boardService.inviteAgent(id, dto.agentId);
+    const result = await this.boardService.inviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + board_member（invite-agent）；controller 层
+    // （inviteAgent 无 actor 参数，决策 2）；newData {boardId, actorId, role}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'board_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { boardId: id, actorId: dto.agentId, role: 'member' },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -362,7 +432,17 @@ export class BoardController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.boardService.uninviteAgent(id, dto.agentId);
+    const result = await this.boardService.uninviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + board_member（uninvite-agent）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'board_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { boardId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -386,7 +466,18 @@ export class BoardController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.boardService.addEditor(id, dto.agentId);
+    const result = await this.boardService.addEditor(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + board_member（add-editor——新建 editor 行或
+    // member→editor 升级均属「授予 editor 角色」写入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'board_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { boardId: id, actorId: dto.agentId, role: 'editor' },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -413,7 +504,17 @@ export class BoardController {
         code: ErrorCode.PERMISSION_DENIED,
       });
     }
-    return this.boardService.removeEditor(id, dto.agentId);
+    const result = await this.boardService.removeEditor(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + board_member（remove-editor）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'board_member',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { boardId: id, actorId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -428,7 +529,17 @@ export class BoardController {
   ) {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.createList(id, dto);
+    const result = await this.boardService.createList(id, dto);
+    // 审计（Phase 2）：CREATE + board_list；newData 白名单 {boardId, listId, name}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'board_list',
+      entityId: result.id,
+      actorId: actor.id,
+      newData: { boardId: id, listId: result.id, name: result.name },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -443,7 +554,18 @@ export class BoardController {
   ) {
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.reorderLists(id, dto);
+    const result = await this.boardService.reorderLists(id, dto);
+    // 审计（Phase 2）：UPDATE + board（lists reorder）；轻量 newData {boardId, listCount}
+    // （决策 6——不记具体顺序，条目数即可）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'board',
+      entityId: id,
+      actorId: actor.id,
+      newData: { boardId: id, listCount: dto.lists.length },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -468,7 +590,21 @@ export class BoardController {
     const list = await this.boardService.findList(id);
     const board = await this.boardService.findById(list.boardId);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.updateList(id, dto);
+    const result = await this.boardService.updateList(id, dto);
+    // 审计（Phase 2）：UPDATE + board_list；newData 白名单 {boardId, listId, name?}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'board_list',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        boardId: list.boardId,
+        listId: id,
+        ...(dto.name !== undefined && { name: dto.name }),
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -487,7 +623,17 @@ export class BoardController {
     const list = await this.boardService.findList(id);
     const board = await this.boardService.findById(list.boardId);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.removeList(id, dto?.moveTasksTo);
+    await this.boardService.removeList(id, dto?.moveTasksTo);
+    // 审计（Phase 2）：DELETE + board_list；newData 白名单 {boardId, listId, name}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'board_list',
+      entityId: id,
+      actorId: actor.id,
+      newData: { boardId: list.boardId, listId: id, name: list.name },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -503,6 +649,17 @@ export class BoardController {
     const list = await this.boardService.findList(listId);
     const board = await this.boardService.findById(list.boardId);
     await this.permService.ensureCan(board, actor, 'write');
-    return this.boardService.reorderTasks(listId, dto);
+    const result = await this.boardService.reorderTasks(listId, dto);
+    // 审计（Phase 2）：UPDATE + board_list（tasks reorder）；轻量 newData
+    // {boardId, listId, taskCount}（决策 6——不记具体顺序）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'board_list',
+      entityId: listId,
+      actorId: actor.id,
+      newData: { boardId: list.boardId, listId, taskCount: dto.tasks.length },
+      source: 'api',
+    });
+    return result;
   }
 }

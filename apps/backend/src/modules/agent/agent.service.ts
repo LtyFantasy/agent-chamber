@@ -5,6 +5,8 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/api-definition.md §5. Agents
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（revokeKey service 层
+ *     插桩 + 可选 operatorActorId，决策 8 同构——key 实体字段 controller 不可得）
  *
  * [踩坑索引] B-46(PATCH清空字段) B-47(topics返回null) D-3(controller预存失败) A3-1(remove事务吊销Key) A3-2(seatCount须jsonb路径)
  *
@@ -41,7 +43,7 @@ import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
-import { AgentStatus, ErrorCode, ActorType } from '@agent-chamber/shared';
+import { AgentStatus, ErrorCode, ActorType, AuditAction } from '@agent-chamber/shared';
 import type {
   PaginatedResponse,
   Agent as AgentDto,
@@ -49,6 +51,7 @@ import type {
   TopicUnreadCount,
 } from '@agent-chamber/shared';
 import { CreateAgentDto, UpdateAgentDto, AgentHeartbeatDto, CreateAgentKeyDto } from './dto';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class AgentService {
@@ -59,6 +62,7 @@ export class AgentService {
     private apiKeyRepo: Repository<ApiKey>,
     @InjectRepository(RoundtableSeat)
     private seatRepo: Repository<RoundtableSeat>,
+    private readonly auditService: AuditService,
   ) {}
 
   async findAll(query: {
@@ -577,12 +581,30 @@ export class AgentService {
     return { ...apiKey, apiKey: rawKey };
   }
 
-  async revokeKey(keyId: string) {
+  /**
+   * 吊销指定 API Key（软吊销：revokedAt 置位）
+   *
+   * @param keyId 要吊销的 key id
+   * @param operatorActorId 操作者 actor id（审计用；controller 传入，决策 8 同构）
+   * @returns true
+   * @throws NotFoundException key 不存在
+   */
+  async revokeKey(keyId: string, operatorActorId?: string) {
     const key = await this.apiKeyRepo.findOne({ where: { id: keyId } });
     if (!key)
       throw new NotFoundException({ message: 'API Key not found', code: ErrorCode.NOT_FOUND });
     key.revokedAt = new Date();
     await this.apiKeyRepo.save(key);
+    // 审计（Phase 2）：DELETE + api_key；service 层（key 实体含 agentId/keyPrefix，
+    // controller 不可得）；newData 白名单 {keyId, keyPrefix, agentId}（决策 9，非明文）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'api_key',
+      entityId: keyId,
+      actorId: operatorActorId ?? key.agentId,
+      newData: { keyId: key.id, keyPrefix: key.keyPrefix, agentId: key.agentId },
+      source: 'api',
+    });
     return true;
   }
 }

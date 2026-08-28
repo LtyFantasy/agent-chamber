@@ -3,6 +3,7 @@ import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { BoardController } from './board.controller';
 import { BoardService } from './board.service';
 import { PermissionService } from '../../common/services/permission.service';
+import { AuditService } from '../audit/audit.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
@@ -42,6 +43,7 @@ describe('BoardController', () => {
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   /** OwnerProxyService mock：beforeEach 重置默认返回 false（clearAllMocks 不清 mock 实现） */
   const mockOwnerProxyService = {
@@ -55,6 +57,7 @@ describe('BoardController', () => {
       providers: [
         { provide: BoardService, useValue: mockService },
         { provide: PermissionService, useValue: mockPermService },
+        { provide: AuditService, useValue: mockAuditService },
         { provide: OwnerProxyService, useValue: mockOwnerProxyService },
       ],
     })
@@ -93,12 +96,21 @@ describe('BoardController', () => {
 
   describe('create', () => {
     it('should call service.create with actor id and type', async () => {
-      const result = { id: 'board-1' };
+      const result = { id: 'board-1', name: 'New Board' };
       service.create.mockResolvedValue(result);
 
       const dto = { name: 'New Board' };
       expect(await controller.create(mockActor, dto)).toBe(result);
       expect(service.create).toHaveBeenCalledWith(mockActor.id, mockActor.type, dto);
+      // 审计（Phase 2）：CREATE + board
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'board',
+        entityId: 'board-1',
+        actorId: mockActor.id,
+        newData: { boardId: 'board-1', name: 'New Board' },
+        source: 'api',
+      });
     });
   });
 
@@ -178,7 +190,7 @@ describe('BoardController', () => {
 
   describe('remove', () => {
     it('should ensure delete permission then remove', async () => {
-      const board = { id: 'board-1' };
+      const board = { id: 'board-1', name: 'Board 1' };
       const result = true;
       service.findById.mockResolvedValue(board);
       service.remove.mockResolvedValue(result);
@@ -186,6 +198,15 @@ describe('BoardController', () => {
       expect(await controller.remove('board-1', mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'delete');
       expect(service.remove).toHaveBeenCalledWith('board-1');
+      // 审计（Phase 2）：DELETE + board
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'delete',
+        entityType: 'board',
+        entityId: 'board-1',
+        actorId: mockActor.id,
+        newData: { boardId: 'board-1', name: 'Board 1' },
+        source: 'api',
+      });
     });
   });
 
@@ -197,9 +218,20 @@ describe('BoardController', () => {
       service.createList.mockResolvedValue(result);
 
       const dto = { name: 'To Do' };
-      expect(await controller.createList('board-1', dto, mockActor)).toBe(result);
+      const listResult = { id: 'list-1', name: 'To Do' };
+      service.createList.mockResolvedValue(listResult);
+      expect(await controller.createList('board-1', dto, mockActor)).toBe(listResult);
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
       expect(service.createList).toHaveBeenCalledWith('board-1', dto);
+      // 审计（Phase 2）：CREATE + board_list
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'board_list',
+        entityId: 'list-1',
+        actorId: mockActor.id,
+        newData: { boardId: 'board-1', listId: 'list-1', name: 'To Do' },
+        source: 'api',
+      });
     });
   });
 
@@ -292,6 +324,15 @@ describe('BoardController', () => {
       const dto = { agentId: 'agent-2' };
       expect(await controller.inviteAgent('board-1', dto, mockActor)).toBe(result);
       expect(service.inviteAgent).toHaveBeenCalledWith('board-1', 'agent-2');
+      // 审计（Phase 2）：CREATE + board_member
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'board_member',
+        entityId: 'agent-2',
+        actorId: mockActor.id,
+        newData: { boardId: 'board-1', actorId: 'agent-2', role: 'member' },
+        source: 'api',
+      });
     });
 
     it('should reject non-creator from inviting agent', async () => {

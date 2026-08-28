@@ -317,7 +317,7 @@ export class DocBundleService {
     const space = await this.docspaceService.findById(spaceId);
 
     // 阶段 ①：categories（按 name 幂等，先于 docs）
-    const categorySection = await this.importCategories(spaceId, bundle.categories ?? []);
+    const categorySection = await this.importCategories(spaceId, bundle.categories ?? [], actor);
     // 阶段 ②：docs（复用 batchUpsert per-doc 独立事务——单篇失败不中止批次）
     const docsResult = await this.docService.batchUpsert(
       spaceId,
@@ -355,10 +355,13 @@ export class DocBundleService {
    * 分类回导（业务键 = name，空间内非软删精确匹配）：
    * 已存在 → updateCategory（复用平台 slug 自动去重语义：冲突 slug 自动加后缀）；
    * 不存在 → createCategory。单条 try/catch，失败不中止批次。
+   *
+   * @param actor 操作者（审计透传：createCategory/updateCategory 的 operatorActorId）
    */
   private async importCategories(
     spaceId: string,
     items: Array<{ name: string; slug?: string; description?: string | null; sortOrder?: number }>,
+    actor: UnifiedActor,
   ): Promise<DocBundleCategoryImportSection> {
     const results: DocBundleCategoryImportSection['results'] = [];
     const summary = { total: items.length, created: 0, updated: 0, failed: 0 };
@@ -382,11 +385,11 @@ export class DocBundleService {
           sortOrder: item.sortOrder ?? 0,
         } as { name: string; slug?: string; description?: string; sortOrder?: number };
         if (existing.length === 1) {
-          await this.docspaceService.updateCategory(existing[0].id, dto);
+          await this.docspaceService.updateCategory(existing[0].id, dto, actor.id);
           results.push({ name: item.name, status: 'updated', id: existing[0].id });
           summary.updated++;
         } else {
-          const created = await this.docspaceService.createCategory(spaceId, dto);
+          const created = await this.docspaceService.createCategory(spaceId, dto, actor.id);
           results.push({ name: item.name, status: 'created', id: created.id });
           summary.created++;
         }
@@ -472,7 +475,7 @@ export class DocBundleService {
 
         if (existing.length === 1) {
           // update 全量 dto → refsChanged=true → 合并后整体重跑写时校验（防半校验漏洞，见 doc-route.service）
-          await this.docRouteService.update(existing[0].id, dto);
+          await this.docRouteService.update(existing[0].id, dto, actor.id);
           results.push({
             intent: item.intent,
             primaryDocPath: item.primaryDocPath,

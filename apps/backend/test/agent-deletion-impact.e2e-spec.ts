@@ -50,9 +50,13 @@ import {
 } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { AgentService } from '../src/modules/agent/agent.service';
+import { AuditService } from '../src/modules/audit/audit.service';
+import { OwnerProxyService } from '../src/common/services/owner-proxy.service';
+import { ActorProfileService } from '../src/common/services/actor-profile.service';
 import { Agent } from '../src/database/entities/agent.entity';
 import { Actor } from '../src/database/entities/actor.entity';
 import { ApiKey } from '../src/database/entities/api-key.entity';
+import { AuditLog } from '../src/database/entities/audit-log.entity';
 import { Topic } from '../src/database/entities/topic.entity';
 import { TopicParticipant } from '../src/database/entities/topic-participant.entity';
 import { Message } from '../src/database/entities/message.entity';
@@ -121,6 +125,16 @@ describe('Agent 删除影响面 + 事务化吊销 Key — 真实 PG 集成', () 
       ds.getRepository(Agent),
       ds.getRepository(ApiKey),
       ds.getRepository(RoundtableSeat),
+      // 活动日志插桩（Phase 2）：本套件只读路径不触发，真实例防误触
+      new AuditService(
+        ds.getRepository(AuditLog),
+        new OwnerProxyService(ds.getRepository(Agent)),
+        new ActorProfileService(
+          ds.getRepository(Actor),
+          ds.getRepository(Agent),
+          ds.getRepository(User),
+        ),
+      ),
     );
   }, 30000);
 

@@ -14,6 +14,7 @@ import { Board } from '../../database/entities/board.entity';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { ResourceValidator } from '../../common/resource-validator';
+import { AuditService } from '../audit/audit.service';
 import { ErrorCode, MilestoneStatus, TaskStatus, UserRole, ActorType } from '@agent-chamber/shared';
 
 describe('MilestoneService', () => {
@@ -24,6 +25,7 @@ describe('MilestoneService', () => {
   let accessQuery: jest.Mocked<AccessQueryService>;
   let resourceValidator: { exists: jest.Mock; existsMany: jest.Mock };
   let permService: { ensureCan: jest.Mock; can: jest.Mock };
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     accessQuery = {
@@ -39,6 +41,7 @@ describe('MilestoneService', () => {
       ensureCan: jest.fn().mockResolvedValue(undefined),
       can: jest.fn().mockResolvedValue(true),
     };
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -79,6 +82,7 @@ describe('MilestoneService', () => {
         { provide: AccessQueryService, useValue: accessQuery },
         { provide: ResourceValidator, useValue: resourceValidator },
         { provide: PermissionService, useValue: permService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -102,6 +106,15 @@ describe('MilestoneService', () => {
 
       expect(result.id).toBe('ms-1');
       expect(result.name).toBe(dto.name);
+      // 审计（Phase 2）：CREATE + milestone；newData 白名单 {milestoneId, name, status?}
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'milestone',
+        entityId: 'ms-1',
+        actorId: 'user-1',
+        newData: { milestoneId: 'ms-1', name: 'v1.3.0', status: MilestoneStatus.ACTIVE },
+        source: 'api',
+      });
       // 方案 A：创建时写入创建者 Actor ID
       expect(milestoneRepo.create).toHaveBeenCalledWith(
         expect.objectContaining({ creatorId: actor.id }),

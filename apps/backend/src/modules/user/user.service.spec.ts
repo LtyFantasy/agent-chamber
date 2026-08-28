@@ -12,6 +12,7 @@ import { UpdateSettingsDto } from './dto/update-settings.dto';
 import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 import { UpdateUserByAdminDto } from './dto/update-user-by-admin.dto';
 import { UserRole, ActorType, ErrorCode } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 jest.mock('bcrypt', () => ({
   compare: jest.fn(),
@@ -96,12 +97,18 @@ function createMockUser(overrides: Partial<User> & Partial<Actor> = {}): User {
 describe('UserService', () => {
   let service: UserService;
   let mockRepo: jest.Mocked<Repository<User>>;
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     mockRepo = createMockRepo<User>();
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
-      providers: [UserService, { provide: getRepositoryToken(User), useValue: mockRepo }],
+      providers: [
+        UserService,
+        { provide: getRepositoryToken(User), useValue: mockRepo },
+        { provide: AuditService, useValue: mockAuditService },
+      ],
     }).compile();
 
     service = moduleRef.get<UserService>(UserService);
@@ -165,6 +172,19 @@ describe('UserService', () => {
       expect(result.name).toBe('New Name');
       expect(result.avatar).toBe('https://example.com/avatar.png');
       expect(result.preferences).toEqual({ theme: 'dark', lang: 'en' });
+      // 审计（Phase 2）：UPDATE + user；actor=自己；newData 只记字段名
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: {
+          userId: 'user-1',
+          username: 'testuser',
+          changedFields: ['name', 'avatar', 'preferences'],
+        },
+        source: 'api',
+      });
     });
 
     it('should clear avatarSvg when avatar is cleared (avatar: null)', async () => {
@@ -249,6 +269,15 @@ describe('UserService', () => {
       expect(user.preferences).toEqual({ theme: 'dark', notifications: true });
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result).toEqual({ theme: 'dark', notifications: true });
+      // 审计（Phase 2）：UPDATE + user（settings）；只记字段名
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1', username: 'testuser', changedFields: ['preferences'] },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when user not found', async () => {
@@ -286,6 +315,15 @@ describe('UserService', () => {
       expect(user.passwordHash).toBe('new-hashed');
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result).toBe(true);
+      // 审计（Phase 2）：UPDATE + user（change-password）；passwordHash 黑名单不入
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1', username: 'testuser' },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when user not found', async () => {
@@ -325,6 +363,15 @@ describe('UserService', () => {
       expect(user.avatarUrl).toBe('https://example.com/new.png');
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result.avatar).toBe('https://example.com/new.png');
+      // 审计（Phase 2）：UPDATE + user（avatar）；只记字段名
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1', username: 'testuser', changedFields: ['avatar'] },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when user not found', async () => {
@@ -473,7 +520,7 @@ describe('UserService', () => {
         name: 'New User',
       };
 
-      const result = await service.createByAdmin(dto);
+      const result = await service.createByAdmin(dto, 'admin-1');
 
       expect(mockRepo.findOne).toHaveBeenCalledWith({
         where: { email: dto.email },
@@ -499,6 +546,15 @@ describe('UserService', () => {
       expect(mockRepo.save).toHaveBeenCalled();
       expect(result.email).toBe('new@example.com');
       expect(result.name).toBe('New User');
+      // 审计（Phase 2）：CREATE + user；actor=操作 admin（决策 8）；passwordHash 不入
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'user',
+        entityId: 'actor-new',
+        actorId: 'admin-1',
+        newData: { userId: 'actor-new', username: 'testuser', role: UserRole.EDITOR },
+        source: 'api',
+      });
     });
 
     it('should throw ConflictException when email already exists', async () => {
@@ -634,6 +690,19 @@ describe('UserService', () => {
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result.name).toBe('Updated Name');
       expect(result.role).toBe(UserRole.ADMIN);
+      // 审计（Phase 2）：UPDATE + user（admin 操作）；actor=操作 admin；只记字段名
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'admin-1',
+        newData: {
+          userId: 'user-1',
+          username: 'testuser',
+          changedFields: ['name', 'role'],
+        },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when user not found', async () => {
@@ -713,6 +782,15 @@ describe('UserService', () => {
       expect(user.actor.deletedAt).toBeInstanceOf(Date);
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result).toBe(true);
+      // 审计（Phase 2）：DELETE + user（admin 软删）；actor=操作 admin
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'delete',
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'admin-1',
+        newData: { userId: 'user-1', username: 'testuser' },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when user not found', async () => {

@@ -5,12 +5,14 @@ import { PermissionService } from '../../common/services/permission.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
-import { ActorType, UserRole } from '@agent-chamber/shared';
+import { ActorType, UserRole, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 describe('AgentController', () => {
   let controller: AgentController;
   let service: typeof mockService;
   let permService: typeof mockPermService;
+  let auditService: { log: jest.Mock };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const mockAgentActor = { id: 'agent-1', type: ActorType.AGENT };
@@ -40,12 +42,15 @@ describe('AgentController', () => {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
 
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AgentController],
       providers: [
         { provide: AgentService, useValue: mockService },
         { provide: PermissionService, useValue: mockPermService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     })
       .overrideGuard(JwtAuthGuard)
@@ -61,6 +66,7 @@ describe('AgentController', () => {
     permService = module.get<PermissionService>(
       PermissionService,
     ) as unknown as typeof mockPermService;
+    auditService = module.get<AuditService>(AuditService) as unknown as { log: jest.Mock };
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -408,6 +414,15 @@ describe('AgentController', () => {
         apiKey: 'ask_newkey',
       });
       expect(service.create).toHaveBeenCalledWith(mockActor.id, dto);
+      // 审计（Phase 2）：CREATE + agent；newData 白名单 {agentId, name, status}
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'agent',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { agentId: 'agent-1', name: 'New Agent', status: 'active' },
+        source: 'api',
+      });
     });
   });
 
@@ -444,6 +459,15 @@ describe('AgentController', () => {
       expect(response).toEqual({ ...publicAgentFields, name: 'Updated Agent' });
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
       expect(service.update).toHaveBeenCalledWith('agent-1', dto);
+      // 审计（Phase 2）：UPDATE + agent；newData 只含白名单字段（name 变更）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'agent',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { agentId: 'agent-1', name: 'Updated Agent' },
+        source: 'api',
+      });
     });
   });
 
@@ -456,6 +480,16 @@ describe('AgentController', () => {
       expect(await controller.remove('agent-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'delete');
       expect(service.remove).toHaveBeenCalledWith('agent-1');
+      // 审计（Phase 2）：DELETE + agent
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: AuditAction.DELETE,
+          entityType: 'agent',
+          entityId: 'agent-1',
+          actorId: 'user-1',
+          source: 'api',
+        }),
+      );
     });
   });
 
@@ -493,6 +527,15 @@ describe('AgentController', () => {
       expect(await controller.resetKey('agent-1', mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
       expect(service.resetKey).toHaveBeenCalledWith('agent-1');
+      // 审计（Phase 2）：RESET_API_KEY + agent；newData 带新 key 前缀（非明文）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.RESET_API_KEY,
+        entityType: 'agent',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { agentId: 'agent-1', keyPrefix: 'ask_newk' },
+        source: 'api',
+      });
     });
   });
 
@@ -506,6 +549,15 @@ describe('AgentController', () => {
       expect(await controller.toggle('agent-1', mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
       expect(service.toggle).toHaveBeenCalledWith('agent-1');
+      // 审计（Phase 2）：TOGGLE_AGENT + agent；newData 带切换后 status
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.TOGGLE_AGENT,
+        entityType: 'agent',
+        entityId: 'agent-1',
+        actorId: 'user-1',
+        newData: { agentId: 'agent-1', status: 'disabled' },
+        source: 'api',
+      });
     });
   });
 
@@ -570,6 +622,16 @@ describe('AgentController', () => {
       expect(await controller.createKey('agent-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
       expect(service.createKey).toHaveBeenCalledWith('agent-1', dto);
+      // 审计（Phase 2）：CREATE + api_key；newData {keyId, keyPrefix, agentId}（决策 9）
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: AuditAction.CREATE,
+          entityType: 'api_key',
+          entityId: 'key-1',
+          actorId: 'user-1',
+          source: 'api',
+        }),
+      );
     });
   });
 
@@ -581,7 +643,8 @@ describe('AgentController', () => {
 
       expect(await controller.revokeKey('agent-1', 'key-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
-      expect(service.revokeKey).toHaveBeenCalledWith('key-1');
+      // 审计在 service 层（key 实体字段 controller 不可得）→ actor 透传
+      expect(service.revokeKey).toHaveBeenCalledWith('key-1', 'user-1');
     });
   });
 
@@ -598,6 +661,15 @@ describe('AgentController', () => {
       const response = await controller.updateMe(mockAgentActor, dto);
       expect(response).toEqual({ ...publicAgentFields, name: 'Updated Name' });
       expect(service.updateMe).toHaveBeenCalledWith(mockAgentActor.id, dto);
+      // 审计（Phase 2）：UPDATE + agent；actor=自己（PATCH /agents/me）
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: AuditAction.UPDATE,
+        entityType: 'agent',
+        entityId: 'agent-1',
+        actorId: 'agent-1',
+        newData: { agentId: 'agent-1', name: 'Updated Name' },
+        source: 'api',
+      });
     });
   });
 

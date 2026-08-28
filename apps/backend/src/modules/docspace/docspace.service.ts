@@ -61,8 +61,9 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
-import { Visibility, ErrorCode, ActorType, EventType } from '@agent-chamber/shared';
+import { Visibility, ErrorCode, ActorType, EventType, AuditAction } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
+import { AuditService } from '../audit/audit.service';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import type {
   DocSpaceSummary,
@@ -382,6 +383,7 @@ export class DocSpaceService {
     private readonly resourceValidator: ResourceValidator,
     private readonly eventService: EventService,
     private readonly actorProfileService: ActorProfileService,
+    private readonly auditService: AuditService,
   ) {}
 
   // ─── Actor helpers ──────────────────────────────────────────
@@ -1104,9 +1106,17 @@ export class DocSpaceService {
   }
 
   /** Create a category in a space. Slug must be unique within the space. */
+  /**
+   * 创建分类（service 层插桩——importBundle 的 importCategories 内部调用本方法，
+   * 决策 2：controller 层会漏掉批量回导的分类写）。
+   *
+   * @param operatorActorId 操作者 actor id（审计用；importBundle 回导时传 bundle 操作者，
+   *                        缺省 = 无（系统/批量路径兜底 null））
+   */
   async createCategory(
     spaceId: string,
     dto: { name: string; slug?: string; description?: string; sortOrder?: number },
+    operatorActorId?: string,
   ): Promise<DocCategory> {
     const space = await this.findById(spaceId);
 
@@ -1120,13 +1130,29 @@ export class DocSpaceService {
       description: dto.description ?? null,
       sortOrder: dto.sortOrder ?? 0,
     });
-    return this.categoryRepo.save(category);
+    const saved = await this.categoryRepo.save(category);
+    // 审计（Phase 2）：CREATE + doc_category；newData 白名单 {categoryId, spaceId, name}
+    // （决策 6——slug/description 不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_category',
+      entityId: saved.id,
+      actorId: operatorActorId ?? null,
+      newData: { categoryId: saved.id, spaceId: space.id, name: saved.name },
+      source: 'api',
+    });
+    return saved;
   }
 
-  /** Update a category. */
+  /**
+   * Update a category.（service 层插桩——importCategories 内部调用，理由同 createCategory）
+   *
+   * @param operatorActorId 操作者 actor id（审计用；importBundle 回导时传 bundle 操作者）
+   */
   async updateCategory(
     id: string,
     dto: { name?: string; slug?: string; description?: string; sortOrder?: number },
+    operatorActorId?: string,
   ): Promise<DocCategory> {
     const category = await this.findCategoryById(id);
 
@@ -1142,7 +1168,21 @@ export class DocSpaceService {
       category.slug = newSlug;
     }
 
-    return this.categoryRepo.save(category);
+    const saved = await this.categoryRepo.save(category);
+    // 审计（Phase 2）：UPDATE + doc_category；newData 白名单 {categoryId, spaceId, name?}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_category',
+      entityId: saved.id,
+      actorId: operatorActorId ?? null,
+      newData: {
+        categoryId: saved.id,
+        spaceId: saved.spaceId,
+        ...(dto.name !== undefined && { name: saved.name }),
+      },
+      source: 'api',
+    });
+    return saved;
   }
 
   /**

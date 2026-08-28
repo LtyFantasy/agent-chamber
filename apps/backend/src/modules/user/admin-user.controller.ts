@@ -70,8 +70,12 @@ export class AdminUserController {
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 403, description: 'Forbidden — admin only' })
   @ApiResponse({ status: 409, description: 'Email already registered or admin already exists' })
-  async createByAdmin(@Body() dto: CreateUserByAdminDto) {
-    return this.userService.createByAdmin(dto);
+  async createByAdmin(
+    @Body() dto: CreateUserByAdminDto,
+    @CurrentUser('userId') currentAdminId: string,
+  ) {
+    // 审计 actor=操作 admin（决策 8，从 controller 传入 service）
+    return this.userService.createByAdmin(dto, currentAdminId);
   }
 
   @Patch(':id')

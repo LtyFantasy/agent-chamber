@@ -5,6 +5,10 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/api-definition.md §4.3-4.6 Admin users
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（user 写操作全量记，
+ *     service 层插桩——实体已加载可拿 username；actor=自己（资料类）/操作 admin
+ *     （admin 类，createByAdmin 改签名传操作者，auth register 先例）；newData
+ *     {userId, username, 变更字段名列表}，passwordHash 黑名单）
  *
  * [踩坑索引] B-55(QueryBuilder orderBy select 风险)
  *
@@ -41,12 +45,15 @@ import { UpdateSettingsDto } from './dto/update-settings.dto';
 import type { PaginatedResponse, User as UserDto } from '@agent-chamber/shared';
 import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 import { UpdateUserByAdminDto } from './dto/update-user-by-admin.dto';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '@agent-chamber/shared';
 
 @Injectable()
 export class UserService {
   constructor(
     @InjectRepository(User)
     private userRepo: Repository<User>,
+    private readonly auditService: AuditService,
   ) {}
 
   async getMe(userId: string) {
@@ -77,6 +84,22 @@ export class UserService {
       user.preferences = { ...user.preferences, ...dto.preferences };
     }
     await this.userRepo.save(user);
+    // 审计（Phase 2）：UPDATE + user；actor=自己；newData {userId, username, 变更字段名列表}
+    // （决策 6——email/preferences 值不入，只记字段名）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'user',
+      entityId: userId,
+      actorId: userId,
+      newData: {
+        userId,
+        username: user.username,
+        changedFields: ['name', 'avatar', 'preferences'].filter(
+          (f) => dto[f as keyof UpdateProfileDto] !== undefined,
+        ),
+      },
+      source: 'api',
+    });
     return this.toProfile(user);
   }
 
@@ -95,6 +118,16 @@ export class UserService {
     }
     user.preferences = { ...user.preferences, ...dto };
     await this.userRepo.save(user);
+    // 审计（Phase 2）：UPDATE + user（settings）；actor=自己；newData 只记字段名
+    // （决策 6——preferences 值不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'user',
+      entityId: userId,
+      actorId: userId,
+      newData: { userId, username: user.username, changedFields: ['preferences'] },
+      source: 'api',
+    });
     return user.preferences;
   }
 
@@ -116,6 +149,16 @@ export class UserService {
     }
     user.passwordHash = await bcrypt.hash(dto.newPassword, 12);
     await this.userRepo.save(user);
+    // 审计（Phase 2）：UPDATE + user（change-password）；actor=自己；newData 白名单
+    // {userId, username}——passwordHash 显式黑名单（决策 6），永不入审计
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'user',
+      entityId: userId,
+      actorId: userId,
+      newData: { userId, username: user.username },
+      source: 'api',
+    });
     return true;
   }
 
@@ -126,6 +169,16 @@ export class UserService {
     }
     user.avatarUrl = avatarUrl;
     await this.userRepo.save(user);
+    // 审计（Phase 2）：UPDATE + user（avatar）；actor=自己；newData {userId, username,
+    // changedFields: ['avatar']}（决策 6——avatarUrl 值不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'user',
+      entityId: userId,
+      actorId: userId,
+      newData: { userId, username: user.username, changedFields: ['avatar'] },
+      source: 'api',
+    });
     return this.toProfile(user);
   }
 
@@ -226,10 +279,12 @@ export class UserService {
   /**
    * 管理员创建用户
    * @param dto 创建用户数据
+   * @param operatorActorId 操作者（admin）actor id——审计 actorId=操作 admin 本人
+   *                        （决策 8，auth register 同款语义；缺省兜底新用户自身）
    * @returns 创建成功的用户资料
    * @throws ConflictException 当 email 已存在时
    */
-  async createByAdmin(dto: CreateUserByAdminDto) {
+  async createByAdmin(dto: CreateUserByAdminDto, operatorActorId?: string) {
     const existing = await this.userRepo.findOne({
       where: { email: dto.email },
       relations: { actor: true },
@@ -270,6 +325,20 @@ export class UserService {
     });
 
     await this.userRepo.save(user);
+    // 审计（Phase 2）：CREATE + user；actor=操作 admin（controller 传入，决策 8）；
+    // newData 白名单 {userId, username, role?}（决策 6——email/passwordHash 不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'user',
+      entityId: user.id,
+      actorId: operatorActorId ?? user.id,
+      newData: {
+        userId: user.id,
+        username: user.username,
+        ...(user.role !== undefined && { role: user.role }),
+      },
+      source: 'api',
+    });
     return this.toProfile(user);
   }
 
@@ -318,6 +387,22 @@ export class UserService {
     }
 
     await this.userRepo.save(user);
+    // 审计（Phase 2）：UPDATE + user（admin 操作）；actor=操作 admin 本人；
+    // newData {userId, username, 变更字段名列表}（决策 6——email 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'user',
+      entityId: id,
+      actorId: currentAdminId,
+      newData: {
+        userId: id,
+        username: user.username,
+        changedFields: ['name', 'role', 'status'].filter(
+          (f) => dto[f as keyof UpdateUserByAdminDto] !== undefined,
+        ),
+      },
+      source: 'api',
+    });
     return this.toProfile(user);
   }
 
@@ -346,6 +431,16 @@ export class UserService {
     // 软删除标记在 actor 表上（users 已不再持有 deleted_at）
     user.deletedAt = new Date();
     await this.userRepo.save(user);
+    // 审计（Phase 2）：DELETE + user（admin 软删）；actor=操作 admin 本人；
+    // newData 白名单 {userId, username}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'user',
+      entityId: id,
+      actorId: currentAdminId,
+      newData: { userId: id, username: user.username },
+      source: 'api',
+    });
     return true;
   }
 

@@ -12,7 +12,8 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { RefreshToken } from '../../database/entities/refresh-token.entity';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
-import { UserRole, ActorType } from '@agent-chamber/shared';
+import { UserRole, ActorType, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 jest.mock('bcrypt', () => ({
   hash: jest.fn().mockResolvedValue('hashed-password'),
@@ -117,6 +118,7 @@ describe('AuthService', () => {
   let mockRefreshTokenRepo: jest.Mocked<Repository<RefreshToken>>;
   let mockJwtService: { sign: jest.Mock; verify: jest.Mock };
   let mockConfigService: { get: jest.Mock };
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     // NestJS module-token-factory uses crypto.createHash to generate module tokens.
@@ -151,6 +153,8 @@ describe('AuthService', () => {
       }),
     };
 
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
+
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         AuthService,
@@ -158,6 +162,7 @@ describe('AuthService', () => {
         { provide: getRepositoryToken(RefreshToken), useValue: mockRefreshTokenRepo },
         { provide: JwtService, useValue: mockJwtService },
         { provide: ConfigService, useValue: mockConfigService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -200,6 +205,15 @@ describe('AuthService', () => {
       );
       expect(bcrypt.hash).toHaveBeenCalledWith(dto.password, 12);
       expect(mockUserRepo.save).toHaveBeenCalled();
+      // 审计（Phase 2）：register → CREATE + user；actor=操作者（未传 → 兜底新用户）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.CREATE,
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1', username: 'testuser' },
+        source: 'api',
+      });
       expect(result).toEqual({
         accessToken: 'mocked-jwt-token',
         refreshToken: 'mocked-jwt-token',
@@ -267,6 +281,15 @@ describe('AuthService', () => {
       expect(bcrypt.compare).toHaveBeenCalledWith(dto.password, user.passwordHash);
       expect(user.lastLoginAt).toBeInstanceOf(Date);
       expect(mockUserRepo.save).toHaveBeenCalledWith(user);
+      // 审计（Phase 2）：login → LOGIN + user；actor=实体=登录者自身；newData 无敏感字段
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.LOGIN,
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1', username: 'testuser' },
+        source: 'api',
+      });
       expect(result).toEqual({
         accessToken: 'mocked-jwt-token',
         refreshToken: 'mocked-jwt-token',
@@ -453,6 +476,15 @@ describe('AuthService', () => {
         { tokenHash: 'mocked-hash', userId: 'user-1' },
         { revokedAt: expect.any(Date) },
       );
+      // 审计（Phase 2）：logout → LOGOUT + user；actor=实体=登出者自身
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.LOGOUT,
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1' },
+        source: 'api',
+      });
       expect(result).toBe(true);
     });
 
@@ -460,6 +492,15 @@ describe('AuthService', () => {
       const result = await service.logout('user-1');
 
       expect(mockRefreshTokenRepo.update).not.toHaveBeenCalled();
+      // 无 refreshToken 时仍记 LOGOUT（审计不依赖请求体）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: AuditAction.LOGOUT,
+        entityType: 'user',
+        entityId: 'user-1',
+        actorId: 'user-1',
+        newData: { userId: 'user-1' },
+        source: 'api',
+      });
       expect(result).toBe(true);
     });
   });

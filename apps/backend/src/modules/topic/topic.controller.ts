@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §6.11
  *   - 补充: docs/architecture.md §3.2.2 (Topic / Message)
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（topic 写操作全量记；
+ *     service 层插桩点=sendMessageInternal/join/removeParticipant/removeMessage/create，
+ *     其余 controller 层决策 2；join 可选 operatorActorId 覆盖 invite-user 场景决策 8）
  *   D5: TopicController 权限检查从 Service 迁移到 Controller。
  *         findOne → findById() + ensureCan() + enrich()。见 memory/2026-06-05.md
  *
@@ -56,7 +59,8 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Topic } from '../../database/entities/topic.entity';
-import { TopicStatus, ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
+import { TopicStatus, ActorType, ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -82,6 +86,7 @@ export class TopicController {
     private readonly topicService: TopicService,
     private readonly permService: PermissionService,
     private readonly ownerProxy: OwnerProxyService,
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -235,7 +240,23 @@ export class TopicController {
       // 内容字段（title/description）：creator/editor 参与方/owner-proxy/admin 可改 → policy write
       await this.permService.ensureCan(topic, actor, 'write');
     }
-    return this.topicService.update(id, dto);
+    const updated = await this.topicService.update(id, dto);
+    // 审计（Phase 2）：UPDATE + topic；controller 层（update 无 actor 参数且仅
+    // controller 调用，决策 2）；newData 白名单 {topicId, title?/status?/visibility?}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        topicId: id,
+        ...(dto.title !== undefined && { title: dto.title }),
+        ...(dto.status !== undefined && { status: dto.status }),
+        ...(dto.visibility !== undefined && { visibility: dto.visibility }),
+      },
+      source: 'api',
+    });
+    return updated;
   }
 
   @UseGuards(JwtAuthGuard)
@@ -253,7 +274,18 @@ export class TopicController {
   async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.permService.ensureCan(topic, actor, 'delete');
-    return this.topicService.remove(id);
+    await this.topicService.remove(id);
+    // 审计（Phase 2）：DELETE + topic；controller 层（remove 无 actor 参数，决策 2）；
+    // newData 白名单 {topicId, title}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, title: topic.title },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -270,7 +302,18 @@ export class TopicController {
   async close(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.changeStatus(id, TopicStatus.CLOSED);
+    const result = await this.topicService.changeStatus(id, TopicStatus.CLOSED);
+    // 审计（Phase 2）：状态流转无专门枚举 → UPDATE + topic（决策 6/枚举约束）；
+    // controller 层（changeStatus 无 actor 参数，决策 2）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, status: TopicStatus.CLOSED },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -287,7 +330,17 @@ export class TopicController {
   async pause(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.changeStatus(id, TopicStatus.PAUSED);
+    const result = await this.topicService.changeStatus(id, TopicStatus.PAUSED);
+    // 审计（Phase 2）：PAUSE_TOPIC 专用枚举 + topic
+    await this.auditService.log({
+      action: AuditAction.PAUSE_TOPIC,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, status: TopicStatus.PAUSED },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -304,7 +357,17 @@ export class TopicController {
   async open(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.changeStatus(id, TopicStatus.ACTIVE);
+    const result = await this.topicService.changeStatus(id, TopicStatus.ACTIVE);
+    // 审计（Phase 2）：open 无专门枚举 → UPDATE + topic
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, status: TopicStatus.ACTIVE },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -321,7 +384,17 @@ export class TopicController {
   async resume(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.changeStatus(id, TopicStatus.ACTIVE);
+    const result = await this.topicService.changeStatus(id, TopicStatus.ACTIVE);
+    // 审计（Phase 2）：RESUME_TOPIC 专用枚举 + topic
+    await this.auditService.log({
+      action: AuditAction.RESUME_TOPIC,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, status: TopicStatus.ACTIVE },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -338,7 +411,17 @@ export class TopicController {
   async archive(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.changeStatus(id, TopicStatus.ARCHIVED);
+    const result = await this.topicService.changeStatus(id, TopicStatus.ARCHIVED);
+    // 审计（Phase 2）：archive 无专门枚举 → UPDATE + topic
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, status: TopicStatus.ARCHIVED },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -364,6 +447,8 @@ export class TopicController {
     // 否则被邀请但尚未 join 的参与者会被误判无权限（404）
     const hasAccess = await this.topicService.hasTopicAccess(topicId, actor.id);
     await this.permService.ensureCan(topic, actor, 'join', { hasAccess });
+    // 审计在 service 层（join 有内部调用方——roundtable 自动加入，决策 2）；
+    // 本端点 operatorActorId 缺省 = actor.id（自己加入）
     return this.topicService.join(topicId, actor.id, actor.type);
   }
 
@@ -379,7 +464,18 @@ export class TopicController {
   @ApiResponse({ status: 403, description: 'Forbidden' })
   @ApiResponse({ status: 404, description: 'Topic not found' })
   async leave(@Param('id', ParseUUIDPipe) topicId: string, @CurrentActor() actor: UnifiedActor) {
-    return this.topicService.leave(topicId, actor.id, actor.type);
+    const result = await this.topicService.leave(topicId, actor.id, actor.type);
+    // 审计（Phase 2）：DELETE + topic_participant（leave）；controller 层（leave 无
+    // actor 参数且仅 controller 调用，决策 2）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic_participant',
+      entityId: actor.id,
+      actorId: actor.id,
+      newData: { topicId, participantId: actor.id },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -605,7 +701,18 @@ export class TopicController {
   ) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.updateAgenda(id, dto);
+    const result = await this.topicService.updateAgenda(id, dto);
+    // 审计（Phase 2）：UPDATE + topic；agenda 不在白名单示例（决策 6）→ 只记
+    // {topicId, title}（标题快照便于定位被改议程的话题）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'topic',
+      entityId: id,
+      actorId: actor.id,
+      newData: { topicId: id, title: topic.title },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -627,7 +734,18 @@ export class TopicController {
   ) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.inviteAgent(id, dto.agentId);
+    const result = await this.topicService.inviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + topic_participant（invite）；controller 层（inviteAgent
+    // 无 actor 参数，决策 2）；newData {topicId, participantId}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'topic_participant',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { topicId: id, participantId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -648,7 +766,17 @@ export class TopicController {
   ) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.uninviteAgent(id, dto.agentId);
+    const result = await this.topicService.uninviteAgent(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + topic_participant（uninvite-agent）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic_participant',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { topicId: id, participantId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -676,7 +804,18 @@ export class TopicController {
     const topic = await this.topicService.findById(id);
     // 成员管理属结构操作（D2）：creator/admin-only（owner 代理含内）
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.addEditor(id, dto.agentId);
+    const result = await this.topicService.addEditor(id, dto.agentId);
+    // 审计（Phase 2）：CREATE + topic_participant（add-editor，与 invite 同族——
+    // 新建行或角色提升均属参与者关系写入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'topic_participant',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { topicId: id, participantId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -701,7 +840,17 @@ export class TopicController {
     const topic = await this.topicService.findById(id);
     // 成员管理属结构操作（D2）：creator/admin-only（owner 代理含内）
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.removeEditor(id, dto.agentId);
+    const result = await this.topicService.removeEditor(id, dto.agentId);
+    // 审计（Phase 2）：DELETE + topic_participant（remove-editor，与 uninvite 同族）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic_participant',
+      entityId: dto.agentId,
+      actorId: actor.id,
+      newData: { topicId: id, participantId: dto.agentId },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtAuthGuard)
@@ -723,7 +872,9 @@ export class TopicController {
   ) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.join(id, dto.userId, ActorType.HUMAN);
+    // 审计在 service join 层（invite-user 复用 join 通道）；operatorActorId=操作者
+    // （admin/creator），与「自己 join」语义区分（决策 8 同构）
+    return this.topicService.join(id, dto.userId, ActorType.HUMAN, actor.id);
   }
 
   @UseGuards(JwtAuthGuard)
@@ -744,6 +895,16 @@ export class TopicController {
   ) {
     const topic = await this.topicService.findById(id);
     await this.ensureCreatorOrAdmin(topic, actor);
-    return this.topicService.uninviteUser(id, dto.userId);
+    const result = await this.topicService.uninviteUser(id, dto.userId);
+    // 审计（Phase 2）：DELETE + topic_participant（uninvite-user）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'topic_participant',
+      entityId: dto.userId,
+      actorId: actor.id,
+      newData: { topicId: id, participantId: dto.userId },
+      source: 'api',
+    });
+    return result;
   }
 }

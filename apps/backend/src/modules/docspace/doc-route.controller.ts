@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: docs/api-definition.md §16 (doc_routes 段), plan §4-B5 (意图路由结构化)
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（route create/update 在
+ *     service 层——importBundle 内部调用；remove/recheck 在 controller 层决策 2；
+ *     recheck 是空间级健康重检写，记 UPDATE + doc_space 轻量行）
  *
  * [踩坑索引] (无历史踩坑，新建文件)
  *
@@ -39,6 +42,8 @@ import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { CreateDocRouteDto, UpdateDocRouteDto, QueryDocRouteDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '@agent-chamber/shared';
 
 /**
  * doc_routes 意图路由 Controller（v1.42 批次 B5）
@@ -57,6 +62,7 @@ export class DocRouteController {
     private readonly docSpaceService: DocSpaceService,
     private readonly routeHealthService: RouteHealthService,
     private readonly permService: PermissionService,
+    private readonly auditService: AuditService,
   ) {}
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -114,7 +120,18 @@ export class DocRouteController {
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor, 'write');
-    return this.routeHealthService.recheckSpace(spaceId);
+    const result = await this.routeHealthService.recheckSpace(spaceId);
+    // 审计（Phase 2）：UPDATE + doc_space（routes recheck——空间级健康重检写，
+    // 覆写全部路由 health jsonb）；轻量 newData {spaceId, rechecked: true}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'doc_space',
+      entityId: spaceId,
+      actorId: actor.id,
+      newData: { spaceId, rechecked: true },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -161,7 +178,8 @@ export class DocRouteController {
     const route = await this.routeService.findById(id);
     const space = await this.docSpaceService.findById(route.spaceId);
     await this.permService.ensureCan(space, actor, 'write');
-    return this.routeService.update(id, dto);
+    // 审计在 service 层（update 有内部调用方 importRoutes，决策 2）；actor 从 controller 传入
+    return this.routeService.update(id, dto, actor.id);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -175,13 +193,21 @@ export class DocRouteController {
   @ApiParam({ name: 'id', description: 'DocRoute ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Route deleted successfully' })
   @ApiResponse({ status: 404, description: 'DOC_ROUTE_NOT_FOUND' })
-  async remove(
-    @Param('id', ParseUUIDPipe) id: string,
-    @CurrentActor() actor: UnifiedActor,
-  ) {
+  async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const route = await this.routeService.findById(id);
     const space = await this.docSpaceService.findById(route.spaceId);
     await this.permService.ensureCan(space, actor, 'write');
-    return this.routeService.remove(id);
+    await this.routeService.remove(id);
+    // 审计（Phase 2）：DELETE + doc_route；controller 层（remove 无 actor 参数，
+    // 决策 2）；newData 白名单 {routeId, spaceId, intent}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'doc_route',
+      entityId: id,
+      actorId: actor.id,
+      newData: { routeId: id, spaceId: route.spaceId, intent: route.intent },
+      source: 'api',
+    });
+    return { deleted: true };
   }
 }

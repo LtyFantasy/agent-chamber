@@ -5,6 +5,12 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.3 (Board / Task)
  *   - 补充: docs/api-definition.md §7. Tasks, docs/spec.md §3.2 TaskStatus
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（service 层插桩点 =
+ *     create/update/patchDescription/addComment/addDocLink——create 有内部调用方
+ *     batchCreate（batch 不单独记，循环自然产 N 行）；update/addComment/addDocLink
+ *     有内部调用方 reportResult（report 不单独记，构成写各自落行，幂等 replay 跳过
+ *     步骤自然不双记）；patchDescription 幂等 replay 不记。move/remove/assign/
+ *     dependency/doc-link 删除在 controller 层）
  *
  * [踩坑索引] B-50(列表权限过滤) B-50-EVT(任务事件boardId) B-42(单对象返回null) B-49(softDelete500) B-3(completedAt缺失) B-4(move到不存在的list) D5(权限迁移) P1-1(findOne载荷瘦身) Batch1-P2(milestone绑定校验) Batch3(topicId下线) R1(公共解析收口) A2.5(assignee须usable) WS-A(orderBy表达式坑)
  *
@@ -104,6 +110,8 @@ import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '@agent-chamber/shared';
 import type { PaginatedResponse, TaskSummary } from '@agent-chamber/shared';
 import type { TaskDocLinkItem } from '@agent-chamber/shared';
 
@@ -190,6 +198,7 @@ export class TaskService {
     private docSpaceRepo: Repository<DocSpace>,
     private readonly docSpacePolicy: DocSpacePolicy,
     private readonly actorProfileService: ActorProfileService,
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -645,6 +654,24 @@ export class TaskService {
         });
       }
 
+      // 审计（Phase 2）：CREATE + task；service 层（batchCreate 循环调本方法——
+      // batch 不单独记，决策 2）；newData 白名单 {taskId, title, status?, listId,
+      // assigneeId?}（决策 6；description/customFields 不入）
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'task',
+        entityId: savedTask.id,
+        actorId: actorId ?? null,
+        newData: {
+          taskId: savedTask.id,
+          title: savedTask.title,
+          ...(savedTask.status !== undefined && { status: savedTask.status }),
+          ...(savedTask.listId !== undefined && { listId: savedTask.listId }),
+          ...(savedTask.assigneeId !== undefined && { assigneeId: savedTask.assigneeId }),
+        },
+        source: 'api',
+      });
+
       return { ...this.toPlain(savedTask), boardId: boardId ?? null, topicId: topicId ?? null };
     }
 
@@ -694,6 +721,23 @@ export class TaskService {
           details: '创建了任务',
         });
       }
+
+      // 审计（Phase 2）：幂等键路径的真实写成功后记（replay 分支在 catch 中提前
+      // 返回，不落审计——决策 2「幂等 replay 不重复记」）；载荷与无幂等键路径一致
+      await this.auditService.log({
+        action: AuditAction.CREATE,
+        entityType: 'task',
+        entityId: savedTask.id,
+        actorId: actorId ?? null,
+        newData: {
+          taskId: savedTask.id,
+          title: savedTask.title,
+          ...(savedTask.status !== undefined && { status: savedTask.status }),
+          ...(savedTask.listId !== undefined && { listId: savedTask.listId }),
+          ...(savedTask.assigneeId !== undefined && { assigneeId: savedTask.assigneeId }),
+        },
+        source: 'api',
+      });
 
       return { ...this.toPlain(savedTask), boardId: boardId ?? null, topicId: topicId ?? null };
     } catch (err: unknown) {
@@ -838,6 +882,8 @@ export class TaskService {
     // 保存旧状态用于状态机判断
     const oldStatus = task.status;
     const hadStartedAt = !!task.startedAt;
+    // 审计用：listId 前后值（task.listId 在下方可能被 status→mappedStatus 自动吸附改写）
+    const oldListId = task.listId;
 
     // listId 变更时，保留 list 存在性校验（topicId 不再存储，由后续 join 派生）
     if (dto.listId && dto.listId !== task.listId) {
@@ -969,6 +1015,33 @@ export class TaskService {
       }
     }
 
+    // 审计（Phase 2）：UPDATE + task；service 层（reportResult 内部调用本方法——
+    // report 不单独记，状态变更由本行承载，决策 2）；newData 白名单 {taskId, title,
+    // status?/listId?/assigneeId? 前后值}（决策 6；description/customFields 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'task',
+      entityId: saved.id,
+      actorId: actorId ?? null,
+      newData: {
+        taskId: saved.id,
+        title: saved.title,
+        ...(saved.status !== oldStatus && {
+          status: saved.status,
+          statusBefore: oldStatus,
+        }),
+        ...(saved.listId !== oldListId && {
+          listId: saved.listId,
+          listIdBefore: oldListId,
+        }),
+        ...(saved.assigneeId !== oldAssigneeId && {
+          assigneeId: saved.assigneeId,
+          assigneeIdBefore: oldAssigneeId,
+        }),
+      },
+      source: 'api',
+    });
+
     return {
       ...this.toPlain(saved),
       boardId: updatedList?.boardId ?? null,
@@ -1044,7 +1117,7 @@ export class TaskService {
 
     // ── 主事务：锁行 → 乐观锁 → match → 替换 → save → 幂等记录（同事务）──
     try {
-      const { response, oldDescription, newDescription, boardId, topicId } =
+      const { response, oldDescription, newDescription, boardId, topicId, title } =
         await this.dataSource.transaction(async (manager) => {
           const taskRepo = manager.getRepository(Task);
           // FOR UPDATE 行锁：并发 patch 串行化，锁内复核的 oldString/descriptionHash
@@ -1133,6 +1206,7 @@ export class TaskService {
             newDescription: saved.description,
             boardId: list?.boardId ?? null,
             topicId: list?.board?.topicId ?? null,
+            title: saved.title,
           };
         });
 
@@ -1160,6 +1234,18 @@ export class TaskService {
           details: '更新了: description',
         });
       }
+
+      // 审计（Phase 2）：UPDATE + task；service 层（幂等 replay 在入口/并发 catch
+      // 提前返回，只有真实写路径走到这里——决策 2「幂等 replay 不重复记」）；
+      // newData 白名单 {taskId, title}（决策 6——description 正文不入）
+      await this.auditService.log({
+        action: AuditAction.UPDATE,
+        entityType: 'task',
+        entityId: id,
+        actorId: actor.id,
+        newData: { taskId: id, title },
+        source: 'api',
+      });
 
       return response;
     } catch (err: unknown) {
@@ -1367,6 +1453,17 @@ export class TaskService {
       actorType: authorType ?? ActorType.HUMAN,
       details: `添加了评论`,
     });
+    // 审计（Phase 2）：CREATE + task_comment；service 层（reportResult 内部调用
+    // 本方法——report 不单独记，评论由本行承载，决策 2）；newData 白名单
+    // {taskId, commentId}（决策 6——content 显式黑名单，正文永不入审计）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'task_comment',
+      entityId: saved.id,
+      actorId: authorId,
+      newData: { taskId: id, commentId: saved.id },
+      source: 'api',
+    });
     return saved;
   }
 
@@ -1463,7 +1560,19 @@ export class TaskService {
     if (existing) return existing;
 
     const link = this.docLinkRepo.create({ taskId, docId, createdBy: actor.id });
-    return this.docLinkRepo.save(link);
+    const saved = await this.docLinkRepo.save(link);
+    // 审计（Phase 2）：CREATE + doc_link；service 层（reportResult 的 runDocLinks
+    // 内部调用本方法——report 不单独记，链接由本行承载，决策 2）；幂等重复关联
+    // 提前返回不记；newData 白名单 {taskId, docId}；entityId=docId（复合主键无 id 列）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'doc_link',
+      entityId: docId,
+      actorId: actor.id,
+      newData: { taskId, docId },
+      source: 'api',
+    });
+    return saved;
   }
 
   /**

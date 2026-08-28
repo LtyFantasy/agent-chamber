@@ -22,6 +22,7 @@ import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
 import { EventModule } from '../event/event.module';
+import { AuditModule } from '../audit/audit.module';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
 
 @Module({
@@ -46,6 +47,7 @@ import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
       TopicParticipant,
     ]),
     EventModule,
+    AuditModule,
   ],
   providers: [TaskService, TaskDependencyService, MilestoneService, DocSpacePolicy],
   controllers: [TaskController],

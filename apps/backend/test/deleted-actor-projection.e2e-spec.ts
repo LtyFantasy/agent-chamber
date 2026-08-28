@@ -46,10 +46,13 @@ import { ActorType, AgentStatus, MessageType, TopicStatus, UserRole } from '@age
 import * as entities from '../src/database/entities';
 import { AgentService } from '../src/modules/agent/agent.service';
 import { TopicService } from '../src/modules/topic/topic.service';
+import { AuditService } from '../src/modules/audit/audit.service';
 import { ActorProfileService } from '../src/common/services/actor-profile.service';
+import { OwnerProxyService } from '../src/common/services/owner-proxy.service';
 import { Agent } from '../src/database/entities/agent.entity';
 import { Actor } from '../src/database/entities/actor.entity';
 import { ApiKey } from '../src/database/entities/api-key.entity';
+import { AuditLog } from '../src/database/entities/audit-log.entity';
 import { Topic } from '../src/database/entities/topic.entity';
 import { TopicParticipant } from '../src/database/entities/topic-participant.entity';
 import { Message } from '../src/database/entities/message.entity';
@@ -121,6 +124,11 @@ describe('已删除 Actor 消息/参与者投影语义 — 真实 PG 集成', ()
       ds.getRepository(Agent),
       ds.getRepository(User),
     );
+    const auditService = new AuditService(
+      ds.getRepository(AuditLog),
+      new OwnerProxyService(ds.getRepository(Agent)),
+      actorProfileService,
+    );
     topicService = new TopicService(
       ds.getRepository(Topic),
       ds.getRepository(TopicParticipant),
@@ -136,11 +144,13 @@ describe('已删除 Actor 消息/参与者投影语义 — 真实 PG 集成', ()
       {} as never, // dataSource（未触达）
       {} as never, // ownerProxy（未触达）
       actorProfileService,
+      auditService, // 活动日志插桩（Phase 2）——本套件只读路径不触发，真实例防误触
     );
     agentService = new AgentService(
       ds.getRepository(Agent),
       ds.getRepository(ApiKey),
       ds.getRepository(RoundtableSeat),
+      auditService,
     );
   }, 30000);
 

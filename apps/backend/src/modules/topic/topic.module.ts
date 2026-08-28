@@ -12,6 +12,7 @@ import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Task } from '../../database/entities/task.entity';
 import { EventModule } from '../event/event.module';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
@@ -27,6 +28,8 @@ import { EventModule } from '../event/event.module';
       Task,
     ]),
     EventModule,
+    // 活动日志插桩（plan shadowcat-sunspot-catwoman Phase 2）：topic 写操作全量记
+    AuditModule,
   ],
   providers: [TopicService],
   controllers: [TopicController],

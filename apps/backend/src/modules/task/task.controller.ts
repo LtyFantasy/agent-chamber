@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.3 (Board / Task)
  *   - 补充: docs/api-definition.md §7. Tasks
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（task 写操作全量记；
+ *     service 层插桩点=create/update/patchDescription/addComment/addDocLink（有内部
+ *     调用方 batchCreate/reportResult），其余 controller 层决策 2；batch 不单独记）
  *
  * [踩坑索引] B-50(列表权限过滤) D5(权限盲区) B-42(单对象返回null) B-49(softDelete500) P1-1(findOne载荷瘦身)
  *
@@ -63,7 +66,8 @@ import {
 } from './dto';
 import { AddDocLinkDto } from '../docspace/dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { TaskStatus } from '@agent-chamber/shared';
+import { TaskStatus, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Tasks')
 @Controller('tasks')
@@ -73,6 +77,7 @@ export class TaskController {
     private readonly taskDependencyService: TaskDependencyService,
     private readonly milestoneService: MilestoneService,
     private readonly permService: PermissionService,
+    private readonly auditService: AuditService,
   ) {}
 
   // ===== Task 基础 CRUD =====
@@ -413,7 +418,18 @@ export class TaskController {
   async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'delete');
-    return this.taskService.remove(id);
+    await this.taskService.remove(id);
+    // 审计（Phase 2）：DELETE + task；controller 层（remove 无 actor 参数，决策 2）；
+    // newData 白名单 {taskId, title}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'task',
+      entityId: id,
+      actorId: actor.id,
+      newData: { taskId: id, title: task.title },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -438,7 +454,28 @@ export class TaskController {
   ) {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
-    return this.taskService.move(id, dto, actor.id, actor.type);
+    const result = await this.taskService.move(id, dto, actor.id, actor.type);
+    // 审计（Phase 2）：UPDATE + task（move）；controller 层（move 无 actor 参数，
+    // 决策 2）；newData 白名单 {taskId, title, fromListId, toListId, status? 前后值}
+    // （决策 6；position 不入）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'task',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        taskId: id,
+        title: task.title,
+        fromListId: task.listId,
+        toListId: dto.listId,
+        ...(result.status !== task.status && {
+          status: result.status,
+          statusBefore: task.status,
+        }),
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -462,7 +499,23 @@ export class TaskController {
   ) {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
-    return this.taskService.assign(id, dto, actor.id, actor.type);
+    const result = await this.taskService.assign(id, dto, actor.id, actor.type);
+    // 审计（Phase 2）：UPDATE + task（assign）；controller 层（assign 无 actor 参数，
+    // 决策 2）；newData 白名单 {taskId, title, assigneeId 前后值}
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'task',
+      entityId: id,
+      actorId: actor.id,
+      newData: {
+        taskId: id,
+        title: task.title,
+        assigneeId: result.assigneeId,
+        assigneeIdBefore: task.assigneeId,
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -536,7 +589,18 @@ export class TaskController {
   ) {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
-    return this.taskService.removeDocLink(id, docId);
+    await this.taskService.removeDocLink(id, docId);
+    // 审计（Phase 2）：DELETE + doc_link；controller 层（removeDocLink 无 actor
+    // 参数，决策 2）；newData 白名单 {taskId, docId}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'doc_link',
+      entityId: docId,
+      actorId: actor.id,
+      newData: { taskId: id, docId },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -652,8 +716,27 @@ export class TaskController {
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 403, description: 'Forbidden' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async addDependency(@Param('id', ParseUUIDPipe) id: string, @Body() dto: AddTaskDependencyDto) {
-    return this.taskDependencyService.addDependency(id, dto);
+  async addDependency(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AddTaskDependencyDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const result = await this.taskDependencyService.addDependency(id, dto);
+    // 审计（Phase 2）：CREATE + task_dependency；controller 层（addDependency 无
+    // actor 参数，决策 2）；newData 白名单 {taskId, dependsOnTaskId, type}
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'task_dependency',
+      entityId: result.id,
+      actorId: actor.id,
+      newData: {
+        taskId: id,
+        dependsOnTaskId: dto.dependsOnTaskId,
+        type: dto.type ?? 'blocks',
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -671,8 +754,20 @@ export class TaskController {
   async removeDependency(
     @Param('id', ParseUUIDPipe) id: string,
     @Param('depId', ParseUUIDPipe) depId: string,
+    @CurrentActor() actor: UnifiedActor,
   ) {
-    return this.taskDependencyService.removeDependency(id, depId);
+    await this.taskDependencyService.removeDependency(id, depId);
+    // 审计（Phase 2）：DELETE + task_dependency；controller 层；newData 白名单
+    // {taskId, dependsOnTaskId}
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'task_dependency',
+      entityId: depId,
+      actorId: actor.id,
+      newData: { taskId: id, dependsOnTaskId: depId },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)

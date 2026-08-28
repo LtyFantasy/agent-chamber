@@ -4,6 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/architecture.md §7.2 (统一权限模型)
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md 决策 9（透传 request.agent.keyPrefix）
  *
  * [踩坑索引] D5(双身份统一)
  *
@@ -56,6 +57,8 @@ export const CurrentActor = createParamDecorator(
         type: ActorType.AGENT,
         name: request.agent.name,
         permissions: request.agent.permissions,
+        // 决策 9：透传本次认证所用 key 前缀（审计插桩 keyPrefix 缓解，非明文）
+        keyPrefix: request.agent.keyPrefix,
       };
     }
 

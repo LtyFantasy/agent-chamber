@@ -4,13 +4,15 @@ import { TaskService } from './task.service';
 import { TaskDependencyService } from './task-dependency.service';
 import { MilestoneService } from './milestone.service';
 import { PermissionService } from '../../common/services/permission.service';
-import { ActorType, UserRole, TaskStatus } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
+import { ActorType, UserRole, TaskStatus, TaskDependencyType } from '@agent-chamber/shared';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
 describe('TaskController', () => {
   let controller: TaskController;
   let service: typeof mockService;
   let permService: typeof mockPermService;
+  let auditService: { log: jest.Mock };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const mockAgentActor = { id: 'agent-1', type: ActorType.AGENT };
@@ -29,6 +31,7 @@ describe('TaskController', () => {
     getComments: jest.fn(),
     addComment: jest.fn(),
     getActivities: jest.fn(),
+    removeDocLink: jest.fn(),
   };
 
   const mockDepService = {
@@ -52,6 +55,7 @@ describe('TaskController', () => {
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -61,6 +65,7 @@ describe('TaskController', () => {
         { provide: TaskDependencyService, useValue: mockDepService },
         { provide: MilestoneService, useValue: mockMilestoneService },
         { provide: PermissionService, useValue: mockPermService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -72,6 +77,7 @@ describe('TaskController', () => {
     permService = module.get<PermissionService>(
       PermissionService,
     ) as unknown as typeof mockPermService;
+    auditService = module.get<AuditService>(AuditService) as unknown as { log: jest.Mock };
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -164,33 +170,58 @@ describe('TaskController', () => {
 
   describe('remove', () => {
     it('should ensure delete permission then remove', async () => {
-      const task = { id: 'task-1' };
+      const task = { id: 'task-1', title: 'Task 1' };
       service.findById.mockResolvedValue(task);
       service.remove.mockResolvedValue(true);
 
       expect(await controller.remove('task-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'delete');
       expect(service.remove).toHaveBeenCalledWith('task-1');
+      // 审计（Phase 2）：DELETE + task
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'delete',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: mockActor.id,
+        newData: { taskId: 'task-1', title: 'Task 1' },
+        source: 'api',
+      });
     });
   });
 
   describe('move', () => {
     it('should ensure write permission then move', async () => {
-      const task = { id: 'task-1' };
+      const task = { id: 'task-1', title: 'Task 1', listId: 'list-1', status: 'todo' };
       const dto = { listId: 'list-2', order: 5 };
-      const result = { id: 'task-1', listId: 'list-2', position: 5 };
+      const result = { id: 'task-1', listId: 'list-2', position: 5, status: 'in_progress' };
       service.findById.mockResolvedValue(task);
       service.move.mockResolvedValue(result);
 
       expect(await controller.move('task-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
       expect(service.move).toHaveBeenCalledWith('task-1', dto, mockActor.id, mockActor.type);
+      // 审计（Phase 2）：UPDATE + task（move）；含 listId 前后值与 status 前后值
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: mockActor.id,
+        newData: {
+          taskId: 'task-1',
+          title: 'Task 1',
+          fromListId: 'list-1',
+          toListId: 'list-2',
+          status: 'in_progress',
+          statusBefore: 'todo',
+        },
+        source: 'api',
+      });
     });
   });
 
   describe('assign', () => {
     it('should ensure write permission then assign', async () => {
-      const task = { id: 'task-1' };
+      const task = { id: 'task-1', title: 'Task 1', assigneeId: null };
       const dto = { assigneeId: 'user-2', assigneeType: ActorType.HUMAN };
       const result = { id: 'task-1', assigneeId: 'user-2', assigneeType: 'agent' };
       service.findById.mockResolvedValue(task);
@@ -199,6 +230,20 @@ describe('TaskController', () => {
       expect(await controller.assign('task-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
       expect(service.assign).toHaveBeenCalledWith('task-1', dto, mockActor.id, mockActor.type);
+      // 审计（Phase 2）：UPDATE + task（assign）；含 assigneeId 前后值
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: mockActor.id,
+        newData: {
+          taskId: 'task-1',
+          title: 'Task 1',
+          assigneeId: 'user-2',
+          assigneeIdBefore: null,
+        },
+        source: 'api',
+      });
     });
   });
 
@@ -264,6 +309,62 @@ describe('TaskController', () => {
 
       expect(await controller.getActivities('task-1')).toBe(result);
       expect(service.getActivities).toHaveBeenCalledWith('task-1', undefined);
+    });
+  });
+
+  describe('addDependency', () => {
+    it('should add dependency and audit CREATE + task_dependency', async () => {
+      const dto = { dependsOnTaskId: 'task-2', type: TaskDependencyType.BLOCKS };
+      const result = { id: 'dep-1', taskId: 'task-1', dependsOnTaskId: 'task-2', type: 'blocks' };
+      mockDepService.addDependency.mockResolvedValue(result);
+
+      expect(await controller.addDependency('task-1', dto, mockActor)).toBe(result);
+      expect(mockDepService.addDependency).toHaveBeenCalledWith('task-1', dto);
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'task_dependency',
+        entityId: 'dep-1',
+        actorId: mockActor.id,
+        newData: { taskId: 'task-1', dependsOnTaskId: 'task-2', type: 'blocks' },
+        source: 'api',
+      });
+    });
+  });
+
+  describe('removeDependency', () => {
+    it('should remove dependency and audit DELETE + task_dependency', async () => {
+      mockDepService.removeDependency.mockResolvedValue(true);
+
+      expect(await controller.removeDependency('task-1', 'dep-1', mockActor)).toBe(true);
+      expect(mockDepService.removeDependency).toHaveBeenCalledWith('task-1', 'dep-1');
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'delete',
+        entityType: 'task_dependency',
+        entityId: 'dep-1',
+        actorId: mockActor.id,
+        newData: { taskId: 'task-1', dependsOnTaskId: 'dep-1' },
+        source: 'api',
+      });
+    });
+  });
+
+  describe('removeDocLink', () => {
+    it('should remove doc link and audit DELETE + doc_link', async () => {
+      const task = { id: 'task-1' };
+      service.findById.mockResolvedValue(task);
+      service.removeDocLink.mockResolvedValue(true);
+
+      expect(await controller.removeDocLink('task-1', 'doc-1', mockActor)).toBe(true);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
+      expect(service.removeDocLink).toHaveBeenCalledWith('task-1', 'doc-1');
+      expect(auditService.log).toHaveBeenCalledWith({
+        action: 'delete',
+        entityType: 'doc_link',
+        entityId: 'doc-1',
+        actorId: mockActor.id,
+        newData: { taskId: 'task-1', docId: 'doc-1' },
+        source: 'api',
+      });
     });
   });
 });

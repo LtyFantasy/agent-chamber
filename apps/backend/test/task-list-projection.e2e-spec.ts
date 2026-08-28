@@ -115,6 +115,7 @@ describe('Task 列表投影扁平化 + statusPriority 排序 — 真实 PG 集�
       ds.getRepository(entities.DocSpace),
       {} as never, // docSpacePolicy（未触达）
       actorProfileService,
+      {} as never, // auditService（未触达）
     );
 
     // 测试数据：1 board + 1 list + 5 tasks（覆盖全部优先级组，assignee 全 null

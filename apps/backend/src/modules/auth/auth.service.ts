@@ -5,6 +5,8 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/api-definition.md §3. Auth
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（login/logout/register，
+ *     actor=操作者语义决策 8，refresh 显式排除）
  *
  * [踩坑索引] （暂无重大踩坑）
  *
@@ -30,8 +32,9 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { RefreshToken } from '../../database/entities/refresh-token.entity';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
-import { UserRole, AgentStatus, ErrorCode, ActorType } from '@agent-chamber/shared';
+import { UserRole, AgentStatus, ErrorCode, ActorType, AuditAction } from '@agent-chamber/shared';
 import type { AuthResponse } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class AuthService {
@@ -42,9 +45,17 @@ export class AuthService {
     private refreshTokenRepo: Repository<RefreshToken>,
     private jwtService: JwtService,
     private configService: ConfigService,
+    private readonly auditService: AuditService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<AuthResponse> {
+  /**
+   * 注册新用户（admin-only，plan shadowcat-sunspot-catwoman 决策 8）
+   *
+   * @param dto 注册表单
+   * @param operatorActorId 操作者（admin）actor id——审计 actorId=操作者而非新用户
+   *                        （与 login 的 actor=实体主体语义区分）；缺省兜底新用户自身
+   */
+  async register(dto: RegisterDto, operatorActorId?: string): Promise<AuthResponse> {
     const existing = await this.userRepo.findOne({
       where: { email: dto.email },
       withDeleted: true,
@@ -73,6 +84,18 @@ export class AuthService {
     });
 
     await this.userRepo.save(user);
+
+    // 审计（决策 8）：actor=操作 admin（controller 传入）；实体=新用户
+    // newData 白名单 {userId, username}（决策 6）——passwordHash/email 不入
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'user',
+      entityId: user.id,
+      actorId: operatorActorId ?? user.id,
+      newData: { userId: user.id, username: user.username },
+      source: 'api',
+    });
+
     return this.generateTokens(user);
   }
 
@@ -108,6 +131,17 @@ export class AuthService {
 
     user.lastLoginAt = new Date();
     await this.userRepo.save(user);
+
+    // 审计（决策 8）：LOGIN 行，actor=实体=登录用户自身；
+    // newData 白名单 {userId, username}——失败 login 记不了（entity_id NOT NULL）
+    await this.auditService.log({
+      action: AuditAction.LOGIN,
+      entityType: 'user',
+      entityId: user.id,
+      actorId: user.id,
+      newData: { userId: user.id, username: user.username },
+      source: 'api',
+    });
 
     return this.generateTokens(user);
   }
@@ -156,6 +190,17 @@ export class AuthService {
       const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
       await this.refreshTokenRepo.update({ tokenHash, userId }, { revokedAt: new Date() });
     }
+
+    // 审计（决策 8）：LOGOUT 行，actor=实体=登出用户自身
+    await this.auditService.log({
+      action: AuditAction.LOGOUT,
+      entityType: 'user',
+      entityId: userId,
+      actorId: userId,
+      newData: { userId },
+      source: 'api',
+    });
+
     return true;
   }
 

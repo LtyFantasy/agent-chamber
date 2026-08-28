@@ -5,6 +5,11 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.4 (统一事件层)
  *   - 补充: docs/api-definition.md §9. Webhooks
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（webhook 模块唯一
+ *     mutating 端点 = POST /webhooks/test 模拟投递；⚠️ 前提修正：agent 实体
+ *     webhookUrl/webhookSecret/webhookEvents 为遗留死字段（无任何写路径），
+ *     「webhook 配置变更」端点不存在——本模块按 test 端点落 CREATE + webhook_delivery，
+ *     newData 只记 deliveryId + targetUrl 域名部分，payload 不入）
  *
  * [踩坑索引] B-50(webhook列表越权)
  *
@@ -36,7 +41,9 @@ import { WebhookService } from './webhook.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
-import { UserRole } from '@agent-chamber/shared';
+import { UserRole, AuditAction } from '@agent-chamber/shared';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 import { QueryWebhookDto } from './dto/query-webhook.dto';
 import { TestWebhookDto } from './dto/test-webhook.dto';
 
@@ -45,7 +52,10 @@ import { TestWebhookDto } from './dto/test-webhook.dto';
 @Roles(UserRole.ADMIN)
 @Controller('webhooks')
 export class WebhookController {
-  constructor(private readonly webhookService: WebhookService) {}
+  constructor(
+    private readonly webhookService: WebhookService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Get()
   @ApiOperation({
@@ -88,7 +98,31 @@ export class WebhookController {
     description: 'Webhook test successful; simulated delivery log returned',
   })
   @ApiResponse({ status: 400, description: 'Request validation failed' })
-  async test(@Body() dto: TestWebhookDto) {
-    return this.webhookService.test(dto);
+  async test(@Body() dto: TestWebhookDto, @CurrentUser('userId') adminId?: string) {
+    const result = await this.webhookService.test(dto);
+    // 审计（Phase 2）：CREATE + webhook_delivery（模拟投递）；actor=操作 admin；
+    // newData 只记 deliveryId + targetUrl 域名部分（决策 6——payload 测试载荷不入，
+    // 可能含任意内容）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'webhook_delivery',
+      entityId: result.log.id,
+      actorId: adminId ?? null,
+      newData: {
+        deliveryId: result.log.id,
+        targetUrl: this.hostnameOf(dto.url),
+      },
+      source: 'api',
+    });
+    return result;
+  }
+
+  /** 提取 URL 域名部分（决策 6：完整 URL 可能带 query/secret 参数，只记 hostname） */
+  private hostnameOf(url: string): string {
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return url;
+    }
   }
 }

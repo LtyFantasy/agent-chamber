@@ -5,6 +5,9 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Agent)
  *   - 补充: docs/api-definition.md §5. Agents
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（agent 写操作全量记，
+ *     controller 层插桩决策 2，keyPrefix 缓解决策 9——create 的 status 是 actor 代理
+ *     getter，TS spread 类实例不保留 getter 类型，须从 agent.actor.status 直取）
  *
  * [踩坑索引] D5(权限盲区) AGENT-VISIBILITY(Agent可见性) AGENT-FIELD-WHITELIST(白名单漏字段) A3-2(deletion-impact与DELETE同权)
  *
@@ -63,7 +66,8 @@ import {
 } from './dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { UserRole, ErrorCode, AgentStatus } from '@agent-chamber/shared';
+import { UserRole, ErrorCode, AgentStatus, AuditAction } from '@agent-chamber/shared';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Agents')
 @UseGuards(JwtAuthGuard)
@@ -72,6 +76,7 @@ export class AgentController {
   constructor(
     private readonly agentService: AgentService,
     private readonly permService: PermissionService,
+    private readonly auditService: AuditService,
   ) {}
 
   @Get()
@@ -185,6 +190,21 @@ export class AgentController {
   @ApiResponse({ status: 201, description: 'Agent created successfully' })
   async create(@CurrentActor() actor: UnifiedActor, @Body() dto: CreateAgentDto) {
     const { apiKey, ...agent } = await this.agentService.create(actor.id, dto);
+    // 审计（Phase 2）：CREATE + agent；newData 白名单 {agentId, name, status}（决策 6）
+    // status 是 Agent 的 actor 代理 getter——TS spread 类实例不保留 getter 类型，
+    // 从 actor 列直取（actor 在返回类型中恒存在，create 必建 actor 行）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'agent',
+      entityId: agent.id,
+      actorId: actor.id,
+      newData: {
+        agentId: agent.id,
+        name: agent.name,
+        status: agent.actor?.status ?? AgentStatus.ACTIVE,
+      },
+      source: 'api',
+    });
     return {
       ...this.pickPublicAgentFields(agent as unknown as Record<string, unknown>),
       apiKey,
@@ -212,6 +232,19 @@ export class AgentController {
   @ApiResponse({ status: 200, description: 'Current agent updated successfully' })
   async updateMe(@CurrentActor() actor: UnifiedActor, @Body() dto: UpdateAgentDto) {
     const agent = await this.agentService.updateMe(actor.id, dto);
+    // 审计（Phase 2）：UPDATE + agent；actor=自己；newData 白名单子集（决策 6）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'agent',
+      entityId: agent.id,
+      actorId: actor.id,
+      newData: {
+        agentId: agent.id,
+        ...(dto.name !== undefined && { name: dto.name }),
+        ...(dto.status !== undefined && { status: dto.status }),
+      },
+      source: 'api',
+    });
     return this.pickPublicAgentFields(agent as unknown as Record<string, unknown>);
   }
 
@@ -313,6 +346,19 @@ export class AgentController {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
     const updated = await this.agentService.update(id, dto);
+    // 审计（Phase 2）：UPDATE + agent；actor=操作者（决策 2：controller 层，无签名波及）
+    await this.auditService.log({
+      action: AuditAction.UPDATE,
+      entityType: 'agent',
+      entityId: updated.id,
+      actorId: actor.id,
+      newData: {
+        agentId: updated.id,
+        ...(dto.name !== undefined && { name: dto.name }),
+        ...(dto.status !== undefined && { status: dto.status }),
+      },
+      source: 'api',
+    });
     return this.pickPublicAgentFields(updated as unknown as Record<string, unknown>);
   }
 
@@ -324,7 +370,17 @@ export class AgentController {
   async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'delete');
-    return this.agentService.remove(id);
+    await this.agentService.remove(id);
+    // 审计（Phase 2）：DELETE + agent；newData 白名单 {agentId, name}（决策 6）
+    await this.auditService.log({
+      action: AuditAction.DELETE,
+      entityType: 'agent',
+      entityId: id,
+      actorId: actor.id,
+      newData: { agentId: id, name: agent.name },
+      source: 'api',
+    });
+    return true;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -335,7 +391,18 @@ export class AgentController {
   async resetKey(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
-    return this.agentService.resetKey(id);
+    const result = await this.agentService.resetKey(id);
+    // 审计（Phase 2）：RESET_API_KEY + agent；newData 带新 key 前缀（决策 9 缓解，
+    // 前缀 = rawKey 前 8 字符，非明文；完整 apiKey 红线禁止入审计字段）
+    await this.auditService.log({
+      action: AuditAction.RESET_API_KEY,
+      entityType: 'agent',
+      entityId: id,
+      actorId: actor.id,
+      newData: { agentId: id, keyPrefix: result.apiKey?.substring(0, 8) },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -349,7 +416,17 @@ export class AgentController {
   async toggle(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
-    return this.agentService.toggle(id);
+    const result = await this.agentService.toggle(id);
+    // 审计（Phase 2）：TOGGLE_AGENT + agent；newData 带切换后 status
+    await this.auditService.log({
+      action: AuditAction.TOGGLE_AGENT,
+      entityType: 'agent',
+      entityId: id,
+      actorId: actor.id,
+      newData: { agentId: id, status: result.status },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -432,7 +509,22 @@ export class AgentController {
   ) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
-    return this.agentService.createKey(id, dto);
+    const result = await this.agentService.createKey(id, dto);
+    // 审计（Phase 2）：CREATE + api_key；newData {keyId, keyPrefix, agentId}（决策 9，
+    // keyPrefix 非明文；apiKey 明文不入）
+    await this.auditService.log({
+      action: AuditAction.CREATE,
+      entityType: 'api_key',
+      entityId: result.id,
+      actorId: actor.id,
+      newData: {
+        keyId: result.id,
+        keyPrefix: result.keyPrefix,
+        agentId: result.agentId,
+      },
+      source: 'api',
+    });
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -448,6 +540,8 @@ export class AgentController {
   ) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
-    return this.agentService.revokeKey(keyId);
+    // 审计在 service 层（revokeKey 内部持有 key 实体 → keyId/keyPrefix/agentId 齐备；
+    // actor 从 controller 传入，决策 8 同构）
+    return this.agentService.revokeKey(keyId, actor.id);
   }
 }

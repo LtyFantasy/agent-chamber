@@ -4,6 +4,8 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/architecture.md §7.2 (统一权限模型)
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md 决策 9（UnifiedActor 携带
+ *     keyPrefix，审计插桩缓解）
  *
  * [踩坑索引] D5(双身份统一)
  *
@@ -35,4 +37,9 @@ export interface UnifiedActor {
   role?: UserRole;
   /** Agent 权限范围（仅 agent 有效，来自 API Key permissions） */
   permissions?: string[];
+  /**
+   * 本次认证所用 API Key 前缀（仅 agent 有效，来自 AgentPayload.keyPrefix；
+   * 活动日志决策 9 缓解：审计插桩 newData 带 keyPrefix，非明文）
+   */
+  keyPrefix?: string;
 }

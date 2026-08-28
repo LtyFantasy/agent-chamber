@@ -6,6 +6,8 @@
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
  *   - 补充: docs/roundtable-design.md §7 (安全边界: runner 用普通 agent API Key 拨出,
  *     WS 握手认证与 HTTP guard 共用本服务)
+ *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md 决策 9（AgentPayload 携带
+ *     keyPrefix——多 key 粒度缓解，认证上下文供审计 newData，非明文）
  *
  * [踩坑索引] A3-1b(actor.deletedAt死代码)
  *
@@ -35,6 +37,11 @@ import { AgentStatus, ErrorCode } from '@agent-chamber/shared';
 /**
  * API Key → Agent 身份认证结果（HTTP guard 挂到 request.agent，WS 握手直接消费）。
  * permissions 形状来自 api_keys 表 jsonb（{ scopes: [...] }，MCP/REST 通用）。
+ *
+ * keyPrefix（v1.69.0 活动日志插桩，plan shadowcat-sunspot-catwoman 决策 9）：
+ * 多 key 粒度缓解——认证上下文携带本次所用 key 的前缀（8 字符，非明文），
+ * 审计插桩塞进 newData（{keyId, keyPrefix, agentId}），「我的哪把 key 做了什么」
+ * 可答。仅前缀不涉密；完整 apiKey 明文禁止入审计字段。
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface AgentPayload {
@@ -42,6 +49,8 @@ export interface AgentPayload {
   name: string;
   ownerId: string;
   permissions: Record<string, any>;
+  /** 本次认证所用 API Key 的前缀（rawKey.substring(0,8)，如 'ask_abcD'；可选——兼容 WS/其他构造方） */
+  keyPrefix?: string;
 }
 
 /**
@@ -140,6 +149,8 @@ export class ApiKeyAuthService {
       name: agent.name,
       ownerId: agent.ownerId,
       permissions: apiKey.permissions,
+      // 决策 9：认证上下文携带本次 key 前缀（审计 newData 缓解多 key 粒度）
+      keyPrefix: apiKey.keyPrefix,
     };
   }
 }

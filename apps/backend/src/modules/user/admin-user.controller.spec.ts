@@ -106,8 +106,8 @@ describe('AdminUserController', () => {
         name: 'New User',
       };
 
-      expect(await controller.createByAdmin(dto)).toBe(result);
-      expect(service.createByAdmin).toHaveBeenCalledWith(dto);
+      expect(await controller.createByAdmin(dto, 'admin-1')).toBe(result);
+      expect(service.createByAdmin).toHaveBeenCalledWith(dto, 'admin-1');
     });
 
     it('should require ADMIN role decorator', () => {

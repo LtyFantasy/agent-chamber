@@ -3,7 +3,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
-import { UserRole } from '@agent-chamber/shared';
+import { UserRole, ActorType } from '@agent-chamber/shared';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { ROLES_KEY } from '../../common/decorators/roles.decorator';
@@ -53,9 +53,10 @@ describe('AuthController', () => {
       };
       service.register.mockResolvedValue(expectedResult);
 
-      const result = await controller.register(dto);
+      const result = await controller.register(dto, { id: 'admin-1', type: ActorType.HUMAN });
 
-      expect(service.register).toHaveBeenCalledWith(dto);
+      // 审计 actor=操作 admin（决策 8，从 controller 传入 service）
+      expect(service.register).toHaveBeenCalledWith(dto, 'admin-1');
       expect(result).toBe(expectedResult);
     });
 

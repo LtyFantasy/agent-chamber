@@ -33,6 +33,7 @@ import { Message } from '../../database/entities/message.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
 import { TopicModule } from '../topic/topic.module';
+import { AuditModule } from '../audit/audit.module';
 import { RunnerGateway } from './runner.gateway';
 import { RunnerRegistryService } from './runner-registry.service';
 import { RoundtableService } from './roundtable.service';
@@ -72,6 +73,7 @@ import { RoundtableController } from './roundtable.controller';
       User,
     ]),
     TopicModule,
+    AuditModule,
   ],
   providers: [RunnerGateway, RunnerRegistryService, RoundtableService],
   controllers: [RoundtableController],

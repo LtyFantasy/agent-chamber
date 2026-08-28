@@ -19,6 +19,7 @@ import {
   Search,
   Settings,
   Activity,
+  History,
   X,
   BookOpen,
   ExternalLink,
@@ -41,6 +42,8 @@ const allNavItems = [
   { href: '/search', labelKey: 'search', icon: Search },
   { href: '/settings', labelKey: 'settings', icon: Settings },
   { href: '/monitoring', labelKey: 'monitoring', icon: Activity },
+  // 活动日志：不加 adminOnly——human 非 admin 可见可查自己+名下 agent（plan 决策）
+  { href: '/logs', labelKey: 'logs', icon: History },
   { href: '/skills', labelKey: 'skill', icon: BookOpen, external: true },
 ] as const;
 

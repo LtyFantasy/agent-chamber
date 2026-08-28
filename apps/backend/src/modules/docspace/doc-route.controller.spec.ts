@@ -5,6 +5,7 @@ import { DocRouteService } from './doc-route.service';
 import { DocSpaceService } from './docspace.service';
 import { RouteHealthService } from './route-health.service';
 import { PermissionService } from '../../common/services/permission.service';
+import { AuditService } from '../audit/audit.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ActorType, ErrorCode, UserRole, Visibility } from '@agent-chamber/shared';
 
@@ -44,6 +45,7 @@ describe('DocRouteController', () => {
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   const space = {
     id: 'space-1',
@@ -69,6 +71,7 @@ describe('DocRouteController', () => {
         { provide: DocSpaceService, useValue: mockDocSpaceService },
         { provide: RouteHealthService, useValue: mockRouteHealthService },
         { provide: PermissionService, useValue: mockPermService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
@@ -252,7 +255,7 @@ describe('DocRouteController', () => {
       expect(routeService.findById).toHaveBeenCalledWith('route-1');
       expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'write');
-      expect(routeService.update).toHaveBeenCalledWith('route-1', { sortOrder: 5 });
+      expect(routeService.update).toHaveBeenCalledWith('route-1', { sortOrder: 5 }, 'user-1');
     });
 
     it('does not call service when space write denied (403)', async () => {

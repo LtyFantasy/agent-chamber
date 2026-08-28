@@ -4,6 +4,7 @@ import { DocRouteService } from './doc-route.service';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocService } from './doc.service';
+import { AuditService } from '../audit/audit.service';
 import { ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
 
 /**
@@ -19,6 +20,7 @@ describe('DocRouteService', () => {
   let docService: { sectionExistsByHeadingPath: jest.Mock };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+  const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
   function makeRoute(overrides: Partial<DocRoute> = {}): DocRoute {
     return {
@@ -92,7 +94,12 @@ describe('DocRouteService', () => {
 
     docService = { sectionExistsByHeadingPath: jest.fn() };
 
-    service = new DocRouteService(routeRepo, docRepo, docService as unknown as DocService);
+    service = new DocRouteService(
+      routeRepo,
+      docRepo,
+      docService as unknown as DocService,
+      mockAuditService as unknown as AuditService,
+    );
   });
 
   afterEach(() => jest.resetAllMocks());

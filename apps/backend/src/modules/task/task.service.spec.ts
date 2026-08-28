@@ -27,6 +27,7 @@ import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { EventService } from '../event/event.service';
+import { AuditService } from '../audit/audit.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
@@ -162,6 +163,7 @@ describe('TaskService', () => {
   let mockDocSpacePolicy: { can: jest.Mock };
   let mockEventService: { create: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
+  let mockAuditService: { log: jest.Mock };
 
   beforeEach(async () => {
     mockTaskRepo = createMockRepo<Task>();
@@ -264,6 +266,7 @@ describe('TaskService', () => {
       }),
       assertActorUsable: jest.fn().mockResolvedValue(undefined),
     };
+    mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
     // DataSource mock：transaction 默认透传回调
     mockDataSource = {
@@ -310,6 +313,7 @@ describe('TaskService', () => {
         { provide: ResourceValidator, useValue: mockResourceValidator },
         { provide: DataSource, useValue: mockDataSource },
         { provide: ActorProfileService, useValue: mockActorProfileService },
+        { provide: AuditService, useValue: mockAuditService },
       ],
     }).compile();
 
@@ -950,6 +954,21 @@ describe('TaskService', () => {
       });
       // Batch 3: create 返回 boardId/topicId，由 board→topic 派生填充
       expect(result).toEqual({ ...savedTask, boardId: 'board-1', topicId: 'topic-1' });
+      // 审计（Phase 2）：CREATE + task；newData 白名单 {taskId, title, status?, listId, assigneeId?}
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'task',
+        entityId: savedTask.id,
+        actorId: 'creator-1',
+        newData: {
+          taskId: savedTask.id,
+          title: 'New Task',
+          status: savedTask.status,
+          listId: savedTask.listId,
+          assigneeId: 'creator-1',
+        },
+        source: 'api',
+      });
     });
 
     it('should derive assigneeType from Actor when creating task with assigneeId', async () => {
@@ -1606,6 +1625,15 @@ describe('TaskService', () => {
         expect.objectContaining({ title: 'Updated Task' }),
       );
       expect(result).toEqual(expect.objectContaining({ title: 'Updated Task' }));
+      // 审计（Phase 2）：UPDATE + task；title 变更不入前后值（白名单只含 status/listId/assigneeId 前后值）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: null,
+        newData: { taskId: 'task-1', title: 'Updated Task' },
+        source: 'api',
+      });
     });
 
     it('should persist milestoneId update even when old milestone relation is loaded', async () => {
@@ -1664,6 +1692,20 @@ describe('TaskService', () => {
       expect(result).toEqual(
         expect.objectContaining({ assigneeId: 'user-2', assigneeType: 'human' }),
       );
+      // 审计（Phase 2）：assigneeId 前后值入 newData
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: 'actor-1',
+        newData: {
+          taskId: 'task-1',
+          title: 'Test Task',
+          assigneeId: 'user-2',
+          assigneeIdBefore: null,
+        },
+        source: 'api',
+      });
     });
 
     it('should derive assigneeType from Actor when only assigneeId provided', async () => {
@@ -2363,6 +2405,15 @@ describe('TaskService', () => {
       });
       expect(mockCommentRepo.save).toHaveBeenCalledWith(createdComment);
       expect(result).toEqual(savedComment);
+      // 审计（Phase 2）：CREATE + task_comment；newData {taskId, commentId}——content 黑名单
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'task_comment',
+        entityId: savedComment.id,
+        actorId: 'user-1',
+        newData: { taskId: 'task-1', commentId: savedComment.id },
+        source: 'api',
+      });
     });
 
     it('should throw NotFoundException when task not found', async () => {
@@ -2499,6 +2550,15 @@ describe('TaskService', () => {
         createdBy: 'user-1',
       });
       expect(mockDocLinkRepo.save).toHaveBeenCalled();
+      // 审计（Phase 2）：CREATE + doc_link；entityId=docId（复合主键无 id 列）
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'create',
+        entityType: 'doc_link',
+        entityId: 'doc-1',
+        actorId: 'user-1',
+        newData: { taskId: 'task-1', docId: 'doc-1' },
+        source: 'api',
+      });
     });
 
     it('idempotent on re-add', async () => {
@@ -2522,6 +2582,8 @@ describe('TaskService', () => {
       expect(result).toEqual(existing);
       expect(mockDocLinkRepo.create).not.toHaveBeenCalled();
       expect(mockDocLinkRepo.save).not.toHaveBeenCalled();
+      // 幂等重复关联提前返回 → 不落审计（决策 2）
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it("throws 403 when actor lacks read access to doc's space", async () => {
@@ -2661,6 +2723,15 @@ describe('TaskService', () => {
       // 零开销：无幂等记录读写
       expect(mockIdempotencyRepo.findOne).not.toHaveBeenCalled();
       expect(mockIdempotencyRepo.save).not.toHaveBeenCalled();
+      // 审计（Phase 2）：report 不单独记——状态变更由 update 内部落行（决策 2）
+      expect(mockAuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'update',
+          entityType: 'task',
+          entityId: taskId,
+          actorId: 'user-1',
+        }),
+      );
     });
 
     it('仅 comment → 评论文本 = comment', async () => {
@@ -2728,6 +2799,10 @@ describe('TaskService', () => {
       );
 
       expect(result.docLinks).toEqual({ succeeded: ['doc-1', 'doc-2'], failed: [] });
+      // 审计（Phase 2）：report 不单独记——状态 1 行 + 每 doc-link 1 行（决策 2）
+      const auditCalls = mockAuditService.log.mock.calls.map((c) => c[0]);
+      expect(auditCalls.filter((c) => c.entityType === 'doc_link')).toHaveLength(2);
+      expect(auditCalls.filter((c) => c.entityType === 'task')).toHaveLength(1);
     });
 
     it('docIds 部分失败 → 失败内嵌 docLinks.failed（status/code），主体仍成功', async () => {
@@ -2782,6 +2857,8 @@ describe('TaskService', () => {
       expect(mockCommentRepo.save).not.toHaveBeenCalled();
       expect(mockTaskRepo.save).not.toHaveBeenCalled();
       expect(mockDocLinkRepo.save).not.toHaveBeenCalled();
+      // 幂等 replay 不落审计（决策 2——构成写全部跳过）
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it('同 key 不同 payload（hash 不符）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {
@@ -3121,6 +3198,15 @@ describe('TaskService', () => {
           newValue: '新',
         }),
       );
+      // 审计（Phase 2）：UPDATE + task；newData 白名单 {taskId, title}——description 正文不入
+      expect(mockAuditService.log).toHaveBeenCalledWith({
+        action: 'update',
+        entityType: 'task',
+        entityId: taskId,
+        actorId: 'user-1',
+        newData: { taskId, title: 'Test Task' },
+        source: 'api',
+      });
     });
 
     it('expectedDescriptionHash 相符 → 通过', async () => {
@@ -3222,6 +3308,8 @@ describe('TaskService', () => {
       expect(mockTaskRepo.save).not.toHaveBeenCalled();
       expect(mockIdempotencyRepo.save).not.toHaveBeenCalled();
       expect(mockEventService.create).not.toHaveBeenCalled();
+      // 幂等 replay 不落审计（决策 2）
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it('同 key 不同 payload（hash 不符）→ 409 IDEMPOTENCY_KEY_CONFLICT', async () => {

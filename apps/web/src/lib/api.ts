@@ -67,6 +67,8 @@ import type {
   UpdateDocCategoryInput,
   UpsertDocInput,
   UpsertDocResult,
+  ActivityLogListResponse,
+  ActivityLogQuery,
 } from '@/types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '/api/v1';
@@ -952,6 +954,15 @@ const monitoring = {
 };
 
 // ──────────────────────────────────────────────
+// Activity Logs（GET /activity-logs，活动日志系统 Phase 4 web 页）
+// ──────────────────────────────────────────────
+const logs = {
+  /** 分页查询活动日志（三层权限 scope 由服务端强制，响应带 scope 回声字段） */
+  list: (params?: ActivityLogQuery) =>
+    apiRequest<ActivityLogListResponse>('GET', '/activity-logs', undefined, { params }),
+};
+
+// ──────────────────────────────────────────────
 // Skills（公开访问，无需认证）
 // ──────────────────────────────────────────────
 
@@ -1018,6 +1029,7 @@ export const Api = {
   events,
   webhooks,
   monitoring,
+  logs,
   skills,
 };
 

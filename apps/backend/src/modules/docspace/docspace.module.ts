@@ -26,6 +26,7 @@ import { AuditLog } from '../../database/entities/audit-log.entity';
 import { Event } from '../../database/entities/event.entity';
 import { BoardModule } from '../board/board.module';
 import { EventModule } from '../event/event.module';
+import { AuditModule } from '../audit/audit.module';
 import { DocSearchService } from './doc-search.service';
 import { DocRouteService } from './doc-route.service';
 import { DocRouteController } from './doc-route.controller';
@@ -56,6 +57,7 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
     ]),
     BoardModule,
     EventModule,
+    AuditModule,
   ],
   providers: [
     DocSpaceService,
