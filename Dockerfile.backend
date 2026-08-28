@@ -3,7 +3,10 @@ WORKDIR /app
 ENV CI=true
 # pnpm 11 默认在 run/build 前做依赖状态校验（verify-deps-before-run=install）：
 # COPY . . 之后 workspace 多出未参与过滤安装的 package.json，校验判定过期并触发整量重装，
-# 慢网络下 280s 超时必炸（2026-08-28 v1.69.0 从零冒烟两次实测）。安装层已 --frozen-lockfile，校验冗余，关闭。
+# 慢网络下 280s 超时必炸（2026-08-28 v1.69.0 从零冒烟两次实测），故关闭。
+# ⚠️ 关闭校验后「谁要被 build，谁的依赖就必须进下面的过滤安装集」——该校验曾为
+# build-runner-bundle.sh 里的 roundtable-runner tsc 兜底自动装依赖（第三次冒烟实测：
+# 关闭后 runner node_modules 缺失、TS18046 全炸），故 runner package.json 必须 COPY 进安装层。
 ENV pnpm_config_verify_deps_before_run=false
 RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY pnpm-workspace.yaml package.json ./
@@ -14,6 +17,9 @@ COPY packages/shared/package.json ./packages/shared/
 # 缺装缺编译则 backend tsc 产物 require 被改写成直指 .ts 源码的相对路径，容器启动必挂
 # （2026-08-08 圆桌首发事故的 docker 版复现，v1.51.2 从零冒烟第五层 bug）
 COPY packages/roundtable-protocol/package.json ./packages/roundtable-protocol/
+# build-runner-bundle.sh（本文件尾部）要编译 roundtable-runner——verify-deps 关闭后
+# 不再有自动安装兜底，runner 的依赖（含 devDeps 的 typescript）必须进过滤安装集
+COPY packages/roundtable-runner/package.json ./packages/roundtable-runner/
 # 原生模块编译工具链：bcrypt 的 node-pre-gyp 预编译包托管在 github releases，
 # 国内拉取偶发 socket hang up 时会 --fallback-to-build 走源码编译，alpine 无
 # python3/make/g++ 则 gyp configure 必炸（v1.51.3 冒烟 mcp 镜像同坑实证，
