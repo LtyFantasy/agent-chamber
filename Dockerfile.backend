@@ -8,6 +8,14 @@ ENV CI=true
 # build-runner-bundle.sh 里的 roundtable-runner tsc 兜底自动装依赖（第三次冒烟实测：
 # 关闭后 runner node_modules 缺失、TS18046 全炸），故 runner package.json 必须 COPY 进安装层。
 ENV pnpm_config_verify_deps_before_run=false
+# 构建期镜像源注入（可选，默认空=官方源，境外网络环境用）：
+# docker compose build 时经环境变量透传，如 APK_MIRROR=mirrors.aliyun.com
+# NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm（2026-08-28 v1.69.0 冒烟实测：
+# 官方源 1-73KB/s 反复超时/挂死，阿里云 apk 镜像 2.5MB/s、腾讯云 npm 镜像 940KB/s）
+ARG APK_MIRROR=
+ARG NPM_REGISTRY=
+RUN if [ -n "$APK_MIRROR" ]; then sed -i "s|dl-cdn.alpinelinux.org|$APK_MIRROR|g" /etc/apk/repositories; fi \
+ && if [ -n "$NPM_REGISTRY" ]; then echo "registry=$NPM_REGISTRY" >> /usr/local/etc/npmrc; fi
 RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./

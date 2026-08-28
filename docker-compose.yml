@@ -23,6 +23,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
+      args:
+        # 构建期镜像源注入（可选，默认空=官方源）：境外网络环境构建前
+        # export APK_MIRROR=mirrors.aliyun.com NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm
+        APK_MIRROR: ${APK_MIRROR:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     container_name: chamber-backend
     # migration 失败等启动即 crash 时最多重启 5 次后停止（on-failure:5），
     # 避免 DB 配置错误导致的无休止 crash 循环刷日志
@@ -53,6 +58,8 @@ services:
         # Next.js 的 NEXT_PUBLIC_* 在构建期内联，runtime environment 不生效；
         # 非本机部署时必须改这里并重建（--build）
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8743/api/v1}
+        APK_MIRROR: ${APK_MIRROR:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     container_name: chamber-web
     restart: unless-stopped
     ports:
@@ -66,6 +73,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.automcp
+      args:
+        APK_MIRROR: ${APK_MIRROR:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     container_name: chamber-mcp
     restart: unless-stopped
     ports:

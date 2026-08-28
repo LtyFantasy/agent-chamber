@@ -5,6 +5,11 @@ WORKDIR /app
 ENV CI=true
 # pnpm 11 构建期依赖状态校验关闭（原因见 Dockerfile.backend 同位注释，v1.69.0 冒烟实测）
 ENV pnpm_config_verify_deps_before_run=false
+# 构建期镜像源注入（可选，默认空=官方源；用法与实测数据见 Dockerfile.backend 同位注释）
+ARG APK_MIRROR=
+ARG NPM_REGISTRY=
+RUN if [ -n "$APK_MIRROR" ]; then sed -i "s|dl-cdn.alpinelinux.org|$APK_MIRROR|g" /etc/apk/repositories; fi \
+ && if [ -n "$NPM_REGISTRY" ]; then echo "registry=$NPM_REGISTRY" >> /usr/local/etc/npmrc; fi
 RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./
