@@ -15,7 +15,7 @@ ENV pnpm_config_verify_deps_before_run=false
 ARG APK_MIRROR=
 ARG NPM_REGISTRY=
 RUN if [ -n "$APK_MIRROR" ]; then sed -i "s|dl-cdn.alpinelinux.org|$APK_MIRROR|g" /etc/apk/repositories; fi \
- && if [ -n "$NPM_REGISTRY" ]; then echo "registry=$NPM_REGISTRY" >> /usr/local/etc/npmrc; fi
+ && if [ -n "$NPM_REGISTRY" ]; then echo "registry=$NPM_REGISTRY" >> /root/.npmrc; fi
 RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./
