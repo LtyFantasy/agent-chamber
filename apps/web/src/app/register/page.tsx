@@ -14,6 +14,7 @@ import { AmbientGlow } from '@/components/layout/ambient-glow';
 import { LocaleSwitcher } from '@/components/locale-switcher';
 import { Logo } from '@/components/ui/logo';
 import { CheckCircle } from 'lucide-react';
+import { UserRole } from '@/types';
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -40,7 +41,7 @@ export default function RegisterPage() {
 
   // 已登录但非 admin 的用户自动跳转到 dashboard
   useEffect(() => {
-    if (isReady && isAuthenticated && user && user.role !== 'admin') {
+    if (isReady && isAuthenticated && user && user.role !== UserRole.ADMIN) {
       router.replace('/dashboard');
     }
   }, [isReady, isAuthenticated, user, router]);

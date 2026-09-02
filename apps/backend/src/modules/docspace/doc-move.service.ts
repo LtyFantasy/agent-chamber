@@ -40,7 +40,7 @@
 import { Injectable, Logger, NotFoundException, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ErrorCode, AuditAction, EventType } from '@agent-chamber/shared';
+import { ErrorCode, AuditAction, EventType, ResourceType } from '@agent-chamber/shared';
 import type {
   DocInboundLink,
   DocMoveImpact,
@@ -53,8 +53,10 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { AuditLog } from '../../database/entities/audit-log.entity';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { DocService } from './doc.service';
+import { DOC_SOURCE_NATIVE } from './doc-constants';
 import { EventService } from '../event/event.service';
 import { extractDocLinks, resolveHrefToDocPath, matchDocReferenceLink } from './link-health';
 import type { MoveDocDto } from './dto';
@@ -434,10 +436,10 @@ export class DocMoveService {
     const impact = await this.computeMoveImpact(doc.spaceId, doc, dto.toPath);
 
     // ② 409 DOC_SOURCE_MISMATCH：非 native（ingest）文档由适配器管，move 会断 source 映射
-    if (doc.source !== 'native') {
+    if (doc.source !== DOC_SOURCE_NATIVE) {
       throw new ConflictException({
         message:
-          `Document source '${doc.source}' is not 'native'; only native documents can be moved ` +
+          `Document source '${doc.source}' is not ${DOC_SOURCE_NATIVE}; only native documents can be moved ` +
           `(ingest documents are managed by their adapter)`,
         code: ErrorCode.DOC_SOURCE_MISMATCH,
       });
@@ -609,7 +611,7 @@ export class DocMoveService {
     if (actor) {
       const auditEntry = this.auditRepo.create({
         action: AuditAction.MOVE_DOC,
-        entityType: 'doc',
+        entityType: AUDIT_ENTITY_TYPE.DOC,
         entityId: docId,
         actorId: actor.id,
         newData: { oldPath: doc.path, newPath: movedDoc.path, title: doc.title },
@@ -625,7 +627,7 @@ export class DocMoveService {
     const eventCtx = await this.docService.getSpaceEventContext(doc.spaceId);
     await this.eventService.create({
       eventType: EventType.DOC_MOVED,
-      resourceType: 'doc',
+      resourceType: ResourceType.DOC,
       resourceId: docId,
       actorId: actor?.id ?? undefined,
       topicId: eventCtx.topicId ?? undefined,

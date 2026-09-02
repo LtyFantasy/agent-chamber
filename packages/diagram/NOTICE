@@ -1,0 +1,35 @@
+# NOTICE — vendored 声明与本地补丁清单
+
+## Vendored-from
+
+- **上游项目**：archify（JSON-IR diagram renderers: architecture / workflow / sequence / dataflow / lifecycle）
+- **来源仓库**：tt-a1i/archify
+- **许可证**：MIT（本目录 `LICENSE` 为上游原样副本，MIT 义务随行）
+- **版本**：2.16.0-dev.0
+- **引入 commit**：`2da62eba`
+- **引入方式**：快照式 vendor（Phase 0，Diagram IR v1）。零 npm 依赖、纯 `.mjs`、无构建步骤；backend 以文件路径 spawn 子进程调用，不经 import/构建。
+
+## 本地补丁清单
+
+> 上游同步 = 重拷 + 按本清单重打补丁 + 跑 `pnpm smoke`。清单之外任何对 vendored 文件的改动都会破坏上游同步，禁止。
+
+| # | 文件 | 位置 | 补丁内容 | 理由 |
+|---|------|------|----------|------|
+| 1 | `assets/template.html` | 第 6 行 | `<meta name="generator" content="archify 2.16.0-dev.0">` → `<meta name="generator" content="agent-chamber diagram (archify-derived)">` | 品牌化（MIT 允许）。**刻意不动**任何 `archify-*` CSS 类 / `Archify` JS 全局 / localStorage key——内部标识符改名 = fork 风险且无用户可见收益 |
+| 2 | `assets/template.html` | `toast()` | `toast(msg, duration)` 加 duration 参数（默认 1500ms；错误路径显式 ≥4000ms）；导出链路 7 处 `alert()` → `toast()` | viewer iframe sandbox 吞 `alert`，导出失败用户零感知 |
+| 3 | `assets/template.html` | `exportMessage()` | 导出失败消息区分「浏览器拦截」场景（`failedBlocked` 专门文案，与笼统 unknown 分流） | sandbox 拦 `a[download]` 与生成本身失败需给用户不同提示 |
+| 4 | `assets/template.html` | `serializeSvg()` | 序列化前防御性移除 `script`/`foreignObject` 节点 | 导出文件不携带可执行/外部嵌入内容（安全加固，clone 非 live DOM 零副作用） |
+| 5 | `renderers/shared/i18n.mjs` | 词条表 | 新增 `viewer.export.failedBlocked` 词条 | 配合 #3 |
+| 6 | `scripts/check-render-output.mjs` | 静态检查 | 新增 `no_modal_calls` 门：`<script>` 块内禁 `alert`/`confirm`/`prompt`/`window.open` | 防回归：sandbox 环境 modal 调用静默失效（script 块限定，防用户内容误报） |
+| 7 | `assets/template.html` | embed CSS | `html[data-embed="true"]` 高度链 5 条（html/body/.container/.diagram-container 撑满视口）+ embed 隐藏 chrome | web 嵌入预览初始裁切看不到/无法拖动/全屏不自适应；svg 盒=视口后 `preserveAspectRatio meet` 天然整图居中 fit，camera 数学零改动 |
+| 8 | `assets/template.html` | pointerdown/pointermove | 删节点区拖拽排除；延迟 pointer capture：pointermove 位移 >3px 才 capture + 置 is-panning | 节点区可拖动画布；capture 会把 click 重定向到公共祖先毁单击聚焦，延迟阈值两全 |
+| 9 | `assets/template.html` | `clamp()` | 双轴独立钳制：内容>视口的轴保持两端对齐钳制（scale>1 零变化）；内容≤视口的轴放开为防丢钳制（keep=0.25，任一轴至少 25% 内容留视口内） | 原实现 scale=1 时 x/y 恒钳 0 致「100% 无法拖拽」；现任意缩放级别可拖且拖出屏防丢 |
+| 10 | `assets/template.html` | pointerdown | 删 `state.scale <= 1` 拖拽门槛 | 配合 #9 |
+| 11 | `assets/template.html` | `apply()` | `is-pannable` 常亮（原为 `state.scale > 1` 才亮） | 光标与拖拽能力一致（配合 #9） |
+
+## 裁剪说明（相对上游完整 skill 目录）
+
+- **不拷**：`examples/`（除 `test/fixtures/` 精选 5 个）、`delta/`、`recipes/`、`references/`、`SKILL.md`、`scripts/render-examples.mjs`、`scripts/generate-validators.mjs`、上游 `package.json`（本包重写）。
+- 后果：`bin/archify.mjs` 的无参 render/demo 模式不可用（`renderers/shared/cli.mjs:21` 缺省输入指向 `skillRoot/examples/<defaultExample>`）。服务端 spawn 恒带显式路径参数，不受影响。
+- `schemas/` 与 `brand-marks/catalog.json` 仅作文档与再生成源；运行时校验走 `renderers/shared/generated-validators.mjs`（AJV standalone 预编译产物），品牌走 `generated-brand-marks.mjs`。
+- 如需再生成 validators：临时沙箱 `npm i ajv` 后跑上游 `scripts/generate-validators.mjs`（v1 不引入 ajv 依赖）。

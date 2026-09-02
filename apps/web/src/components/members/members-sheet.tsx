@@ -10,7 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Sheet, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
 import { InvitePanel } from './invite-panel';
 import { MemberRow } from './member-row';
-import type { MemberItem, MembersSheetProps } from './types';
+import type { MembersSheetProps } from './types';
 
 /** 主视图搜索框阈值（P2）：活跃成员 ≥8 才渲染搜索（仅计活跃成员，invited 不计入） */
 const MAIN_SEARCH_THRESHOLD = 8;

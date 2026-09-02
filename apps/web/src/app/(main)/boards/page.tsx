@@ -3,6 +3,7 @@
 import { useState, useMemo } from 'react';
 import { Visibility } from '@agent-chamber/shared';
 import type { Board } from '@agent-chamber/shared';
+import { UserRole } from '@/types';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
@@ -70,7 +71,7 @@ export default function BoardsPage() {
    * 编辑走详情页图例模态框/后续入口，避免列表页 403 回归。
    */
   const canManageBoard = (b: Board): boolean =>
-    user?.role === 'admin' || isCreatorOrOwner(b.creatorId, user?.id, myAgentIds);
+    user?.role === UserRole.ADMIN || isCreatorOrOwner(b.creatorId, user?.id, myAgentIds);
 
   const createMutation = useMutation({
     mutationFn: Api.boards.create,
@@ -172,10 +173,10 @@ export default function BoardsPage() {
                   <div className="flex items-start justify-between">
                     <CardTitle className="text-lg flex items-center">
                       {board.name}
-                      {board.visibility === 'private' && (
+                      {board.visibility === Visibility.PRIVATE && (
                         <Lock className="ml-2 h-4 w-4 text-amber-500" />
                       )}
-                      {board.visibility === 'open' && (
+                      {board.visibility === Visibility.OPEN && (
                         <Globe className="ml-2 h-4 w-4 text-emerald-500" />
                       )}
                     </CardTitle>

@@ -48,6 +48,7 @@ import { ActorType, ErrorCode, EventType } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { DocMoveService } from '../src/modules/docspace/doc-move.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
@@ -170,6 +171,8 @@ describe('DocMoveService — 真实 PG 集成（原子 move + move impact）', (
       eventStub,
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
+      // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
+      { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
     );
 
     moveService = new DocMoveService(
@@ -286,9 +289,10 @@ describe('DocMoveService — 真实 PG 集成（原子 move + move impact）', (
     }
     await ds.getRepository(TaskDocLink).delete({ docId: docA.id });
     await ds.getRepository(DocRoute).delete({ spaceId });
-    // audit 行按种子 docId 清理（move 写 audit，entity_id = docId）
+    // audit 行按种子 docId 清理（move 写 audit，entity_id = docId；ingestDoc 为
+    // source mismatch 用例的临时 doc——08-29 全量跑实测其 audit 行漏网残留 1 行）
     await ds.query(`DELETE FROM audit_logs WHERE entity_type = 'doc' AND entity_id = ANY($1)`, [
-      [docA.id, docB.id, docC.id, docE.id, docF.id],
+      [docA.id, docB.id, docC.id, docE.id, docF.id, ...(ingestDoc ? [ingestDoc.id] : [])],
     ]);
     if (spaceId) {
       await ds.getRepository(DocSpace).delete({ id: spaceId });

@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigation';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useTranslations } from 'next-intl';
-import { Visibility, extractLastHeadingSegment } from '@agent-chamber/shared';
+import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
+import { useLocale, useTranslations } from 'next-intl';
+import { Visibility, DOC_TYPE_DIAGRAM, extractLastHeadingSegment } from '@agent-chamber/shared';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Link from 'next/link';
@@ -16,7 +16,6 @@ import {
   CheckCircle,
   Copy,
   FilePlus,
-  FileText,
   Link2,
   Pencil,
   Search,
@@ -28,6 +27,7 @@ import {
   Plus,
   Trash2,
   Upload,
+  Workflow,
   X,
   FolderTree,
   ListTree,
@@ -50,15 +50,19 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Sheet, SheetHeader, SheetTitle } from '@/components/ui/sheet';
-import type { DocSummary, DocSearchHit } from '@/types';
+import type { DocSearchHit } from '@/types';
+import { UserRole, DocSpaceMemberRole, AgentStatus, ActorType, DOC_SOURCE_NATIVE } from '@/types';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
 import { DocEditor } from '@/components/docs/doc-editor';
+import { DiagramViewer } from '@/components/docs/diagram-viewer';
 import { BatchUploadDialog } from '@/components/docs/batch-upload-dialog';
-import { isExternalHref, resolveDocPath, PLATFORM_DOC_LINK_RE } from '@/components/docs/doc-link';
+import { isExternalHref, resolveDocHref, PLATFORM_DOC_LINK_RE } from '@/components/docs/doc-link';
 import { confirm, toast } from '@/lib/notify';
 import { MembersSheet } from '@/components/members/members-sheet';
 import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
-import { buildPathTree, PathTreeView } from './sidebar-tree';
+import { SidebarTree } from './sidebar-tree';
+// 左栏文档树组件（前端债包批次 4 子项 2 commit 6 抽取自本页：DocTreeItem + CategorySection）
+import { DocTreeItem, CategorySection } from '@/components/docs/doc-tree';
 
 /** 左栏视图模式 localStorage key（同 login 页 auth:last-email 先例；SSR 无 localStorage，挂载后校正） */
 const SIDEBAR_MODE_KEY = 'docs:sidebar-mode';
@@ -75,34 +79,6 @@ const alertMutationError = (fallback: string) => (err: unknown) => {
   alert(axiosErr?.response?.data?.message || axiosErr?.message || fallback);
 };
 
-/** 左栏文档项：title + type badge，选中态青光描边 */
-function DocTreeItem({
-  docItem,
-  active,
-  onSelect,
-}: {
-  docItem: DocSummary;
-  active: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      onClick={onSelect}
-      className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors ${
-        active ? 'bg-primary/10 text-primary' : 'hover:bg-accent'
-      }`}
-    >
-      <FileText className="h-3.5 w-3.5 shrink-0 opacity-70" />
-      <span className="flex-1 truncate text-xs">{docItem.title}</span>
-      {docItem.docType && (
-        <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
-          {docItem.docType}
-        </span>
-      )}
-    </button>
-  );
-}
-
 /**
  * 去除标题中的行内代码记号，匹配 React Markdown 的 textContent。
  *
@@ -110,6 +86,13 @@ function DocTreeItem({
  */
 function normalizeHeadingText(text: string): string {
   return text.replace(/`([^`]*)`/g, '$1').trim();
+}
+
+/** 字节数人性化显示（图信息卡快照体积；B/KB/MB 为通用单位，不随 locale 翻译） */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** 滚动到正文内指定标题（目录传 outline DTO heading——后端 heading_text 列直读，
@@ -134,6 +117,7 @@ export default function DocSpaceDetailPage() {
   const router = useRouter();
   const pathname = usePathname();
   const t = useTranslations('docs');
+  const locale = useLocale();
   const tGlobal = useTranslations();
   const user = useAuthStore((state) => state.user);
 
@@ -151,8 +135,6 @@ export default function DocSpaceDetailPage() {
   const [collapsedCats, setCollapsedCats] = useState<Set<string>>(new Set());
   /** 左栏视图模式（目录/分类双模式）：默认 tree（用户拍板——目录是人脑心智模型），localStorage 持久化记住 */
   const [viewMode, setViewMode] = useState<SidebarViewMode>('tree');
-  /** 目录树折叠集合（key = 文件夹路径前缀；仅会话内记忆不持久化，默认空 = 全展开，防过度设计） */
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
   const [membersSheetOpen, setMembersSheetOpen] = useState(false);
   const [rightSheetOpen, setRightSheetOpen] = useState(false);
   /** 左栏折叠 Sheet（xl 以下，v1.47.0-dev 移动端优化）：搜索/过滤/分类树收进抽屉 */
@@ -174,6 +156,8 @@ export default function DocSpaceDetailPage() {
   });
   /** 待滚动定位的标题路径（搜索命中直达 section 用） */
   const pendingHeadingRef = useRef<string | null>(null);
+  /** 断链点击解析的会话内缓存（path → docId | null；null = 已确认不存在，避免重复请求） */
+  const pathCacheRef = useRef<Map<string, string | null>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
   /** 空间图例对话框开关（v1.43.1-dev）：图例改为头部按钮触发只读弹窗，不再内联占用首屏三栏区 */
   const [legendOpen, setLegendOpen] = useState(false);
@@ -197,23 +181,33 @@ export default function DocSpaceDetailPage() {
     enabled: spaceSettingsOpen,
   });
 
-  /** 文档列表（左栏分类树；搜索态不用它） */
-  const { data: docsData } = useQuery({
-    queryKey: ['docs', 'docs', spaceId, typeFilter, tagFilter],
-    // listAllDocs 循环翻页拉全：单页 pageSize:100 在 >100 篇文档的空间静默丢尾部（对齐 agents.listAll 评审 M-e）
-    queryFn: () =>
-      Api.docs.listAllDocs(spaceId, {
-        type: typeFilter || undefined,
-        tag: tagFilter || undefined,
-      }),
+  /** 全空间聚合计数（type/tag/category 候选；替代前端全量列表聚合，v1.70.0-dev） */
+  const { data: facetsData } = useQuery({
+    queryKey: ['docs', 'facets', spaceId],
+    queryFn: () => Api.docs.getFacets(spaceId),
     enabled: !!spaceId,
   });
 
-  /** 过滤候选专用全量列表（不带 type/tag——否则选中过滤后下拉只剩被筛文档的标签，反直觉） */
-  const { data: facetDocsData } = useQuery({
-    queryKey: ['docs', 'doc-facets', spaceId],
-    queryFn: () => Api.docs.listAllDocs(spaceId),
-    enabled: !!spaceId,
+  /** type/tag 过滤激活 → 扁平分页列表态（P3 行为变更：过滤后不再保持树形） */
+  const filterActive = typeFilter !== '' || tagFilter !== '';
+  const {
+    data: filteredData,
+    fetchNextPage: fetchNextFiltered,
+    hasNextPage: filteredHasNext,
+    isFetchingNextPage: filteredFetching,
+    isPending: filteredPending,
+  } = useInfiniteQuery({
+    queryKey: ['docs', 'filtered', spaceId, typeFilter, tagFilter],
+    queryFn: ({ pageParam }) =>
+      Api.docs.listDocs(spaceId, {
+        type: typeFilter || undefined,
+        tag: tagFilter || undefined,
+        page: pageParam,
+        pageSize: 50,
+      }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => (lastPage.hasNext ? lastPage.page + 1 : undefined),
+    enabled: !!spaceId && filterActive,
   });
 
   /** 搜索防抖 effect：300ms 停顿后同步 debounced 值；卸载时清理 timer，避免旧输入晚到 */
@@ -236,6 +230,26 @@ export default function DocSpaceDetailPage() {
     enabled: !!spaceId && debouncedSearchQuery.trim().length > 0,
   });
 
+  /**
+   * 搜索 B 组「文档匹配」：服务端 GET docs?q=（title+path ILIKE 既有契约）分页 + 加载更多。
+   * 为什么服务端化：旧实现对全量 facetDocs 前端子串过滤，全量拉取已删除（懒加载改造）；
+   * 后端 q= 对 title/path 做 ILIKE，语义等价且天然分页。
+   */
+  const {
+    data: docMatchesData,
+    fetchNextPage: fetchNextDocMatches,
+    hasNextPage: docMatchesHasNext,
+    isFetchingNextPage: docMatchesFetching,
+    isPending: docMatchesPending,
+  } = useInfiniteQuery({
+    queryKey: ['docs', 'search-docs', spaceId, debouncedSearchQuery],
+    queryFn: ({ pageParam }) =>
+      Api.docs.listDocs(spaceId, { q: debouncedSearchQuery, page: pageParam, pageSize: 20 }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => (lastPage.hasNext ? lastPage.page + 1 : undefined),
+    enabled: !!spaceId && debouncedSearchQuery.trim().length > 0,
+  });
+
   /** 选中文档元数据 + 大纲 */
   const { data: doc, isError: docIsError } = useQuery({
     queryKey: ['docs', 'doc', selectedDocId],
@@ -243,7 +257,13 @@ export default function DocSpaceDetailPage() {
     enabled: !!selectedDocId,
   });
 
-  /** Web 全文通道（中栏渲染） */
+  /**
+   * Web 全文通道（中栏渲染）。enabled 追加 doc 就绪 + 非 diagram 双条件：
+   * ① doc 就绪才能知道 docType——diagram doc 的正文是 IR JSON，中栏走
+   *   DiagramViewer（iframe 快照），绝不能发 /content 拉 IR 文本（acceptance:
+   *   diagram doc 下 getDocContent 零调用）；② 若只在 docType 上做 gate，
+   *   首渲染时 doc 未加载（undefined !== 'diagram'）仍会发起一次无谓请求。
+   */
   const {
     data: docContent,
     isLoading: contentLoading,
@@ -252,7 +272,7 @@ export default function DocSpaceDetailPage() {
   } = useQuery({
     queryKey: ['docs', 'doc-content', selectedDocId],
     queryFn: () => Api.docs.getDocContent(selectedDocId!),
-    enabled: !!selectedDocId,
+    enabled: !!selectedDocId && !!doc && doc.docType !== DOC_TYPE_DIAGRAM,
   });
 
   /** 编辑器专用完整原文（full=true 含首标题行，回写安全；仅进入编辑态才拉取） */
@@ -280,17 +300,16 @@ export default function DocSpaceDetailPage() {
   const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
 
   // ── 派生数据 ────────────────────────────────────
-  /** useMemo 包裹避免 ?? [] 每次渲染产生新数组、污染下游 memo 依赖（listAllDocs 直接返回数组） */
-  const docs = useMemo<DocSummary[]>(() => docsData ?? [], [docsData]);
-  const categories = space?.categories ?? [];
-  const members = space?.members ?? [];
+  /** useMemo 包裹：space 未加载时 ?? [] 每次渲染产生新数组，污染下游 memo 依赖（exhaustive-deps） */
+  const categories = useMemo(() => space?.categories ?? [], [space]);
+  const members = useMemo(() => space?.members ?? [], [space]);
 
   /** 管理权：admin | creator（含 owner 代理：creatorId ∈ 我的 agent id） | editor 成员（人类 actorId === user.id） */
   const canManage =
     !!user &&
-    (user.role === 'admin' ||
+    (user.role === UserRole.ADMIN ||
       isCreatorOrOwner(space?.creatorId, user.id, myAgentIds) ||
-      members.some((m) => m.actorId === user.id && m.role === 'editor'));
+      members.some((m) => m.actorId === user.id && m.role === DocSpaceMemberRole.EDITOR));
 
   /**
    * 所有权（v1.45 DOCSPACE-PERM 拆权）：admin | creator（含 owner 代理）。
@@ -299,35 +318,82 @@ export default function DocSpaceDetailPage() {
    * editor 看到这些 UI 后端必 403（修 invite 403 mismatch）。
    */
   const isOwnerLike =
-    !!user && (user.role === 'admin' || isCreatorOrOwner(space?.creatorId, user.id, myAgentIds));
+    !!user &&
+    (user.role === UserRole.ADMIN || isCreatorOrOwner(space?.creatorId, user.id, myAgentIds));
 
-  /** type / tag 候选（从「未过滤」全量列表聚合，开放字符串无硬编码枚举；listAllDocs 直接返回数组） */
-  const facetDocs = useMemo<DocSummary[]>(() => facetDocsData ?? [], [facetDocsData]);
+  /** type / tag 候选（facets 端点聚合，开放字符串无硬编码枚举；未过滤——选中过滤后
+   *  下拉仍保留全部候选，反直觉问题与旧 facetDocs 行为一致） */
   const typeOptions = useMemo(
-    () =>
-      Array.from(new Set(facetDocs.map((d) => d.docType).filter((v): v is string => !!v))).sort(),
-    [facetDocs],
+    () => (facetsData?.types ?? []).map((f) => f.value).sort(),
+    [facetsData],
   );
   const tagOptions = useMemo(
-    () => Array.from(new Set(facetDocs.flatMap((d) => d.tags ?? []))).sort(),
-    [facetDocs],
+    () => (facetsData?.tags ?? []).map((f) => f.value).sort(),
+    [facetsData],
+  );
+
+  /** 分类计数（facets 聚合；count=0 的分类在分类视图隐藏，保持现行行为） */
+  const categoryCounts = useMemo(
+    () => new Map((facetsData?.categories ?? []).map((c) => [c.slug, c.count])),
+    [facetsData],
+  );
+  const visibleCategories = useMemo(
+    () => categories.filter((cat) => (categoryCounts.get(cat.slug) ?? 0) > 0),
+    [categories, categoryCounts],
+  );
+
+  /** 过滤态扁平列表（P3：type/tag 过滤激活 → 扁平分页列表态） */
+  const filteredDocs = useMemo(
+    () => filteredData?.pages.flatMap((p) => p.items) ?? [],
+    [filteredData],
+  );
+
+  /** 搜索 B 组「文档匹配」（服务端 q= 分页结果） */
+  const docMatches = useMemo(
+    () => docMatchesData?.pages.flatMap((p) => p.items) ?? [],
+    [docMatchesData],
   );
 
   /**
    * 正文链接渲染器（path 写法 → docId 跳转的关键接线）：
    * - 外部 http/mailto → 新标签打开
    * - 平台规范链接 /docs/<spaceId>?doc=<docId> → SPA 导航（消掉整页刷新）
-   * - 相对 .md path → resolveDocPath 命中后 SPA 跳 /docs/<spaceId>?doc=<id>；未命中按断链样式渲染（琥珀虚线，呼应右栏 linkHealth 警告）
+   * - 相对 .md path → 渲染为普通链接，点击时 ?path= 异步解析（单一机制 + 会话内缓存）：
+   *   命中 → SPA 跳 /docs/<spaceId>?doc=<id>；未命中 → toast「文档不存在或已删除」
    * - 纯 #锚点 / 非 .md 相对路径 → 默认渲染不干预
-   * 解析映射用「未过滤」的 facetDocs，避免左栏 type/tag 过滤激活时误判断链。
-   * facetDocs 经 listAllDocs 循环翻页拉全（对齐 agents.listAll 评审 M-e）：>100 篇的空间
-   * 不再截断，断链判定与后端 linkHealth 全量集合对齐。
+   * 琥珀断链样式只保留在右栏 linkHealth 区（未加载的链接不再预判断链——点击才知死活）。
    * 跨文档 #锚点不做滚动定位：markdown 锚点 slug 与 headingPath 文本匹配规则不同构，落地不可靠。
    */
-  const docPathToId = useMemo(() => new Map(facetDocs.map((d) => [d.path, d.id])), [facetDocs]);
   /** 当前文档 path 标量：markdownComponents 闭包只用到 doc 的 truthiness + path，
    *  提取标量进 deps 替代 doc 对象本体（消解 exhaustive-deps warning，语义等价） */
   const currentDocPath = doc?.path;
+
+  /** 相对 .md 链接点击解析：会话内缓存（path → docId | null）优先，未命中走 ?path= 异步解析 */
+  const handleRelativeDocLink = useCallback(
+    async (resolvedPath: string) => {
+      const cached = pathCacheRef.current.get(resolvedPath);
+      if (cached !== undefined) {
+        if (cached) router.push(`/docs/${spaceId}?doc=${cached}`, { scroll: false });
+        else toast.error({ title: t('detail.docLinkNotFound') });
+        return;
+      }
+      try {
+        const doc = await Api.docs.getDocByPath(spaceId, resolvedPath);
+        if (doc) {
+          pathCacheRef.current.set(resolvedPath, doc.id);
+          router.push(`/docs/${spaceId}?doc=${doc.id}`, { scroll: false });
+        } else {
+          pathCacheRef.current.set(resolvedPath, null);
+          toast.error({ title: t('detail.docLinkNotFound') });
+        }
+      } catch {
+        // 解析请求失败：不缓存（下次点击可重试），toast 提示
+        toast.error({ title: t('detail.docLinkNotFound') });
+      }
+    },
+    [router, spaceId, t],
+  );
+
   const markdownComponents = useMemo<Components>(
     () => ({
       a: ({ href, children }) => {
@@ -352,71 +418,33 @@ export default function DocSpaceDetailPage() {
             </a>
           );
         }
-        // 文档 path 未就绪（doc 未加载）时正文未渲染，天然进默认 <a> 分支（loading 态无 SPA 跳转）
-        const targetId = currentDocPath
-          ? resolveDocPath(href, docPathToId, currentDocPath)
-          : undefined;
-        if (targetId) {
-          const url = `/docs/${spaceId}?doc=${targetId}`;
-          return (
-            <a
-              href={url}
-              onClick={(e) => {
-                e.preventDefault();
-                router.push(url, { scroll: false });
-              }}
-            >
-              {children}
-            </a>
-          );
-        }
-        if (targetId === null) {
-          return (
-            <span className="text-amber-500 underline decoration-dashed" title={href}>
-              {children}
-            </span>
-          );
+        // 相对 .md 链接：普通链接渲染，点击时异步解析（未加载不预判断链）
+        if (currentDocPath) {
+          const resolved = resolveDocHref(href, currentDocPath);
+          if (resolved !== undefined) {
+            return (
+              <a
+                href={href}
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (resolved === null) {
+                    // 越出空间根的不可达解析：直接判断链
+                    toast.error({ title: t('detail.docLinkNotFound') });
+                  } else {
+                    void handleRelativeDocLink(resolved);
+                  }
+                }}
+              >
+                {children}
+              </a>
+            );
+          }
         }
         return <a href={href}>{children}</a>;
       },
     }),
-    [docPathToId, router, spaceId, currentDocPath],
+    [router, currentDocPath, handleRelativeDocLink, t],
   );
-
-  /** 分类树：category → docs；未分类单列 */
-  const docsByCategory = useMemo(() => {
-    const map = new Map<string, DocSummary[]>();
-    const uncategorized: DocSummary[] = [];
-    for (const d of docs) {
-      if (!d.categoryId) {
-        uncategorized.push(d);
-        continue;
-      }
-      const list = map.get(d.categoryId) ?? [];
-      list.push(d);
-      map.set(d.categoryId, list);
-    }
-    return { map, uncategorized };
-  }, [docs]);
-
-  /** 目录树节点（viewMode=tree 用；buildPathTree 纯函数独立单测见 sidebar-tree.test.tsx）。
-   *  基于过滤后的 docs 构建——与分类树同源，type/tag 过滤对两种模式行为一致 */
-  const treeNodes = useMemo(() => buildPathTree(docs), [docs]);
-
-  /**
-   * 文档匹配（搜索态 B 组）：对「未过滤全量」facetDocs 的 path + title 做大小写不敏感子串过滤。
-   * 为什么：后端全文搜索只对 section 正文/heading 打分，doc.path/title 不参与——凭文件名找不到文档。
-   * 为什么用 facetDocs 而非 docs：type/tag 过滤激活时列表 query 只剩被筛文档，
-   * 文档匹配不能被过滤器静默吞掉（评审修订②）。
-   * 与内容命中可能重复出现同一篇文档——有意为之：文件级/段落级两个入口各是各的维度，不做去重。
-   */
-  const docMatches = useMemo(() => {
-    const q = debouncedSearchQuery.trim().toLowerCase();
-    if (!q) return [];
-    return facetDocs.filter(
-      (d) => d.path.toLowerCase().includes(q) || d.title.toLowerCase().includes(q),
-    );
-  }, [debouncedSearchQuery, facetDocs]);
 
   /** 断链展示名：从正文 markdown 提取 href → 链接文本（空文本回退 href，仅首个出现生效） */
   const linkTextMap = useMemo(() => {
@@ -454,7 +482,9 @@ export default function DocSpaceDetailPage() {
   // ── Mutations ────────────────────────────────────
   const invalidateSpace = () => {
     void queryClient.invalidateQueries({ queryKey: ['docs', 'space', spaceId] });
-    void queryClient.invalidateQueries({ queryKey: ['docs', 'docs', spaceId] });
+    // 懒加载目录树/聚合计数（A4 防脏目录计数）：前缀通配失效覆盖全部 prefix 层
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
   };
 
@@ -516,7 +546,7 @@ export default function DocSpaceDetailPage() {
     if (!space) return [];
     const memberIds = new Set((space.members ?? []).map((m) => m.actorId));
     return (agentsData ?? [])
-      .filter((a) => a.status === 'active' && !memberIds.has(a.id))
+      .filter((a) => a.status === AgentStatus.ACTIVE && !memberIds.has(a.id))
       .map((a) => ({
         actorId: a.id,
         name: a.name,
@@ -545,10 +575,11 @@ export default function DocSpaceDetailPage() {
    *  失败汇总 toast（成功 N / 失败 M）。docs 无人类候选，kind 恒为 'agent'，
    *  非 agent 防御性短路 */
   const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
-    if (kind !== 'agent') return;
+    if (kind !== ActorType.AGENT) return;
     const results = await Promise.allSettled(
       actorIds.map((actorId) => inviteMutation.mutateAsync(actorId)),
     );
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- PromiseSettledResult 内置状态（'fulfilled'|'rejected'），非圆桌权限请求状态
     const failed = results.filter((r) => r.status === 'rejected').length;
     const succeeded = results.length - failed;
     if (failed > 0) {
@@ -571,7 +602,7 @@ export default function DocSpaceDetailPage() {
    *  与 board 的完全移除相反——docspace.service.ts removeEditor 注释明示
    *  "Demote: editor → member (never delete the row)"） */
   const handleChangeRole = (actorId: string, newRole: string) => {
-    if (newRole === 'editor') {
+    if (newRole === DocSpaceMemberRole.EDITOR) {
       addEditorMutation.mutate(actorId);
     } else {
       removeEditorMutation.mutate(actorId);
@@ -613,6 +644,8 @@ export default function DocSpaceDetailPage() {
     }) => Api.docs.updateSpace(spaceId, data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['docs', 'space', spaceId] });
+      void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
+      void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
       setSpaceSettingsOpen(false);
     },
@@ -631,8 +664,9 @@ export default function DocSpaceDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content-full', selectedDocId] });
-      void queryClient.invalidateQueries({ queryKey: ['docs', 'docs', spaceId] });
-      void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-facets', spaceId] });
+      // 懒加载目录树/聚合计数（A4 防脏目录计数）：前缀通配失效覆盖全部 prefix 层
+      void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
+      void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
       if (editing?.mode === 'create') {
         selectDoc(result.id);
       }
@@ -671,16 +705,6 @@ export default function DocSpaceDetailPage() {
   const handleViewModeChange = (mode: SidebarViewMode) => {
     setViewMode(mode);
     localStorage.setItem(SIDEBAR_MODE_KEY, mode);
-  };
-
-  /** 目录树折叠切换（key = 文件夹路径前缀；Set 不可变更新，与 collapsedCats 同款写法） */
-  const handleToggleFolder = (folderPath: string) => {
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(folderPath)) next.delete(folderPath);
-      else next.add(folderPath);
-      return next;
-    });
   };
 
   /** 选中搜索命中：编辑态先确认，切文档并排队滚动 */
@@ -786,7 +810,7 @@ export default function DocSpaceDetailPage() {
 
       <div className="flex-1 overflow-y-auto pr-1">
         {searchQuery.trim() ? (
-          /* 搜索命中列：文档匹配（path/title 子串，B 组）在上，内容命中（section 正文，现状）在下 */
+          /* 搜索命中列：文档匹配（服务端 q= 分页，B 组）在上，内容命中（section 正文，现状）在下 */
           <div className="space-y-3">
             {docMatches.length > 0 && (
               <div className="space-y-1">
@@ -805,12 +829,21 @@ export default function DocSpaceDetailPage() {
                     </span>
                   </button>
                 ))}
+                {docMatchesHasNext && (
+                  <button
+                    onClick={() => void fetchNextDocMatches()}
+                    disabled={docMatchesFetching}
+                    className="w-full rounded px-1 py-0.5 text-left text-[11px] text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    {t('detail.loadMore')}
+                  </button>
+                )}
               </div>
             )}
             <div className="space-y-1">
               <p className="px-1 py-0.5 text-xs text-muted-foreground">{t('detail.searchHits')}</p>
-              {(searchHits ?? []).length === 0 && docMatches.length === 0 ? (
-                /* noSearchResults 两组皆空才显示：文档匹配命中但内容无命中时不该误导「无结果」 */
+              {(searchHits ?? []).length === 0 && docMatches.length === 0 && !docMatchesPending ? (
+                /* noSearchResults 两组皆空（且文档匹配已加载完）才显示：文档匹配命中但内容无命中时不该误导「无结果」 */
                 <p className="px-1 py-2 text-xs text-muted-foreground">
                   {t('detail.noSearchResults')}
                 </p>
@@ -835,75 +868,67 @@ export default function DocSpaceDetailPage() {
               )}
             </div>
           </div>
-        ) : docs.length === 0 ? (
-          <p className="px-1 py-4 text-center text-xs text-muted-foreground">
-            {t('detail.noDocs')}
-          </p>
+        ) : filterActive ? (
+          /* P3 行为变更：type/tag 过滤激活 → 扁平分页列表态（不再保持树形） */
+          filteredPending ? null : filteredDocs.length === 0 ? (
+            <p className="px-1 py-4 text-center text-xs text-muted-foreground">
+              {t('detail.noDocs')}
+            </p>
+          ) : (
+            <div className="space-y-0.5">
+              {filteredDocs.map((d) => (
+                <DocTreeItem
+                  key={d.id}
+                  docItem={d}
+                  active={d.id === selectedDocId}
+                  onSelect={() => handleDocSelect(d.id)}
+                />
+              ))}
+              {filteredHasNext && (
+                <button
+                  onClick={() => void fetchNextFiltered()}
+                  disabled={filteredFetching}
+                  className="w-full rounded px-1 py-0.5 text-left text-[11px] text-muted-foreground transition-colors hover:bg-accent"
+                >
+                  {t('detail.loadMore')}
+                </button>
+              )}
+            </div>
+          )
         ) : viewMode === 'tree' ? (
-          /* 目录模式（默认）：按 path 前缀嵌套树；折叠状态仅会话内记忆 */
-          <PathTreeView
-            nodes={treeNodes}
-            collapsedFolders={collapsedFolders}
-            onToggleFolder={handleToggleFolder}
+          /* 目录模式（默认）：懒加载目录树（展开态 localStorage 持久化在 SidebarTree 内部管理） */
+          <SidebarTree
+            spaceId={spaceId}
             activeDocId={selectedDocId}
             onSelectDoc={(docId) => handleDocSelect(docId)}
           />
+        ) : /* 分类模式：分类 = getSpace categories ⋈ facets 计数（count=0 隐藏），展开拉 ?category=slug 分页 */
+        visibleCategories.length === 0 ? (
+          <p className="px-1 py-4 text-center text-xs text-muted-foreground">
+            {t('detail.noDocs')}
+          </p>
         ) : (
-          /* 分类模式：可折叠分类 + 未分类区（原分类树原样保留） */
           <div className="space-y-2">
-            {categories.map((cat) => {
-              const catDocs = docsByCategory.map.get(cat.id) ?? [];
-              if (catDocs.length === 0) return null;
-              const collapsed = collapsedCats.has(cat.id);
-              return (
-                <div key={cat.id}>
-                  <button
-                    onClick={() =>
-                      setCollapsedCats((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(cat.id)) next.delete(cat.id);
-                        else next.add(cat.id);
-                        return next;
-                      })
-                    }
-                    className="flex w-full items-center gap-1 px-1 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    <FolderTree className="h-3.5 w-3.5 text-primary/70" />
-                    <span className="flex-1 truncate text-left">{cat.name}</span>
-                    <span className="text-[10px]">{catDocs.length}</span>
-                  </button>
-                  {!collapsed && (
-                    <div className="ml-2 space-y-0.5 border-l border-border/40 pl-2">
-                      {catDocs.map((d) => (
-                        <DocTreeItem
-                          key={d.id}
-                          docItem={d}
-                          active={d.id === selectedDocId}
-                          onSelect={() => handleDocSelect(d.id)}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            {docsByCategory.uncategorized.length > 0 && (
-              <div>
-                <p className="px-1 py-1 text-xs font-medium text-muted-foreground">
-                  {t('detail.uncategorized')}
-                </p>
-                <div className="space-y-0.5">
-                  {docsByCategory.uncategorized.map((d) => (
-                    <DocTreeItem
-                      key={d.id}
-                      docItem={d}
-                      active={d.id === selectedDocId}
-                      onSelect={() => handleDocSelect(d.id)}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
+            {visibleCategories.map((cat) => (
+              <CategorySection
+                key={cat.id}
+                spaceId={spaceId}
+                slug={cat.slug}
+                name={cat.name}
+                count={categoryCounts.get(cat.slug) ?? 0}
+                collapsed={collapsedCats.has(cat.id)}
+                onToggle={() =>
+                  setCollapsedCats((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(cat.id)) next.delete(cat.id);
+                    else next.add(cat.id);
+                    return next;
+                  })
+                }
+                activeDocId={selectedDocId}
+                onSelectDoc={(docId) => handleDocSelect(docId)}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -913,37 +938,41 @@ export default function DocSpaceDetailPage() {
   /** 大纲/元数据右栏内容（xl 常驻列与折叠 Sheet 共用） */
   const rightPanel = (
     <>
-      {/* Section 大纲导航 */}
-      <div className="rounded-lg border border-border/50 p-3">
-        <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
-          <ListTree className="h-4 w-4 text-primary" />
-          {t('doc.outline')}
-        </h3>
-        {!doc?.sections || doc.sections.length === 0 ? (
-          <p className="text-xs text-muted-foreground">{t('doc.noOutline')}</p>
-        ) : (
-          <nav className="space-y-0.5">
-            {/* 超长 section 的续 chunk 共用同一 headingPath/headingLevel，渲染前折叠
-                （bug 1a6b57d0），否则同一标题在大纲重复 N 条 */}
-            {dedupeOutlineSections(doc.sections).map((section) => (
-              <button
-                key={section.position}
-                onClick={() => scrollToHeading(contentRef.current, section.heading)}
-                className="block w-full truncate rounded px-1.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                style={{ paddingLeft: `${6 + section.headingLevel * 10}px` }}
-                title={section.headingPath ?? undefined}
-              >
-                {/* 目录只显示本地标题（outline DTO heading 列直读——标题正文含 ` § `
-                    也完整保留；面包屑全路径留在 tooltip），否则每项都被父级标题刷屏 */}
-                {section.heading || t('doc.noOutline')}
-              </button>
-            ))}
-          </nav>
-        )}
-      </div>
+      {/* Section 大纲导航：diagram doc 隐藏（合成节无标题大纲，只显示「无大纲」噪音）；
+          正文未就绪时也隐藏——大纲按钮点击依赖 contentRef（正文容器），
+          正文晚于 doc 元数据加载（diagram 分支的 enabled gate），过早渲染会点到空容器 */}
+      {doc?.docType !== DOC_TYPE_DIAGRAM && !contentLoading && (
+        <div className="rounded-lg border border-border/50 p-3">
+          <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+            <ListTree className="h-4 w-4 text-primary" />
+            {t('doc.outline')}
+          </h3>
+          {!doc?.sections || doc.sections.length === 0 ? (
+            <p className="text-xs text-muted-foreground">{t('doc.noOutline')}</p>
+          ) : (
+            <nav className="space-y-0.5">
+              {/* 超长 section 的续 chunk 共用同一 headingPath/headingLevel，渲染前折叠
+                  （bug 1a6b57d0），否则同一标题在大纲重复 N 条 */}
+              {dedupeOutlineSections(doc.sections).map((section) => (
+                <button
+                  key={section.position}
+                  onClick={() => scrollToHeading(contentRef.current, section.heading)}
+                  className="block w-full truncate rounded px-1.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  style={{ paddingLeft: `${6 + section.headingLevel * 10}px` }}
+                  title={section.headingPath ?? undefined}
+                >
+                  {/* 目录只显示本地标题（outline DTO heading 列直读——标题正文含 ` § `
+                      也完整保留；面包屑全路径留在 tooltip），否则每项都被父级标题刷屏 */}
+                  {section.heading || t('doc.noOutline')}
+                </button>
+              ))}
+            </nav>
+          )}
+        </div>
+      )}
 
-      {/* 链接健康卡 */}
-      {doc && (
+      {/* 链接健康卡（diagram doc 隐藏：IR JSON 无 markdown 链接，linkHealth 恒 0 噪音） */}
+      {doc && doc.docType !== DOC_TYPE_DIAGRAM && (
         <div className="rounded-lg border border-border/50 p-3">
           <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
             <Link2 className="h-4 w-4 text-primary" />
@@ -1005,12 +1034,72 @@ export default function DocSpaceDetailPage() {
                   </>
                 )}
                 <p className="text-[11px] opacity-60">
-                  {t('linkHealth.checkedAt', { time: formatDate(doc.linkHealth.checkedAt) })}
+                  {t('linkHealth.checkedAt', {
+                    time: formatDate(doc.linkHealth.checkedAt, locale),
+                  })}
                 </p>
               </>
             ) : (
               <p>{t('linkHealth.notChecked')}</p>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 图信息卡（Diagram IR v1）：diagram doc 专用，数据源 = DocDetail.diagram
+          （GET /docs/:id 摘要携带 render_meta，免二次请求；html 大字段另走 diagram.html） */}
+      {doc?.docType === DOC_TYPE_DIAGRAM && doc.diagram && (
+        <div className="rounded-lg border border-border/50 p-3 text-xs">
+          <h3 className="mb-2 flex items-center gap-1.5 text-sm font-medium">
+            <Workflow className="h-4 w-4 text-primary" />
+            {t('diagram.infoCard')}
+          </h3>
+          <div className="space-y-1.5 text-muted-foreground">
+            <div className="flex justify-between gap-2">
+              <span>{t('doc.type')}</span>
+              <span className="truncate text-foreground">{doc.diagram.diagramType ?? '-'}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>{t('diagram.qualityProfile')}</span>
+              <span className="text-foreground">{doc.diagram.qualityProfile ?? '-'}</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>{t('diagram.renderedAt')}</span>
+              <span className="text-foreground">
+                {doc.diagram.renderedAt ? formatDate(doc.diagram.renderedAt, locale) : '-'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>{t('diagram.htmlBytes')}</span>
+              <span className="text-foreground">
+                {doc.diagram.htmlBytes != null ? formatBytes(doc.diagram.htmlBytes) : '-'}
+              </span>
+            </div>
+            {/* composition 计数：errors > 0 标红、warnings > 0 标琥珀（对齐后端门槛语义） */}
+            <div className="flex justify-between gap-2">
+              <span>{t('diagram.compositionErrors')}</span>
+              <span
+                className={
+                  (doc.diagram.composition?.errors ?? 0) > 0
+                    ? 'text-destructive'
+                    : 'text-emerald-500'
+                }
+              >
+                {doc.diagram.composition?.errors ?? 0}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <span>{t('diagram.compositionWarnings')}</span>
+              <span
+                className={
+                  (doc.diagram.composition?.warnings ?? 0) > 0
+                    ? 'text-amber-500'
+                    : 'text-muted-foreground'
+                }
+              >
+                {doc.diagram.composition?.warnings ?? 0}
+              </span>
+            </div>
           </div>
         </div>
       )}
@@ -1034,7 +1123,7 @@ export default function DocSpaceDetailPage() {
             )}
             <div className="flex justify-between gap-2">
               <span>{t('doc.source')}</span>
-              <span className="text-foreground">{doc.source ?? 'native'}</span>
+              <span className="text-foreground">{doc.source ?? DOC_SOURCE_NATIVE}</span>
             </div>
             <div className="flex justify-between gap-2">
               <span>{t('doc.sectionCount', { count: doc.sectionCount ?? 0 })}</span>
@@ -1043,7 +1132,7 @@ export default function DocSpaceDetailPage() {
             {doc.updatedAt && (
               <div className="flex justify-between gap-2">
                 <span>{t('doc.updatedAt')}</span>
-                <span className="text-foreground">{formatDate(doc.updatedAt)}</span>
+                <span className="text-foreground">{formatDate(doc.updatedAt, locale)}</span>
               </div>
             )}
             {doc.tags && doc.tags.length > 0 && (
@@ -1081,7 +1170,7 @@ export default function DocSpaceDetailPage() {
           </Button>
           <h1 className="flex min-w-0 items-center truncate text-xl font-bold sm:text-2xl">
             <span className="truncate">{space.name}</span>
-            {space.visibility === 'private' ? (
+            {space.visibility === Visibility.PRIVATE ? (
               <Lock className="ml-2 h-4 w-4 shrink-0 text-amber-500" />
             ) : (
               <Globe className="ml-2 h-4 w-4 shrink-0 text-emerald-500" />
@@ -1140,7 +1229,8 @@ export default function DocSpaceDetailPage() {
                 setSpaceForm({
                   name: space.name ?? '',
                   description: space.description ?? '',
-                  visibility: space.visibility === 'private' ? Visibility.PRIVATE : Visibility.OPEN,
+                  visibility:
+                    space.visibility === Visibility.PRIVATE ? Visibility.PRIVATE : Visibility.OPEN,
                   binding: space.boardId
                     ? `board:${space.boardId}`
                     : space.topicId
@@ -1217,7 +1307,6 @@ export default function DocSpaceDetailPage() {
                 spaceId={spaceId}
                 initialContent={editing.mode === 'edit' ? (docFullContent?.content ?? '') : ''}
                 initialPath={editing.mode === 'edit' ? (doc?.path ?? '') : undefined}
-                existingPaths={facetDocs.map((d) => d.path)}
                 boardId={space?.boardId ?? undefined}
                 saving={upsertMutation.isPending}
                 onSave={(input) => upsertMutation.mutate(input)}
@@ -1228,10 +1317,10 @@ export default function DocSpaceDetailPage() {
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
               {t('detail.selectDoc')}
             </div>
-          ) : contentLoading ? (
-            <Loading />
           ) : docIsError ? (
-            /* 坏链直达 / 文档已删：友好空态 + 返回选择，不再裸 404 空白 */
+            /* 坏链直达 / 文档已删：友好空态 + 返回选择，不再裸 404 空白。
+               必须排在 Loading 前：doc 查询失败时 doc 恒 undefined，
+               （diagram 分支引入的）!doc Loading 条件会把它误判成永久加载 */
             <div className="flex h-full items-center justify-center">
               <EmptyState
                 title={t('detail.docNotFound')}
@@ -1242,6 +1331,10 @@ export default function DocSpaceDetailPage() {
                 }
               />
             </div>
+          ) : !doc || contentLoading ? (
+            /* 等待 doc 元数据（diagram 判定依据）或正文；diagram doc 的正文查询
+               恒 disabled（contentLoading=false），走完此条件即落入 DiagramViewer */
+            <Loading />
           ) : contentIsError ? (
             /* 正文查询失败：错误态 + 重试/返回，不再静默吞错渲染空正文 */
             <div className="flex h-full items-center justify-center">
@@ -1261,7 +1354,14 @@ export default function DocSpaceDetailPage() {
               />
             </div>
           ) : (
-            <div ref={contentRef}>
+            // diagram 分支补 h-full 链（2026-09-02 用户反馈）：main 定高但本 div
+            // 原为自然流，viewer h-full 对 auto 高度父级退化为 min-h 560px，窗口
+            // 更高时中栏下方留白；flex h-full flex-col + viewer flex-1 让图撑满
+            // 中栏剩余高度。文本文档保持自然流（长文滚动语义不变）
+            <div
+              ref={contentRef}
+              className={doc?.docType === DOC_TYPE_DIAGRAM ? 'flex h-full flex-col' : undefined}
+            >
               {/* 标题区：title / summary / tags / 来源 badge + 编辑按钮 */}
               <header className="mb-4 border-b border-border/50 pb-3">
                 <div className="flex items-start justify-between gap-2">
@@ -1271,20 +1371,24 @@ export default function DocSpaceDetailPage() {
                       <p className="mt-1 text-sm text-muted-foreground">{doc.summary}</p>
                     )}
                   </div>
-                  {canManage && doc?.source === 'native' && !contentLoading && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="shrink-0"
-                      onClick={() => setEditing({ mode: 'edit' })}
-                    >
-                      <Pencil className="mr-1 h-3.5 w-3.5" />
-                      {t('editor.edit')}
-                    </Button>
-                  )}
+                  {canManage &&
+                    doc?.source === DOC_SOURCE_NATIVE &&
+                    !contentLoading &&
+                    /* v1 只读拍板（Q5）：diagram doc 隐藏编辑按钮——IR 走 MCP/Agent 写入 */
+                    doc?.docType !== DOC_TYPE_DIAGRAM && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => setEditing({ mode: 'edit' })}
+                      >
+                        <Pencil className="mr-1 h-3.5 w-3.5" />
+                        {t('editor.edit')}
+                      </Button>
+                    )}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                  {doc?.source && doc.source !== 'native' && (
+                  {doc?.source && doc.source !== DOC_SOURCE_NATIVE && (
                     <Badge
                       variant="outline"
                       className="border-amber-500/40 bg-amber-500/10 text-amber-300"
@@ -1314,11 +1418,16 @@ export default function DocSpaceDetailPage() {
                   ))}
                 </div>
               </header>
-              <div className={`text-sm ${MARKDOWN_CLASSES}`}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                  {docContent?.content ?? ''}
-                </ReactMarkdown>
-              </div>
+              {/* 中栏正文：diagram doc → iframe 预览（DiagramViewer）；其余走 ReactMarkdown */}
+              {doc?.docType === DOC_TYPE_DIAGRAM ? (
+                <DiagramViewer docId={selectedDocId} />
+              ) : (
+                <div className={`text-sm ${MARKDOWN_CLASSES}`}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                    {docContent?.content ?? ''}
+                  </ReactMarkdown>
+                </div>
+              )}
             </div>
           )}
         </main>
@@ -1626,12 +1735,12 @@ export default function DocSpaceDetailPage() {
       {/* 批量上传 Dialog */}
       <BatchUploadDialog
         spaceId={spaceId}
-        existingPaths={facetDocs.map((d) => d.path)}
         open={batchUploadOpen}
         onOpenChange={setBatchUploadOpen}
         onUploaded={() => {
-          void queryClient.invalidateQueries({ queryKey: ['docs', 'docs', spaceId] });
-          void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-facets', spaceId] });
+          // 懒加载目录树/聚合计数（A4 防脏目录计数）：前缀通配失效覆盖全部 prefix 层
+          void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
+          void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
           void queryClient.invalidateQueries({ queryKey: ['docs', 'space', spaceId] });
         }}
       />

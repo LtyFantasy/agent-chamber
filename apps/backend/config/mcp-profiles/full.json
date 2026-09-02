@@ -1,6 +1,6 @@
 {
   "name": "Platform Full",
-  "description": "全量工具面（OpenAPI 137 − 显式排除 8 = 129 原子 + 15 语义 = 144；排除项：admin 用户管理 4 + audit/monitoring/sse 内部模块 4），平台管理/低频操作入口",
+  "description": "全量工具面（实测 172 原子 + 38 语义 = 210 tools，以运行时 tools/list 为准；排除项：admin 用户管理 4 + audit/monitoring/sse 内部模块 4），平台管理/低频操作入口",
   "include": [
     ".*"
   ],

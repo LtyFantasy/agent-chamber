@@ -19,6 +19,20 @@
  *     helper 见 doc-idempotency.helper.ts；重放返回 response_snapshot 首次快照，
  *     同 key 不同 payload → 409 IDEMPOTENCY_KEY_CONFLICT；patch 借道 upsertCore
  *     事务登记（快照形状 = patch 入口响应），禁止把幂等包裹放进 upsert 内层
+ *   - 补充: plan docspace-lazy-tree-v1.md（v1.70.0-dev：findTree/findFacets 只读端点）。
+ *     SQL 形态硬约束（plan A1/A2）：WHERE 只用 LIKE 模式（索引友好），禁止 substring
+ *     进 WHERE；substring/split_part 只允许在 SELECT/GROUP BY（narrowing 之后）；
+ *     plen 由 JS 算好整数传入（归一化 prefix 含尾 / 时 plen = prefix.length + 1，
+ *     PG 1-based）；folders total = 分组数子查询 COUNT；docs total = getManyAndCount
+ *     双查；一律显式 d.deleted_at IS NULL。改 findTree 前先读 plan「SQL 形态硬约束」节
+ *   - 补充: plan diagram-ir-v1-plan.md（Diagram IR v1）：upsertCore diagram 分支——
+ *     parse/canonicalize 前置（computeHash 对规范化形态生效）→ R3 仓库证据前置拒绝 →
+ *     R1 渲染门仅 hashChanged||forceRechunk 触发（unchanged 零渲染）→ 单节合成
+ *     （headingPath=null 刻意差异，绕过 chunkMarkdown）→ title/summary 从 ir.meta
+ *     派生 → 三列同事务写入/迁出置 null（不变量：docType='diagram' ⟺
+ *     diagram_type/rendered_html 非空）。D9 三拒绝落点 = patchSection/patchByMatch/
+ *     appendDocOnce 的 findById 之后；D10 patchMetadata docType 双向守卫在事务内
+ *     变更面判定处。渲染门实现见 diagram-renderer.service.ts
  *
  * [踩坑索引]
  *   - headingPath-separator-v1.57.2：headingPath 结构分隔符必须是带空格的 ` § `；标题正文中的
@@ -63,7 +77,7 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
-  InternalServerErrorException,
+  UnprocessableEntityException,
   forwardRef,
   Inject,
 } from '@nestjs/common';
@@ -81,7 +95,13 @@ import {
   ErrorCode,
   AuditAction,
   EventType,
+  ResourceType,
   extractLastHeadingSegment,
+  DOC_TYPE_DIAGRAM,
+  DIAGRAM_TYPES,
+  DOC_VERSION_SOURCE,
+  DOC_SUMMARY_MAX_LENGTH,
+  DOC_TITLE_MAX_LENGTH,
 } from '@agent-chamber/shared';
 import type {
   DocSummary,
@@ -102,14 +122,32 @@ import type {
   PatchDocMetadataResult,
   PatchDocMetadataView,
   AppendDocInput,
+  DocTreeResponse,
+  DocFacetsResponse,
+  DiagramType,
+  DiagramRenderMeta,
+  DiagramWriteRenderInfo,
+  DiagramDiagnostic,
+  UpsertDiagramResult,
 } from '@agent-chamber/shared';
-import { chunkMarkdown } from './markdown-chunker';
+import { chunkMarkdown, estimateTokens } from './markdown-chunker';
+import type { ChunkResult } from './markdown-chunker';
+import { DOC_SOURCE_NATIVE } from './doc-constants';
+// review-0831 任务 bbd175dc 子项 1：slugify 唯一实现（本文件复制品已删，行为统一为
+// 带兜底版——中文分类名 slug 从 '' 变为 's-xxxxxxxx'，属预期修复：按 slug 匹配的
+// 分类查询对中文名不再必然不命中）
+import { slugify } from './doc-slug.helper';
+// review-0831 任务 bbd175dc 子项 2：批量 per-item 错误提取唯一实现（batchUpsert
+// 内联复制品已删，与 doc-bundle.service 共用同一 { message, code } 契约）
+import { errorOf } from './doc-error.helper';
 import { computeLinkHealth } from './link-health';
 import { computeLineDiff } from './doc-version-diff';
 import { RouteHealthService } from './route-health.service';
+import { DiagramRendererService, type DiagramRenderArtifacts } from './diagram-renderer.service';
 import type { UpsertDocDto, BatchUpsertItemDto } from './dto';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AuditLog } from '../../database/entities/audit-log.entity';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { EventService } from '../event/event.service';
 // v1.63.0 DocSpace 写族幂等（Board 任务 7d918c7b）：helper 与 DocMoveService 共用
 import {
@@ -119,19 +157,6 @@ import {
   insertIdempotencyInTx,
   type DocWriteIdempotencyContext,
 } from './doc-idempotency.helper';
-
-/**
- * Generate a URL-friendly slug from a name.
- * Lowercase, replace non-alphanumeric with hyphens, collapse multiples.
- * Mirrors the slugify in docspace.service.ts.
- */
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 128);
-}
 
 /**
  * 小文档全文内联的缺省 token 阈值（?maxFullTokens= 可覆盖，0 = 强制 outline）。
@@ -201,6 +226,11 @@ export class DocService {
     // helper 实现见 doc-idempotency.helper.ts（DocMoveService 共用同一套）
     @InjectRepository(IdempotencyRecord)
     private readonly idempotencyRepo: Repository<IdempotencyRecord>,
+    // Diagram IR v1 渲染门（plan diagram-ir-v1-plan.md §3.2-3.3）：upsertCore diagram
+    // 分支在 hashChanged||forceRechunk 时同步调 validateAndRender（fail-closed，
+    // 失败即整单拒绝不落库）。markdown 文档路径零开销（仅 effectiveDocType==='diagram'
+    // 时触及本依赖）。
+    private readonly diagramRenderer: DiagramRendererService,
   ) {}
 
   // ─── Helpers ─────────────────────────────────────────────────
@@ -271,7 +301,7 @@ export class DocService {
   }
 
   /** Extract first paragraph (≤ maxLen) from text for auto-summary. */
-  private extractFirstParagraph(text: string, maxLen = 500): string {
+  private extractFirstParagraph(text: string, maxLen = DOC_SUMMARY_MAX_LENGTH): string {
     const firstPara = text.split('\n\n')[0]?.trim() || text.slice(0, maxLen);
     return firstPara.length > maxLen ? firstPara.slice(0, maxLen) : firstPara;
   }
@@ -348,6 +378,8 @@ export class DocService {
       title: doc.title,
       summary: doc.summary,
       docType: doc.docType,
+      // Diagram IR v1：反正范化列直读透传（列表/过滤免解析 IR；非 diagram 为 null）
+      diagramType: doc.diagramType ?? null,
       tags: doc.tags,
       source: doc.source,
       sourceSha: doc.sourceSha,
@@ -458,11 +490,15 @@ export class DocService {
    * upsert 业务内核（upsert 公开入口的主体；patchSection/patchByMatch 转调时携带
    * 各自入口的幂等 ctx——requestHash 是 patch 入口 payload 的指纹而非本方法的）。
    *
+   * public（Diagram IR v1）：内部收口，外部仅 DiagramService patch 入口可直调
+   * （patchSection/patchByMatch/appendDoc 本就同模式直调，只是它们长在本类内部）——
+   * 所有内容变更写通道必须收口于本事务，禁止另起写管线（版本/幂等/事件/23505 漂移源）。
+   *
    * @param ctx 幂等上下文（null/undefined = 无键旁路）；携带时在三个成功出口登记
    *   幂等记录：① unchanged 早退（独立单插）② 主事务内（与业务写同事务）
    *   ③ 23505 path-winner catch（独立单插）
    */
-  private async upsertCore(
+  async upsertCore(
     spaceId: string,
     dto: {
       path: string;
@@ -481,8 +517,7 @@ export class DocService {
     actor?: UnifiedActor,
     ctx?: DocWriteIdempotencyContext | null,
   ): Promise<UpsertDocResult> {
-    const computedHash = this.computeHash(dto.content);
-    const source = dto.source || 'native';
+    const source = dto.source || DOC_SOURCE_NATIVE;
 
     // Check existing doc
     const existing = await this.docRepo
@@ -500,7 +535,31 @@ export class DocService {
           code: ErrorCode.DOC_SOURCE_MISMATCH,
         });
       }
+    }
 
+    // ── Diagram IR v1 分支前置（plan §3.3，D4 写通道收口）──────────────────
+    // effectiveDocType = 请求显式 docType ?? 现存 docType——通用 upsert 不传 docType 时
+    // 继承现存值：diagram doc 上的 markdown 内容写入因此仍撞图校验门（fail-closed，
+    // 不可能误腐化）；upsert_diagram 命中非 diagram path 则显式翻转为 diagram。
+    // parse + canonicalize 是纯 CPU（微秒级），保持前置使 computeHash 对规范化形态生效
+    // （unchanged 短路对规范化形态判定——同语义异格式 IR 二次 upsert 正确早退）；
+    // 渲染动作按 R1 修订置于 unchanged 短路**之后**（见下方 hashChanged 处注释）。
+    const effectiveDocType = dto.docType ?? existing?.docType ?? null;
+    let diagramIr: {
+      irObj: Record<string, unknown>;
+      diagramType: DiagramType;
+      canonical: string;
+    } | null = null;
+    if (effectiveDocType === DOC_TYPE_DIAGRAM) {
+      diagramIr = this.parseDiagramIr(dto.content);
+      // 规范化形态入管线：contentHash / doc_versions 快照 / bundle 导出全部基于
+      // canonical（JSON.parse→stringify(2)），二次 upsert 同语义 IR 才能 hash 命中
+      dto.content = diagramIr.canonical;
+    }
+
+    const computedHash = this.computeHash(dto.content);
+
+    if (existing) {
       // expectedContentHash 乐观锁——事务外快速失败路径（fail-closed 改造）：
       // 此刻 hash 已不符则直接 409，不必进事务；权威校验在事务内 FOR UPDATE 后复核
       // （防「事务外校验通过 → 并发写入 → 事务内覆盖」的 TOCTOU 窗口）。
@@ -520,6 +579,8 @@ export class DocService {
       // Unchanged check（债 B：forceRechunk 短路豁免）——hash 相同且未要求强制重建
       // 才走 unchanged 早退；hash 相同 + forceRechunk=true 继续进入事务重建路径
       // （section 元数据损坏的修复入口，响应带 rechunked:true）。
+      // R1（Diagram IR v1）：unchanged 重放**零渲染**——unchanged 内容库存时必已过门，
+      // 跳过渲染安全；三列保持库存快照不动。
       if (existing.contentHash === computedHash && !dto.forceRechunk) {
         // Backfill gap: docs ingested before link_health existed keep NULL forever
         // on no-op re-ingests. If content is unchanged but link_health is missing,
@@ -559,13 +620,21 @@ export class DocService {
             .where('id = :id', { id: existing.id })
             .execute();
         }
-        const unchangedResult: UpsertDocResult = {
+        const unchangedResult: UpsertDiagramResult = {
           id: existing.id,
           path: existing.path,
           sectionCount: existing.sectionCount,
           tokenEstimate: existing.tokenEstimate,
           unchanged: true,
           contentHash: existing.contentHash ?? undefined,
+          // Diagram IR v1：diagram doc 的 unchanged 早退同样携带图信息（库存快照元数据，
+          // 不触发重渲染）——upsert_diagram 响应形状在各出口一致
+          ...(existing.docType === DOC_TYPE_DIAGRAM
+            ? {
+                diagramType: existing.diagramType,
+                render: this.diagramRenderInfoFromMeta(existing.renderMeta),
+              }
+            : {}),
         };
         // 幂等登记（plan 设计决定：unchanged 也写幂等记录——重放返回 unchanged 快照，
         // 语义一致）。此出口在主事务外早退 → 独立单插；并发同 key 抢先时改用对方快照。
@@ -600,15 +669,64 @@ export class DocService {
     // 变化才落版」——hash 未变的重切**不写** doc_versions 版本行（见事务内守卫）。
     const hashChanged = existing ? existing.contentHash !== computedHash : true;
 
+    // ── Diagram IR v1 渲染门（plan §3.3 R1 修订顺序）──────────────────────
+    // 渲染只发生在内容真变更（hashChanged）或 forceRechunk（派生数据修复入口，
+    // rendered_html 是派生数据）时——unchanged 重放 / stale hash 409 / bundle 重复
+    // 导入都零渲染（unchanged 短路已在上方早退）。校验+渲染全部在事务**之前**完成，
+    // 失败即抛（422 IR 内容问题 / 500 渲染器基础设施问题），此刻零写入——无 sections、
+    // 无版本行、无事件、无幂等记录（同 key 重试会重新校验，语义正确）。
+    let diagramArtifacts: DiagramRenderArtifacts | null = null;
+    if (diagramIr && (hashChanged || dto.forceRechunk)) {
+      diagramArtifacts = await this.diagramRenderer.validateAndRender(diagramIr.irObj, {
+        qualityProfile: (diagramIr.irObj.meta as Record<string, unknown> | undefined)
+          ?.quality_profile,
+      });
+    }
+
     // Pre-compute category, title, summary
     const categoryId = await this.resolveCategory(spaceId, dto.category);
 
-    const chunks = chunkMarkdown(dto.content, dto.title || dto.path);
+    // 分块策略（plan §1.1）：diagram → 单节合成（position=0, headingLevel=0,
+    // headingPath=null, headingText=null, content=规范化 IR 全文, isContinuation=false,
+    // tokenEstimate=CJK 估算）——绕过 chunkMarkdown：markdown 语义切分（ATX 标题 +
+    // >4000 字符段落二切）对 JSON 无意义且有字节一致性风险。
+    // ⚠️ 合成节 headingPath=null 与 chunker level-0 产物（headingPath=文档 title）是
+    // **刻意差异**——IR 无标题层级语义；全部消费路径已验证 null 安全（搜索 trigger
+    // COALESCE / reconstructContent / link_health / bundle / outline / positions 批量读）。
+    // SectionInput = ChunkResult 放宽 headingPath 可空（chunker 契约恒 string，不污染其类型）
+    type SectionInput = Omit<ChunkResult, 'headingPath'> & { headingPath: string | null };
+    const chunks: SectionInput[] = diagramIr
+      ? [
+          {
+            position: 0,
+            headingPath: null,
+            headingText: null,
+            headingLevel: 0,
+            content: dto.content,
+            tokenEstimate: estimateTokens(dto.content),
+            isContinuation: false,
+          },
+        ]
+      : chunkMarkdown(dto.content, dto.title || dto.path);
     const totalTokens = chunks.reduce((sum, c) => sum + c.tokenEstimate, 0);
-    const autoTitle = dto.title || this.extractHeadingFromContent(dto.content) || dto.path;
+    // title 派生：diagram → dto.title ?? ir.meta.title（截 200）?? path——IR 无 ATX
+    // 标题，不拦截会把 title 写成 path（extractHeadingFromContent 对 JSON 恒 null）
+    const irMetaTitle = diagramIr ? this.extractIrMetaTitle(diagramIr.irObj) : null;
+    const autoTitle = diagramIr
+      ? dto.title || irMetaTitle || dto.path
+      : dto.title || this.extractHeadingFromContent(dto.content) || dto.path;
+    // summary 派生：diagram → dto.summary ?? `${diagramType} 图：${ir.meta.title}`（截 500）
+    // ——现状首段派生对 JSON 会截出 `"schema_version": 1,` 这种无信息片段
     const summary =
       dto.summary ??
-      (chunks.length > 0 ? this.extractFirstParagraph(chunks[0].content, 500) : null);
+      (diagramIr
+        ? (irMetaTitle
+            ? `${diagramIr.diagramType} 图：${irMetaTitle}`
+            : `${diagramIr.diagramType} 图`
+          ).slice(0, DOC_SUMMARY_MAX_LENGTH)
+        : chunks.length > 0
+          ? this.extractFirstParagraph(chunks[0].content, DOC_SUMMARY_MAX_LENGTH)
+          : null);
 
     // Link health: query all docs in space for candidate resolution (light query, id+path only)
     const spaceDocs = await this.docRepo
@@ -681,7 +799,24 @@ export class DocService {
           // Update metadata
           target.title = autoTitle;
           target.summary = summary;
+          // Diagram IR v1 三列维护（不变量：docType='diagram' ⟺ diagram_type/rendered_html
+          // 非空，铁律 #18 断言点）——先捕获迁出前状态，再赋新 docType
+          const wasDiagram = target.docType === DOC_TYPE_DIAGRAM;
           target.docType = dto.docType ?? target.docType;
+          if (target.docType === DOC_TYPE_DIAGRAM) {
+            // diagram 分支：写反正范化图类型 + 渲染产物（artifacts 在本路径必然已渲染
+            // ——能进事务 = hashChanged||forceRechunk = 已过渲染门；防御性 ?? 保留旧值不破坏）
+            target.diagramType = diagramIr?.diagramType ?? target.diagramType;
+            target.renderedHtml = diagramArtifacts?.html ?? target.renderedHtml;
+            target.renderMeta =
+              (diagramArtifacts?.meta as unknown as Record<string, unknown>) ?? target.renderMeta;
+          } else if (wasDiagram) {
+            // docType 迁出（显式 dto.docType='note' 等，plan §4.1 防呆矩阵唯一合法
+            // 迁出通道）：三列同置 null——不留"非 diagram 带渲染快照"的烂态
+            target.diagramType = null;
+            target.renderedHtml = null;
+            target.renderMeta = null;
+          }
           target.tags = dto.tags ?? target.tags;
           target.categoryId = categoryId ?? target.categoryId;
           target.contentHash = computedHash;
@@ -693,7 +828,7 @@ export class DocService {
           target.linkHealth = linkHealth as unknown as Record<string, unknown>;
           doc = await docRepo.save(target);
         } else {
-          // Create new
+          // Create new（diagram 新建：effectiveDocType 来自 dto.docType，渲染门已过）
           doc = docRepo.create({
             spaceId,
             categoryId,
@@ -701,6 +836,10 @@ export class DocService {
             title: autoTitle,
             summary,
             docType: dto.docType ?? null,
+            // Diagram IR v1 三列（非 diagram 恒 null）
+            diagramType: diagramIr?.diagramType ?? null,
+            renderedHtml: diagramArtifacts?.html ?? null,
+            renderMeta: (diagramArtifacts?.meta as unknown as Record<string, unknown>) ?? null,
             tags: dto.tags ?? [],
             source,
             contentHash: computedHash,
@@ -744,7 +883,7 @@ export class DocService {
         // 兜底（败者不写版本，胜者事务内已写）。
         if (hashChanged) {
           const versionRepo = manager.getRepository(DocVersion);
-          const versionSource = dto.versionSource ?? 'upsert';
+          const versionSource = dto.versionSource ?? DOC_VERSION_SOURCE.UPSERT;
           const maxVersion = await versionRepo
             .createQueryBuilder('v')
             .select('MAX(v.version)', 'max')
@@ -778,7 +917,9 @@ export class DocService {
         // ── v1.63.0 幂等：最终响应在事务内组装并落快照 ────────────────────
         // 「业务提交 ⟺ 快照可查」原子性：快照与业务写同事务，crash/回滚不留半状态。
         // rechunked 判断沿用事务前算好的 hashChanged（实体已被原地改写，见上）。
-        const assembled: UpsertDocResult = {
+        // Diagram IR v1：diagram 写携带 diagramType + render（本次渲染产物元数据）——
+        // upsert_diagram/patch_diagram 响应形状的权威来源（含幂等重放快照）
+        const assembled: UpsertDiagramResult = {
           id: doc.id,
           path: doc.path,
           sectionCount: doc.sectionCount,
@@ -786,6 +927,16 @@ export class DocService {
           created: isCreate,
           contentHash: doc.contentHash ?? undefined,
           rechunked: !hashChanged && dto.forceRechunk ? true : undefined,
+          ...(diagramIr
+            ? {
+                diagramType: diagramIr.diagramType,
+                render: diagramArtifacts
+                  ? this.diagramRenderInfoFromMeta(
+                      diagramArtifacts.meta as unknown as Record<string, unknown>,
+                    )
+                  : this.diagramRenderInfoFromMeta(existing?.renderMeta ?? null),
+              }
+            : {}),
         };
 
         // 幂等记录与业务写同事务插入；并发同 key 撞 uq_idempotency_actor_key →
@@ -801,7 +952,7 @@ export class DocService {
       if (actor) {
         const auditEntry = this.auditRepo.create({
           action: existing ? AuditAction.UPDATE : AuditAction.CREATE,
-          entityType: 'doc',
+          entityType: AUDIT_ENTITY_TYPE.DOC,
           entityId: result.id,
           actorId: actor.id,
           newData: { path: result.path, title: result.title },
@@ -815,7 +966,7 @@ export class DocService {
         const eventCtx = await this.getSpaceEventContext(spaceId);
         await this.eventService.create({
           eventType: EventType.DOC_CREATED,
-          resourceType: 'doc',
+          resourceType: ResourceType.DOC,
           resourceId: result.id,
           actorId: actor?.id ?? undefined,
           topicId: eventCtx.topicId ?? undefined,
@@ -834,7 +985,7 @@ export class DocService {
         const eventCtx = await this.getSpaceEventContext(spaceId);
         await this.eventService.create({
           eventType: EventType.DOC_UPDATED,
-          resourceType: 'doc',
+          resourceType: ResourceType.DOC,
           resourceId: result.id,
           actorId: actor?.id ?? undefined,
           topicId: eventCtx.topicId ?? undefined,
@@ -946,7 +1097,7 @@ export class DocService {
         // task.service.ts 先例——每文档可带各自 key，重放返回该文档的首次结果）
         const r = await this.upsert(
           spaceId,
-          { ...upsertItem, versionSource: 'import' },
+          { ...upsertItem, versionSource: DOC_VERSION_SOURCE.IMPORT },
           actor,
           upsertItem.clientRequestId,
         );
@@ -967,14 +1118,12 @@ export class DocService {
         results.push({ path: dto.path, status, id: r.id });
       } catch (err: unknown) {
         summary.failed++;
-        const httpErr = err as { response?: { message?: string; code?: number }; message?: string };
+        // 错误形状统一走 doc-error.helper.errorOf（review-0831 任务 bbd175dc 子项 2，
+        // 与 doc-bundle.service 共用同一 { message, code } 契约）
         results.push({
           path: dto.path,
           status: 'failed',
-          error: {
-            message: httpErr.response?.message ?? httpErr.message ?? 'Unknown error',
-            code: httpErr.response?.code,
-          },
+          error: errorOf(err),
         });
       }
     }
@@ -986,6 +1135,181 @@ export class DocService {
   private extractHeadingFromContent(content: string): string | null {
     const m = content.match(/^#+\s+(.+)$/m);
     return m ? m[1].trim() : null;
+  }
+
+  /**
+   * Diagram IR v1：解析 + 规范化 + 前置校验（upsertCore diagram 分支的唯一入口）。
+   *
+   * public：DiagramService validate dry-run 共用同一道前置门（DRY——R3 仓库证据拒绝
+   * 与 diagram_type 校验口径只此一份；validate 对 object 入参先 stringify 再走本方法）。
+   *
+   * 校验链（顺序即错误语义，全部 fail-closed）：
+   * ① JSON parse 失败 / 非 object → 422 DIAGRAM_VALIDATION_FAILED stage:'parse'
+   *   （诊断 code 'input/json-parse' 对齐 renderer fallback，diagnostics.mjs:60-68）；
+   * ② diagram_type ∉ 5 型 → 400 VALIDATION_ERROR 列支持类型（类型选择是格式错误，
+   *   不是渲染门失败——DTO 层管格式原则的 service 侧延伸，ir 来源是自由文本 content）；
+   * ③ R3 安全收口：前置拒绝 meta.repository 与 components[].sources（非空）两者——
+   *   平台渲染环境永不设置 ARCHIFY_REPO_ROOT，vendored verifyRepositoryEvidence 会
+   *   硬失败且其 supportedFixes（'pass --repo-root...'）是平台永不支持的修法，会把
+   *   Agent 引向不可修复方向（repository-evidence.mjs:81-85/:114-118）。parse 后即报，
+   *   省一次 spawn。
+   *
+   * 规范化（canonicalize）幂等：JSON.parse → stringify(obj, null, 2)——canonical∘
+   * canonical = canonical（JSON 对象键序 = 解析插入序，同输入恒同输出），保证
+   * contentHash 稳定、doc_versions 行级 diff 可读（pretty JSON 逐行 diff 天然可用）。
+   */
+  parseDiagramIr(content: string): {
+    irObj: Record<string, unknown>;
+    diagramType: DiagramType;
+    canonical: string;
+  } {
+    // ① parse
+    let irObj: unknown;
+    try {
+      irObj = JSON.parse(content);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new UnprocessableEntityException({
+        message: `Diagram IR JSON parse failed: ${reason}`,
+        code: ErrorCode.DIAGRAM_VALIDATION_FAILED,
+        data: {
+          stage: 'parse',
+          diagnostics: [
+            {
+              code: 'input/json-parse',
+              severity: 'error',
+              message: `Input JSON could not be parsed: ${reason}`,
+              evidence: { reason },
+              supportedFixes: ['repair the JSON syntax and retry'],
+            } satisfies DiagramDiagnostic,
+          ],
+        },
+      });
+    }
+    if (!irObj || typeof irObj !== 'object' || Array.isArray(irObj)) {
+      throw new UnprocessableEntityException({
+        message: 'Diagram IR must be a JSON object',
+        code: ErrorCode.DIAGRAM_VALIDATION_FAILED,
+        data: {
+          stage: 'parse',
+          diagnostics: [
+            {
+              code: 'input/not-object',
+              severity: 'error',
+              message: `Diagram IR must be a JSON object, got ${Array.isArray(irObj) ? 'array' : typeof irObj}`,
+              supportedFixes: [
+                'pass the diagram IR as a JSON object with schema_version/diagram_type/meta',
+              ],
+            } satisfies DiagramDiagnostic,
+          ],
+        },
+      });
+    }
+    const ir = irObj as Record<string, unknown>;
+
+    // ② diagram_type 反正范化校验（varchar(16) 列写库；5 型对应 vendored 渲染器）
+    const diagramType = ir.diagram_type;
+    if (
+      typeof diagramType !== 'string' ||
+      !(DIAGRAM_TYPES as readonly string[]).includes(diagramType)
+    ) {
+      throw new BadRequestException({
+        message:
+          `Invalid or missing IR 'diagram_type': ${JSON.stringify(diagramType)}; ` +
+          `supported types: ${DIAGRAM_TYPES.join(', ')}`,
+        code: ErrorCode.VALIDATION_ERROR,
+        data: { supportedTypes: [...DIAGRAM_TYPES] },
+      });
+    }
+
+    // ③ R3 前置拒绝仓库证据（两路触发面：meta.repository 或任一 component 带非空
+    // sources 数组——与 vendored hasRepositoryEvidence 的判定面一致，但平台不按
+    // diagram_type 放行其他类型：sources 字段在非 architecture 类型上本就会被
+    // schema 拒，统一提前拒绝口径更干净）
+    const meta = ir.meta as Record<string, unknown> | undefined;
+    const components = Array.isArray(ir.components) ? ir.components : [];
+    const hasComponentSources = components.some(
+      (c) =>
+        c &&
+        typeof c === 'object' &&
+        Array.isArray((c as Record<string, unknown>).sources) &&
+        ((c as Record<string, unknown>).sources as unknown[]).length > 0,
+    );
+    if (meta?.repository || hasComponentSources) {
+      throw new UnprocessableEntityException({
+        message:
+          'Diagram IR declares repository evidence (meta.repository / components[].sources): ' +
+          '平台渲染环境不支持仓库证据，请移除该字段（the platform renderer never sets ' +
+          'ARCHIFY_REPO_ROOT; repository verification is not available)',
+        code: ErrorCode.DIAGRAM_VALIDATION_FAILED,
+        data: {
+          stage: 'schema',
+          diagnostics: [
+            {
+              code: 'platform/repository-evidence-unsupported',
+              severity: 'error',
+              message:
+                '平台渲染环境不支持仓库证据，请移除该字段 (repository evidence is not supported on the platform renderer; remove meta.repository and any components[].sources)',
+              subject: {
+                path: meta?.repository ? '/meta/repository' : '/components[].sources',
+              },
+              supportedFixes: ['remove meta.repository and any components[].sources from the IR'],
+            } satisfies DiagramDiagnostic,
+          ],
+        },
+      });
+    }
+
+    return {
+      irObj: ir,
+      diagramType: diagramType as DiagramType,
+      canonical: JSON.stringify(ir, null, 2),
+    };
+  }
+
+  /** IR meta.title 提取（title 派生用；截 DOC_TITLE_MAX_LENGTH 对齐 docs.title 列长） */
+  private extractIrMetaTitle(irObj: Record<string, unknown>): string | null {
+    const meta = irObj.meta as Record<string, unknown> | undefined;
+    const title = meta?.title;
+    return typeof title === 'string' && title.trim()
+      ? title.trim().slice(0, DOC_TITLE_MAX_LENGTH)
+      : null;
+  }
+
+  /** DocDetail.diagram 摘要装配（render_meta 子集；存量无快照 → 各字段 undefined） */
+  private buildDiagramSummary(doc: Doc): NonNullable<DocDetail['diagram']> {
+    const meta = doc.renderMeta as Partial<DiagramRenderMeta> | null;
+    return {
+      diagramType: doc.diagramType,
+      qualityProfile: meta?.qualityProfile,
+      renderedAt: meta?.renderedAt,
+      htmlBytes: meta?.htmlBytes,
+      composition: meta?.composition,
+    };
+  }
+
+  /**
+   * render_meta jsonb → 响应级渲染信息（upsert_diagram/patch_diagram/read 透出用）。
+   * 存量无快照 diagram（renderMeta NULL，历史数据）→ undefined（响应省略 render 键）。
+   */
+  private diagramRenderInfoFromMeta(
+    renderMeta: Record<string, unknown> | null,
+  ): DiagramWriteRenderInfo | undefined {
+    if (!renderMeta) return undefined;
+    const meta = renderMeta as Partial<DiagramRenderMeta>;
+    return {
+      renderedAt: typeof meta.renderedAt === 'string' ? meta.renderedAt : '',
+      rendererVersion: typeof meta.rendererVersion === 'string' ? meta.rendererVersion : '',
+      qualityProfile: typeof meta.qualityProfile === 'string' ? meta.qualityProfile : '',
+      htmlBytes: typeof meta.htmlBytes === 'number' ? meta.htmlBytes : 0,
+      htmlSha256: typeof meta.htmlSha256 === 'string' ? meta.htmlSha256 : '',
+      composition:
+        meta.composition &&
+        typeof meta.composition === 'object' &&
+        typeof (meta.composition as { errors?: unknown }).errors === 'number'
+          ? (meta.composition as { errors: number; warnings: number })
+          : { errors: 0, warnings: 0 },
+    };
   }
 
   /**
@@ -1086,6 +1410,216 @@ export class DocService {
   }
 
   /**
+   * 目录树分层浏览（GET /doc-spaces/:id/docs/tree，v1.70.0-dev）
+   *
+   * 按 prefix 返回「当前层直接子目录（docCount/latestDocAt 递归聚合）+ 当前层
+   * 直挂文档（slim 分页）」。web 左栏懒加载与 Agent 目录发现共用。
+   *
+   * SQL 形态硬约束（plan A1/A2，防 implementation drift）：
+   * - WHERE 只用 LIKE 模式（索引友好），禁止 substring 进 WHERE：
+   *   子树收窄 `d.path LIKE :escapedPrefix || '%' ESCAPE '\'`；folders 追加
+   *   `AND d.path LIKE :escapedPrefix || '%/%' ESCAPE '\'`（剩余部分含更深分隔符
+   *   = 有子目录）；docs 追加 `AND d.path NOT LIKE :escapedPrefix || '%/%'
+   *   ESCAPE '\'`（无更深分隔符 = 直挂）。转义照抄 findAll 先例（\ % _ 逐字符）。
+   * - substring/split_part 只出现在 SELECT/GROUP BY（narrowing 之后）：
+   *   `split_part(substring(d.path from :plen::int), '/', 1)`——plen 由本方法 JS 算好
+   *   整数传入（归一化 prefix 含尾 / 时 plen = prefix.length + 1，PG 1-based）。
+   *   ⚠️ `::int` cast 必须保留：node pg 绑定 number 到 `substring(text from $1)`
+   *   时 PG 参数类型推断为 text（正则重载，实测返回匹配子串而非位置截取），
+   *   显式 cast 强制 int4 重载（位置截取）。
+   * - 一律显式 d.deleted_at IS NULL。
+   * - folders total = 分组数（子查询 COUNT）；docs total 用 getManyAndCount 双查。
+   *
+   * @param spaceId 目标空间 ID
+   * @param query 查询参数（prefix/sort/docsLimit/docsOffset/foldersLimit/foldersOffset）
+   * @returns DocTreeResponse（prefix 归一化回显 + folders/docs 分页信封）
+   */
+  async findTree(
+    spaceId: string,
+    query: {
+      prefix?: string;
+      sort?: 'recent' | 'name';
+      docsLimit?: number;
+      docsOffset?: number;
+      foldersLimit?: number;
+      foldersOffset?: number;
+    },
+  ): Promise<DocTreeResponse> {
+    const {
+      prefix: rawPrefix = '',
+      sort = 'recent',
+      docsLimit = 50,
+      docsOffset = 0,
+      foldersLimit = 200,
+      foldersOffset = 0,
+    } = query;
+
+    // 纵深防御钳制（DTO 已 @Max 校验，service 层兜底，对齐 spec §7.4 双层保护）
+    const docsLimitC = Math.min(docsLimit, 200);
+    const foldersLimitC = Math.min(foldersLimit, 500);
+
+    // prefix 归一化：去前导 /、非空补尾部 /（根层 = ''）
+    const prefix = rawPrefix.replace(/^\/+/, '');
+    const normalizedPrefix = prefix === '' ? '' : prefix.endsWith('/') ? prefix : `${prefix}/`;
+
+    // LIKE 通配符转义（照抄 findAll 先例）：\ % _ 逐字符转义，保证字面前缀语义
+    const escapedPrefix = normalizedPrefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+
+    // plen：substring(d.path from :plen) 的起始位置（PG 1-based）。
+    // 归一化 prefix 恒以 / 结尾（非空时），plen = prefix.length + 1 跳过 "prefix/"
+    // 本身、从下一段开始取；根层（''）plen = 1 取全文首段。
+    const plen = normalizedPrefix === '' ? 1 : normalizedPrefix.length + 1;
+
+    // ── folders：当前层直接子目录（GROUP BY 首段）──
+    const folderQb = this.docRepo
+      .createQueryBuilder('d')
+      .select(`split_part(substring(d.path from :plen::int), '/', 1)`, 'name')
+      .addSelect('COUNT(*)', 'docCount')
+      .addSelect('MAX(d.updated_at)', 'latestDocAt')
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .andWhere(`d.path LIKE :escapedPrefix || '%' ESCAPE '\\'`, { escapedPrefix })
+      .andWhere(`d.path LIKE :escapedPrefix || '%/%' ESCAPE '\\'`, { escapedPrefix })
+      .groupBy(`split_part(substring(d.path from :plen::int), '/', 1)`)
+      .setParameter('plen', plen)
+      .offset(foldersOffset)
+      .limit(foldersLimitC);
+    // 目录排序：recent = 最近更新 DESC（MAX(updated_at)）；name = 段名 ASC
+    if (sort === 'name') {
+      folderQb.orderBy('name', 'ASC');
+    } else {
+      folderQb.orderBy('MAX(d.updated_at)', 'DESC');
+    }
+    const folderRows = await folderQb.getRawMany();
+
+    // folders total = 分组数（子查询 COUNT，不拉全量分组行）
+    // from 工厂契约：返回 subQuery QB（TypeORM 内部自行 getQuery/getParameters 合并），
+    // 禁止返回 getQuery() 字符串——否则 subQueryBuilder.getParameters 不存在。
+    // ⚠️ 必须用 manager.createQueryBuilder()（无主 FROM）：repo.createQueryBuilder()
+    // 无论是否传 alias 都会设主 FROM（alias 缺省 = 实体名），.from(sub) 变成追加
+    // FROM（逗号笛卡尔积），COUNT(*) 会变成 docs 行数 × 分组数
+    const folderTotalQb = this.docRepo.manager
+      .createQueryBuilder()
+      .select('COUNT(*)', 'total')
+      .from((qb) => {
+        return qb
+          .select(`split_part(substring(d.path from :plen::int), '/', 1)`, 'seg')
+          .from(Doc, 'd')
+          .where('d.space_id = :spaceId')
+          .andWhere('d.deleted_at IS NULL')
+          .andWhere(`d.path LIKE :escapedPrefix || '%' ESCAPE '\\'`)
+          .andWhere(`d.path LIKE :escapedPrefix || '%/%' ESCAPE '\\'`)
+          .groupBy(`split_part(substring(d.path from :plen::int), '/', 1)`);
+      }, 't')
+      .setParameter('spaceId', spaceId)
+      .setParameter('escapedPrefix', escapedPrefix)
+      .setParameter('plen', plen);
+    const folderTotalRow = await folderTotalQb.getRawOne();
+    const folderTotal = Number(folderTotalRow?.total ?? 0);
+
+    // ── docs：当前层直挂文档（无更深分隔符，slim 分页）──
+    const docQb = this.docRepo
+      .createQueryBuilder('d')
+      .select(['d.id', 'd.path', 'd.title', 'd.docType', 'd.updatedAt'])
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .andWhere(`d.path LIKE :escapedPrefix || '%' ESCAPE '\\'`, { escapedPrefix })
+      .andWhere(`d.path NOT LIKE :escapedPrefix || '%/%' ESCAPE '\\'`, { escapedPrefix })
+      .orderBy('d.path', 'ASC')
+      .skip(docsOffset)
+      .take(docsLimitC);
+    const [docItems, docTotal] = await docQb.getManyAndCount();
+
+    return {
+      prefix: normalizedPrefix,
+      folders: {
+        items: folderRows.map((r) => ({
+          path: `${normalizedPrefix}${r.name}/`,
+          name: r.name,
+          docCount: Number(r.docCount),
+          latestDocAt: r.latestDocAt ? new Date(r.latestDocAt).toISOString() : null,
+        })),
+        total: folderTotal,
+        hasMore: foldersOffset + folderRows.length < folderTotal,
+      },
+      docs: {
+        items: docItems.map((d) => ({
+          id: d.id,
+          path: d.path,
+          title: d.title,
+          docType: d.docType,
+          updatedAt: d.updatedAt,
+        })),
+        total: docTotal,
+        hasMore: docsOffset + docItems.length < docTotal,
+      },
+    };
+  }
+
+  /**
+   * 全空间聚合计数（GET /doc-spaces/:id/docs/facets，v1.70.0-dev）
+   *
+   * 替代前端全量列表聚合：types = GROUP BY doc_type（非空）；tags = unnest(tags)
+   * GROUP BY；categories = JOIN doc_categories（含软删过滤，照抄 findAll 先例
+   * doc.service.ts:1021）。全部只统计未删文档；排序 count DESC + value/slug ASC
+   * tie-break（确定性输出）。
+   *
+   * @param spaceId 目标空间 ID
+   * @returns DocFacetsResponse（types/tags/categories 三组聚合计数）
+   */
+  async findFacets(spaceId: string): Promise<DocFacetsResponse> {
+    // types：GROUP BY doc_type（非空 = IS NOT NULL AND <> ''）
+    const typeRows = await this.docRepo
+      .createQueryBuilder('d')
+      .select('d.doc_type', 'value')
+      .addSelect('COUNT(*)', 'count')
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .andWhere('d.doc_type IS NOT NULL')
+      .andWhere("d.doc_type <> ''")
+      .groupBy('d.doc_type')
+      .orderBy('count', 'DESC')
+      .addOrderBy('value', 'ASC')
+      .getRawMany();
+
+    // tags：unnest(tags) GROUP BY（空 tags 数组不产出行）
+    const tagRows = await this.docRepo
+      .createQueryBuilder('d')
+      .select('unnest(d.tags)', 'value')
+      .addSelect('COUNT(*)', 'count')
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .groupBy('unnest(d.tags)')
+      .orderBy('count', 'DESC')
+      .addOrderBy('value', 'ASC')
+      .getRawMany();
+
+    // categories：JOIN doc_categories（裸表 join 仅用于按 slug/name 聚合，无关系可
+    // 水合，禁 leftJoinAndSelect——照抄 findAll 先例）；join 条件带软删过滤——
+    // 已软删分类不应再作为聚合命中依据
+    const catRows = await this.docRepo
+      .createQueryBuilder('d')
+      .select('dc.slug', 'slug')
+      .addSelect('dc.name', 'name')
+      .addSelect('COUNT(*)', 'count')
+      .leftJoin('doc_categories', 'dc', 'dc.id = d.category_id AND dc.deleted_at IS NULL')
+      .where('d.space_id = :spaceId', { spaceId })
+      .andWhere('d.deleted_at IS NULL')
+      .andWhere('dc.id IS NOT NULL')
+      .groupBy('dc.slug')
+      .addGroupBy('dc.name')
+      .orderBy('count', 'DESC')
+      .addOrderBy('slug', 'ASC')
+      .getRawMany();
+
+    return {
+      types: typeRows.map((r) => ({ value: r.value, count: Number(r.count) })),
+      tags: tagRows.map((r) => ({ value: r.value, count: Number(r.count) })),
+      categories: catRows.map((r) => ({ slug: r.slug, name: r.name, count: Number(r.count) })),
+    };
+  }
+
+  /**
    * Get document detail: metadata + section outline (no content by default).
    * QB select explicitly excludes section content.
    *
@@ -1131,6 +1665,9 @@ export class DocService {
       ...base,
       sections: outline,
       linkHealth: doc.linkHealth as LinkHealth | null | undefined,
+      // Diagram IR v1：图信息摘要透传（DocDetail.diagram，免二次请求拿渲染元数据）——
+      // 数据源自 docs.render_meta（不含 rendered_html 大字段，select:false 未水合）
+      ...(doc.docType === DOC_TYPE_DIAGRAM ? { diagram: this.buildDiagramSummary(doc) } : {}),
     };
 
     // 生效阈值：显式 maxFullTokens 优先（0 = 强制 outline），缺省用模块常量
@@ -1671,6 +2208,18 @@ export class DocService {
 
     const doc = await this.findById(docId);
 
+    // D9 防呆（Diagram IR v1，plan §3.3 M-b 落点）：diagram doc 禁止 markdown section 写——
+    // 若放行进 upsertCore，拼接产物会被当 IR 解析报 422 stage:'parse'，错误语境混乱。
+    // 统一心智模型：IR 按文档整体（upsert_diagram）或 JSON-patch（patch_diagram）改。
+    if (doc.docType === DOC_TYPE_DIAGRAM) {
+      throw new BadRequestException({
+        message:
+          `Document is docType='diagram': section-based text patching is not applicable; ` +
+          `use patch_diagram (RFC 6902 JSON patch) or upsert_diagram (full IR replace) instead`,
+        code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED,
+      });
+    }
+
     // 全量 section（position ASC）：拼接整篇与越界判断都需要有序全量。
     // 与 getContent 同款查询（doc_id + position ASC），走实体 hydration。
     const sections = await this.sectionRepo
@@ -1729,7 +2278,7 @@ export class DocService {
         title: doc.title,
         summary: doc.summary ?? undefined,
         source,
-        versionSource: 'patch',
+        versionSource: DOC_VERSION_SOURCE.PATCH,
         // 内部乐观锁（TOCTOU 加固）：doc.contentHash 为 null 的远古文档无哈希可比对，
         // 退化为无前提（无法加固的既有数据形态，不阻塞写）
         expectedContentHash: doc.contentHash ?? undefined,
@@ -1792,6 +2341,17 @@ export class DocService {
 
     const doc = await this.findById(docId);
 
+    // D9 防呆（Diagram IR v1，plan §3.3 M-b 落点）：diagram doc 禁止 markdown match 写——
+    // IR 是结构化 JSON，substring 替换语义不适用；用 patch_diagram / upsert_diagram。
+    if (doc.docType === DOC_TYPE_DIAGRAM) {
+      throw new BadRequestException({
+        message:
+          `Document is docType='diagram': match-based text patching is not applicable; ` +
+          `use patch_diagram (RFC 6902 JSON patch) or upsert_diagram (full IR replace) instead`,
+        code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED,
+      });
+    }
+
     // 操作面 = getContent(id, full=true) 同款全文（见方法 doc 注释「操作面钉死」）
     const sections = await this.sectionRepo
       .createQueryBuilder('s')
@@ -1838,7 +2398,7 @@ export class DocService {
         title: doc.title,
         summary: doc.summary ?? undefined,
         source,
-        versionSource: 'patch',
+        versionSource: DOC_VERSION_SOURCE.PATCH,
         // 内部乐观锁（TOCTOU 加固）：doc.contentHash 为 null 的远古文档无哈希可比对，
         // 退化为无前提（无法加固的既有数据形态，不阻塞写）
         expectedContentHash: doc.contentHash ?? undefined,
@@ -1940,6 +2500,17 @@ export class DocService {
   ): Promise<UpsertDocResult> {
     const doc = await this.findById(docId);
 
+    // D9 防呆（Diagram IR v1，plan §3.3 M-b 落点）：diagram doc 禁止 markdown 追加写——
+    // 单节合成文档无 heading 子树语义；用 patch_diagram / upsert_diagram。
+    if (doc.docType === DOC_TYPE_DIAGRAM) {
+      throw new BadRequestException({
+        message:
+          `Document is docType='diagram': append is not applicable to a structured IR document; ` +
+          `use patch_diagram (RFC 6902 JSON patch) or upsert_diagram (full IR replace) instead`,
+        code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED,
+      });
+    }
+
     // 全量 section（position ASC）：end 模式拼整篇与 under-heading 模式子树推导
     // 都需要有序全量（与 patch 两入口同款查询）
     const sections = await this.sectionRepo
@@ -1967,7 +2538,7 @@ export class DocService {
         title: doc.title,
         summary: doc.summary ?? undefined,
         source,
-        versionSource: 'append',
+        versionSource: DOC_VERSION_SOURCE.APPEND,
         // 内部乐观锁（TOCTOU 加固）：doc.contentHash 为 null 的远古文档无哈希可比对，
         // 退化为无前提（无法加固的既有数据形态，不阻塞写）
         expectedContentHash: doc.contentHash ?? undefined,
@@ -2149,10 +2720,10 @@ export class DocService {
 
     // ② 409 DOC_SOURCE_MISMATCH：native-only（与 upsert/patch 一致——ingest 文档
     // 元数据由适配器管，平台侧直改会撕裂 sync 语义）
-    if (doc.source !== 'native') {
+    if (doc.source !== DOC_SOURCE_NATIVE) {
       throw new ConflictException({
         message:
-          `Document source '${doc.source}' is not 'native'; only native documents can be ` +
+          `Document source '${doc.source}' is not ${DOC_SOURCE_NATIVE}; only native documents can be ` +
           `metadata-patched (ingest documents are managed by their adapter)`,
         code: ErrorCode.DOC_SOURCE_MISMATCH,
       });
@@ -2247,6 +2818,19 @@ export class DocService {
           updates.summary = dto.summary;
         }
         if (dto.docType !== undefined && dto.docType !== locked.docType) {
+          // D10 docType 转换双向守卫（Diagram IR v1，plan §0 D10）：metadata-only 通道
+          // 不重切/不渲染（本方法契约），任何触及 'diagram' 的转换都会留下"diagram 无
+          // 快照"（转入）或"IR 当 markdown"（转出）的烂态 → 400 指路 upsert 通道。
+          if (dto.docType === DOC_TYPE_DIAGRAM || locked.docType === DOC_TYPE_DIAGRAM) {
+            throw new BadRequestException({
+              message:
+                `docType transitions involving 'diagram' are not allowed on the metadata-only ` +
+                `channel (no re-chunk/re-render here); use upsert_diagram / PUT /doc-spaces/:id/diagrams ` +
+                `with the full IR (markdown → diagram) or PUT /docs with the full markdown content ` +
+                `and an explicit non-diagram docType (diagram → markdown) instead`,
+              code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED,
+            });
+          }
           changedFields.push('docType');
           before.docType = locked.docType;
           updates.docType = dto.docType;
@@ -2347,7 +2931,7 @@ export class DocService {
       }
       const auditEntry = this.auditRepo.create({
         action: AuditAction.UPDATE,
-        entityType: 'doc',
+        entityType: AUDIT_ENTITY_TYPE.DOC,
         entityId: docId,
         actorId: actor.id,
         newData: { metadataOnly: true, changedFields: tx.changedFields, before: tx.before, after },
@@ -2362,7 +2946,7 @@ export class DocService {
     const eventCtx = await this.getSpaceEventContext(doc.spaceId);
     await this.eventService.create({
       eventType: EventType.DOC_UPDATED,
-      resourceType: 'doc',
+      resourceType: ResourceType.DOC,
       resourceId: docId,
       actorId: actor?.id ?? undefined,
       topicId: eventCtx.topicId ?? undefined,
@@ -2425,7 +3009,7 @@ export class DocService {
     // A missing/undefined source also mismatches → ingest docs cannot be
     // deleted through the plain API path (sync-docs.mjs passes ?source=).
     // Native docs are unaffected (deletable by any authorized actor).
-    if (doc.source !== 'native' && source !== doc.source) {
+    if (doc.source !== DOC_SOURCE_NATIVE && source !== doc.source) {
       throw new ConflictException({
         message: `Document source '${doc.source}' does not match request source '${source ?? '<missing>'}'`,
         code: ErrorCode.DOC_SOURCE_MISMATCH,
@@ -2445,7 +3029,7 @@ export class DocService {
     if (actor) {
       const auditEntry = this.auditRepo.create({
         action: AuditAction.DELETE,
-        entityType: 'doc',
+        entityType: AUDIT_ENTITY_TYPE.DOC,
         entityId: docId,
         actorId: actor.id,
         newData: { path: doc.path, title: doc.title },
@@ -2458,7 +3042,7 @@ export class DocService {
     const ctx = await this.getSpaceEventContext(doc.spaceId);
     await this.eventService.create({
       eventType: EventType.DOC_DELETED,
-      resourceType: 'doc',
+      resourceType: ResourceType.DOC,
       resourceId: docId,
       actorId: actor?.id ?? undefined,
       topicId: ctx.topicId ?? undefined,

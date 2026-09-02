@@ -73,6 +73,8 @@ jest.mock('@/lib/api', () => ({
       listAll: jest.fn(),
     },
   },
+  // 值域常量（与 api.ts 单源一致；vendor-runner 联动提示消费）
+  RUNNER_STATUS: { ONLINE: 'online', OFFLINE: 'offline' },
 }));
 
 const mockCreateSeat = Api.roundtable.createSeat as jest.Mock;

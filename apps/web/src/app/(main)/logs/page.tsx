@@ -27,7 +27,7 @@
 'use client';
 
 import { Fragment, useCallback, useMemo, useState } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
 import { Api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth.store';
@@ -132,6 +132,7 @@ function RowDetail({ log }: { log: { newData: unknown; oldData: unknown; diff: u
  */
 export default function LogsPage() {
   const t = useTranslations('logs');
+  const locale = useLocale();
   const tFilter = useTranslations('logs.filter');
   const user = useAuthStore((state) => state.user);
   const isAdmin = user?.role === UserRole.ADMIN;
@@ -454,7 +455,7 @@ export default function LogsPage() {
                             </button>
                           </TableCell>
                           <TableCell className="whitespace-nowrap">
-                            {formatDate(String(log.createdAt))}
+                            {formatDate(String(log.createdAt), locale)}
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center gap-1.5">

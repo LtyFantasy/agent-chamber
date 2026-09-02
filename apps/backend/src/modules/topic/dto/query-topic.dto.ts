@@ -1,5 +1,5 @@
-import { IsOptional, IsString, IsIn, IsInt, Min, Max, MaxLength } from 'class-validator';
-import { Type } from 'class-transformer';
+import { IsOptional, IsString, IsIn, IsInt, Min, Max, MaxLength, IsBoolean } from 'class-validator';
+import { Type, Transform } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { TopicStatus } from '@agent-chamber/shared';
 
@@ -35,7 +35,7 @@ export class QueryTopicDto {
   @ApiPropertyOptional({
     enum: [...Object.values(TopicStatus), 'all'],
     description:
-      'Filter by topic status, one of: draft, open, active, voting, paused, closed, archived, all (no filter). Defaults to active',
+      'Filter by topic status, one of: open, active, paused, closed, archived, all (no filter). Defaults to active',
     example: TopicStatus.ACTIVE,
   })
   status?: TopicStatus | 'all';
@@ -49,4 +49,28 @@ export class QueryTopicDto {
     example: 'Search keyword',
   })
   q?: string;
+
+  /**
+   * 仅返回"我的"项（v1.70 插件绑定推断语义底座）：query 参数均为字符串，
+   * 用 @Transform 严格解析（对齐 doc-overview/query-board-digest 布尔 query 惯例）：
+   * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：mine=true 时可见集收缩为 creator（含 owner-proxy 名下 agent 创建的）+
+   * participant（status IN invited/active，对齐 unread SQL 口径），排除仅因 open 可见的项；
+   * admin 求 mine 同样按 creator/participant 身份收缩。
+   * 缺省 false = 现有可见性口径不变（现有消费方零影响）。
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Return only topics I created or participate in (invited/active), excluding open-visible-only ones. Default false.',
+    example: 'true',
+  })
+  mine?: boolean;
 }

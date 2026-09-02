@@ -244,6 +244,25 @@ describe('AuthController (e2e)', () => {
       .expect((res: any) => {
         expect(res.body.code).toBe(200);
         expect(res.body.data).toBe(true);
+      })
+      .then(() => {
+        // B-57 回归断言：撤销 update 的 where 必须含正确 userId（旧实现
+        // @CurrentUser('sub') 恒 undefined → criteria 绑定 SQL NULL 恒不命中，
+        // 撤销 0 行；此断言在旧代码下必失败——mock 未断言 where 是漏网点）
+        expect(mockRepos.RefreshToken.update).toHaveBeenCalledWith(
+          { tokenHash: 'mocked-hash', userId: '00000000-0000-4000-8000-000000000005' },
+          { revokedAt: expect.any(Date) },
+        );
+        // B-57 回归断言：LOGOUT 审计 entityId 必须为真实 userId（旧实现 entityId
+        // undefined 违反 NOT NULL 落库失败被 fail-open 吞掉，审计静默丢失）
+        expect(mockRepos.AuditLog.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'logout',
+            entityType: 'user',
+            entityId: '00000000-0000-4000-8000-000000000005',
+            actorId: '00000000-0000-4000-8000-000000000005',
+          }),
+        );
       });
   });
 });

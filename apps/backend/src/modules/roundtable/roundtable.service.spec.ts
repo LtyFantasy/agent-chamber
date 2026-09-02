@@ -16,7 +16,14 @@ import {
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
-import { EventType, ActorType, ErrorCode, MessageType, UserRole } from '@agent-chamber/shared';
+import {
+  EventType,
+  ActorType,
+  ErrorCode,
+  MessageType,
+  UserRole,
+  SYSTEM_ACTOR_ID,
+} from '@agent-chamber/shared';
 import { In, Not } from 'typeorm';
 import {
   buildEnvelope,
@@ -104,8 +111,7 @@ const HUMAN_ADMIN_ACTOR: UnifiedActor = {
   role: UserRole.ADMIN,
 };
 
-/** 系统 actor 哨兵 id（与 service 内 SYSTEM_ACTOR_ID 同值，公告断言用） */
-const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
+/** 系统 actor 哨兵 id（单源 = shared SYSTEM_ACTOR_ID，公告断言用） */
 
 /**
  * 构造最小合法 PendingInject（注入埋点用例用；buildEnvelope 不校验 payload 结构，
@@ -1718,9 +1724,6 @@ describe('RoundtableService', () => {
   // ─────────────────────────── 失败回执（决策 #6，M2 阶段 3） ───────────────────────────
 
   describe('失败回执（决策 #6）', () => {
-    /** 系统 actor 哨兵 id（ActorUnification migration 播种；与服务常量同值） */
-    const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
-
     /** 单座位直通（batchWindowMs=0）可达/不可达切换 */
     function mockSingleSeat(online: boolean) {
       const seat = makeSeat();
@@ -2990,28 +2993,45 @@ describe('RoundtableService', () => {
     });
   });
 
-  it('listSeats：响应透出 state.modelInfo（M3 阶段 5——实体原样返回，modelInfo 与 lastUsage 同款嵌套 state jsonb，web 直接消费）', async () => {
+  it('listSeats：响应透出 state.modelInfo（M3 阶段 5——modelInfo 与 lastUsage 同款嵌套 state jsonb，web 直接消费）', async () => {
     topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't' });
     permService.ensureCan.mockResolvedValue(undefined);
     seatRepo.find.mockResolvedValue([
       makeSeat({
         state: {
-          recentInjects: [],
+          recentInjects: [{ seq: 1, messageIds: ['m1'] }],
+          failedEventSeqs: [5],
+          roundsWithoutHuman: 2,
+          valveTripCount: 1,
           modelInfo: {
             model: 'kimi-k2',
             thinking: 'high',
             mode: 'auto',
             at: '2026-08-08T00:00:00Z',
           },
+          recentActivity: [
+            { at: '2026-08-08T00:00:00Z', kind: 'reply', summary: 's', result: 'ok' },
+          ],
+          silentCount: 1,
+          lastUsage: { at: '2026-08-08T00:00:00Z' },
         },
       }),
     ]);
     const list = await service.listSeats('topic-1', AGENT_ACTOR);
+    // 契约字段保留（web 活消费：seat-badges/seat-presence-bar/popover）
     expect(list[0].state.modelInfo).toMatchObject({
       model: 'kimi-k2',
       thinking: 'high',
       mode: 'auto',
     });
+    expect(list[0].state.recentActivity).toHaveLength(1);
+    expect(list[0].state.silentCount).toBe(1);
+    expect(list[0].state.lastUsage).toMatchObject({ at: '2026-08-08T00:00:00Z' });
+    // 接口瘦身二期：state 白名单投影——纯内部字段剔除（web 零消费，grep 实证）
+    expect(list[0].state).not.toHaveProperty('recentInjects');
+    expect(list[0].state).not.toHaveProperty('failedEventSeqs');
+    expect(list[0].state).not.toHaveProperty('roundsWithoutHuman');
+    expect(list[0].state).not.toHaveProperty('valveTripCount');
   });
 
   // ─────────────────────────── runner 列表 listRunners（v1.49.0） ───────────────────────────
@@ -3562,8 +3582,6 @@ describe('RoundtableService', () => {
 
   describe('圆桌安全阀（M2 阶段 4）', () => {
     const BATCH = 30000;
-    /** 系统 actor 哨兵 id（与服务常量同值） */
-    const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
 
     /** mention 模式 topic + 安全阀阈值（undefined = settings 无该键 → 缺省 8） */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

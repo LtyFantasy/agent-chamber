@@ -87,6 +87,15 @@ jest.mock('@/lib/api', () => ({
       listSeats: jest.fn(),
     },
   },
+  // 值域常量（与 api.ts 单源一致；runner 在线判定 + presence 存活判定消费）
+  RUNNER_STATUS: { ONLINE: 'online', OFFLINE: 'offline' },
+  PRESENCE_PHASE: {
+    THINKING: 'thinking',
+    TOOL: 'tool',
+    REPLYING: 'replying',
+    IDLE: 'idle',
+    OFFLINE: 'offline',
+  },
 }));
 const mockListRunners = Api.roundtable.listRunners as jest.Mock;
 

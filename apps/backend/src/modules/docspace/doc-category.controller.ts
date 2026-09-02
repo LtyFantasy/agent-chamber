@@ -27,6 +27,7 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { UpdateDocCategoryDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 
 @ApiTags('DocSpaces')
@@ -79,7 +80,7 @@ export class DocCategoryController {
     // 参数，决策 2）；newData 白名单 {categoryId, spaceId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_category',
+      entityType: AUDIT_ENTITY_TYPE.DOC_CATEGORY,
       entityId: id,
       actorId: actor.id,
       newData: { categoryId: id, spaceId: category.spaceId, name: category.name },

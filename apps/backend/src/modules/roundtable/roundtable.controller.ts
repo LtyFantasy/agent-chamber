@@ -76,7 +76,10 @@ export class RoundtableController {
   @Get('seats')
   @ApiOperation({
     summary: 'List roundtable seats',
-    description: 'List seats of a roundtable topic. Requires read permission on the topic.',
+    description:
+      'List seats of a roundtable topic. Requires read permission on the topic. ' +
+      'seat.state is a whitelist projection: modelInfo/recentActivity/silentCount/lastUsage are kept; ' +
+      'internal fields (recentInjects/failedEventSeqs/roundsWithoutHuman/valveTripCount) are not exposed.',
   })
   @ApiResponse({ status: 200, description: 'Seat list' })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })

@@ -23,6 +23,7 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient, PlatformApiError } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { TaskStatus, Visibility } from '@agent-chamber/shared';
 
 /** 默认看板列（当 lists 参数未提供时） */
 const DEFAULT_LISTS = [{ name: 'backlog' }, { name: 'in_progress' }, { name: 'done' }];
@@ -55,7 +56,8 @@ export const createTopicWithBoardTool: CustomTool = {
         },
         visibility: {
           type: 'string',
-          enum: ['open', 'private'],
+          // 枚举值从 shared Visibility 单源取值（防 backend DTO 加值后此处漂移）
+          enum: Object.values(Visibility),
           description:
             'Topic visibility, default "private" (intentionally stricter than the server default of "open", ' +
             'following the principle of least exposure for autonomous agents)',
@@ -75,7 +77,8 @@ export const createTopicWithBoardTool: CustomTool = {
               name: { type: 'string', description: 'List name' },
               mappedStatus: {
                 type: 'string',
-                enum: ['backlog', 'todo', 'in_progress', 'review', 'done', 'blocked', 'archived'],
+                // 枚举值从 shared TaskStatus 单源取值（防 backend DTO 加值后此处漂移）
+                enum: Object.values(TaskStatus),
                 description: 'Mapped task status (optional)',
               },
             },

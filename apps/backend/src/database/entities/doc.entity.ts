@@ -5,6 +5,8 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: docs/database.md (docs 表), plan §3.1
+ *   - 补充: plan diagram-ir-v1-plan.md §1.1（Diagram IR v1：+diagram_type/rendered_html/
+ *     render_meta 三列；docType='diagram' ⟺ 三列非空 不变量，迁出置 null）
  *
  * [踩坑索引] (无历史踩坑，新建文件)
  *
@@ -25,6 +27,11 @@ import {
   DeleteDateColumn,
   Index,
 } from 'typeorm';
+import {
+  DOC_SOURCE_NATIVE,
+  DOC_TITLE_MAX_LENGTH,
+  DOC_SUMMARY_MAX_LENGTH,
+} from '@agent-chamber/shared';
 
 @Entity('docs')
 @Index(['spaceId'])
@@ -50,19 +57,49 @@ export class Doc {
   @Column({ type: 'varchar', length: 512, nullable: false })
   path: string;
 
-  @Column({ type: 'varchar', length: 200, nullable: false })
+  // 列长单源 = shared DOC_TITLE_MAX_LENGTH（改值需配套 migration，见常量注释）
+  @Column({ type: 'varchar', length: DOC_TITLE_MAX_LENGTH, nullable: false })
   title: string;
 
   /**
    * 摘要
    * ≤500 字符，缺省取首段（chunking 时生成）
    */
-  @Column({ type: 'varchar', length: 500, nullable: true })
+  // 列长单源 = shared DOC_SUMMARY_MAX_LENGTH（改值需配套 migration，见常量注释）
+  @Column({ type: 'varchar', length: DOC_SUMMARY_MAX_LENGTH, nullable: true })
   summary: string | null;
 
-  /** 文档类型，用户自定义，开放字符串 */
+  /** 文档类型，用户自定义，开放字符串（'diagram' = Diagram IR 图文档，见下方三列） */
   @Column({ type: 'varchar', length: 64, nullable: true, name: 'doc_type' })
   docType: string | null;
+
+  /**
+   * 图类型（Diagram IR v1，plan diagram-ir-v1-plan.md §1.1）
+   * 从 IR `diagram_type` 字段反正范化（architecture/workflow/sequence/dataflow/lifecycle，
+   * 最长 12 字符 < varchar(16)），免解析 IR 即可列表/过滤；非 diagram 文档恒 NULL。
+   * 不变量（铁律 #18）：docType='diagram' ⟺ diagram_type/rendered_html 非空——
+   * 写入路径 upsertCore diagram 分支同事务维护；迁出（docType 改非 diagram）三列同置 null。
+   */
+  @Column({ type: 'varchar', length: 16, nullable: true, name: 'diagram_type' })
+  diagramType: string | null;
+
+  /**
+   * 渲染产物 HTML 快照（自包含 viewer：内联 SVG+CSS+JS，PG TOAST 自动压缩）。
+   * IR 的确定性编译产物——可由任意版本 IR 重渲染复原，故不进 doc_versions（版本只快照 IR）。
+   * select:false 防水合大字段（先例：本表 deletedAt / doc_sections.searchVector）；
+   * 读端点（GET /docs/:id/diagram.html）必须 QB addSelect('d.renderedHtml') 显式取（plan §4.1 M-c）。
+   */
+  @Column({ type: 'text', nullable: true, name: 'rendered_html', select: false })
+  renderedHtml: string | null;
+
+  /**
+   * 渲染元数据（~1KB 紧凑 JSON，读详情页用）：
+   * {engine:'archify', rendererVersion, qualityProfile（服务端注入后的生效值）,
+   *  checks:[{name,ok}], composition:{errors,warnings}（checker composition.summary 子对象）,
+   *  renderedAt, htmlBytes, htmlSha256}
+   */
+  @Column({ type: 'jsonb', nullable: true, name: 'render_meta' })
+  renderMeta: Record<string, unknown> | null;
 
   /** 标签数组 */
   @Column({ type: 'text', array: true, default: '{}' })
@@ -72,8 +109,9 @@ export class Doc {
    * 文档来源
    * 'native'（默认，API/MCP 可写）vs ingest 来源（如 'git:agent-chamber'，平台只读，写操作 409）
    * DB 为 NOT NULL DEFAULT 'native'，实体对齐 nullable:false（消除 migration:generate 噪声 diff）
+   * 哨兵值引用 shared DOC_SOURCE_NATIVE（review-0831 任务 8fab2a9d 上移单源）
    */
-  @Column({ type: 'varchar', length: 128, default: 'native', nullable: false })
+  @Column({ type: 'varchar', length: 128, default: DOC_SOURCE_NATIVE, nullable: false })
   source: string;
 
   /** 内容 SHA256，ingest 幂等跳过用 */

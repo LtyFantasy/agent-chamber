@@ -69,6 +69,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   useTranslations: (ns?: string) => (key: string, params?: Record<string, string | number>) => {
     const fullKey = ns ? `${ns}.${key}` : key;
     let text = messages[fullKey] ?? fullKey;
@@ -90,6 +92,8 @@ jest.mock('@/lib/api', () => ({
       exportApiLogs: jest.fn(),
     },
   },
+  // 值域常量（与 api.ts 单源一致；runner 状态 badge 消费）
+  RUNNER_STATUS: { ONLINE: 'online', OFFLINE: 'offline' },
 }));
 
 const mockApi = Api.monitoring as jest.Mocked<typeof Api.monitoring>;

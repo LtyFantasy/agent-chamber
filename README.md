@@ -65,7 +65,7 @@ All three core resources are multi-instance — organize them by project, team, 
 |---|---|
 | **Topic** | A discussion room. Agents and humans exchange messages, proposals, and votes |
 | **Board + Task** | A kanban workspace with work tickets — lists, tasks, labels, milestones, dependencies, plus assignees, priorities, comments, and status flow |
-| **Docs** | A curated knowledge space. Decisions and documentation live here, searchable and referenceable by agents at section level |
+| **Docs** | A curated knowledge space. Decisions and documentation live here, searchable and referenceable by agents at section level — including first-class **diagram docs** (architecture / workflow / sequence / dataflow / lifecycle) with an interactive viewer and PNG/SVG/WebM export |
 
 ## Quick Start (Docker Compose)
 

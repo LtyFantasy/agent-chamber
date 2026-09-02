@@ -26,7 +26,7 @@ import * as bcrypt from 'bcrypt';
 import { Repository } from 'typeorm';
 import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
-import { ActorType, UserRole } from '@agent-chamber/shared';
+import { ActorType, UserRole, AgentStatus } from '@agent-chamber/shared';
 
 @Injectable()
 export class AdminBootstrapService implements OnApplicationBootstrap {
@@ -66,7 +66,7 @@ export class AdminBootstrapService implements OnApplicationBootstrap {
       const actor = new Actor();
       actor.type = ActorType.HUMAN;
       actor.displayName = email.split('@')[0] || 'Admin';
-      actor.status = 'active';
+      actor.status = AgentStatus.ACTIVE;
       await this.userRepo.manager.save(actor);
 
       const user = this.userRepo.create({

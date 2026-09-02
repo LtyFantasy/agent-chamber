@@ -38,6 +38,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   useTranslations: (ns?: string) => (key: string) => {
     const fullKey = ns ? `${ns}.${key}` : key;
     return messages[fullKey] ?? fullKey;

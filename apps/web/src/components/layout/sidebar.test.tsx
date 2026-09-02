@@ -66,6 +66,9 @@ jest.mock('@/components/locale-switcher', () => ({
 }));
 
 jest.mock('@/lib/api', () => ({
+  // setAuthHooks：auth.store.ts 模块加载时调用（review-0831 任务 04e8d744 拆环注入），
+  // mock 缺此导出会 TypeError: setAuthHooks is not a function
+  setAuthHooks: jest.fn(),
   Api: {
     roundtable: {
       pendingPermissionRequestCount: jest.fn(),

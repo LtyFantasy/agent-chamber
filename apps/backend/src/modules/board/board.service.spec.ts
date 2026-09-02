@@ -81,6 +81,14 @@ describe('BoardService', () => {
       findOne: jest.fn(),
       find: jest.fn().mockResolvedValue([]),
       remove: jest.fn(),
+      // findAll 跨 board 批量 lists 查询（接口瘦身二期：不再 join board.lists）
+      createQueryBuilder: jest.fn(() => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([]),
+      })),
     } as unknown as jest.Mocked<Repository<BoardList>>;
     taskRepo = {
       update: jest.fn(),
@@ -849,6 +857,22 @@ describe('BoardService', () => {
       expect(result.items).toHaveLength(1);
     });
 
+    it('should delegate to mine-only whitelist when query.mine is true (v1.70)', async () => {
+      const board = makeBoard({ id: 'board-1' });
+      const qbMock = createMockQueryBuilder([board], 1);
+      boardRepo.createQueryBuilder.mockReturnValue(qbMock);
+      accessQuery.getMyBoardIds = jest.fn().mockResolvedValue(['board-1']);
+
+      const actor = { id: 'user-1', type: ActorType.HUMAN };
+      await service.findAll({ mine: true }, actor);
+
+      expect(accessQuery.getMyBoardIds).toHaveBeenCalledWith(actor);
+      expect(accessQuery.getAccessibleBoardIds).not.toHaveBeenCalled();
+      expect(qbMock.andWhere).toHaveBeenCalledWith('board.id IN (:...accessibleBoardIds)', {
+        accessibleBoardIds: ['board-1'],
+      });
+    });
+
     it('should return empty pagination when accessible board ids is empty', async () => {
       accessQuery.getAccessibleBoardIds.mockResolvedValue([]);
 
@@ -865,6 +889,65 @@ describe('BoardService', () => {
         hasNext: false,
         hasPrev: false,
       });
+    });
+
+    it('should expose lists summary (findLists shape) and strip settings (接口瘦身二期)', async () => {
+      const board = makeBoard({ settings: { visibility: Visibility.OPEN } });
+      const qbMock = createMockQueryBuilder([board], 1);
+      boardRepo.createQueryBuilder.mockReturnValue(qbMock);
+      // 跨 board 批量 lists 查询返回 1 条（含软删列应被 SQL 过滤，mock 只给非软删）
+      listRepo.createQueryBuilder.mockReturnValue({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([
+          {
+            id: 'list-1',
+            boardId: 'board-1',
+            name: '待办',
+            position: 0,
+            color: 'blue',
+            mappedStatus: 'backlog',
+            createdAt: new Date('2026-08-01T00:00:00.000Z'),
+            updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+          } as BoardList,
+        ]),
+      } as unknown as SelectQueryBuilder<BoardList>);
+      // 批量 task count per list
+      taskRepo.createQueryBuilder.mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        addSelect: jest.fn().mockReturnThis(),
+        innerJoin: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        setParameter: jest.fn().mockReturnThis(),
+        groupBy: jest.fn().mockReturnThis(),
+        getRawMany: jest.fn().mockResolvedValue([{ listId: 'list-1', count: '3' }]),
+      } as any);
+
+      const result = await service.findAll();
+      const item = result.items[0] as unknown as Record<string, unknown>;
+
+      // settings 不再透传；顶层 visibility 拍平保留
+      expect(item).not.toHaveProperty('settings');
+      expect(item.visibility).toBe(Visibility.OPEN);
+      // lists 摘要形状 = findLists 项形状（含 taskCount），无软删列/实体泄漏
+      expect(item.lists).toEqual([
+        {
+          id: 'list-1',
+          boardId: 'board-1',
+          name: '待办',
+          position: 0,
+          color: 'blue',
+          mappedStatus: 'backlog',
+          taskCount: 3,
+          createdAt: new Date('2026-08-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      ]);
+      expect((item.lists as unknown[])[0]).not.toHaveProperty('deletedAt');
+      expect(item.listCount).toBe(1);
     });
   });
 

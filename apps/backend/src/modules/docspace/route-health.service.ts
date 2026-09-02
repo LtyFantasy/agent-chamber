@@ -25,6 +25,7 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { DocService } from './doc.service';
 import type { RepoManifest, RouteHealthIssue } from '@agent-chamber/shared';
+import { CODE_ENTRY_TYPE } from './doc-constants';
 
 /**
  * codeEntry ↔ manifest.files 匹配（C2，路径段边界语义）：
@@ -146,7 +147,7 @@ export class RouteHealthService {
       // codeEntryStatus 键由类型注释约定（RouteHealth.codeEntryStatus，shared DTO）。
       const codeEntry = route.codeEntry;
       if (codeEntry) {
-        if (route.codeEntryType === 'pattern') {
+        if (route.codeEntryType === CODE_ENTRY_TYPE.PATTERN) {
           route.health = {
             issues,
             codeEntryStatus: 'exempt',

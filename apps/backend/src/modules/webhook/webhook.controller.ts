@@ -44,6 +44,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole, AuditAction } from '@agent-chamber/shared';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { QueryWebhookDto } from './dto/query-webhook.dto';
 import { TestWebhookDto } from './dto/test-webhook.dto';
 
@@ -105,7 +106,7 @@ export class WebhookController {
     // 可能含任意内容）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'webhook_delivery',
+      entityType: AUDIT_ENTITY_TYPE.WEBHOOK_DELIVERY,
       entityId: result.log.id,
       actorId: adminId ?? null,
       newData: {

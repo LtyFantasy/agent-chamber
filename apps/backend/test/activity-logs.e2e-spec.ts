@@ -222,13 +222,16 @@ describe('活动日志三层权限查询 — 真实 PG 集成', () => {
     });
     created.auditIds.push(rowE.id);
 
-    // 显式时间戳：row-A/row-C 落 2026-08-27 窗口，row-B/row-D/row-E 落 2026-08-28
+    // 显式时间戳：row-A/row-C 落 2026-08-27 窗口；row-B/row-D/row-E 落 2099-01-01
+    // （未来时间戳——admin 全量断言用 from=2099 窗口时，窗口内只剩本套件 3 行：
+    // 并行 e2e 下其他套件写 audit 行 created_at=now（2026-08-29）会挤占 20 条
+    // createdAt DESC 分页窗口把 row-B/D/E 挤出，未来时间戳免疫该交错，08-29 修复）
     await ds.query(`UPDATE audit_logs SET created_at = $1 WHERE id = ANY($2)`, [
       '2026-08-27T12:00:00Z',
       [rowA.id, rowC.id],
     ]);
     await ds.query(`UPDATE audit_logs SET created_at = $1 WHERE id = ANY($2)`, [
-      '2026-08-28T12:00:00Z',
+      '2099-01-01T00:00:00Z',
       [rowB.id, rowD.id, rowE.id],
     ]);
   }, 30000);
@@ -359,10 +362,11 @@ describe('活动日志三层权限查询 — 真实 PG 集成', () => {
   });
 
   it('admin：全量（含他人行 + actorId=null 系统行），scope=null，保留网络元数据', async () => {
-    // from=08-28T12:00Z 精确窗口：本套件 row-B/row-D/row-E 恰为该时刻，本地库
-    // 其他历史行 created_at 均早于它 → 窗口内仅本套件 3 行，避开分页截断
+    // from=2099-01-01 未来窗口：本套件 row-B/row-D/row-E 恰为该时刻（beforeAll 显式
+    // UPDATE），任何其他行（含并行 e2e 套件 created_at=now 的写入）都早于它 → 窗口内
+    // 仅本套件 3 行，避开 20 条 createdAt DESC 分页截断（08-29 并行交错修复）
     const result = await auditService.findScoped(
-      { from: '2026-08-28T12:00:00Z' },
+      { from: '2099-01-01T00:00:00Z' },
       humanActor('99999999-9999-4999-8999-999999999999', UserRole.ADMIN),
     );
 
@@ -403,7 +407,7 @@ describe('活动日志三层权限查询 — 真实 PG 集成', () => {
       humanActor('99999999-9999-4999-8999-999999999999', UserRole.ADMIN),
     );
 
-    // 相对断言：08-27 窗口内的 row-A + row-C 在结果中，08-28 的 row-B/row-D/row-E 不在
+    // 相对断言：08-27 窗口内的 row-A + row-C 在结果中，2099 的 row-B/row-D/row-E 不在
     const entityIds = new Set(result.items.map((i) => i.entityId));
     expect(entityIds.has(ENTITY_IDS.rowA)).toBe(true);
     expect(entityIds.has(ENTITY_IDS.rowC)).toBe(true);

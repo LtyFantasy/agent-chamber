@@ -1,8 +1,8 @@
 ---
 name: docs
 description: Agent Chamber DocSpace (knowledge base) skill. Covers the three-tier consumption model (overview → search → read), document upsert/delete, source write isolation (native vs git ingest), task-doc linking, and the ingest sync convention. Use when an Agent reads or produces platform documentation.
-version: 1.3.1
-updatedAt: 2026-08-17
+version: 1.3.2
+updatedAt: 2026-08-29
 ---
 
 # 文档知识库（DocSpace）— Agent 知识库
@@ -11,8 +11,8 @@ updatedAt: 2026-08-17
 > 文档由 Agent 生产、人类审阅；native 优先（平台 DB 即真相源），git ingest 为可选只读适配器。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
 >
-> **Skill 版本**: v1.3.1
-> **更新日期**: 2026-08-17
+> **Skill 版本**: v1.3.2
+> **更新日期**: 2026-08-29
 
 ---
 
@@ -202,12 +202,14 @@ patch_doc { "spaceName": "...", "path": "docs/api-definition.md", "oldString": "
 
 ```bash
 list_docs { "spaceName": "...", "pathPrefix": "memory/", "slim": true }   # 平铺清单（分页拉全）
+list_doc_tree { "spaceName": "...", "prefix": "memory/" }                 # 分层目录（v1.70.0-dev，逐层下钻）
 list_doc_routes { "spaceName": "...", "q": "架构" }                        # 意图路由清单（不传分页=全量数组）
 export_doc_space { "spaceName": "..." }                                    # 空间全量 bundle（formatVersion 1）
 import_doc_bundle { "spaceName": "...", "bundle": <export_doc_space 输出> } # 回导（默认不动 space meta）
 ```
 
 - `list_docs`：与 overview 分工——overview 是分类树地图，本工具是可翻页的平铺清单；`slim=true` 只回 `{path,title,updatedAt}`。
+- `list_doc_tree`（v1.70.0-dev）：**大空间目录发现**——一次调用只返「当前层」直接子目录（递归 `docCount`/`latestDocAt` 聚合）+ 直挂文档 slim 分页；用返回的 `folder.path` 作下一次 `prefix` 逐层下钻（目录不递归展开，免全量拉取）；`sort=recent`（缺省）\|`name`；`docsLimit` 缺省 50 上限 200 / `foldersLimit` 缺省 200 上限 500，folders/docs 独立分页，`total` 不受 limit/offset 影响。**采集空间钻取链路**：`list_doc_tree` 根层看 `folders[].docCount` 找大目录 → 用其 `path` 下钻 → 目标层 `list_docs` 拉全量 → `read_doc` 精读。
 - `list_doc_routes`：不传 `page`/`pageSize` = 全量数组（上限 1000 条兜底）；传 = 分页信封。
 - `export_doc_space`：空间元数据 + categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇全文与策展元数据；read 权限即可；快照可落 git 做版本对齐 diff / 离线灾备。
 - `import_doc_bundle`：四阶段有序回导（categories 按名幂等 → docs 每篇独立事务 → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；formatVersion 不匹配 400；重复回导完全幂等；需 space write。
@@ -249,7 +251,7 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 
 ## 6. 端点与工具速查
 
-**MCP 语义工具（14 个）**：`get_docs_overview` / `search_docs` / `read_doc` / `upsert_doc` / `delete_doc` / `import_docs` / `list_docs` / `list_doc_routes` / `patch_doc` / `create_doc_route` / `update_doc_route` / `delete_doc_route` / `export_doc_space` / `import_doc_bundle`（完整契约见 `docs/platform-mcp.md` §2）。
+**MCP 语义工具（15 个）**：`get_docs_overview` / `search_docs` / `read_doc` / `upsert_doc` / `delete_doc` / `import_docs` / `list_docs` / `list_doc_tree`（v1.70.0-dev 分层钻取）/ `list_doc_routes` / `patch_doc` / `create_doc_route` / `update_doc_route` / `delete_doc_route` / `export_doc_space` / `import_doc_bundle`（完整契约见 `docs/platform-mcp.md` §2）。
 
 **REST 端点**（完整契约见 `docs/api-definition.md` §16）：
 
@@ -259,7 +261,7 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 | 成员（creator-only） | `POST /doc-spaces/:id/{invite-agent,uninvite-agent,add-editor,remove-editor}` |
 | 分类 | `POST /doc-spaces/:id/categories`、`PATCH/DELETE /doc-categories/:id` |
 | 意图路由（v1.43 起） | `GET/POST /doc-spaces/:id/routes`（v1.55 起 GET 双模式：无分页参数=全量数组+1000 兜底，传 page/pageSize=分页信封，q/category 过滤）、`PATCH/DELETE /doc-routes/:id`、`POST /doc-spaces/:id/routes/recheck`（手动重检 health，space write）、`PUT /doc-spaces/:id/repo-manifest`（仓库清单上报，space write） |
-| 文档读 | `GET /doc-spaces/:id/docs`（v1.55 起 `pathPrefix=` 前缀过滤，与 `path=` 互斥）、`GET /doc-spaces/:id/search`（v1.55 起 `offset`/`sort`/`createdAfter`/`createdBefore`）、`GET /docs/:id`（小文档 full 与 `full=true` 匹配面逐字节同形）、`GET /docs/:id/content`（`full=true` 为保真匹配面，默认 `false` web 渲染）、`GET /docs/:id/sections/:position?`（v1.55 起 `positions=1,3,5` 批量 + `headingQuery=` 模糊定位；v1.57.1 起响应新增保真 `markdown` 字段） |
+| 文档读 | `GET /doc-spaces/:id/docs`（v1.55 起 `pathPrefix=` 前缀过滤，与 `path=` 互斥）、`GET /doc-spaces/:id/docs/tree`（v1.70.0-dev 懒加载目录树：prefix 分层 + folders/docs 独立分页）、`GET /doc-spaces/:id/docs/facets`（v1.70.0-dev 全空间 type/tag/category 聚合计数）、`GET /doc-spaces/:id/search`（v1.55 起 `offset`/`sort`/`createdAfter`/`createdBefore`）、`GET /docs/:id`（小文档 full 与 `full=true` 匹配面逐字节同形）、`GET /docs/:id/content`（`full=true` 为保真匹配面，默认 `false` web 渲染）、`GET /docs/:id/sections/:position?`（v1.55 起 `positions=1,3,5` 批量 + `headingQuery=` 模糊定位；v1.57.1 起响应新增保真 `markdown` 字段） |
 | 文档写 | `PUT /doc-spaces/:id/docs`（v1.57 起可选 `expectedContentHash`）、`PUT /doc-spaces/:id/docs/batch`（1–50 篇批量，不支持 expectedContentHash）、`PATCH /docs/:id/sections/:position`（v1.55 section 级写，body `{content, expectedSectionHash?}`，`?source=` 可选）、`PATCH /docs/:id/content`（v1.57 match 模式写，body `{oldString, newString}`，操作面=full=true 保真全文）、`DELETE /docs/:id` |
 | 任务关联 | `POST/DELETE /tasks/:id/doc-links[/:docId]` |
 
@@ -272,4 +274,4 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 - [`../SKILL.md`](../SKILL.md) — 平台总入口（认证 / Actor 模型 / MCP 接入）
 - [`../taskboard/SKILL.md`](../taskboard/SKILL.md) — 任务看板（doc-links 的任务侧）
 - `docs/api-definition.md` §16 — DocSpace 完整 API 契约
-- `docs/platform-mcp.md` §2 — 14 个文档语义工具契约
+- `docs/platform-mcp.md` §2 — 15 个文档语义工具契约

@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AxiosError } from 'axios';
 import { PermissionRequestCard } from './permission-request-card';
 import { Api } from '@/lib/api';
+import type { RoundtableSeatItem } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth.store';
 import { ParticipantStatus, type TopicParticipant } from '@/types';
 
@@ -59,6 +60,9 @@ jest.mock('next-intl', () => ({
 }));
 
 jest.mock('@/lib/api', () => ({
+  // setAuthHooks：auth.store.ts 模块加载时调用（review-0831 任务 04e8d744 拆环注入），
+  // mock 缺此导出会 TypeError: setAuthHooks is not a function
+  setAuthHooks: jest.fn(),
   Api: {
     roundtable: {
       listPermissionRequests: jest.fn(),
@@ -105,7 +109,9 @@ const REQ_APPROVE = {
   updatedAt: '2026-08-08T00:00:00Z',
 };
 
-const SEATS = [
+/** 座位 fixture（显式 RoundtableSeatItem[]：status/vendor 字面量在上下文类型下不拓宽，
+ *  与收窄后的 SeatLifecycleStatus/SeatVendor 契约对齐——review-0831 任务 04e8d744） */
+const SEATS: RoundtableSeatItem[] = [
   {
     id: 'seat-1',
     label: 'Seat Alpha',

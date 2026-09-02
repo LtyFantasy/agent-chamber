@@ -293,6 +293,106 @@ describe('AccessQueryService', () => {
     });
   });
 
+  describe('getMyTopicIds (mine-only, v1.70)', () => {
+    it('should exclude OPEN topics and include creator + participant topics', async () => {
+      // mine 不查 open 源：creator 1 条 + participant 1 条
+      topicQb.getRawMany.mockResolvedValueOnce([{ id: 'topic-creator' }]);
+      participantQb.getRawMany.mockResolvedValueOnce([{ id: 'topic-accessible' }]);
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getMyTopicIds(actor);
+
+      expect(result).toEqual(['topic-creator', 'topic-accessible']);
+      // 未构建 open 查询（accessible 路径会调用 2 次 topicRepo.createQueryBuilder）
+      expect(mockTopicRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(mockParticipantRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(topicQb.where).not.toHaveBeenCalledWith(
+        "COALESCE(t.settings->>'visibility', 'open') = :open",
+      );
+    });
+
+    it('should return empty for anonymous actor (open source excluded)', async () => {
+      const result = await service.getMyTopicIds(undefined);
+      expect(result).toEqual([]);
+      expect(mockTopicRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(mockParticipantRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('should include topics created by owned agents (owner proxy whitelist in mine)', async () => {
+      mockOwnerProxy.getOwnedAgentIds.mockResolvedValue(['agent-1']);
+      topicQb.getRawMany.mockResolvedValueOnce([{ id: 'topic-agent-created' }]);
+      participantQb.getRawMany.mockResolvedValueOnce([]);
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getMyTopicIds(actor);
+
+      expect(result).toEqual(['topic-agent-created']);
+      expect(topicQb.setParameter).toHaveBeenCalledWith('creatorIds', ['user-1', 'agent-1']);
+      expect(mockTopicRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('admin mine: no null short-circuit — creator+participant 身份计算', async () => {
+      topicQb.getRawMany.mockResolvedValueOnce([{ id: 'topic-admin-created' }]);
+      participantQb.getRawMany.mockResolvedValueOnce([]);
+
+      const admin: UnifiedActor = { id: 'admin-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+      const result = await service.getMyTopicIds(admin);
+
+      expect(result).toEqual(['topic-admin-created']);
+      expect(mockTopicRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(mockParticipantRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getMyBoardIds (mine-only, v1.70)', () => {
+    it('should exclude OPEN boards and include creator + member boards', async () => {
+      boardQb.getRawMany.mockResolvedValueOnce([{ id: 'board-creator' }]);
+      memberQb.getRawMany.mockResolvedValueOnce([{ id: 'board-member' }]);
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getMyBoardIds(actor);
+
+      expect(result).toEqual(['board-creator', 'board-member']);
+      expect(mockBoardRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(mockMemberRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(boardQb.where).not.toHaveBeenCalledWith(
+        "COALESCE(b.settings->>'visibility', 'open') = :open",
+      );
+    });
+
+    it('should return empty for anonymous actor (open source excluded)', async () => {
+      const result = await service.getMyBoardIds(undefined);
+      expect(result).toEqual([]);
+      expect(mockBoardRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(mockMemberRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('should include boards created by owned agents (owner proxy whitelist in mine)', async () => {
+      mockOwnerProxy.getOwnedAgentIds.mockResolvedValue(['agent-1']);
+      boardQb.getRawMany.mockResolvedValueOnce([{ id: 'board-agent-created' }]);
+      memberQb.getRawMany.mockResolvedValueOnce([]);
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+      const result = await service.getMyBoardIds(actor);
+
+      expect(result).toEqual(['board-agent-created']);
+      expect(boardQb.setParameter).toHaveBeenCalledWith('creatorIds', ['user-1', 'agent-1']);
+      expect(mockBoardRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('admin mine: no null short-circuit — creator+member 身份计算', async () => {
+      boardQb.getRawMany.mockResolvedValueOnce([{ id: 'board-admin-created' }]);
+      memberQb.getRawMany.mockResolvedValueOnce([]);
+
+      const admin: UnifiedActor = { id: 'admin-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
+      const result = await service.getMyBoardIds(admin);
+
+      expect(result).toEqual(['board-admin-created']);
+      expect(mockBoardRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(mockMemberRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('getAccessibleDocSpaceIds', () => {
     it('should return null for admin', async () => {
       const admin: UnifiedActor = { id: 'admin-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
@@ -419,6 +519,54 @@ describe('AccessQueryService', () => {
       // 3 parallel queries total (2 space + 1 member)，缓存命中后不再查 DB
       expect(mockDocSpaceRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
       expect(mockDocSpaceMemberRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep mine and default topic whitelists in separate cache buckets', async () => {
+      topicQb.getRawMany
+        .mockResolvedValueOnce([{ id: 'topic-open' }]) // default: open
+        .mockResolvedValueOnce([{ id: 'topic-creator' }]) // default: creator
+        .mockResolvedValueOnce([{ id: 'topic-creator' }]); // mine: creator
+      participantQb.getRawMany
+        .mockResolvedValueOnce([]) // default: participant
+        .mockResolvedValueOnce([]); // mine: participant
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+
+      await store.run(new Map(), async () => {
+        const accessible = await service.getAccessibleTopicIds(actor);
+        const mineFirst = await service.getMyTopicIds(actor);
+        const mineSecond = await service.getMyTopicIds(actor);
+        // mine 与默认口径同请求不串缓存：mine 仍排除 open（若键碰撞会返回默认集）
+        expect(accessible).toEqual(['topic-open', 'topic-creator']);
+        expect(mineFirst).toEqual(['topic-creator']);
+        expect(mineSecond).toEqual(['topic-creator']);
+      });
+
+      // default: 2 topic + 1 participant；mine 首次: 1 topic + 1 participant；第二次缓存命中
+      expect(mockTopicRepo.createQueryBuilder).toHaveBeenCalledTimes(3);
+      expect(mockParticipantRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep mine and default board whitelists in separate cache buckets', async () => {
+      boardQb.getRawMany
+        .mockResolvedValueOnce([{ id: 'board-open' }]) // default: open
+        .mockResolvedValueOnce([]) // default: creator
+        .mockResolvedValueOnce([]); // mine: creator
+      memberQb.getRawMany
+        .mockResolvedValueOnce([{ id: 'board-member' }]) // default: member
+        .mockResolvedValueOnce([{ id: 'board-member' }]); // mine: member
+
+      const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+
+      await store.run(new Map(), async () => {
+        await service.getAccessibleBoardIds(actor);
+        const mine = await service.getMyBoardIds(actor);
+        // mine 与默认口径同请求不串缓存：mine 仍排除 open（default 集含 board-open）
+        expect(mine).toEqual(['board-member']);
+      });
+
+      expect(mockBoardRepo.createQueryBuilder).toHaveBeenCalledTimes(3);
+      expect(mockMemberRepo.createQueryBuilder).toHaveBeenCalledTimes(2);
     });
   });
 });

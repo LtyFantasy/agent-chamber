@@ -40,6 +40,8 @@ import {
   Query,
   UseGuards,
   ParseUUIDPipe,
+  BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse } from '@nestjs/swagger';
 import { TaskService } from './task.service';
@@ -66,8 +68,9 @@ import {
 } from './dto';
 import { AddDocLinkDto } from '../docspace/dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
-import { TaskStatus, AuditAction } from '@agent-chamber/shared';
+import { TaskStatus, AuditAction, ErrorCode } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 
 @ApiTags('Tasks')
 @Controller('tasks')
@@ -176,6 +179,11 @@ export class TaskController {
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 403, description: 'Forbidden (not a board participant)' })
   async create(@Body() dto: CreateTaskDto, @CurrentActor() actor: UnifiedActor) {
+    // B-58：目标 board 的 write 校验（boardId 解析顺序与 service.create 对齐：
+    // listId 优先、statusName 需 boardId、boardId 可从 listId 推断）——兑现
+    // @ApiResponse 403 "Forbidden (not a board participant)" 契约（铁律 #20）
+    const board = await this.taskService.resolveCreateBoard(dto);
+    await this.permService.ensureCan(board, actor, 'write');
     return this.taskService.create(dto, actor.id, actor.type);
   }
 
@@ -192,6 +200,15 @@ export class TaskController {
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 403, description: 'Forbidden (not a board participant)' })
   async batchCreate(@Body() dto: BatchCreateTasksDto, @CurrentActor() actor: UnifiedActor) {
+    // B-58：批量任务允许跨 board——对每个去重后的目标 board 校验 write（任一无权即 403）
+    const checkedBoards = new Set<string>();
+    for (const taskDto of dto.tasks) {
+      const board = await this.taskService.resolveCreateBoard(taskDto);
+      if (!checkedBoards.has(board.id)) {
+        await this.permService.ensureCan(board, actor, 'write');
+        checkedBoards.add(board.id);
+      }
+    }
     return this.taskService.batchCreate(dto, actor.id, actor.type);
   }
 
@@ -423,7 +440,7 @@ export class TaskController {
     // newData 白名单 {taskId, title}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'task',
+      entityType: AUDIT_ENTITY_TYPE.TASK,
       entityId: id,
       actorId: actor.id,
       newData: { taskId: id, title: task.title },
@@ -460,7 +477,7 @@ export class TaskController {
     // （决策 6；position 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'task',
+      entityType: AUDIT_ENTITY_TYPE.TASK,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -504,7 +521,7 @@ export class TaskController {
     // 决策 2）；newData 白名单 {taskId, title, assigneeId 前后值}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'task',
+      entityType: AUDIT_ENTITY_TYPE.TASK,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -594,7 +611,7 @@ export class TaskController {
     // 参数，决策 2）；newData 白名单 {taskId, docId}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_link',
+      entityType: AUDIT_ENTITY_TYPE.DOC_LINK,
       entityId: docId,
       actorId: actor.id,
       newData: { taskId: id, docId },
@@ -620,7 +637,14 @@ export class TaskController {
   @ApiResponse({ status: 200, description: 'Comment list' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async getComments(@Param('id', ParseUUIDPipe) id: string, @Query('limit') limit?: string) {
+  async getComments(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+    @Query('limit') limit?: string,
+  ) {
+    // B-58：评论属 task 私有数据，task→board 的 read 校验（read 无权限 → 404）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'read');
     return this.taskService.getComments(id, limit ? +limit : undefined);
   }
 
@@ -663,7 +687,14 @@ export class TaskController {
   @ApiResponse({ status: 200, description: 'Activity log list' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async getActivities(@Param('id', ParseUUIDPipe) id: string, @Query('limit') limit?: string) {
+  async getActivities(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+    @Query('limit') limit?: string,
+  ) {
+    // B-58：活动日志属 task 私有数据，task→board 的 read 校验（read 无权限 → 404）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'read');
     return this.taskService.getActivities(id, limit ? +limit : undefined);
   }
 
@@ -674,13 +705,22 @@ export class TaskController {
   @ApiOperation({
     summary: 'Get task dependencies (tasks this task depends on)',
     description:
-      "Get the task's dependency list (tasks this task depends on). Returns TaskDependency[].",
+      "Get the task's dependency list (tasks this task depends on). " +
+      'Each row is a summary projection {id, taskId, dependsOnTaskId, type, createdAt} ' +
+      'with nested dependsOnTask {id, title, status} (id = dependency row id, used for DELETE; ' +
+      'dependsOnTask.id = the task id). At most 100 rows.',
   })
   @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Dependency list (tasks this task depends on)' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async findDependencies(@Param('id', ParseUUIDPipe) id: string) {
+  async findDependencies(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    // B-58：依赖图属 task 私有数据，task→board 的 read 校验（read 无权限 → 404）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'read');
     return this.taskDependencyService.findDependencies(id);
   }
 
@@ -689,13 +729,21 @@ export class TaskController {
   @ApiOperation({
     summary: 'Get task dependents (tasks that depend on this task)',
     description:
-      "Get the task's dependent list (tasks that depend on this task). Returns TaskDependency[].",
+      "Get the task's dependent list (tasks that depend on this task). " +
+      'Each row is a summary projection {id, taskId, dependsOnTaskId, type, createdAt} ' +
+      'with nested task {id, title, status}. At most 100 rows.',
   })
   @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Dependent list (tasks depending on this task)' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async findDependents(@Param('id', ParseUUIDPipe) id: string) {
+  async findDependents(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    // B-58：依赖图属 task 私有数据，task→board 的 read 校验（read 无权限 → 404）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'read');
     return this.taskDependencyService.findDependents(id);
   }
 
@@ -721,12 +769,20 @@ export class TaskController {
     @Body() dto: AddTaskDependencyDto,
     @CurrentActor() actor: UnifiedActor,
   ) {
+    // B-58：主 task 的 board write（与 addComment 等写端点一致）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'write');
+    // dependsOnTaskId 可能跨 board：既有设计允许跨 board 依赖边（无 board 一致性
+    // 校验），但权限语义未定义——保守选择两端 board 都校验 write（防越权探测/
+    // 写入私有 board 任务；若产品上需放宽为"被依赖 board 仅 read"，见 B-58 汇报）
+    const dependsOnTask = await this.taskService.findById(dto.dependsOnTaskId);
+    await this.permService.ensureCan(dependsOnTask, actor, 'write');
     const result = await this.taskDependencyService.addDependency(id, dto);
     // 审计（Phase 2）：CREATE + task_dependency；controller 层（addDependency 无
     // actor 参数，决策 2）；newData 白名单 {taskId, dependsOnTaskId, type}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'task_dependency',
+      entityType: AUDIT_ENTITY_TYPE.TASK_DEPENDENCY,
       entityId: result.id,
       actorId: actor.id,
       newData: {
@@ -756,12 +812,15 @@ export class TaskController {
     @Param('depId', ParseUUIDPipe) depId: string,
     @CurrentActor() actor: UnifiedActor,
   ) {
+    // B-58：删除依赖行只影响主 task 的依赖图，task→board 的 write 校验
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'write');
     await this.taskDependencyService.removeDependency(id, depId);
     // 审计（Phase 2）：DELETE + task_dependency；controller 层；newData 白名单
     // {taskId, dependsOnTaskId}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'task_dependency',
+      entityType: AUDIT_ENTITY_TYPE.TASK_DEPENDENCY,
       entityId: depId,
       actorId: actor.id,
       newData: { taskId: id, dependsOnTaskId: depId },
@@ -775,13 +834,18 @@ export class TaskController {
   @ApiOperation({
     summary: 'Get active blockers (blocks type + incomplete)',
     description:
-      'Get active blockers for this task (type=blocks and the dependent task is incomplete). Returns TaskDependency[].',
+      'Get active blockers for this task (type=blocks and the dependent task is incomplete). ' +
+      'Each row is a summary projection {id, taskId, dependsOnTaskId, type, createdAt} ' +
+      'with nested dependsOnTask {id, title, status}. At most 100 rows.',
   })
   @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Blocker list' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
   @ApiResponse({ status: 404, description: 'Task not found' })
-  async findBlockers(@Param('id', ParseUUIDPipe) id: string) {
+  async findBlockers(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+    // B-58：blockers 属 task 私有数据，task→board 的 read 校验（read 无权限 → 404）
+    const task = await this.taskService.findById(id);
+    await this.permService.ensureCan(task, actor, 'read');
     return this.taskDependencyService.findBlockers(id);
   }
 
@@ -802,8 +866,38 @@ export class TaskController {
   })
   @ApiResponse({ status: 200, description: 'Blocker status map per task' })
   @ApiResponse({ status: 401, description: 'Unauthenticated or token expired' })
-  async batchBlockers(@Query('ids') ids: string) {
+  async batchBlockers(@Query('ids') ids: string, @CurrentActor() actor: UnifiedActor) {
     const taskIds = ids ? ids.split(',').filter(Boolean) : [];
+    // B-61：逐段校验 UUID 格式——非法值 400 先于权限 403（铁律 #21 格式校验在
+    // controller 层，不透传到 PG 绑定参数变成 22P02 500；写法对齐
+    // task.service.ts move() 的 listId regex 先例）
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const invalid = taskIds.find((taskId) => !uuidRegex.test(taskId));
+    if (invalid !== undefined) {
+      throw new BadRequestException({
+        message: `ids contains invalid UUID: ${invalid}`,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+    // B-58：多 task 可能跨多 board——对每个去重后的 board 校验 read，任一不可访问
+    // 即 403（batch 场景 404 无法隐藏存在性——其他 task 正常返回——故与单任务端点
+    // ensureCan(read→404) 不同，显式 403；权限判定在 B-61 格式校验之后执行）
+    const checkedBoards = new Set<string>();
+    for (const taskId of taskIds) {
+      const task = await this.taskService.findById(taskId);
+      const board = await this.taskService.resolveTaskBoard(task);
+      if (!board) continue; // orphan task = 公开（TaskPolicy 同语义）
+      if (!checkedBoards.has(board.id)) {
+        const allowed = await this.permService.can(board, actor, 'read');
+        if (!allowed) {
+          throw new ForbiddenException({
+            message: 'Access denied: read on Board',
+            code: ErrorCode.PERMISSION_DENIED,
+          });
+        }
+        checkedBoards.add(board.id);
+      }
+    }
     return this.taskDependencyService.hasBlockers(taskIds);
   }
 }

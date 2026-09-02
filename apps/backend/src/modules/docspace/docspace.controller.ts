@@ -75,6 +75,7 @@ import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 
 @ApiTags('DocSpaces')
 @Controller('doc-spaces')
@@ -134,7 +135,7 @@ export class DocSpaceController {
     // 决策 2）；newData 白名单 {spaceId, name}（决策 6——description/settings 不入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: result.id,
       actorId: actor.id,
       newData: { spaceId: result.id, name: result.name },
@@ -251,7 +252,7 @@ export class DocSpaceController {
     // ——description/overviewFilter/settings 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -292,7 +293,7 @@ export class DocSpaceController {
     // {spaceId, name}（决策 6——manifest 文件清单不入，可能巨大）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: id,
       actorId: actor.id,
       newData: { spaceId: id, name: space.name },
@@ -327,7 +328,7 @@ export class DocSpaceController {
     // 审计（Phase 2）：DELETE + doc_space；newData 白名单 {spaceId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: id,
       actorId: actor.id,
       newData: { spaceId: id, name: space.name },
@@ -365,7 +366,7 @@ export class DocSpaceController {
     // （inviteAgent 无 actor 参数，决策 2）；newData {spaceId, actorId}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_space_member',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { spaceId: id, actorId: dto.agentId },
@@ -400,7 +401,7 @@ export class DocSpaceController {
     // 审计（Phase 2）：DELETE + doc_space_member（uninvite-agent）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_space_member',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { spaceId: id, actorId: dto.agentId },
@@ -436,7 +437,7 @@ export class DocSpaceController {
     // member→editor 升级均属「授予 editor 角色」写入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_space_member',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { spaceId: id, actorId: dto.agentId },
@@ -471,7 +472,7 @@ export class DocSpaceController {
     // 审计（Phase 2）：DELETE + doc_space_member（remove-editor）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_space_member',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { spaceId: id, actorId: dto.agentId },
@@ -523,7 +524,7 @@ export class DocSpaceController {
     // {spaceId, newCreatorId}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: id,
       actorId: actor.id,
       newData: { spaceId: id, newCreatorId: dto.newCreatorId },

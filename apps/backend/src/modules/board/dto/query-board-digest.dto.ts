@@ -40,7 +40,12 @@ export class BoardDigestQueryDto {
   @IsInt()
   @Min(0)
   @Max(50)
-  @ApiPropertyOptional({ description: 'Max nextUp items (default 10; 0 = empty)', minimum: 0, maximum: 50, example: 10 })
+  @ApiPropertyOptional({
+    description: 'Max nextUp items (default 10; 0 = empty)',
+    minimum: 0,
+    maximum: 50,
+    example: 10,
+  })
   openLimit?: number;
 
   /** recentDone 段条数上限（缺省 5；0 = 空数组） */
@@ -49,7 +54,12 @@ export class BoardDigestQueryDto {
   @IsInt()
   @Min(0)
   @Max(50)
-  @ApiPropertyOptional({ description: 'Max recentDone items (default 5; 0 = empty)', minimum: 0, maximum: 50, example: 5 })
+  @ApiPropertyOptional({
+    description: 'Max recentDone items (default 5; 0 = empty)',
+    minimum: 0,
+    maximum: 50,
+    example: 5,
+  })
   doneLimit?: number;
 
   /** risks 段条数上限（缺省 10；0 = 空数组） */
@@ -58,7 +68,12 @@ export class BoardDigestQueryDto {
   @IsInt()
   @Min(0)
   @Max(50)
-  @ApiPropertyOptional({ description: 'Max risks items (default 10; 0 = empty)', minimum: 0, maximum: 50, example: 10 })
+  @ApiPropertyOptional({
+    description: 'Max risks items (default 10; 0 = empty)',
+    minimum: 0,
+    maximum: 50,
+    example: 10,
+  })
   riskLimit?: number;
 
   /** docs.recentlyUpdated 条数上限（缺省 5；0 = 空数组，docs 段仍返回空间元数据） */
@@ -67,7 +82,12 @@ export class BoardDigestQueryDto {
   @IsInt()
   @Min(0)
   @Max(50)
-  @ApiPropertyOptional({ description: 'Max docs.recentlyUpdated items (default 5; 0 = empty)', minimum: 0, maximum: 50, example: 5 })
+  @ApiPropertyOptional({
+    description: 'Max docs.recentlyUpdated items (default 5; 0 = empty)',
+    minimum: 0,
+    maximum: 50,
+    example: 5,
+  })
   docsLimit?: number;
 
   /** versions.history 条数上限（v1.42；缺省 5；0 = 空数组；production/development/total 不受影响） */
@@ -76,7 +96,12 @@ export class BoardDigestQueryDto {
   @IsInt()
   @Min(0)
   @Max(50)
-  @ApiPropertyOptional({ description: 'Max versions.history items (default 5; 0 = empty)', minimum: 0, maximum: 50, example: 5 })
+  @ApiPropertyOptional({
+    description: 'Max versions.history items (default 5; 0 = empty)',
+    minimum: 0,
+    maximum: 50,
+    example: 5,
+  })
   versionLimit?: number;
 
   /**

@@ -94,7 +94,11 @@ export class DownloadsController {
       'Whitelisted files: kimi.md / codex.md / opencode.md / claude-code.md (plus each .zh-CN.md).',
   })
   @ApiProduces('text/markdown')
-  @ApiParam({ name: 'file', description: 'Guide filename (whitelist enforced)', example: 'kimi.md' })
+  @ApiParam({
+    name: 'file',
+    description: 'Guide filename (whitelist enforced)',
+    example: 'kimi.md',
+  })
   @ApiResponse({ status: 200, description: 'Markdown guide (attachment)' })
   @ApiResponse({ status: 404, description: 'File not in whitelist or missing' })
   getIntegrationGuide(@Param('file') file: string): StreamableFile {

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Priority, TaskStatus, Visibility } from '@agent-chamber/shared';
+import { UserRole, BoardMemberRole, AgentStatus, ActorType } from '@/types';
 import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
@@ -37,7 +38,6 @@ import {
   Lock,
   Globe,
   Pencil,
-  X,
   Flag,
   Users,
   FileText,
@@ -68,12 +68,9 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import type { BoardListSummary, TaskSummary, TaskDetail, Agent, Milestone } from '@/types';
 // 任务卡视觉映射与徽章行（统一批 B 抽取自本页：SortableTask/DragOverlay 共用，独立可测）
-import {
-  TaskCardBadges,
-  priorityColors,
-  statusLabelKeys,
-  statusStyles,
-} from '@/components/tasks/task-card-badges';
+import { TaskCardBadges, statusLabelKeys, statusStyles } from '@/components/tasks/task-card-badges';
+// 里程碑管理弹窗（前端债包批次 4 子项 2 commit 5 抽取自本页：useQuery/useMutation 逻辑随组件搬移）
+import { MilestoneManageDialog } from '@/components/boards/milestone-manage-dialog';
 
 /**
  * mutation 错误统一提示（范式照抄 docs/[id]/page.tsx alertMutationError）：
@@ -116,7 +113,7 @@ function SortableTask({
   };
 
   const statusStyle = statusStyles[task.status] || statusStyles.todo;
-  const isDone = task.status === 'done' || task.status === 'archived';
+  const isDone = task.status === TaskStatus.DONE || task.status === TaskStatus.ARCHIVED;
 
   return (
     // 滚动区重复元素红线：半透实色底（bg-card/60），禁 backdrop-blur；
@@ -580,356 +577,6 @@ function SortableBoardColumn({
 }
 
 // ──────────────────────────────────────────────
-// MilestoneManageDialog — 里程碑管理弹窗
-// ──────────────────────────────────────────────
-function MilestoneManageDialog({
-  boardId,
-  open,
-  onClose,
-}: {
-  boardId: string;
-  open: boolean;
-  onClose: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const t = useTranslations('boards');
-  const tGlobal = useTranslations();
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    name: '',
-    description: '',
-    status: 'planned',
-    startDate: '',
-    targetDate: '',
-    // Release 字段（v1.42 B6）：version 创建时可填、编辑只读（release 身份标识，避免唯一索引冲突 UX 复杂化）；body 任何时候可编辑
-    version: '',
-    body: '',
-  });
-
-  const { data: milestonesData } = useQuery({
-    queryKey: ['milestones', 'list', boardId],
-    queryFn: () => Api.tasks.getMilestones({ boardId, pageSize: 100 }),
-    enabled: !!boardId,
-  });
-
-  // 正在编辑的里程碑对象（deployed 状态：select 禁用占位 + 提交保态用）
-  const editingMilestone = (milestonesData?.items ?? []).find((m: Milestone) => m.id === editingId);
-
-  /**
-   * 后端状态机（B1）：version 非空 → 禁普通态（planned/active/completed）；version 空 → 禁 release 态。
-   * 创建态填了 version 后自动把不在 release 组的 status 切到 dev（后端 create 缺省 dev 同语义）；
-   * 编辑态 version 只读不会变，状态由后端约束，前端不干预。
-   */
-  useEffect(() => {
-    if (editingId) return;
-    const releaseStatuses = ['dev', 'ready', 'verified', 'cancelled'];
-    if (form.version.trim() && !releaseStatuses.includes(form.status)) {
-      setForm((f) => ({ ...f, status: 'dev' }));
-    }
-  }, [form.version, form.status, editingId]);
-
-  const createMutation = useMutation({
-    mutationFn: (data: Parameters<typeof Api.tasks.createMilestone>[0]) =>
-      Api.tasks.createMilestone(data),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['milestones', 'list', boardId] });
-      setForm({
-        name: '',
-        description: '',
-        status: 'planned',
-        startDate: '',
-        targetDate: '',
-        version: '',
-        body: '',
-      });
-    },
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: ({
-      id,
-      data,
-    }: {
-      id: string;
-      data: Parameters<typeof Api.tasks.updateMilestone>[1];
-    }) => Api.tasks.updateMilestone(id, data),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['milestones', 'list', boardId] });
-      setEditingId(null);
-      setForm({
-        name: '',
-        description: '',
-        status: 'planned',
-        startDate: '',
-        targetDate: '',
-        version: '',
-        body: '',
-      });
-    },
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (id: string) => Api.tasks.deleteMilestone(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['milestones', 'list', boardId] });
-    },
-  });
-
-  const handleSubmit = () => {
-    if (!form.name.trim()) return;
-    const payload = {
-      name: form.name,
-      description: form.description || undefined,
-      boardId,
-      // deployed 只能经 POST /tasks/milestones/:id/deployed 端点写入（PATCH status=deployed 后端 400）；
-      // 编辑 deployed 里程碑时保持原状态（不传 status，PATCH 保留原值）
-      status: editingMilestone?.status === 'deployed' ? undefined : form.status,
-      startDate: form.startDate || undefined,
-      targetDate: form.targetDate || undefined,
-      // version 仅创建时可填（编辑只读展示，不允许改挂/改 version——部分唯一索引冲突 UX 复杂化）
-      ...(!editingId && form.version.trim() ? { version: form.version.trim() } : {}),
-      ...(form.body.trim() ? { body: form.body.trim() } : {}),
-    };
-    if (editingId) {
-      updateMutation.mutate({ id: editingId, data: payload });
-    } else {
-      createMutation.mutate(payload);
-    }
-  };
-
-  const startEdit = (m: Milestone) => {
-    setEditingId(m.id);
-    setForm({
-      name: m.name || '',
-      description: m.description || '',
-      status: m.status || 'planned',
-      startDate: m.startDate ? String(m.startDate).slice(0, 10) : '',
-      targetDate: m.targetDate ? String(m.targetDate).slice(0, 10) : '',
-      version: m.version ?? '',
-      // body 不回填：列表投影只返回 bodySnippet（300 字符截断），回填会覆盖截断原正文；
-      // 提交时 body 留空 = 不传（PATCH 保留原值），安全
-      body: '',
-    });
-  };
-
-  const milestoneStatusLabelKeys: Record<string, string> = {
-    planned: 'boards.milestone.status.planned',
-    active: 'boards.milestone.status.active',
-    completed: 'boards.milestone.status.completed',
-    cancelled: 'boards.milestone.status.cancelled',
-    dev: 'boards.milestone.status.dev',
-    ready: 'boards.milestone.status.ready',
-    deployed: 'boards.milestone.status.deployed',
-    verified: 'boards.milestone.status.verified',
-  };
-
-  // 里程碑状态徽章：新色板暗色适配（半透明语义色底 + 亮阶文字）
-  const statusColors: Record<string, string> = {
-    planned: 'bg-muted/50 text-muted-foreground',
-    active: 'bg-blue-500/15 text-blue-300',
-    completed: 'bg-emerald-500/15 text-emerald-300',
-    cancelled: 'bg-muted/40 text-muted-foreground line-through',
-    dev: 'bg-amber-500/15 text-amber-300',
-    ready: 'bg-cyan-500/15 text-cyan-300',
-    deployed: 'bg-violet-500/15 text-violet-300',
-    verified: 'bg-emerald-500/15 text-emerald-300',
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogHeader>
-        <DialogTitle>{t('milestone.title')}</DialogTitle>
-        <DialogDescription>{t('milestone.description')}</DialogDescription>
-      </DialogHeader>
-      <div className="py-4 space-y-4 max-h-[60vh] overflow-y-auto">
-        {/* 表单 */}
-        <div className="space-y-3 rounded-lg border p-3">
-          <Input
-            placeholder={t('milestone.namePlaceholder')}
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          />
-          <Input
-            placeholder={t('milestone.descPlaceholder')}
-            value={form.description}
-            onChange={(e) => setForm({ ...form, description: e.target.value })}
-          />
-          <div className="flex gap-2">
-            <select
-              className="h-9 rounded-md border border-input bg-background px-2 text-sm flex-1"
-              value={form.status}
-              onChange={(e) => setForm({ ...form, status: e.target.value })}
-            >
-              {form.version.trim() !== '' ? (
-                /* Release 里程碑（version 非空）：release 状态组——deployed 不出现在选项（端点专属，
-                   PATCH 会被后端 400 MILESTONE_DEPLOY_VIA_ENDPOINT）；当前 status=deployed 时以 disabled
-                   占位展示（不可选，编辑保存时保态不传 status） */
-                <>
-                  <option value="dev">{t('milestone.status.dev')}</option>
-                  <option value="ready">{t('milestone.status.ready')}</option>
-                  <option value="verified">{t('milestone.status.verified')}</option>
-                  <option value="cancelled">{t('milestone.status.cancelled')}</option>
-                  {editingMilestone?.status === 'deployed' && (
-                    <option value="deployed" disabled>
-                      {t('milestone.status.deployed')}
-                    </option>
-                  )}
-                </>
-              ) : (
-                /* 普通里程碑（version 空）：普通四态，行为零变更 */
-                <>
-                  <option value="planned">{t('milestone.status.planned')}</option>
-                  <option value="active">{t('milestone.status.active')}</option>
-                  <option value="completed">{t('milestone.status.completed')}</option>
-                  <option value="cancelled">{t('milestone.status.cancelled')}</option>
-                </>
-              )}
-            </select>
-            <Input
-              type="date"
-              placeholder={t('milestone.startDate')}
-              value={form.startDate}
-              onChange={(e) => setForm({ ...form, startDate: e.target.value })}
-              className="flex-1"
-            />
-            <Input
-              type="date"
-              placeholder={t('milestone.targetDate')}
-              value={form.targetDate}
-              onChange={(e) => setForm({ ...form, targetDate: e.target.value })}
-              className="flex-1"
-            />
-          </div>
-          <Input
-            placeholder={t('milestone.versionPlaceholder')}
-            value={form.version}
-            disabled={!!editingId}
-            title={editingId ? t('milestone.versionReadonlyHint') : undefined}
-            onChange={(e) => setForm({ ...form, version: e.target.value })}
-          />
-          <textarea
-            placeholder={t('milestone.bodyPlaceholder')}
-            value={form.body}
-            onChange={(e) => setForm({ ...form, body: e.target.value })}
-            rows={3}
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground"
-          />
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1"
-              onClick={() => {
-                setEditingId(null);
-                setForm({
-                  name: '',
-                  description: '',
-                  status: 'planned',
-                  startDate: '',
-                  targetDate: '',
-                  version: '',
-                  body: '',
-                });
-              }}
-            >
-              <X className="mr-1 h-3 w-3" />
-              {t('milestone.reset')}
-            </Button>
-            <Button
-              size="sm"
-              className="flex-1"
-              onClick={handleSubmit}
-              isLoading={createMutation.isPending || updateMutation.isPending}
-              disabled={!form.name.trim()}
-            >
-              {editingId ? t('milestone.saveChanges') : t('milestone.create')}
-            </Button>
-          </div>
-        </div>
-
-        {/* 列表 */}
-        <div className="space-y-2">
-          {(milestonesData?.items ?? []).length === 0 && (
-            <EmptyState
-              title={t('milestone.noMilestones')}
-              description={t('milestone.noMilestonesDesc')}
-            />
-          )}
-          {(milestonesData?.items ?? []).map((m: Milestone) => (
-            <div
-              key={m.id}
-              className={`flex items-center justify-between rounded-md border p-2 ${editingId === m.id ? 'ring-2 ring-primary bg-primary/5' : ''}`}
-            >
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium truncate">{m.name}</span>
-                  {m.version && (
-                    <Badge
-                      variant="outline"
-                      className="shrink-0 text-xs font-mono text-primary border-primary/40 bg-primary/10"
-                      title={m.version}
-                    >
-                      v{m.version.replace(/^v/i, '')}
-                    </Badge>
-                  )}
-                  <Badge variant="secondary" className={`text-xs ${statusColors[m.status] || ''}`}>
-                    {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-                    {tGlobal((milestoneStatusLabelKeys[m.status] || m.status) as any)}
-                  </Badge>
-                </div>
-                {m.description && (
-                  <p className="text-xs text-muted-foreground truncate mt-0.5">{m.description}</p>
-                )}
-                {(m.startDate || m.targetDate) && (
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {m.startDate ? String(m.startDate).slice(0, 10) : ''}
-                    {m.startDate && m.targetDate ? ' → ' : ''}
-                    {m.targetDate ? String(m.targetDate).slice(0, 10) : ''}
-                  </p>
-                )}
-              </div>
-              <div className="flex items-center gap-1 ml-2">
-                <button
-                  onClick={() => startEdit(m)}
-                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                  title={tGlobal('common.edit')}
-                >
-                  <Pencil className="h-3 w-3" />
-                </button>
-                <button
-                  onClick={async () => {
-                    // 删除里程碑（破坏性，danger 确认弹框，v1.48.1 收尾）
-                    if (
-                      await confirm({
-                        title: t('milestone.deleteConfirm', { name: m.name }),
-                        confirmText: tGlobal('common.confirm'),
-                        cancelText: tGlobal('common.cancel'),
-                        confirmVariant: 'danger',
-                      })
-                    ) {
-                      deleteMutation.mutate(m.id);
-                    }
-                  }}
-                  className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive"
-                  title={tGlobal('common.delete')}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-      <DialogFooter>
-        <Button variant="outline" onClick={onClose}>
-          {tGlobal('common.close')}
-        </Button>
-      </DialogFooter>
-    </Dialog>
-  );
-}
-
-// ──────────────────────────────────────────────
 // BoardDetailPage — 看板详情页
 // ──────────────────────────────────────────────
 export default function BoardDetailPage() {
@@ -1026,9 +673,9 @@ export default function BoardDetailPage() {
    */
   const canManage =
     !!currentUser &&
-    (currentUser.role === 'admin' ||
+    (currentUser.role === UserRole.ADMIN ||
       isCreatorOrOwner(board?.creatorId, currentUser.id, myAgentIds) ||
-      board?.members?.some((m) => m.id === currentUser.id && m.role === 'editor'));
+      board?.members?.some((m) => m.id === currentUser.id && m.role === BoardMemberRole.EDITOR));
 
   /**
    * 结构字段门控（v1.47.0-dev，对齐 DocSpace isOwnerLike）：admin | creator（含 owner 代理）——
@@ -1038,7 +685,7 @@ export default function BoardDetailPage() {
   const isBoardOwnerLike = useMemo(
     () =>
       !!currentUser &&
-      (currentUser.role === 'admin' ||
+      (currentUser.role === UserRole.ADMIN ||
         isCreatorOrOwner(board?.creatorId, currentUser.id, myAgentIds)),
     [currentUser, board?.creatorId, myAgentIds],
   );
@@ -1055,7 +702,7 @@ export default function BoardDetailPage() {
     onError: alertMutationError(t('legend.saveError')),
   });
 
-  const activeAgents = (agentsData ?? []).filter((a) => a.status === 'active');
+  const activeAgents = (agentsData ?? []).filter((a) => a.status === AgentStatus.ACTIVE);
 
   const { data: milestonesData } = useQuery({
     queryKey: ['milestones', 'list', board?.id],
@@ -1265,7 +912,7 @@ export default function BoardDetailPage() {
    *  创建者/owner 代理——体验层闸，后端同样 403；与页面级 canManage（内容管理，
    *  含 editor 成员）区分，勿混用） */
   const canManageMembers =
-    currentUser?.role === 'admin' ||
+    currentUser?.role === UserRole.ADMIN ||
     isCreatorOrOwner(board?.creatorId, currentUser?.id, myAgentIds);
 
   /** 活跃成员 → MemberItem（board.members 已按 DTO 投影：id/name/type/role；
@@ -1292,7 +939,7 @@ export default function BoardDetailPage() {
     if (!board) return [];
     const memberIds = new Set((board.members ?? []).map((m) => m.id));
     return (agentsData ?? [])
-      .filter((a: Agent) => a.status === 'active' && !memberIds.has(a.id))
+      .filter((a: Agent) => a.status === AgentStatus.ACTIVE && !memberIds.has(a.id))
       .map((a) => ({
         actorId: a.id,
         name: a.name,
@@ -1329,10 +976,11 @@ export default function BoardDetailPage() {
    *  失败汇总 toast（成功 N / 失败 M）。board 无人类候选，kind 恒为 'agent'，
    *  非 agent 防御性短路（不 resolve 也不 reject） */
   const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
-    if (kind !== 'agent') return;
+    if (kind !== ActorType.AGENT) return;
     const results = await Promise.allSettled(
       actorIds.map((actorId) => inviteAgentMutation.mutateAsync(actorId)),
     );
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- PromiseSettledResult 内置状态（'fulfilled'|'rejected'），非圆桌权限请求状态
     const failed = results.filter((r) => r.status === 'rejected').length;
     const succeeded = results.length - failed;
     if (failed > 0) {
@@ -1346,7 +994,7 @@ export default function BoardDetailPage() {
   /** 移除活跃成员（组件 AlertDialog 确认后回调）：照抄旧 UI 按角色分发——
    *  editor 行 → removeEditor（后端语义 = 完全移除）；member 行 → uninviteAgent */
   const handleRemoveMember = (actorId: string) => {
-    if (memberRoleById.get(actorId) === 'editor') {
+    if (memberRoleById.get(actorId) === BoardMemberRole.EDITOR) {
       removeEditorMutation.mutate(actorId);
     } else {
       uninviteAgentMutation.mutate(actorId);
@@ -1357,7 +1005,7 @@ export default function BoardDetailPage() {
    *  editor → member 降级后端无 demote 端点（removeEditor = 完全移除非降级），
    *  故 changeRole 配置只含 fromRole='member' 一项，此回调只接 'editor' */
   const handleChangeRole = (actorId: string, newRole: string) => {
-    if (newRole === 'editor') {
+    if (newRole === BoardMemberRole.EDITOR) {
       addEditorMutation.mutate(actorId);
     }
   };
@@ -1416,6 +1064,7 @@ export default function BoardDetailPage() {
     const activeType = event.active.data.current?.type as string;
     setActiveId(activeIdValue);
 
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
     if (activeType === 'task') {
       const item = workingLists.find((item) => item.tasks.some((t) => t.id === activeIdValue));
       originalTaskListIdRef.current = item?.list.id || null;
@@ -1431,6 +1080,7 @@ export default function BoardDetailPage() {
     const activeIdValue = active.id as string;
     const overId = over.id as string;
 
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
     if (active.data.current?.type !== 'task') return;
     if (activeIdValue === overId) return;
 
@@ -1505,6 +1155,7 @@ export default function BoardDetailPage() {
         setLists(newLists.map((item) => item.list));
         reorderListsMutation.mutate(newLists.map((item, i) => ({ id: item.list.id, position: i })));
       }
+      // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
     } else if (activeType === 'task') {
       const sourceListId = originalTaskListIdRef.current;
       const targetListId = over.data.current?.listId as string;
@@ -1583,7 +1234,7 @@ export default function BoardDetailPage() {
           <div className="min-w-0">
             <h1 className="text-xl sm:text-2xl font-bold flex items-center min-w-0">
               <span className="truncate">{board.name}</span>
-              {board.visibility === 'private' && (
+              {board.visibility === Visibility.PRIVATE && (
                 <Badge
                   variant="outline"
                   className="ml-2 shrink-0 text-amber-300 border-amber-500/40 bg-amber-500/10"
@@ -1591,7 +1242,7 @@ export default function BoardDetailPage() {
                   <Lock className="h-3 w-3 mr-1" /> {t('visibility.private')}
                 </Badge>
               )}
-              {board.visibility === 'open' && (
+              {board.visibility === Visibility.OPEN && (
                 <Badge
                   variant="outline"
                   className="ml-2 shrink-0 text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
@@ -1639,7 +1290,7 @@ export default function BoardDetailPage() {
               </span>
             </Link>
           ) : (
-            (currentUser?.role === 'admin' ||
+            (currentUser?.role === UserRole.ADMIN ||
               isCreatorOrOwner(board.creatorId, currentUser?.id, myAgentIds)) && (
               <Button variant="outline" size="sm" onClick={() => setDocsDialogOpen(true)}>
                 <FileText className="mr-1 h-4 w-4" />
@@ -1696,7 +1347,7 @@ export default function BoardDetailPage() {
               </Button>
             </>
           )}
-          {(currentUser?.role === 'admin' ||
+          {(currentUser?.role === UserRole.ADMIN ||
             isCreatorOrOwner(board.creatorId, currentUser?.id, myAgentIds)) && (
             <Button variant="outline" size="sm" onClick={() => setInviteSheetOpen(true)}>
               <Users className="mr-1 h-4 w-4" />
@@ -1758,7 +1409,7 @@ export default function BoardDetailPage() {
                   <GripVertical className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                   <div className="flex-1 min-w-0">
                     <p
-                      className={`text-sm font-medium truncate ${activeTask.status === 'done' || activeTask.status === 'archived' ? 'line-through text-muted-foreground' : ''}`}
+                      className={`text-sm font-medium truncate ${activeTask.status === TaskStatus.DONE || activeTask.status === TaskStatus.ARCHIVED ? 'line-through text-muted-foreground' : ''}`}
                     >
                       {activeTask.title}
                     </p>

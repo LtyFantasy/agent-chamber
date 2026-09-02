@@ -1,5 +1,4 @@
 import axios, { AxiosError, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { useAuthStore } from '@/stores/auth.store';
 import { getApiMessage } from '@/i18n/api-messages';
 import type {
   ApiResponse,
@@ -70,8 +69,39 @@ import type {
   ActivityLogListResponse,
   ActivityLogQuery,
 } from '@/types';
+// 圆桌座位契约类型（review-0831 任务 04e8d744 收窄：vendor 换协议包 SeatVendor）
+import type { SeatVendor } from '@agent-chamber/roundtable-protocol';
+// 懒加载目录树响应类型（v1.70.0-dev）：shared 已就绪，web 直接引用（铁律 #25 类型前置）
+import type { DocTreeResponse, DocFacetsResponse } from '@agent-chamber/shared';
+// 圆桌生命周期/相位类型（review-0831 任务 04e8d744 收窄：status 换 SeatLifecycleStatus，
+// PresencePhase 去本地重复改引 shared——shared enums/index.ts:354/:379 已导出）
+import type { SeatLifecycleStatus, PresencePhase } from '@agent-chamber/shared';
+// 圆桌值域常量（review-0831 任务 150bf876 收敛：单源 = shared enums，本文件仅派生 re-export）
+import {
+  SEAT_LIFECYCLE_STATUSES as SharedSeatLifecycleStatuses,
+  PRESENCE_PHASES as SharedPresencePhases,
+  API_PREFIX,
+} from '@agent-chamber/shared';
+// 命名访问对象 re-export（值域单源 = shared enums，见下方 SEAT_LIFECYCLE_STATUSES / PRESENCE_PHASES 注释）
+export { SEAT_LIFECYCLE_STATUS, PRESENCE_PHASE } from '@agent-chamber/shared';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || '/api/v1';
+/**
+ * 认证钩子注入口（review-0831 任务 04e8d744 拆环：api.ts ↔ auth.store.ts 循环依赖）
+ *
+ * api.ts 不再直接 import auth.store（store 依赖 api 的 Api 对象，反向 import 成环）；
+ * 改为由 store 模块加载时经 setAuthHooks 注入实现，依赖方向收敛为 store→api 单向。
+ * 默认实现（getToken→null / onUnauthorized 空操作）保证未注入场景（如 skills 公开页
+ * 不 import store）与现状等价：无 token 不注入 Authorization、401 不跳转。
+ */
+type AuthHooks = { getToken: () => string | null; onUnauthorized: () => void };
+let authHooks: AuthHooks = { getToken: () => null, onUnauthorized: () => {} };
+export function setAuthHooks(hooks: AuthHooks): void {
+  authHooks = hooks;
+}
+
+// API 前缀单源 = shared API_PREFIX（review-0831 任务 e013af33 三端收口）；
+// NEXT_PUBLIC_API_URL 为部署注入的 env 覆盖（绝对/相对两形态，见 platform-url.ts 注释）
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || API_PREFIX;
 
 export const axiosInstance = axios.create({
   baseURL: API_BASE_URL,
@@ -99,7 +129,7 @@ export const publicAxiosInstance = axios.create({
 // Request interceptor: inject JWT token
 axiosInstance.interceptors.request.use(
   (config) => {
-    const token = useAuthStore.getState().accessToken;
+    const token = authHooks.getToken();
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -123,7 +153,7 @@ axiosInstance.interceptors.response.use(
 
       switch (status) {
         case 401:
-          useAuthStore.getState().logout();
+          authHooks.onUnauthorized();
           if (typeof window !== 'undefined') {
             window.location.href = '/login';
           }
@@ -202,10 +232,15 @@ export interface RoundtableRecentActivityItem {
  * 座位实时相位（M4b-1，chamber 内存派生视图：不落库、不进 events 表，
  * listSeats 响应时 overlay——形状对齐 backend roundtable.service.ts SeatPresence；
  * 无 presence 字段 = 座位从未活动（服务端不加字段））
+ *
+ * PRESENCE_PHASES 为相位值域单源（review-0831 任务 150bf876 收敛：shared enums 派生，
+ * 本常量仅 re-export 保持既有消费面；命名访问用 PRESENCE_PHASE）
  */
+export const PRESENCE_PHASES = SharedPresencePhases;
+
 export interface RoundtableSeatPresence {
   /** 相位：thinking 思考中 / tool 工具调用中 / replying 回复中 / idle 空闲 / offline 离线 */
-  phase: 'thinking' | 'tool' | 'replying' | 'idle' | 'offline';
+  phase: PresencePhase;
   /** 相位变更时间（ISO 8601） */
   at: string;
   /** 工具标题（仅 phase='tool' 时存在；已摘要化，供 chip 展示） */
@@ -215,16 +250,34 @@ export interface RoundtableSeatPresence {
 /**
  * 圆桌座位（web 侧最小投影：补全候选只消费 label/status，审批卡片消费 id→label 映射；
  * 完整实体在 backend database/entities/roundtable-seat.entity.ts，M3 管理 UI 再收口）
+ *
+ * SEAT_LIFECYCLE_STATUSES 为 status 值域单源（review-0831 任务 150bf876 收敛：
+ * shared enums 派生，本常量仅 re-export 保持既有消费面；命名访问用 SEAT_LIFECYCLE_STATUS；
+ * status 字段类型 = shared SeatLifecycleStatus（review-0831 任务 04e8d744 收窄，
+ * 与 SEAT_LIFECYCLE_STATUS.ACTIVE 等常量比较不再 TS2367）
  */
+export const SEAT_LIFECYCLE_STATUSES = SharedSeatLifecycleStatuses;
+
+/**
+ * runner 在线状态值域（roundtable_runners.status；web 侧单源——协议包
+ * SEAT_RUNTIME_STATUSES 含 busy 是座位运行态，runner 行状态仅 online/offline，
+ * 值域不同故仍本地定义（与 backend runner-registry 同值域）；web 已依赖
+ * roundtable-protocol（类型收窄用），但 runner 行状态非协议包契约）
+ */
+export const RUNNER_STATUS = {
+  ONLINE: 'online',
+  OFFLINE: 'offline',
+} as const;
+
 export interface RoundtableSeatItem {
   /** 座位 UUID（审批请求 seatId→label 映射键） */
   id: string;
   /** 座位展示名（seatLabel 身份模型，@ 补全候选） */
   label: string;
-  /** 生命周期状态：active / paused / parked / offline（已移除座位不出现在列表） */
-  status: string;
-  /** 厂商（'kimi'，M4a 起扩展至 codex/opencode/claude-code） */
-  vendor: string;
+  /** 生命周期状态：active / paused / parked / offline（已移除座位不出现在列表；类型 = shared SeatLifecycleStatus） */
+  status: SeatLifecycleStatus;
+  /** 厂商（'kimi'，M4a 起扩展至 codex/opencode/claude-code；类型 = 协议包 SeatVendor） */
+  vendor: SeatVendor;
   /**
    * 认领 runner UUID（backend 实体字段原样透出；null = 未被任何 runner 认领）。
    * 连接向导验收环的「座位被认领」直接信号（roundtable-design §8c）。
@@ -795,6 +848,7 @@ const docs = {
       type?: string;
       q?: string;
       path?: string;
+      pathPrefix?: string;
       page?: number;
       pageSize?: number;
     },
@@ -802,40 +856,47 @@ const docs = {
     apiRequest<PaginatedResponse<DocSummary>>('GET', `/doc-spaces/${spaceId}/docs`, undefined, {
       params,
     }),
-  /**
-   * 循环翻页拉取指定空间的全部文档（对齐 agents.listAll 评审 M-e 范式）
-   *
-   * 后端分页硬上限 100（QueryDocDto @Max(100)）：单次 pageSize:100 在 >100 篇文档的
-   * 空间会静默丢失尾部，导致 /docs/[id] 左栏分类树、type/tag 过滤候选、正文相对链接
-   * 解析（docPathToId）缺项。此处按 hasNext/total 翻页收齐，顺序保持后端 path ASC。
-   *
-   * @param spaceId 空间 ID
-   * @param params 可选过滤条件（category/tag/type/q/path）透传；page/pageSize 由本方法接管
-   * @returns 空间内全部文档摘要（DocSummary[]）
-   */
-  listAllDocs: async (
-    spaceId: string,
-    params?: { category?: string; tag?: string; type?: string; q?: string; path?: string },
-  ): Promise<DocSummary[]> => {
-    const pageSize = 100;
-    const all: DocSummary[] = [];
-    for (let page = 1; ; page++) {
-      const res = await apiRequest<PaginatedResponse<DocSummary>>(
-        'GET',
-        `/doc-spaces/${spaceId}/docs`,
-        undefined,
-        { params: { ...params, page, pageSize } },
-      );
-      all.push(...res.items);
-      // 终止条件：后端已声明无下一页，或已收齐 total 条（双保险，防 hasNext 漂移死循环）
-      if (!res.hasNext || all.length >= res.total) break;
-    }
-    return all;
-  },
   search: (
     spaceId: string,
     params: { q: string; type?: string; tag?: string; category?: string; limit?: number },
   ) => apiRequest<DocSearchHit[]>('GET', `/doc-spaces/${spaceId}/search`, undefined, { params }),
+
+  // ── 懒加载目录树 / 聚合计数（v1.70.0-dev）──
+  /**
+   * 按 prefix 拉取目录树当前层（子目录 + 直挂文档，各自分页）。
+   * 左栏目录树每层一条查询；folders/docs 的「加载更多」由调用方 useInfiniteQuery
+   * 以 { foldersOffset, docsOffset } 双游标驱动（禁止手写数组累加）。
+   */
+  getTree: (
+    spaceId: string,
+    params?: {
+      prefix?: string;
+      sort?: 'recent' | 'name';
+      docsLimit?: number;
+      docsOffset?: number;
+      foldersLimit?: number;
+      foldersOffset?: number;
+    },
+  ) =>
+    apiRequest<DocTreeResponse>('GET', `/doc-spaces/${spaceId}/docs/tree`, undefined, {
+      params,
+    }),
+  /** 全空间 type/tag/category 聚合计数（替代前端全量列表聚合） */
+  getFacets: (spaceId: string) =>
+    apiRequest<DocFacetsResponse>('GET', `/doc-spaces/${spaceId}/docs/facets`),
+  /**
+   * ?path= 精确解析（正文相对链接点击时 path → docId；走既有 docs 列表契约，
+   * 单条命中取首项，未命中返回 null）
+   */
+  getDocByPath: async (spaceId: string, path: string): Promise<DocSummary | null> => {
+    const res = await apiRequest<PaginatedResponse<DocSummary>>(
+      'GET',
+      `/doc-spaces/${spaceId}/docs`,
+      undefined,
+      { params: { path } },
+    );
+    return res.items[0] ?? null;
+  },
 
   // ── 单文档 ──
   getDoc: (docId: string) => apiRequest<DocDetail>('GET', `/docs/${docId}`),
@@ -843,6 +904,21 @@ const docs = {
    *  full=true 返回含首标题行的完整原文（编辑器回写专用，防丢标题行） */
   getDocContent: (docId: string, full?: boolean) =>
     apiRequest<DocFullContent>('GET', `/docs/${docId}/content${full ? '?full=true' : ''}`),
+  /**
+   * diagram HTML 快照直出通道（Diagram IR v1）：后端以 text/html 直出快照
+   * （附 CSP/nosniff 头），不走统一响应信封 —— 响应体即 HTML 字符串。
+   * 必须 responseType:'text' 免 JSON 解析；iframe 无法携带 Authorization 头，
+   * 故快照一律经本通道拉到前端后再塞 iframe srcDoc（禁止 <iframe src> 直挂）。
+   * locale（读时视图语言）：与存储 IR 语言不一致时后端按该语言重渲染
+   * （不落库）；缺省 = 存储快照原语言。
+   */
+  getDiagramHtml: (docId: string, locale?: string) =>
+    axiosInstance
+      .get<string>(`/docs/${docId}/diagram.html`, {
+        responseType: 'text',
+        params: locale ? { lang: locale } : undefined,
+      })
+      .then((res) => res.data),
   getSection: (docId: string, position: number) =>
     apiRequest<DocSectionContent>('GET', `/docs/${docId}/sections/${position}`),
   upsertDoc: (spaceId: string, data: UpsertDocInput) =>

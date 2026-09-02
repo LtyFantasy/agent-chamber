@@ -29,7 +29,7 @@ function Sheet({ open, onOpenChange, children, side = 'right', className }: Shee
   const sideClass =
     side === 'right'
       ? 'inset-y-0 right-0 h-full w-full sm:max-w-sm border-l'
-      : side === 'left'
+      : side === 'left' // eslint-disable-line rulesdir/no-magic-string-compare -- UI 几何方向（'left'|'right'|'bottom'），非 ParticipantStatus.LEFT
         ? 'inset-y-0 left-0 h-full w-full sm:max-w-sm border-r'
         : 'inset-x-0 bottom-0 h-auto max-h-[80vh] border-t rounded-t-xl';
 

@@ -6,6 +6,7 @@ import { DocSpaceService } from './docspace.service';
 import { DocSearchService } from './doc-search.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
 import { ForbiddenException } from '@nestjs/common';
 
@@ -21,6 +22,8 @@ describe('DocController', () => {
   const mockDocService = {
     findById: jest.fn(),
     findAll: jest.fn(),
+    findTree: jest.fn(),
+    findFacets: jest.fn(),
     findOne: jest.fn(),
     getContent: jest.fn(),
     getSection: jest.fn(),
@@ -139,6 +142,55 @@ describe('DocController', () => {
       expect(await controller.findAll('space-1', query, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
       expect(docService.findAll).toHaveBeenCalledWith('space-1', query);
+    });
+  });
+
+  // ─── findTree / findFacets（v1.70.0-dev 懒加载目录树）────────
+
+  describe('findTree', () => {
+    it('calls service.findTree after ensuring read permission', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = {
+        prefix: '',
+        folders: { items: [], total: 0, hasMore: false },
+        docs: { items: [], total: 0, hasMore: false },
+      };
+      docService.findTree.mockResolvedValue(result);
+
+      const query = {
+        prefix: 'memory/',
+        sort: 'recent' as const,
+        docsLimit: 50,
+        foldersLimit: 200,
+      };
+      expect(await controller.findTree('space-1', query, mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(docService.findTree).toHaveBeenCalledWith('space-1', query);
+    });
+
+    it('passes null actor through as null (anonymous read allowed)', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.findTree.mockResolvedValue({
+        prefix: '',
+        folders: { items: [], total: 0, hasMore: false },
+        docs: { items: [], total: 0, hasMore: false },
+      });
+
+      // CurrentActor 在无认证请求时返回 null（controller 内 actor ?? null 透传）
+      await controller.findTree('space-1', {}, null as unknown as UnifiedActor);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, null, 'read');
+    });
+  });
+
+  describe('findFacets', () => {
+    it('calls service.findFacets after ensuring read permission', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      const result = { types: [], tags: [], categories: [] };
+      docService.findFacets.mockResolvedValue(result);
+
+      expect(await controller.findFacets('space-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
+      expect(docService.findFacets).toHaveBeenCalledWith('space-1');
     });
   });
 

@@ -34,6 +34,16 @@ export const SEAT_RUNTIME_STATUSES = ['online', 'busy', 'offline'] as const;
 export type SeatRuntimeStatus = (typeof SEAT_RUNTIME_STATUSES)[number];
 
 /**
+ * 命名访问视图（单源派生自 SEAT_RUNTIME_STATUSES；供 chamber/runner 侧命名引用，
+ * 与 shared SEAT_LIFECYCLE_STATUS 同款「值域数组 + 命名化派生」模式）
+ */
+export const SEAT_RUNTIME_STATUS = {
+  ONLINE: SEAT_RUNTIME_STATUSES[0],
+  BUSY: SEAT_RUNTIME_STATUSES[1],
+  OFFLINE: SEAT_RUNTIME_STATUSES[2],
+} as const;
+
+/**
  * 座位配置（seat.assign 下行下发，docs/roundtable-design.md §3 原文）
  * 一个座位 = 一个运行时会话（单线程串行）
  */

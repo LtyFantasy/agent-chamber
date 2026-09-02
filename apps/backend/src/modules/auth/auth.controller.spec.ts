@@ -4,6 +4,7 @@ import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
 import { UserRole, ActorType } from '@agent-chamber/shared';
+import { ForbiddenException } from '@nestjs/common';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { ROLES_KEY } from '../../common/decorators/roles.decorator';
@@ -23,7 +24,11 @@ describe('AuthController', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AuthController],
       providers: [{ provide: AuthService, useValue: mockService }],
-    }).compile();
+    })
+      // JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起），单测 override 掉
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = module.get<AuthController>(AuthController);
     service = module.get<AuthService>(AuthService) as unknown as typeof mockService;
@@ -156,6 +161,20 @@ describe('AuthController', () => {
 
       expect(service.logout).toHaveBeenCalledWith('user-1', '');
       expect(result).toBe(true);
+    });
+
+    it('should reject logout when userId is missing (agent identity path, B-57)', async () => {
+      // B-57 回归：agent 用 API Key 调 logout 时 guard 只挂 request.agent、
+      // request.user 不存在 → @CurrentUser('userId') 为 undefined → fail-closed
+      // 拒绝（旧实现静默成功：撤销 0 行 + 审计丢失）
+      const body: RefreshTokenDto = {
+        refreshToken: 'some-refresh-token',
+      };
+
+      await expect(controller.logout(undefined as unknown as string, body)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(service.logout).not.toHaveBeenCalled();
     });
   });
 });

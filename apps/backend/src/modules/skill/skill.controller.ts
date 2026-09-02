@@ -18,13 +18,12 @@
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Controller, Get, Param, Query, Req, Res } from '@nestjs/common';
+import { Controller, Get, Param, Query, Res } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiParam } from '@nestjs/swagger';
-import { Request, Response } from 'express';
-import { ErrorCode } from '@agent-chamber/shared';
+import { Response } from 'express';
 import { Public } from '../../common/decorators/public.decorator';
 import { SkillService } from './skill.service';
-import { SkillListItemDto, SkillDetailDto } from './skill.dto';
+import { SkillDetailDto, SkillListItemDto } from './skill.dto';
 
 /**
  * Skill 分发控制器。
@@ -60,15 +59,17 @@ export class SkillController {
   /**
    * 获取 Skill 详情。
    *
-   * - 默认返回 JSON 格式的 `SkillDetailDto`。
+   * - 默认返回 JSON 格式的 `SkillDetailDto`，由全局 ResponseInterceptor 包装为统一信封
+   *   （review-0831 任务 bbd175dc 子项 3：手工信封已删，改 return detail 走拦截器）。
    * - 传 `?format=raw` 时返回原始 Markdown，Content-Type 为 `text/markdown; charset=utf-8`。
    *
-   * 由于同一端点需要同时支持统一 JSON 包装和裸 Markdown，本方法直接使用 Response 对象输出。
+   * raw 分支是刻意的裸响应（与 avatar.controller SVG 同理），保留 @Res() 手动输出；
+   * @Res({ passthrough: true }) 使 JSON 分支的返回值仍由 Nest 处理（拦截器包装），
+   * 拦截器对 headersSent 的请求跳过包装（见 response.interceptor.ts）。
    *
    * @param name Skill 名称
    * @param format 返回格式
-   * @param res Express Response
-   * @param req Express Request
+   * @param res Express Response（passthrough：仅 raw 分支手动写响应）
    */
   @Get(':name')
   @Public()
@@ -88,9 +89,8 @@ export class SkillController {
   async findOne(
     @Param('name') name: string,
     @Query('format') format: string,
-    @Res() res: Response,
-    @Req() req: Request,
-  ): Promise<void> {
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<SkillDetailDto | void> {
     if (format === 'raw') {
       const content = await this.skillService.getRaw(name);
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
@@ -98,14 +98,7 @@ export class SkillController {
       return;
     }
 
-    const detail = await this.skillService.findOne(name);
-    res.json({
-      code: ErrorCode.SUCCESS,
-      message: 'success',
-      data: detail,
-      timestamp: new Date().toISOString(),
-      requestId: req['requestId'] || 'unknown',
-    });
+    return this.skillService.findOne(name);
   }
 
   /**
@@ -137,16 +130,16 @@ export class SkillController {
   /**
    * Get child skill details。
    *
-   * - 默认返回 JSON 格式的 `SkillDetailDto`。
+   * - 默认返回 JSON 格式的 `SkillDetailDto`，由全局 ResponseInterceptor 包装为统一信封
+   *   （review-0831 任务 bbd175dc 子项 3：手工信封已删，改 return detail 走拦截器）。
    * - 传 `?format=raw` 时返回原始 Markdown（含 frontmatter），Content-Type 为 `text/markdown; charset=utf-8`。
    *
-   * 与 `findOne` 同构：同一端点需要同时支持统一 JSON 包装和裸 Markdown，直接使用 Response 对象输出。
+   * 与 `findOne` 同构：raw 分支保留 @Res() 手动输出裸响应，JSON 分支走拦截器包装。
    *
    * @param name 父 Skill 名称
    * @param subpath 子 Skill 路径（如 taskboard、topics）
    * @param format 返回格式
-   * @param res Express Response
-   * @param req Express Request
+   * @param res Express Response（passthrough：仅 raw 分支手动写响应）
    */
   @Get(':name/:subpath')
   @Public()
@@ -168,9 +161,8 @@ export class SkillController {
     @Param('name') name: string,
     @Param('subpath') subpath: string,
     @Query('format') format: string,
-    @Res() res: Response,
-    @Req() req: Request,
-  ): Promise<void> {
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<SkillDetailDto | void> {
     if (format === 'raw') {
       const content = await this.skillService.getSubRaw(name, subpath);
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
@@ -178,13 +170,6 @@ export class SkillController {
       return;
     }
 
-    const detail = await this.skillService.findSubSkill(name, subpath);
-    res.json({
-      code: ErrorCode.SUCCESS,
-      message: 'success',
-      data: detail,
-      timestamp: new Date().toISOString(),
-      requestId: req['requestId'] || 'unknown',
-    });
+    return this.skillService.findSubSkill(name, subpath);
   }
 }

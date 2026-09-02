@@ -7,7 +7,7 @@ import { Task } from '../../database/entities/task.entity';
 import { Agent } from '../../database/entities/agent.entity';
 import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
-import { SearchQueryDto, SearchType } from './dto';
+import { SearchQueryDto } from './dto';
 import { ActorType, UserRole } from '@agent-chamber/shared';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
@@ -423,7 +423,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.ALL,
+        type: 'all',
         page: 1,
         pageSize: 20,
       };
@@ -461,7 +461,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'nonexistent',
-        type: SearchType.ALL,
+        type: 'all',
         page: 1,
         pageSize: 20,
       };
@@ -496,7 +496,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -521,7 +521,7 @@ describe('SearchService', () => {
 
       setupMessageSearchMock(['topic-1'], messages, 1, new Map([['msg-1', '<<<x>>>']]));
 
-      const dto: SearchQueryDto = { q: 'x', type: SearchType.MESSAGES, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'x', type: 'messages', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       const snippet = result.messages!.items[0].contentSnippet;
@@ -537,7 +537,7 @@ describe('SearchService', () => {
 
       setupMessageSearchMock(['topic-1'], messages, 1, new Map([['msg-1', '<<<hello>>>']]));
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.MESSAGES, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'messages', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.messages!.items[0].senderName).toBe('System');
@@ -562,7 +562,7 @@ describe('SearchService', () => {
 
       setupMessageSearchMock(['topic-1'], messages, 1, new Map([['msg-1', '<<<hello>>>']]));
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.MESSAGES, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'messages', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.messages!.items[0].senderName).toBe('TestAgent');
@@ -587,7 +587,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.TASKS,
+        type: 'tasks',
         page: 1,
         pageSize: 20,
       };
@@ -611,7 +611,7 @@ describe('SearchService', () => {
 
       setupTaskSearchMock(['board-1'], tasks, 1, new Map([['task-1', '<<<hello>>>']]));
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.TASKS, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'tasks', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       const snippet = result.tasks!.items[0].descriptionSnippet;
@@ -626,7 +626,7 @@ describe('SearchService', () => {
 
       setupTaskSearchMock(['board-1'], tasks, 1, new Map([['task-1', '<<<hello>>>']]));
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.TASKS, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'tasks', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.tasks!.items[0].descriptionSnippet).toBeNull();
@@ -661,7 +661,7 @@ describe('SearchService', () => {
         ],
       );
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'docs', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.messages).toBeNull();
@@ -684,7 +684,7 @@ describe('SearchService', () => {
     it('should pass null (admin all-spaces) to DocSearchService and skip spaceId query on empty hits', async () => {
       setupDocSearchMock(null, [], []);
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'docs', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'admin-1', type: ActorType.HUMAN });
 
       expect(result.docs).toEqual([]);
@@ -697,7 +697,7 @@ describe('SearchService', () => {
     it('should pass empty whitelist through and return empty docs (non-admin with no accessible spaces)', async () => {
       setupDocSearchMock([], [], []);
 
-      const dto: SearchQueryDto = { q: 'hello', type: SearchType.DOCS, page: 1, pageSize: 20 };
+      const dto: SearchQueryDto = { q: 'hello', type: 'docs', page: 1, pageSize: 20 };
       const result = await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(result.docs).toEqual([]);
@@ -719,7 +719,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -743,7 +743,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.TASKS,
+        type: 'tasks',
         page: 1,
         pageSize: 20,
       };
@@ -778,7 +778,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'task',
-        type: SearchType.TASKS,
+        type: 'tasks',
         page: 2,
         pageSize: 5,
       };
@@ -803,7 +803,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -850,7 +850,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.ALL,
+        type: 'all',
         page: 1,
         pageSize: 20,
       };
@@ -884,7 +884,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'secret',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -903,7 +903,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'secret',
-        type: SearchType.TASKS,
+        type: 'tasks',
         page: 1,
         pageSize: 20,
       };
@@ -927,7 +927,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -949,7 +949,7 @@ describe('SearchService', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };

@@ -7,6 +7,9 @@ import type { DocSearchHit } from './docspace-response.dto';
  */
 export type SearchType = 'all' | 'messages' | 'tasks' | 'docs';
 
+/** SearchType 合法值清单（DTO @IsIn 校验与 swagger enum 共用，单一事实来源——统一批 744aae46 收口双源） */
+export const SEARCH_TYPE_VALUES: readonly SearchType[] = ['all', 'messages', 'tasks', 'docs'];
+
 /**
  * 搜索查询
  */

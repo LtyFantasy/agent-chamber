@@ -42,6 +42,7 @@ import { ActorType, ErrorCode, EventType } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
 import { DocCategory } from '../src/database/entities/doc-category.entity';
@@ -154,6 +155,8 @@ describe('DocService.patchMetadata — 真实 PG 集成（metadata-only patch）
       eventStub,
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
+      // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
+      { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
     );
 
     // ── 种子数据：一个空间 + 目标文档（双版本）+ 任务关联 + 意图路由 + 既有分类 ──

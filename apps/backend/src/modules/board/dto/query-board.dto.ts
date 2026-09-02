@@ -1,5 +1,5 @@
-import { IsOptional, IsUUID, IsInt, Min, Max } from 'class-validator';
-import { Type } from 'class-transformer';
+import { IsOptional, IsUUID, IsInt, Min, Max, IsBoolean } from 'class-validator';
+import { Type, Transform } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 /**
@@ -32,4 +32,27 @@ export class QueryBoardDto {
     example: '550e8400-e29b-41d4-a716-446655440003',
   })
   topicId?: string;
+
+  /**
+   * 仅返回"我的"项（v1.70 插件绑定推断语义底座）：query 参数均为字符串，
+   * 用 @Transform 严格解析（对齐 doc-overview/query-board-digest 布尔 query 惯例）：
+   * 'true' → true、'false' → false、缺省 → undefined；其余值保留原样由 @IsBoolean 拒绝 400。
+   * 语义：mine=true 时可见集收缩为 creator（含 owner-proxy 名下 agent 创建的）+ member，
+   * 排除仅因 open 可见的项；admin 求 mine 同样按 creator/member 身份收缩。
+   * 缺省 false = 现有可见性口径不变（现有消费方零影响）。
+   */
+  @IsOptional()
+  @Transform(({ value }: { value: unknown }) => {
+    if (value === undefined) return undefined;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  })
+  @IsBoolean()
+  @ApiPropertyOptional({
+    description:
+      'Return only boards I created or am a member of, excluding open-visible-only ones. Default false.',
+    example: 'true',
+  })
+  mine?: boolean;
 }

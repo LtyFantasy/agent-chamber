@@ -33,12 +33,13 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import { ErrorCode, UserRole, ActorType } from '@agent-chamber/shared';
+import { ErrorCode, UserRole, ActorType, AgentStatus } from '@agent-chamber/shared';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
 import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
+import { buildAvatarUrl } from '../avatars/avatar.constants';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { UpdateSettingsDto } from './dto/update-settings.dto';
@@ -46,6 +47,7 @@ import type { PaginatedResponse, User as UserDto } from '@agent-chamber/shared';
 import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 import { UpdateUserByAdminDto } from './dto/update-user-by-admin.dto';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 
 @Injectable()
@@ -76,7 +78,7 @@ export class UserService {
       user.avatarUrl = dto.avatar;
       // 联动清理：avatar 被清空或改为非本站 SVG 短链（外部 URL）时，
       // actors.avatar_svg 已成无引用的孤儿数据，一并清除，回落确定性生成头像
-      if (dto.avatar !== `/api/v1/avatars/${user.actor.id}.svg`) {
+      if (dto.avatar !== buildAvatarUrl(user.actor.id)) {
         user.actor.avatarSvg = null;
       }
     }
@@ -88,7 +90,7 @@ export class UserService {
     // （决策 6——email/preferences 值不入，只记字段名）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: userId,
       actorId: userId,
       newData: {
@@ -122,7 +124,7 @@ export class UserService {
     // （决策 6——preferences 值不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: userId,
       actorId: userId,
       newData: { userId, username: user.username, changedFields: ['preferences'] },
@@ -153,7 +155,7 @@ export class UserService {
     // {userId, username}——passwordHash 显式黑名单（决策 6），永不入审计
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: userId,
       actorId: userId,
       newData: { userId, username: user.username },
@@ -173,7 +175,7 @@ export class UserService {
     // changedFields: ['avatar']}（决策 6——avatarUrl 值不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: userId,
       actorId: userId,
       newData: { userId, username: user.username, changedFields: ['avatar'] },
@@ -246,7 +248,7 @@ export class UserService {
       .select(['user.id', 'user.username', 'user.role', 'actor.displayName', 'actor.avatarUrl'])
       .leftJoin('user.actor', 'actor')
       .where('actor.deleted_at IS NULL')
-      .andWhere('actor.status = :status', { status: 'active' })
+      .andWhere('actor.status = :status', { status: AgentStatus.ACTIVE })
       .orderBy('actor.displayName', 'ASC')
       .skip((page - 1) * pageSize)
       .take(pageSize);
@@ -312,7 +314,7 @@ export class UserService {
     const actor = new Actor();
     actor.type = ActorType.HUMAN;
     actor.displayName = dto.name;
-    actor.status = 'active';
+    actor.status = AgentStatus.ACTIVE;
     await this.userRepo.manager.save(actor);
 
     const user = this.userRepo.create({
@@ -329,7 +331,7 @@ export class UserService {
     // newData 白名单 {userId, username, role?}（决策 6——email/passwordHash 不入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: user.id,
       actorId: operatorActorId ?? user.id,
       newData: {
@@ -391,7 +393,7 @@ export class UserService {
     // newData {userId, username, 变更字段名列表}（决策 6——email 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: id,
       actorId: currentAdminId,
       newData: {
@@ -435,7 +437,7 @@ export class UserService {
     // newData 白名单 {userId, username}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: id,
       actorId: currentAdminId,
       newData: { userId: id, username: user.username },
@@ -453,7 +455,7 @@ export class UserService {
       .createQueryBuilder('user')
       .leftJoin('user.actor', 'actor')
       .where('user.role = :role', { role: UserRole.ADMIN })
-      .andWhere('actor.status = :status', { status: 'active' })
+      .andWhere('actor.status = :status', { status: AgentStatus.ACTIVE })
       .andWhere('actor.deleted_at IS NULL')
       .getCount();
     return count > 0;

@@ -176,24 +176,48 @@ describe('TaskDependencyService', () => {
   });
 
   describe('findBlockers', () => {
-    it('should return only incomplete blocks dependencies', async () => {
-      // findBlockers 会传入 where: { taskId, type: BLOCKS }，mock 只返回 BLOCKS 类型的
-      depRepo.find.mockResolvedValue([
+    it('should return only incomplete blocks dependencies (status filter in SQL)', async () => {
+      // findBlockers 走 createQueryBuilder（status NOT IN 下沉 SQL 再 take），
+      // mock 返回未完成 blocker；SQL 层已过滤 DONE/ARCHIVED，JS 不再过滤
+      const mockGetMany = jest.fn().mockResolvedValue([
         {
+          id: 'dep-1',
+          taskId: 'task-a',
+          dependsOnTaskId: 'task-b',
           type: TaskDependencyType.BLOCKS,
-          dependsOnTask: { status: TaskStatus.IN_PROGRESS },
-        } as TaskDependency,
-        {
-          type: TaskDependencyType.BLOCKS,
-          dependsOnTask: { status: TaskStatus.DONE },
+          createdAt: new Date('2026-08-01T00:00:00.000Z'),
+          dependsOnTask: { id: 'task-b', title: 'B', status: TaskStatus.IN_PROGRESS },
         } as TaskDependency,
       ]);
+      depRepo.createQueryBuilder.mockReturnValue({
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getMany: mockGetMany,
+      } as unknown as SelectQueryBuilder<TaskDependency>);
 
       const result = await service.findBlockers('task-a');
 
       expect(result).toHaveLength(1);
       expect(result[0].type).toBe(TaskDependencyType.BLOCKS);
-      expect(result[0].dependsOnTask.status).toBe(TaskStatus.IN_PROGRESS);
+      // 嵌套恰为 {id,title,status} 摘要（无完整 Task 实体泄漏）
+      expect(result[0].dependsOnTask).toEqual({
+        id: 'task-b',
+        title: 'B',
+        status: TaskStatus.IN_PROGRESS,
+      });
+      expect(result[0]).not.toHaveProperty('description');
+      // 行字段投影：与 findOne 内嵌行一致（blockers 行无 task 键）
+      expect(Object.keys(result[0]).sort()).toEqual([
+        'createdAt',
+        'dependsOnTask',
+        'dependsOnTaskId',
+        'id',
+        'taskId',
+        'type',
+      ]);
     });
   });
 

@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { AuditController } from './audit.controller';
 import { AuditService } from './audit.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { ActorType, UserRole } from '@agent-chamber/shared';
 import { UnifiedActor } from '../../common/types/actor.types';
 
@@ -26,8 +27,11 @@ describe('AuditController', () => {
       providers: [{ provide: AuditService, useValue: mockService }],
     })
       // 方法级 @UseGuards(JwtOrApiKeyGuard) 会触发 guard 依赖解析（JwtService/
-      // ConfigService/UserRepo/ApiKeyAuthService）——override 掉，与 topic 先例一致
+      // ConfigService/UserRepo/ApiKeyAuthService）——override 掉，与 topic 先例一致；
+      // findAll 的 JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起）同样 override
       .overrideGuard(JwtOrApiKeyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
       .compile();
 

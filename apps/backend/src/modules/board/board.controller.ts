@@ -84,6 +84,7 @@ import {
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 
 @ApiTags('Boards')
 @Controller('boards')
@@ -99,7 +100,11 @@ export class BoardController {
   @Get()
   @ApiOperation({
     summary: 'List boards',
-    description: 'List all boards with pagination and optional topic filter',
+    description:
+      'List all boards with pagination and optional topic filter. ' +
+      'Each item carries a lists summary (id/boardId/name/position/color/mappedStatus/taskCount/createdAt/updatedAt) ' +
+      'plus visibility/listCount/taskCount/completedTaskCount/memberCount/descriptionSnippet; ' +
+      'settings is not exposed. Consumers needing full list detail should use GET /boards/:id.',
   })
   @ApiQuery({ name: 'page', required: false, description: 'Page number', type: Number })
   @ApiQuery({
@@ -109,6 +114,13 @@ export class BoardController {
     type: Number,
   })
   @ApiQuery({ name: 'topicId', required: false, description: 'Filter by topic ID', type: String })
+  @ApiQuery({
+    name: 'mine',
+    required: false,
+    description:
+      'Return only boards I created or am a member of, excluding open-visible-only ones. Default false.',
+    type: Boolean,
+  })
   @ApiResponse({ status: 200, description: 'Boards list returned successfully' })
   @ApiResponse({ status: 400, description: 'Validation failed (e.g. pageSize exceeds 100)' })
   async findAll(@Query() query: QueryBoardDto, @CurrentActor() actor: UnifiedActor) {
@@ -127,7 +139,7 @@ export class BoardController {
     if (result) {
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'board',
+        entityType: AUDIT_ENTITY_TYPE.BOARD,
         entityId: result.id,
         actorId: actor.id,
         newData: {
@@ -251,7 +263,7 @@ export class BoardController {
     // （决策 6——metrics 全量值不入，机器事实可能含敏感基线）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'board',
+      entityType: AUDIT_ENTITY_TYPE.BOARD,
       entityId: id,
       actorId: actor.id,
       newData: { boardId: id, metricsKeys: Object.keys(dto.metrics) },
@@ -336,7 +348,7 @@ export class BoardController {
     // newData 白名单 {boardId, name?, visibility?}（决策 6；description/settings 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'board',
+      entityType: AUDIT_ENTITY_TYPE.BOARD,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -361,7 +373,7 @@ export class BoardController {
     // 审计（Phase 2）：DELETE + board；newData 白名单 {boardId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'board',
+      entityType: AUDIT_ENTITY_TYPE.BOARD,
       entityId: id,
       actorId: actor.id,
       newData: { boardId: id, name: board.name },
@@ -399,7 +411,7 @@ export class BoardController {
     // （inviteAgent 无 actor 参数，决策 2）；newData {boardId, actorId, role}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'board_member',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { boardId: id, actorId: dto.agentId, role: 'member' },
@@ -436,7 +448,7 @@ export class BoardController {
     // 审计（Phase 2）：DELETE + board_member（uninvite-agent）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'board_member',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { boardId: id, actorId: dto.agentId },
@@ -471,7 +483,7 @@ export class BoardController {
     // member→editor 升级均属「授予 editor 角色」写入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'board_member',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { boardId: id, actorId: dto.agentId, role: 'editor' },
@@ -508,7 +520,7 @@ export class BoardController {
     // 审计（Phase 2）：DELETE + board_member（remove-editor）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'board_member',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_MEMBER,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { boardId: id, actorId: dto.agentId },
@@ -533,7 +545,7 @@ export class BoardController {
     // 审计（Phase 2）：CREATE + board_list；newData 白名单 {boardId, listId, name}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'board_list',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_LIST,
       entityId: result.id,
       actorId: actor.id,
       newData: { boardId: id, listId: result.id, name: result.name },
@@ -559,7 +571,7 @@ export class BoardController {
     // （决策 6——不记具体顺序，条目数即可）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'board',
+      entityType: AUDIT_ENTITY_TYPE.BOARD,
       entityId: id,
       actorId: actor.id,
       newData: { boardId: id, listCount: dto.lists.length },
@@ -573,8 +585,13 @@ export class BoardController {
   @ApiOperation({ summary: 'Get list', description: 'Get list details by ID' })
   @ApiParam({ name: 'id', description: 'List ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'List details returned successfully' })
-  async findList(@Param('id', ParseUUIDPipe) id: string) {
-    return this.boardService.findList(id);
+  async findList(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+    // B-58：list 属 board 私有数据，list→board 的 read 校验（read 无权限 → 404，
+    // 范式照抄 updateList：findList 拿 boardId → findById 拿 board → ensureCan）
+    const list = await this.boardService.findList(id);
+    const board = await this.boardService.findById(list.boardId);
+    await this.permService.ensureCan(board, actor, 'read');
+    return list;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -594,7 +611,7 @@ export class BoardController {
     // 审计（Phase 2）：UPDATE + board_list；newData 白名单 {boardId, listId, name?}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'board_list',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_LIST,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -627,7 +644,7 @@ export class BoardController {
     // 审计（Phase 2）：DELETE + board_list；newData 白名单 {boardId, listId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'board_list',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_LIST,
       entityId: id,
       actorId: actor.id,
       newData: { boardId: list.boardId, listId: id, name: list.name },
@@ -654,7 +671,7 @@ export class BoardController {
     // {boardId, listId, taskCount}（决策 6——不记具体顺序）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'board_list',
+      entityType: AUDIT_ENTITY_TYPE.BOARD_LIST,
       entityId: listId,
       actorId: actor.id,
       newData: { boardId: list.boardId, listId, taskCount: dto.tasks.length },

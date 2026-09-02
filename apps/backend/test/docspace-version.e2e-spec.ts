@@ -40,6 +40,7 @@ import { ActorType, ErrorCode } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
 import { DocVersion } from '../src/database/entities/doc-version.entity';
@@ -62,8 +63,12 @@ const DB_CONFIG = {
 /** 本次运行的唯一后缀：隔离测试数据，防与开发库真实文档互相污染 */
 const RUN = `ver-e2e-${Date.now()}`;
 
-/** 固定测试 actor（docs.created_by / doc_versions.author_actor_id 为 uuid 列） */
-const testActor = { id: '00000000-0000-4000-8000-0000000000aa', type: ActorType.HUMAN };
+/**
+ * 固定测试 actor（docs.created_by / doc_versions.author_actor_id 为 uuid 列）。
+ * 本套件专用哨兵 id（不与 docspace-move/patch-metadata 共用 '...00aa'）：afterAll 按
+ * actorId 清理 audit_logs 时并行安全，不误删其他套件行（08-29 套件污染修复）
+ */
+const testActor = { id: '00000000-0000-4000-8000-0000000000a3', type: ActorType.HUMAN };
 
 describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读取）', () => {
   let ds: DataSource;
@@ -113,6 +118,8 @@ describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读�
       eventStub,
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
+      // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
+      { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
     );
 
     // ── 种子数据：一个空间 + 一篇文档（路径带 RUN 后缀隔离）──
@@ -158,6 +165,11 @@ describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读�
       .delete()
       .where('slug LIKE :p', { p: `version-e2e-${RUN}%` })
       .execute();
+    // upsert 写 audit_logs（actorId = testActor.id）——必须同步清理，否则残留行会挤占
+    // activity-logs 套件 admin 全量查询的 20 条窗口（createdAt DESC）导致其 row-B/row-D/
+    // row-E 被挤出分页（08-29 实测 82+ 行污染）。按 actorId 删（本套件专用哨兵 actor，
+    // 并行安全）
+    await ds.getRepository(AuditLog).delete({ actorId: testActor.id });
     await ds.destroy();
   });
 
@@ -229,6 +241,8 @@ describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读�
   });
 
   describe('保留策略（DOC_VERSION_KEEP=20）与 version 单调递增', () => {
+    // 25 次连续 upsert 在 jest 多 worker 并行打同一 PG 时可能超过默认 5s 超时
+    // （08-29 全量 e2e 实测偶发超时），显式放宽到 15s
     it('连续写 25 版 → 恰保留 20 条，最新 version=25（删旧不归零）', async () => {
       for (let i = 5; i <= 25; i++) {
         await service.upsert(
@@ -247,7 +261,7 @@ describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读�
       // 单调序列无跳号（6..25 连续）
       const nums = versions.map((v) => v.version);
       expect(nums).toEqual(Array.from({ length: 20 }, (_, i) => 25 - i));
-    });
+    }, 15000);
   });
 
   describe('findVersion（单版本详情 + 读时现算 diff）', () => {

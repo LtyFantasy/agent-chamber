@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -19,7 +19,7 @@ import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
 import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { Plus, Pencil, Trash2, Search } from 'lucide-react';
-import type { AdminUser, CreateUserRequest, UpdateUserRequest } from '@/types';
+import { UserRole, type AdminUser, type CreateUserRequest, type UpdateUserRequest } from '@/types';
 
 const ROLE_BADGE_VARIANT: Record<
   string,
@@ -60,6 +60,7 @@ function UserAvatar({ name }: { name: string }) {
 export default function UsersPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('users');
+  const locale = useLocale();
   const tCommon = useTranslations('common');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tGlobal = useTranslations() as any;
@@ -78,11 +79,11 @@ export default function UsersPage() {
   const [createEmail, setCreateEmail] = useState('');
   const [createName, setCreateName] = useState('');
   const [createPassword, setCreatePassword] = useState('');
-  const [createRole, setCreateRole] = useState<'admin' | 'editor'>('editor');
+  const [createRole, setCreateRole] = useState<UserRole>(UserRole.EDITOR);
 
   // ── Edit Form ──
   const [editName, setEditName] = useState('');
-  const [editRole, setEditRole] = useState<'admin' | 'editor'>('editor');
+  const [editRole, setEditRole] = useState<UserRole>(UserRole.EDITOR);
   const [editStatus, setEditStatus] = useState('active');
 
   // ── Errors ──
@@ -174,7 +175,7 @@ export default function UsersPage() {
   const openEdit = useCallback((user: AdminUser) => {
     setEditUser(user);
     setEditName(user.name);
-    setEditRole(user.role as 'admin' | 'editor');
+    setEditRole(user.role as UserRole);
     setEditStatus(user.status);
     setEditError(null);
   }, []);
@@ -188,14 +189,14 @@ export default function UsersPage() {
     setCreateEmail('');
     setCreateName('');
     setCreatePassword('');
-    setCreateRole('editor');
+    setCreateRole(UserRole.EDITOR);
     setCreateError(null);
   };
 
   const handleCloseEdit = () => {
     setEditUser(null);
     setEditName('');
-    setEditRole('editor');
+    setEditRole(UserRole.EDITOR);
     setEditStatus('active');
     setEditError(null);
   };
@@ -293,10 +294,10 @@ export default function UsersPage() {
                         </Badge>
                       </td>
                       <td className="p-4 align-middle text-muted-foreground">
-                        {formatRelativeTime(user.lastLoginAt)}
+                        {formatRelativeTime(user.lastLoginAt, locale)}
                       </td>
                       <td className="p-4 align-middle text-muted-foreground">
-                        {formatDate(user.createdAt)}
+                        {formatDate(user.createdAt, locale)}
                       </td>
                       <td className="p-4 align-middle">
                         <div className="flex items-center justify-end gap-2">
@@ -360,7 +361,7 @@ export default function UsersPage() {
             <select
               className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               value={createRole}
-              onChange={(e) => setCreateRole(e.target.value as 'admin' | 'editor')}
+              onChange={(e) => setCreateRole(e.target.value as UserRole)}
             >
               {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
               <option value="editor">{tGlobal(ROLE_LABEL_KEY.editor as any)}</option>
@@ -401,7 +402,7 @@ export default function UsersPage() {
               <select
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 value={editRole}
-                onChange={(e) => setEditRole(e.target.value as 'admin' | 'editor')}
+                onChange={(e) => setEditRole(e.target.value as UserRole)}
               >
                 {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
                 <option value="editor">{tGlobal(ROLE_LABEL_KEY.editor as any)}</option>

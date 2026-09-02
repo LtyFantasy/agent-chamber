@@ -1,5 +1,14 @@
-import { IsString, IsOptional, IsArray, IsBoolean, MaxLength, ArrayMaxSize, Length } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsArray,
+  IsBoolean,
+  MaxLength,
+  ArrayMaxSize,
+  Length,
+} from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { DOC_TITLE_MAX_LENGTH, DOC_SUMMARY_MAX_LENGTH } from '@agent-chamber/shared';
 
 /**
  * Upsert 文档 DTO
@@ -20,20 +29,22 @@ export class UpsertDocDto {
 
   @ApiPropertyOptional({
     description: 'Document title (defaults to first heading or path basename)',
-    maxLength: 200,
+    maxLength: DOC_TITLE_MAX_LENGTH,
   })
   @IsOptional()
   @IsString()
-  @MaxLength(200)
+  // 列长单源 = shared DOC_TITLE_MAX_LENGTH（改值需配套 migration，见常量注释）
+  @MaxLength(DOC_TITLE_MAX_LENGTH)
   title?: string;
 
   @ApiPropertyOptional({
     description: 'Summary (≤500 chars, defaults to first section first paragraph)',
-    maxLength: 500,
+    maxLength: DOC_SUMMARY_MAX_LENGTH,
   })
   @IsOptional()
   @IsString()
-  @MaxLength(500)
+  // 列长单源 = shared DOC_SUMMARY_MAX_LENGTH（改值需配套 migration，见常量注释）
+  @MaxLength(DOC_SUMMARY_MAX_LENGTH)
   summary?: string;
 
   @ApiPropertyOptional({ description: 'Document type (user-defined)', maxLength: 64 })

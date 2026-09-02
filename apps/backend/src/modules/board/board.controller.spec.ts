@@ -305,12 +305,16 @@ describe('BoardController', () => {
   });
 
   describe('findList', () => {
-    it('should call service.findList with id and return result', async () => {
+    it('should ensure read permission on the list board then return list (B-58)', async () => {
       const result = { id: 'list-1', name: 'To Do', boardId: 'board-1' };
+      const board = { id: 'board-1' };
       service.findList.mockResolvedValue(result);
+      service.findById.mockResolvedValue(board);
 
-      expect(await controller.findList('list-1')).toBe(result);
+      expect(await controller.findList('list-1', mockActor)).toBe(result);
       expect(service.findList).toHaveBeenCalledWith('list-1');
+      expect(service.findById).toHaveBeenCalledWith('board-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'read');
     });
   });
 

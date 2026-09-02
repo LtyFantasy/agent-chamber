@@ -3,6 +3,7 @@ import { ValidationPipe, Logger } from '@nestjs/common';
 import { WsAdapter } from '@nestjs/platform-ws';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { json, urlencoded } from 'express';
+import { API_PREFIX } from '@agent-chamber/shared';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
@@ -33,8 +34,8 @@ async function bootstrap() {
     }),
   );
 
-  // Global prefix
-  app.setGlobalPrefix('/api/v1');
+  // Global prefix（单源 = shared API_PREFIX，review-0831 任务 e013af33 三端收口）
+  app.setGlobalPrefix(API_PREFIX);
 
   // WebSocket 适配器（M1 圆桌计划决策 3：平台首个 WS 服务端）。
   // WsAdapter 挂载后 @WebSocketGateway 生效；WS 路径（/ws/runner 等）不受全局

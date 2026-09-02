@@ -93,7 +93,5 @@ export function findMentionedLabels(text: string, labels: string[]): Set<string>
  * @returns 是否含 @all 提及
  */
 export function hasAllMention(text: string): boolean {
-  return new RegExp(`(?<![${TOKEN_BOUNDARY_CHARS}])@all(?![${TOKEN_BOUNDARY_CHARS}])`).test(
-    text,
-  );
+  return new RegExp(`(?<![${TOKEN_BOUNDARY_CHARS}])@all(?![${TOKEN_BOUNDARY_CHARS}])`).test(text);
 }

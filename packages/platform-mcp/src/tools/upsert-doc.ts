@@ -8,6 +8,9 @@
  *   - 本批次（2026-08-18 债 B forceRechunk）: inputSchema + body 透传 forceRechunk——
  *     hash 相同也强制重建 sections（修复 chunk 级元数据损坏），响应带 rechunked:true、
  *     不产生新 doc_versions 行；batch/import 通道后端已类型 Omit + 运行时剔除
+ *   - 本批次（2026-08-30 Diagram IR v1 Phase 2）: description + docType 词表补
+ *     diagram——docType=diagram 的 content 必须是过渲染门的合法 IR，结构化写图
+ *     优先用 upsert_diagram（四工具在 index.ts ㉟-㊳）
  *
  * [踩坑索引]
  *   - fail-closed 改造（2026-08-16）：新增 expectedContentHash 乐观锁透传——
@@ -26,6 +29,7 @@
  */
 
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
+import { DOC_SOURCE_NATIVE } from '@agent-chamber/shared';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 
@@ -110,7 +114,9 @@ export const upsertDocTool: CustomTool = {
       'Metadata authoring: you are the LLM — curate "summary" yourself instead of relying on ' +
       'auto-derivation. Write it for another agent deciding whether to read this doc: ' +
       '"what is this + when should it be read", with key identifiers verbatim (search anchors). ' +
-      'Reuse existing docType vocabulary and categories (check get_docs_overview first).',
+      'Reuse existing docType vocabulary and categories (check get_docs_overview first). ' +
+      'docType=diagram requires content to be valid diagram IR that passes the render gate; ' +
+      'for structured diagram authoring prefer upsert_diagram.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -142,7 +148,9 @@ export const upsertDocTool: CustomTool = {
           type: 'string',
           description:
             'Optional: prefer controlled vocabulary — ' +
-            'guide | reference | api | architecture | operations | index | note | memory. ' +
+            'guide | reference | api | architecture | operations | index | note | memory | diagram. ' +
+            'docType=diagram: content must be valid diagram IR passing the render gate — ' +
+            'prefer upsert_diagram for structured authoring. ' +
             'CONVENTION (effective this version): high-frequency auto-produced docs (diaries/snapshots) MUST be ' +
             'tagged docType=memory, otherwise they pollute the default global overview; ' +
             'existing docs are NOT retroactively tagged.',
@@ -265,7 +273,7 @@ export const upsertDocTool: CustomTool = {
     const body: Record<string, unknown> = {
       path,
       content,
-      source: 'native',
+      source: DOC_SOURCE_NATIVE,
     };
     if (title !== undefined) body.title = title;
     if (summary !== undefined) body.summary = summary;

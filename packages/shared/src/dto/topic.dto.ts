@@ -1,4 +1,13 @@
-import { MessageType, TopicStatus, Visibility } from '../enums';
+import { MessageType, TopicKind, TopicStatus, Visibility, WakePolicy } from '../enums';
+
+/**
+ * 议程项状态值域（AgendaItemInput.status 单一事实来源；review-0831 任务 a8a295df
+ * 收口——backend agenda-item.dto.ts 此前内联 @IsEnum 字面量，与 shared union 双源）
+ */
+export const AGENDA_ITEM_STATUS_VALUES = ['pending', 'in_progress', 'completed'] as const;
+
+/** 议程项状态联合（'pending' | 'in_progress' | 'completed'） */
+export type AgendaItemStatus = (typeof AGENDA_ITEM_STATUS_VALUES)[number];
 
 /**
  * 话题议程项输入
@@ -9,7 +18,7 @@ export interface AgendaItemInput {
   /** 议程标题 */
   title: string;
   /** 议程状态 */
-  status: 'pending' | 'in_progress' | 'completed';
+  status: AgendaItemStatus;
   /** 分配给的用户/Agent ID */
   assignedTo?: string;
   /** 排序顺序 */
@@ -36,14 +45,14 @@ export interface TopicConfigInput {
    * 话题类型：'normal'（普通，缺省）/ 'roundtable'（圆桌，设计 docs/roundtable-design.md §5）。
    * 仅创建时生效——创建后不可变，update 忽略该字段（互转在 M2 推迟清单）。
    */
-  kind?: 'normal' | 'roundtable';
+  kind?: TopicKind;
   /**
    * 圆桌唤醒策略（设计 §6，r4 修订 + R1 拍板）：
    * 'mention'（缺省——仅 @座位label / @all 唤醒对应座位，新桌默认省钱安全）/
    * 'broadcast'（新消息唤醒全部 active 座位，高强度讨论桌可选）。
    * 普通话题（kind='normal'）不消费该值，但按「配置原样存储」语义照常写入 settings。
    */
-  wakePolicy?: 'mention' | 'broadcast';
+  wakePolicy?: WakePolicy;
   /**
    * 圆桌安全阀阈值（设计 §6，M2 阶段 4 落地）：topic 内座位间连续 N 轮非沉默
    * agent 发言无人类消息 → 暂停注入 + topic 公告（防 agent 间礼貌/抬杠循环）。

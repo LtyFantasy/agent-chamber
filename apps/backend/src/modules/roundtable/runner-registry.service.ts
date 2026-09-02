@@ -27,11 +27,13 @@ import { Repository } from 'typeorm';
 import type { WebSocket } from 'ws';
 import {
   buildEnvelope,
+  SEAT_RUNTIME_STATUS,
   type Envelope,
   type HelloPayload,
   type SeatAssignPayload,
   type SeatVendor,
 } from '@agent-chamber/roundtable-protocol';
+import { SEAT_LIFECYCLE_STATUS } from '@agent-chamber/shared';
 import { RoundtableRunner } from '../../database/entities/roundtable-runner.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import type { AgentPayload } from '../../common/services/api-key-auth.service';
@@ -130,14 +132,14 @@ export class RunnerRegistryService {
   private async upsertRunner(agent: AgentPayload): Promise<RoundtableRunner> {
     const existing = await this.runnerRepo.findOne({ where: { actorId: agent.id } });
     if (existing) {
-      existing.status = 'online';
+      existing.status = SEAT_RUNTIME_STATUS.ONLINE;
       existing.lastSeenAt = new Date();
       return this.runnerRepo.save(existing);
     }
     const created = this.runnerRepo.create({
       name: agent.name,
       actorId: agent.id,
-      status: 'online',
+      status: SEAT_RUNTIME_STATUS.ONLINE,
       version: null,
       vendors: [],
       lastSeenAt: new Date(),
@@ -199,7 +201,9 @@ export class RunnerRegistryService {
       .createQueryBuilder('seat')
       .where(`seat.config->>'bindActorId' = :actorId`, { actorId: entry.actorId })
       .andWhere(`seat.vendor IN (:...vendors)`, { vendors: [...vendors] })
-      .andWhere(`seat.status IN ('active', 'offline')`)
+      .andWhere(
+        `seat.status IN ('${SEAT_LIFECYCLE_STATUS.ACTIVE}', '${SEAT_LIFECYCLE_STATUS.OFFLINE}')`,
+      )
       .getMany();
     const bound: RoundtableSeat[] = [];
     for (const seat of seats) {
@@ -215,7 +219,7 @@ export class RunnerRegistryService {
         continue;
       }
       seat.runnerId = runnerId;
-      seat.status = 'active';
+      seat.status = SEAT_LIFECYCLE_STATUS.ACTIVE;
       await this.seatRepo.save(seat);
       bound.push(seat);
     }
@@ -279,15 +283,17 @@ export class RunnerRegistryService {
       this.clearPingTimer(entry);
       this.logger.log(`runner offline: ${runnerId}`);
       await this.runnerRepo
-        .update({ id: runnerId }, { status: 'offline', lastSeenAt: new Date() })
+        .update({ id: runnerId }, { status: SEAT_RUNTIME_STATUS.OFFLINE, lastSeenAt: new Date() })
         .catch((err: unknown) => {
           this.logger.error(`unregister: runner ${runnerId} offline update failed: ${String(err)}`);
         });
-      await this.seatRepo.update({ runnerId }, { status: 'offline' }).catch((err: unknown) => {
-        this.logger.error(
-          `unregister: seat offline update failed for runner ${runnerId}: ${String(err)}`,
-        );
-      });
+      await this.seatRepo
+        .update({ runnerId }, { status: SEAT_LIFECYCLE_STATUS.OFFLINE })
+        .catch((err: unknown) => {
+          this.logger.error(
+            `unregister: seat offline update failed for runner ${runnerId}: ${String(err)}`,
+          );
+        });
       return runnerId;
     }
     return null;

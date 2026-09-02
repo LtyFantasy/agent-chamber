@@ -25,6 +25,7 @@ import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamb
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 import { projectDocHits } from './project';
+import { DOC_SEARCH_SORT_VALUES } from '@agent-chamber/shared';
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -146,7 +147,8 @@ export const searchDocsTool: CustomTool = {
         },
         sort: {
           type: 'string',
-          enum: ['relevance', 'createdAt_desc', 'createdAt_asc'],
+          // 枚举值从 shared DOC_SEARCH_SORT_VALUES 单源取值（防 backend DTO 加值后此处漂移）
+          enum: [...DOC_SEARCH_SORT_VALUES],
           description:
             'Optional: sort mode (default "relevance" = dual-scoring + boost fusion). ' +
             '"createdAt_desc"/"createdAt_asc" order by doc creation time and skip boost fusion. ' +

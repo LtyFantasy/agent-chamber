@@ -47,8 +47,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, IsNull } from 'typeorm';
-import * as crypto from 'crypto';
+import { Repository, IsNull } from 'typeorm';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { DocSpaceMember } from '../../database/entities/doc-space-member.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
@@ -61,9 +60,18 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Topic } from '../../database/entities/topic.entity';
-import { Visibility, ErrorCode, ActorType, EventType, AuditAction } from '@agent-chamber/shared';
+import {
+  Visibility,
+  ErrorCode,
+  ActorType,
+  EventType,
+  ResourceType,
+  AuditAction,
+  DocSpaceMemberRole,
+} from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import type {
   DocSpaceSummary,
@@ -89,6 +97,10 @@ import { DocOverviewQueryDto } from './dto';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
+import { estimateTokens } from './markdown-chunker';
+// review-0831 任务 bbd175dc 子项 1：slugify 唯一实现（doc.service.ts 复制品已删，
+// 行为统一为带兜底版——中文名 → 's-xxxxxxxx'，不再返回空串）
+import { slugify } from './doc-slug.helper';
 
 /** Overview token cap (~20000, v1.41 图例化升格). When exceeded, docs are truncated and `truncated: true` is set. */
 const OVERVIEW_TOKEN_CAP = 20000;
@@ -104,17 +116,14 @@ const OVERVIEW_TOKEN_CAP = 20000;
 const OVERVIEW_ROUTES_LIMIT = 50;
 
 /**
- * CJK 感知 token 估算（与 markdown-chunker 公式一致）：CJK 字符逐字计 1 token，
- * 其余字符按 4 字符 1 token 折算。用于：
+ * CJK 感知 token 估算：单一实现 = markdown-chunker.estimateTokens（统一批
+ * 5c537e5c，双实现已收口；chunker 版 CJK_RE 覆盖 Ext-A/日文假名/谚文三区）。
+ * 本文件用于：
  * - overview 地图行（title+path+summary）条目成本——不是文档全文 tokenEstimate，
  *   否则单篇大文档（如 39k token 的 api-definition.md）就会顶爆上限，导致真实数据下
  *   地图为空（生产首跑暴露）。
  * - 空间图例（spaceDescription）的 legendTokenEstimate 单列记账（v1.41）。
  */
-function estimateTokens(text: string): number {
-  const cjk = (text.match(/[一-鿿豈-﫿]/g) || []).length;
-  return cjk + Math.ceil((text.length - cjk) / 4);
-}
 
 /** Overview 条目成本 = 地图行自身（title+path+summary）的 CJK 感知 token 估算 */
 function overviewEntryTokens(doc: Doc): number {
@@ -341,16 +350,8 @@ function resolveOverviewFilters(
  * Generate a URL-friendly slug from a name.
  * Lowercase, replace non-alphanumeric with hyphens, collapse multiples.
  * 非拉丁名称（如纯中文）slugify 后为空串 —— 兜底随机后缀，保证 slug 可用且唯一（由调用方唯一性循环再校验）。
+ * （实现已收敛至 doc-slug.helper.ts 唯一来源，review-0831 任务 bbd175dc）
  */
-function slugify(name: string): string {
-  const base = name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 128);
-  if (base) return base;
-  return `s-${crypto.randomUUID().slice(0, 8)}`;
-}
 
 @Injectable()
 export class DocSpaceService {
@@ -509,7 +510,7 @@ export class DocSpaceService {
         actorType: (profile?.type === ActorType.HUMAN ? 'human' : 'agent') as 'human' | 'agent',
         // 软删信号透传：非空 = 该成员已删除，actorName 仍可显示（契约 docs/spec.md §1）
         deletedAt: profile?.deletedAt ? profile.deletedAt.toISOString() : null,
-        role: m.role,
+        role: m.role as DocSpaceMemberRole,
         invitedBy: m.invitedBy,
         createdAt: m.createdAt,
       };
@@ -726,7 +727,7 @@ export class DocSpaceService {
         this.memberRepo.create({
           spaceId: saved.id,
           actorId: agentId,
-          role: 'member',
+          role: DocSpaceMemberRole.MEMBER,
           invitedBy: actor.id,
         }),
       );
@@ -734,7 +735,7 @@ export class DocSpaceService {
       this.memberRepo.create({
         spaceId: saved.id,
         actorId: actor.id,
-        role: 'editor',
+        role: DocSpaceMemberRole.EDITOR,
         invitedBy: null,
       }),
     );
@@ -824,7 +825,7 @@ export class DocSpaceService {
     };
     // 原生 query：TypeORM 实体级 update 无法表达 jsonb_set 片段，且会整体覆盖 settings。
     // AND deleted_at IS NULL：软删空间不得接受写入（Controller findById 已过滤，此处 TOCTOU 兜底）
-    const rows: Array<{ settings?: Record<string, any> | null }> = await this.spaceRepo.query(
+    const rows: Array<{ settings?: Record<string, unknown> | null }> = await this.spaceRepo.query(
       `UPDATE doc_spaces SET settings = jsonb_set(settings, '{repoManifest}', $1::jsonb) WHERE id = $2 AND deleted_at IS NULL RETURNING settings`,
       [JSON.stringify(stored), spaceId],
     );
@@ -905,7 +906,7 @@ export class DocSpaceService {
     for (const d of docResult) {
       await this.eventService.create({
         eventType: EventType.DOC_DELETED,
-        resourceType: 'doc',
+        resourceType: ResourceType.DOC,
         resourceId: d.id,
         actorId: actor?.id ?? undefined,
         topicId: space.topicId ?? undefined,
@@ -939,7 +940,7 @@ export class DocSpaceService {
     const member = this.memberRepo.create({
       spaceId,
       actorId: agentId,
-      role: 'member',
+      role: DocSpaceMemberRole.MEMBER,
       invitedBy: space.creatorId,
     });
     await this.memberRepo.save(member);
@@ -972,7 +973,8 @@ export class DocSpaceService {
         code: ErrorCode.RESOURCE_CONFLICT,
       });
     }
-    if (existing.role === 'editor') {
+    // doc_space_members.role 值域 = DocSpaceMemberRole（'editor'/'member'，专属枚举）
+    if (existing.role === DocSpaceMemberRole.EDITOR) {
       throw new ConflictException({
         message: 'Use removeEditor first',
         code: ErrorCode.RESOURCE_CONFLICT,
@@ -996,21 +998,21 @@ export class DocSpaceService {
     });
 
     if (existing) {
-      if (existing.role === 'editor') {
+      if (existing.role === DocSpaceMemberRole.EDITOR) {
         throw new ConflictException({
           message: 'Agent is already an editor',
           code: ErrorCode.RESOURCE_CONFLICT,
         });
       }
       // member → editor upgrade
-      existing.role = 'editor';
+      existing.role = DocSpaceMemberRole.EDITOR;
       await this.memberRepo.save(existing);
     } else {
       // Create editor row directly (upsert semantics: new editor)
       const member = this.memberRepo.create({
         spaceId,
         actorId: agentId,
-        role: 'editor',
+        role: DocSpaceMemberRole.EDITOR,
         invitedBy: space.creatorId,
       });
       await this.memberRepo.save(member);
@@ -1038,7 +1040,7 @@ export class DocSpaceService {
     await this.resourceValidator.exists(this.agentRepo, agentId, ErrorCode.AGENT_NOT_FOUND);
 
     const existing = await this.memberRepo.findOne({
-      where: { spaceId, actorId: agentId, role: 'editor' },
+      where: { spaceId, actorId: agentId, role: DocSpaceMemberRole.EDITOR },
     });
     if (!existing) {
       throw new ConflictException({
@@ -1048,7 +1050,7 @@ export class DocSpaceService {
     }
 
     // Demote: editor → member (never delete the row — that would remove access)
-    existing.role = 'member';
+    existing.role = DocSpaceMemberRole.MEMBER;
     await this.memberRepo.save(existing);
 
     return space;
@@ -1135,7 +1137,7 @@ export class DocSpaceService {
     // （决策 6——slug/description 不入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_category',
+      entityType: AUDIT_ENTITY_TYPE.DOC_CATEGORY,
       entityId: saved.id,
       actorId: operatorActorId ?? null,
       newData: { categoryId: saved.id, spaceId: space.id, name: saved.name },
@@ -1172,7 +1174,7 @@ export class DocSpaceService {
     // 审计（Phase 2）：UPDATE + doc_category；newData 白名单 {categoryId, spaceId, name?}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_category',
+      entityType: AUDIT_ENTITY_TYPE.DOC_CATEGORY,
       entityId: saved.id,
       actorId: operatorActorId ?? null,
       newData: {

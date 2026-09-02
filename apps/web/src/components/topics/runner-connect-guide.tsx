@@ -30,7 +30,7 @@ import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { Check, ChevronRight, Copy } from 'lucide-react';
-import { Api, type RoundtableSeatItem } from '@/lib/api';
+import { Api, RUNNER_STATUS, PRESENCE_PHASE, type RoundtableSeatItem } from '@/lib/api';
 import { getRunnerPlatformUrl } from '@/lib/platform-url';
 import { useSeatPresence } from '@/lib/use-seat-presence';
 import { Button } from '@/components/ui/button';
@@ -132,12 +132,15 @@ export function RunnerConnectGuide({
 
   // ── 三级信号推导（vendor 感知：runner 必须支持本座位 vendor）──
   const runnerOnline = (runners ?? []).some(
-    (r) => r.status === 'online' && Array.isArray(r.vendors) && r.vendors.includes(seat.vendor),
+    (r) =>
+      r.status === RUNNER_STATUS.ONLINE &&
+      Array.isArray(r.vendors) &&
+      r.vendors.includes(seat.vendor),
   );
   const claimed = runnerId !== null;
   // presence 缺失 = 座位从未活动（chamber 只在活动事件时写入，认领不写）——
   // 不算「不存活」，避免验收环永久卡死在③；显式 offline 才判定未存活
-  const alive = presence === undefined || presence.phase !== 'offline';
+  const alive = presence === undefined || presence.phase !== PRESENCE_PHASE.OFFLINE;
   const allGreen = runnerOnline && claimed && alive;
 
   // ── R5 卡死诊断：runner 在线但座位 90s 不认领 → 计时越界提示 ──

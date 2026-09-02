@@ -24,7 +24,9 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocService } from './doc.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { CreateDocRouteDto, UpdateDocRouteDto } from './dto';
+import { CODE_ENTRY_TYPE } from './doc-constants';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import {
   DocRouteCodeEntryType,
   ErrorCode,
@@ -192,7 +194,7 @@ export class DocRouteService {
       secondaryDocId: dto.secondaryDocId ?? null,
       secondaryHeadingPath: dto.secondaryHeadingPath ?? null,
       codeEntry: dto.codeEntry ?? null,
-      codeEntryType: dto.codeEntryType ?? 'exact',
+      codeEntryType: dto.codeEntryType ?? CODE_ENTRY_TYPE.EXACT,
       sortOrder: dto.sortOrder ?? 0,
       createdBy: actor.id,
     });
@@ -202,7 +204,7 @@ export class DocRouteService {
     // {routeId, spaceId, intent}（决策 6——doc 引用/codeEntry 不入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_route',
+      entityType: AUDIT_ENTITY_TYPE.DOC_ROUTE,
       entityId: saved.id,
       actorId: actor.id,
       newData: { routeId: saved.id, spaceId, intent: saved.intent },
@@ -267,7 +269,7 @@ export class DocRouteService {
     // 决策 2）；newData 白名单 {routeId, spaceId, intent?}（决策 6——doc 引用不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_route',
+      entityType: AUDIT_ENTITY_TYPE.DOC_ROUTE,
       entityId: saved.id,
       actorId: operatorActorId ?? null,
       newData: {
@@ -352,7 +354,7 @@ export class DocRouteService {
     }
 
     // ④ codeEntryType='pattern' 必须配套非空 codeEntry（glob 是 codeEntry 的修饰符）
-    if (refs.codeEntryType === 'pattern' && !refs.codeEntry) {
+    if (refs.codeEntryType === CODE_ENTRY_TYPE.PATTERN && !refs.codeEntry) {
       throw new BadRequestException({
         message: 'codeEntryType "pattern" requires a non-empty codeEntry',
         code: ErrorCode.DOC_ROUTE_INVALID_CODE_ENTRY,

@@ -35,7 +35,7 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -52,6 +52,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import type { Message } from '@/types';
+import { ActorType, MessageType } from '@/types';
 import { formatRelativeTime } from '@/lib/utils';
 import { MARKDOWN_CHAT_CLASSES } from '@/lib/markdown-classes';
 import { CollapsibleMarkdown } from '@/components/topics/collapsible-markdown';
@@ -88,6 +89,7 @@ export function MessageBubble({
   onCopyContent?: (messageId: string, content: string) => void;
 }) {
   const t = useTranslations('topics');
+  const locale = useLocale();
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
   // 不防则连点排队两个确认框——确认两次 = 重复删除消息）
   const deleteConfirmPendingRef = useRef(false);
@@ -204,7 +206,7 @@ export function MessageBubble({
   // 折叠：正文默认 truncate 单行；仅内容真溢出（scrollWidth > clientWidth）时在
   // 末尾显示 chevron——点击展开完整正文，再点收起（aria-expanded 双态）。
   // 早返回：所有 hook 均在其上，无 hook 顺序问题。
-  if (msg.senderType === 'system') {
+  if (msg.senderType === ActorType.SYSTEM) {
     return (
       <div className="flex w-full flex-col items-center gap-0.5 py-1">
         <div className="flex max-w-[80%] items-center gap-1 rounded-md border border-border/60 px-3 py-1.5 md:max-w-[60%]">
@@ -248,14 +250,14 @@ export function MessageBubble({
           )}
         </div>
         <span className="text-[10px] text-muted-foreground opacity-50">
-          {formatRelativeTime(msg.createdAt)}
+          {formatRelativeTime(msg.createdAt, locale)}
         </span>
       </div>
     );
   }
 
   const cfg = msg.type ? typeConfig[msg.type] : null;
-  const isUser = msg.senderType === 'human';
+  const isUser = msg.senderType === ActorType.HUMAN;
 
   // 气泡底（滚动区重复元素，红线：禁 backdrop-blur，一律半透实色底/工具类）
   let bubbleClass: string;
@@ -276,7 +278,7 @@ export function MessageBubble({
         {cfg && (
           // thinking 类型附呼吸微光（animate-breathing 仅 opacity+transform，符合动效红线）
           <span
-            className={`inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded bg-background/60 ${msg.type === 'thinking' ? 'animate-breathing' : ''}`}
+            className={`inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded bg-background/60 ${msg.type === MessageType.THINKING ? 'animate-breathing' : ''}`}
           >
             {cfg.icon}
             {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
@@ -313,7 +315,7 @@ export function MessageBubble({
             {t('message.coordinatorBadge')}
           </Badge>
         )}
-        <span className="text-xs opacity-60">{formatRelativeTime(msg.createdAt)}</span>
+        <span className="text-xs opacity-60">{formatRelativeTime(msg.createdAt, locale)}</span>
         <code
           className="text-[10px] opacity-40 font-mono cursor-pointer hover:opacity-70 transition-opacity relative"
           title={t('message.copyId')}
@@ -346,7 +348,7 @@ export function MessageBubble({
         </button>
         {currentUserId &&
           msg.senderId === currentUserId &&
-          msg.senderType === 'human' &&
+          msg.senderType === ActorType.HUMAN &&
           onDelete && (
             <button
               onClick={async (e) => {
@@ -391,7 +393,7 @@ export function MessageBubble({
           - 外层由 CollapsibleMarkdown 包装（components/topics/collapsible-markdown.tsx）：
             Agent 长消息默认折叠（实测高度阈值，8 种消息类型统一），详见 ui-design-system §6.1。
             thinking 例外：走下方独立「过程记录」折叠（无条件默认折叠 + 展开完整可见） */}
-      {msg.type === 'thinking' ? (
+      {msg.type === MessageType.THINKING ? (
         <div className="flex flex-col gap-1">
           <button
             type="button"
@@ -424,7 +426,7 @@ export function MessageBubble({
           className={`text-sm whitespace-pre-wrap break-words ${MARKDOWN_CHAT_CLASSES}${
             cfg?.strong ? ` ${cfg.strong}` : ''
           }${!cfg ? ' [&&_strong]:text-primary' : ''}${
-            msg.type === 'status_update'
+            msg.type === MessageType.STATUS_UPDATE
               ? ' [&&_a]:text-foreground [&&_a]:decoration-primary [&&_a]:decoration-2'
               : ''
           }`}

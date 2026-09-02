@@ -26,6 +26,7 @@
  */
 
 import { useTranslations } from 'next-intl';
+import { TopicKind, WakePolicy } from '@agent-chamber/shared';
 
 interface RoundtableMentionHintProps {
   /** 话题类型（TopicDetail.kind；normal/未定义 = 不渲染） */
@@ -43,7 +44,7 @@ interface RoundtableMentionHintProps {
 export function RoundtableMentionHint({ kind, wakePolicy }: RoundtableMentionHintProps) {
   const t = useTranslations('topics');
 
-  if (kind !== 'roundtable' || wakePolicy !== 'mention') {
+  if (kind !== TopicKind.ROUNDTABLE || wakePolicy !== WakePolicy.MENTION) {
     return null;
   }
 

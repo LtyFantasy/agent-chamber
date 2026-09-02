@@ -11,7 +11,8 @@
  * [铁律关联] #9(代理层透传) #21(双层校验) #11(注释强制)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   GUARD: 全局 APP_GUARD 是 JwtAuthGuard（见 x-api-key 头自动放行），
+ *   GUARD: 全局 APP_GUARD 是 JwtAuthGuard（B-59 起对 X-API-Key 头做真实 API Key
+ *          认证：成功挂 request.agent、失败 401，不再「放行不认证」），
  *          @Roles(ADMIN) 若留在类级，RolesGuard 会拦截方法级 JwtOrApiKeyGuard
  *          认证通过的 agent 请求（403）。类级 guard 与角色声明一律下沉到方法级：
  *          GET /activity-logs 只挂 JwtOrApiKeyGuard，GET /audit 才挂
@@ -41,8 +42,9 @@ import { AuditLogQueryDto } from './dto/audit-log-query.dto';
  * 权限语义见 AuditService.findScoped：agent 只见自己；human 非 admin 见
  * 自己 + 名下 agent（含软删）；admin 全量（含 actorId=null 系统行）。
  * 越权 actorId 收窄不 403，响应 scope 字段回声实际生效范围。
- * 注意：全局 APP_GUARD 是 JwtAuthGuard（x-api-key 自动放行），此处方法级
- * @UseGuards(JwtOrApiKeyGuard) 才是真正的双通道认证（见文件头 GUARD 踩坑）。
+ * 注意：全局 APP_GUARD 是 JwtAuthGuard（B-59 起对 X-API-Key 做真实认证并挂
+ * request.agent），此处方法级 @UseGuards(JwtOrApiKeyGuard) 仍是双通道认证
+ * （JWT 优先、API Key 兜底；全局 guard 已认证时二次认证幂等，语义不变）。
  * 路径注意：@Controller() 根路径 + 方法路径精确声明（NestJS 方法级 leading
  * slash 不会忽略 controller 前缀——concatPaths 恒拼接，实证 RoutePathFactory），
  * 故 /activity-logs 与 /audit 均为顶层路径。

@@ -1,6 +1,7 @@
 const path = require('path');
 const rulesDirPlugin = require('eslint-plugin-rulesdir');
-rulesDirPlugin.RULES_DIR = path.resolve(__dirname, './eslint-rules');
+// 规则单源化（review-0831 任务 8b57f5a5）：规则文件位于 monorepo 根 eslint-rules/，backend/web 共用
+rulesDirPlugin.RULES_DIR = path.resolve(__dirname, '../../eslint-rules');
 
 module.exports = {
   parser: '@typescript-eslint/parser',

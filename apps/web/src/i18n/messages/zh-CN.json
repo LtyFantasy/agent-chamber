@@ -147,10 +147,8 @@
   },
   "topics": {
     "status": {
-      "draft": "草稿",
       "open": "开放",
       "active": "进行中",
-      "voting": "投票中",
       "paused": "已暂停",
       "closed": "已关闭",
       "archived": "已归档"
@@ -165,7 +163,6 @@
     "viewDetail": "查看详情",
     "notFound": "话题不存在",
     "backToList": "返回话题列表",
-    "publish": "发布",
     "pause": "暂停",
     "resume": "恢复",
     "closeTopic": "关闭",
@@ -689,7 +686,10 @@
       "browse": "文档目录",
       "viewModeTree": "目录",
       "viewModeCategory": "分类",
-      "docMatches": "文档匹配"
+      "docMatches": "文档匹配",
+      "docLinkNotFound": "文档不存在或已删除",
+      "loadMore": "加载更多",
+      "loadMoreFolders": "加载更多目录"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",
@@ -711,6 +711,19 @@
       "notChecked": "尚未检查",
       "copied": "已复制",
       "checkedAt": "检查时间：{time}"
+    },
+    "diagram": {
+      "viewerTitle": "图预览",
+      "loadFailed": "图加载失败",
+      "loadFailedDesc": "图快照加载失败，请重试；如持续失败，可通过 Agent 工具重新保存该图",
+      "infoCard": "图信息",
+      "qualityProfile": "质量档位",
+      "renderedAt": "渲染时间",
+      "htmlBytes": "快照体积",
+      "compositionErrors": "错误",
+      "compositionWarnings": "警告",
+      "fullscreen": "全屏查看",
+      "exitFullscreen": "退出全屏"
     },
     "members": {
       "title": "空间成员",
@@ -781,6 +794,8 @@
       "discardConfirm": "内容已修改，确定放弃？",
       "pathConflict": "路径已存在，请换一个",
       "pathCheckFailed": "路径唯一性校验失败，请重试",
+      "overwriteTitle": "路径已存在",
+      "overwriteConfirm": "该路径已有文档，保存将覆盖已有内容。确定继续？",
       "contentLoadError": "文档原文加载失败",
       "contentLoadErrorDesc": "请检查网络后重试，或退出编辑",
       "exitEdit": "退出编辑"

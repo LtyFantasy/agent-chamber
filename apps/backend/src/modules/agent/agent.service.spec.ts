@@ -11,8 +11,10 @@ import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
-import { AgentStatus, ActorType, AuditAction } from '@agent-chamber/shared';
+import { AgentStatus, ActorType, AuditAction, TaskStatus } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { TaskService } from '../task/task.service';
+import { TaskDependencyService } from '../task/task-dependency.service';
 
 jest.mock('crypto', () => ({
   randomBytes: jest.fn(() => ({ toString: jest.fn(() => 'mocked_random_string') })),
@@ -130,6 +132,8 @@ describe('AgentService', () => {
   let mockApiKeyRepo: jest.Mocked<Repository<ApiKey>>;
   let mockSeatRepo: jest.Mocked<Repository<RoundtableSeat>>;
   let mockAuditService: { log: jest.Mock };
+  let mockTaskService: { findAll: jest.Mock };
+  let mockTaskDependencyService: { hasBlockers: jest.Mock };
 
   beforeEach(async () => {
     // NestJS module-token-factory uses crypto.createHash to generate module tokens.
@@ -149,6 +153,8 @@ describe('AgentService', () => {
     mockApiKeyRepo = createMockRepo<ApiKey>();
     mockSeatRepo = createMockRepo<RoundtableSeat>();
     mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
+    mockTaskService = { findAll: jest.fn() };
+    mockTaskDependencyService = { hasBlockers: jest.fn() };
 
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
@@ -157,6 +163,8 @@ describe('AgentService', () => {
         { provide: getRepositoryToken(ApiKey), useValue: mockApiKeyRepo },
         { provide: getRepositoryToken(RoundtableSeat), useValue: mockSeatRepo },
         { provide: AuditService, useValue: mockAuditService },
+        { provide: TaskService, useValue: mockTaskService },
+        { provide: TaskDependencyService, useValue: mockTaskDependencyService },
       ],
     }).compile();
 
@@ -1108,6 +1116,469 @@ describe('AgentService', () => {
       const result = await service.findMyUnreadCounts('agent-1');
 
       expect(result).toEqual([]);
+    });
+  });
+
+  describe('findMyActivities', () => {
+    /** 按 SQL 内容路由 mock 6 条查询（3 条 LIMIT + 3 条 COUNT） */
+    function mockActivityQueries(rows: {
+      messages?: unknown[];
+      tasks?: unknown[];
+      comments?: unknown[];
+      messageCount?: number;
+      taskCount?: number;
+      commentCount?: number;
+    }) {
+      (mockAgentRepo.manager.query as jest.Mock).mockImplementation((sql: string) => {
+        if (sql.includes("'message' as type")) return Promise.resolve(rows.messages ?? []);
+        if (sql.includes("'task' as type")) return Promise.resolve(rows.tasks ?? []);
+        if (sql.includes("'comment' as type")) return Promise.resolve(rows.comments ?? []);
+        if (sql.includes('FROM messages'))
+          return Promise.resolve([{ total: rows.messageCount ?? 0 }]);
+        if (sql.includes('FROM tasks')) return Promise.resolve([{ total: rows.taskCount ?? 0 }]);
+        if (sql.includes('FROM task_comments'))
+          return Promise.resolve([{ total: rows.commentCount ?? 0 }]);
+        return Promise.resolve([]);
+      });
+    }
+
+    it('should return standard envelope with total = sum of three table counts', async () => {
+      mockActivityQueries({
+        messages: [
+          {
+            type: 'message',
+            id: 'm1',
+            topicId: 't1',
+            content: 'hi',
+            createdAt: '2026-08-01T00:00:00.000Z',
+          },
+        ],
+        tasks: [
+          {
+            type: 'task',
+            id: 'task-1',
+            title: 'T1',
+            status: 'todo',
+            createdAt: '2026-08-02T00:00:00.000Z',
+            updatedAt: '2026-08-02T00:00:00.000Z',
+          },
+        ],
+        comments: [
+          {
+            type: 'comment',
+            id: 'c1',
+            taskId: 'task-1',
+            content: 'note',
+            createdAt: '2026-08-03T00:00:00.000Z',
+          },
+        ],
+        messageCount: 1,
+        taskCount: 1,
+        commentCount: 1,
+      });
+
+      const result = await service.findMyActivities('agent-1', {});
+
+      // 信封字段齐全 + 合并排序 createdAt DESC + total=三表和
+      expect(result).toEqual({
+        items: [
+          expect.objectContaining({ type: 'comment', id: 'c1' }),
+          expect.objectContaining({ type: 'task', id: 'task-1' }),
+          expect.objectContaining({ type: 'message', id: 'm1' }),
+        ],
+        total: 3,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      });
+    });
+
+    it('should treat limit as alias for pageSize when pageSize absent (page=1&limit=N equals legacy behavior)', async () => {
+      mockActivityQueries({
+        messages: [
+          {
+            type: 'message',
+            id: 'm1',
+            topicId: 't1',
+            content: 'hi',
+            createdAt: '2026-08-01T00:00:00.000Z',
+          },
+        ],
+        messageCount: 1,
+      });
+
+      const result = await service.findMyActivities('agent-1', { limit: 5 });
+
+      expect(result.pageSize).toBe(5);
+      expect(result.items).toHaveLength(1);
+      // LIMIT 参数 = page * pageSize = 5（旧 limit 语义等价：page=1 时取前 N 条）
+      expect(mockAgentRepo.manager.query).toHaveBeenCalledWith(
+        expect.stringContaining('LIMIT $2'),
+        ['agent-1', 5],
+      );
+    });
+
+    it('should prefer pageSize over limit when both provided', async () => {
+      mockActivityQueries({ messageCount: 0 });
+
+      const result = await service.findMyActivities('agent-1', { pageSize: 10, limit: 3 });
+
+      expect(result.pageSize).toBe(10);
+    });
+
+    it('should paginate with full-order tie-break (createdAt, type, id): same createdAt records not duplicated across pages', async () => {
+      // 3 条同 createdAt 跨表记录（message/task/comment 各一），pageSize=2 分两页
+      const sameTs = '2026-08-01T00:00:00.000Z';
+      mockActivityQueries({
+        messages: [{ type: 'message', id: 'm1', topicId: 't1', content: 'hi', createdAt: sameTs }],
+        tasks: [
+          {
+            type: 'task',
+            id: 'task-1',
+            title: 'T1',
+            status: 'todo',
+            createdAt: sameTs,
+            updatedAt: sameTs,
+          },
+        ],
+        comments: [
+          { type: 'comment', id: 'c1', taskId: 'task-1', content: 'note', createdAt: sameTs },
+        ],
+        messageCount: 1,
+        taskCount: 1,
+        commentCount: 1,
+      });
+
+      const page1 = await service.findMyActivities('agent-1', { page: 1, pageSize: 2 });
+      const page2 = await service.findMyActivities('agent-1', { page: 2, pageSize: 2 });
+
+      // tie-break 排序：createdAt 相同 → type 升序（comment < message < task）→ id 升序
+      expect(page1.items.map((i) => i.id)).toEqual(['c1', 'm1']);
+      expect(page2.items.map((i) => i.id)).toEqual(['task-1']);
+      // 跨页不重不漏
+      const allIds = [...page1.items, ...page2.items].map((i) => i.id).sort();
+      expect(allIds).toEqual(['c1', 'm1', 'task-1']);
+      expect(page1.total).toBe(3);
+      expect(page2.total).toBe(3);
+    });
+  });
+
+  describe('getMyBriefing', () => {
+    const actor = { id: 'agent-1', type: ActorType.AGENT };
+
+    /** 空分页结果（findAll 返回形状） */
+    const emptyTasks = {
+      items: [],
+      total: 0,
+      page: 1,
+      pageSize: 20,
+      totalPages: 0,
+      hasNext: false,
+      hasPrev: false,
+    };
+
+    /** findMyActivities 3 次 query（messages/tasks/comments）+ unread 1 次，全空 */
+    function mockEmptyQueries() {
+      (mockAgentRepo.manager.query as jest.Mock).mockResolvedValue([]);
+    }
+
+    it('should assemble full briefing: me whitelist (12 fields, no auth/sensitive), 12-field task projection with null preserved, hasBlockers merged, unreadCounts, activities', async () => {
+      const agent = createMockAgent({
+        id: 'agent-1',
+        name: 'Test Agent',
+        webhookSecret: 'super-secret', // 敏感字段不应出网
+        systemPrompt: 'secret prompt',
+        modelConfig: { model: 'gpt-4' },
+        rateLimit: { limit: 100 },
+      });
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockTaskService.findAll.mockResolvedValue({
+        items: [
+          {
+            id: 'task-1',
+            title: 'T1',
+            status: 'in_progress',
+            priority: 'p1',
+            labels: ['bug'],
+            boardId: 'b1',
+            boardName: 'Board',
+            listId: 'l1',
+            listName: 'List',
+            dueDate: null, // null 保留语义：!== undefined 判断，null 字段保留
+            updatedAt: '2026-08-01T00:00:00.000Z',
+            description: 'should be stripped', // 白名单外字段剔除
+            position: 3,
+          },
+          {
+            id: 'task-2',
+            title: 'T2',
+            status: 'todo',
+            priority: 'p2',
+            labels: null,
+            boardId: null,
+            boardName: null,
+            listId: 'l2',
+            listName: null,
+            dueDate: '2026-09-01',
+            updatedAt: '2026-08-02T00:00:00.000Z',
+          },
+        ],
+        total: 2,
+        page: 1,
+        pageSize: 20,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      });
+      mockTaskDependencyService.hasBlockers.mockResolvedValue({
+        'task-1': true,
+        'task-2': false,
+      });
+      // ⚠️ 不能 mockResolvedValueOnce 链：findMyActivities（3 次 query）与
+      // findMyUnreadCounts（1 次 query）在 Promise.all 内并行，Once 消费顺序不确定。
+      // 按 SQL 内容路由（unread SQL 含 topic_participants，与 activity 三 SQL 可区分）。
+      (mockAgentRepo.manager.query as jest.Mock).mockImplementation((sql: string) => {
+        if (sql.includes('topic_participants')) {
+          return Promise.resolve([{ topicId: 'topic-1', topicName: 'T1', unreadCount: 3 }]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const result = await service.getMyBriefing(actor, {
+        taskLimit: 20,
+        activityLimit: 10,
+        maxContentLength: 300,
+      });
+
+      // me：12 字段全集（14 白名单 - avatarUrl - apiKeyPrefix），敏感字段不出网
+      expect(Object.keys(result.me).sort()).toEqual([
+        'capabilities',
+        'createdAt',
+        'description',
+        'descriptionSnippet',
+        'id',
+        'lastActiveAt',
+        'messageCount',
+        'name',
+        'ownerId',
+        'ownerName',
+        'status',
+        'topicCount',
+      ]);
+      expect(result.me).toMatchObject({
+        id: 'agent-1',
+        name: 'Test Agent',
+        status: 'active',
+        ownerId: 'user-1',
+      });
+      expect(result.me).not.toHaveProperty('avatarUrl');
+      expect(result.me).not.toHaveProperty('apiKeyPrefix');
+      expect(result.me).not.toHaveProperty('webhookSecret');
+      expect(result.me).not.toHaveProperty('systemPrompt');
+      expect(result.me).not.toHaveProperty('modelConfig');
+      expect(result.me).not.toHaveProperty('rateLimit');
+
+      // activeTasks：12 字段投影（null 保留、白名单外剔除）+ hasBlockers 合并
+      expect(result.activeTasks).toEqual({
+        items: [
+          {
+            id: 'task-1',
+            title: 'T1',
+            status: 'in_progress',
+            priority: 'p1',
+            labels: ['bug'],
+            boardId: 'b1',
+            boardName: 'Board',
+            listId: 'l1',
+            listName: 'List',
+            dueDate: null,
+            updatedAt: '2026-08-01T00:00:00.000Z',
+            hasBlockers: true,
+          },
+          {
+            id: 'task-2',
+            title: 'T2',
+            status: 'todo',
+            priority: 'p2',
+            labels: null,
+            boardId: null,
+            boardName: null,
+            listId: 'l2',
+            listName: null,
+            dueDate: '2026-09-01',
+            updatedAt: '2026-08-02T00:00:00.000Z',
+            hasBlockers: false,
+          },
+        ],
+        total: 2,
+      });
+
+      expect(result.unreadCounts).toEqual([
+        { topicId: 'topic-1', topicName: 'T1', unreadCount: 3 },
+      ]);
+      expect(result.recentActivities).toEqual([]);
+
+      // 编排调用断言：me 同源（findOne）+ tasks 走 findAll（statusPriority + 权限 actor）
+      expect(mockAgentRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'agent-1' },
+        relations: { actor: true },
+      });
+      expect(mockTaskService.findAll).toHaveBeenCalledWith(
+        {
+          assigneeId: 'agent-1',
+          status: [TaskStatus.BACKLOG, TaskStatus.TODO, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED],
+          pageSize: 20,
+          sort: 'statusPriority',
+        },
+        actor,
+      );
+      expect(mockTaskDependencyService.hasBlockers).toHaveBeenCalledWith(['task-1', 'task-2']);
+
+      // 读操作不落审计行（与 digest/overview 一致）
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('should use default active statuses when statuses omitted and pass custom statuses through', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue(emptyTasks);
+      mockEmptyQueries();
+
+      await service.getMyBriefing(actor, {});
+      expect(mockTaskService.findAll).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: [TaskStatus.BACKLOG, TaskStatus.TODO, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED],
+        }),
+        actor,
+      );
+
+      await service.getMyBriefing(actor, { statuses: [TaskStatus.REVIEW, TaskStatus.DONE] });
+      expect(mockTaskService.findAll).toHaveBeenCalledWith(
+        expect.objectContaining({ status: [TaskStatus.REVIEW, TaskStatus.DONE] }),
+        actor,
+      );
+    });
+
+    it('should omit unreadCounts key when unread query fails (degradation, not whole briefing)', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue(emptyTasks);
+      // unread SQL（含 topic_participants）失败，activity 三 SQL 正常
+      (mockAgentRepo.manager.query as jest.Mock).mockImplementation((sql: string) => {
+        if (sql.includes('topic_participants')) {
+          return Promise.reject(new Error('db down'));
+        }
+        return Promise.resolve([]);
+      });
+
+      const result = await service.getMyBriefing(actor, {});
+
+      expect(result).not.toHaveProperty('unreadCounts');
+      expect(result.activeTasks).toEqual({ items: [], total: 0 });
+      expect(result.recentActivities).toEqual([]);
+      expect(result.me).toBeDefined();
+    });
+
+    it('should omit hasBlockers key when blockers query fails (degradation, no false fill)', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue({
+        ...emptyTasks,
+        items: [{ id: 'task-1', title: 'T1', status: 'todo' }],
+        total: 1,
+      });
+      mockTaskDependencyService.hasBlockers.mockRejectedValue(new Error('db down'));
+      mockEmptyQueries();
+
+      const result = await service.getMyBriefing(actor, {});
+
+      // 降级：hasBlockers 键省略，不补 false（未知 ≠ 无 blocker）
+      expect(result.activeTasks.items[0]).toEqual({ id: 'task-1', title: 'T1', status: 'todo' });
+      expect(result.activeTasks.items[0]).not.toHaveProperty('hasBlockers');
+    });
+
+    it('should skip blockers query when no task items', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue(emptyTasks);
+      mockEmptyQueries();
+
+      const result = await service.getMyBriefing(actor, {});
+
+      expect(mockTaskDependencyService.hasBlockers).not.toHaveBeenCalled();
+      expect(result.activeTasks).toEqual({ items: [], total: 0 });
+    });
+
+    it('should truncate activity content with contentTruncated flag (non-string exempt)', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue(emptyTasks);
+      const longContent = 'x'.repeat(500);
+      (mockAgentRepo.manager.query as jest.Mock).mockImplementation((sql: string) => {
+        if (sql.includes("'message' as type")) {
+          return Promise.resolve([
+            {
+              type: 'message',
+              id: 'm1',
+              topicId: 't1',
+              content: longContent,
+              createdAt: '2026-08-01T00:00:00.000Z',
+            },
+          ]);
+        }
+        if (sql.includes("'task' as type")) {
+          return Promise.resolve([
+            {
+              type: 'task',
+              id: 'task-1',
+              title: 'T1',
+              status: 'todo',
+              createdAt: '2026-08-01T00:00:00.000Z',
+              updatedAt: '2026-08-01T00:00:00.000Z',
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      const result = await service.getMyBriefing(actor, { maxContentLength: 100 });
+
+      const message = result.recentActivities[0] as Record<string, unknown>;
+      expect(message.content).toBe('x'.repeat(100));
+      expect(message.contentTruncated).toBe(true);
+      // 非 string 豁免：task 型条目无 content 字段，原样透传
+      const task = result.recentActivities[1] as Record<string, unknown>;
+      expect(task).not.toHaveProperty('contentTruncated');
+      expect(task.title).toBe('T1');
+    });
+
+    it('should not truncate when maxContentLength is 0 and clamp >50000 to 50000', async () => {
+      mockAgentRepo.findOne.mockResolvedValue(createMockAgent());
+      mockTaskService.findAll.mockResolvedValue(emptyTasks);
+      const longContent = 'y'.repeat(60000);
+      (mockAgentRepo.manager.query as jest.Mock).mockImplementation((sql: string) => {
+        if (sql.includes("'message' as type")) {
+          return Promise.resolve([
+            {
+              type: 'message',
+              id: 'm1',
+              topicId: 't1',
+              content: longContent,
+              createdAt: '2026-08-01T00:00:00.000Z',
+            },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      // 0 = 不截断返全文（哨兵语义）
+      const full = await service.getMyBriefing(actor, { maxContentLength: 0 });
+      expect((full.recentActivities[0] as Record<string, unknown>).content).toBe(longContent);
+      expect(
+        (full.recentActivities[0] as Record<string, unknown>).contentTruncated,
+      ).toBeUndefined();
+
+      // 60000 → 防御性钳到 50000（DTO 已 400 拦截，此处兜底直接调 service 的场景）
+      const clamped = await service.getMyBriefing(actor, { maxContentLength: 60000 });
+      expect((clamped.recentActivities[0] as Record<string, unknown>).content).toHaveLength(50000);
+      expect((clamped.recentActivities[0] as Record<string, unknown>).contentTruncated).toBe(true);
     });
   });
 });

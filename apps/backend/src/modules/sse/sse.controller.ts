@@ -46,7 +46,9 @@ export class SseController {
 
   @UseGuards(JwtOrApiKeyGuard)
   @Sse('stream')
-  @ApiOperation({ summary: 'SSE stream（按连接 actor 授权过滤；types/topics 为偏好过滤，与可见性取交集）' })
+  @ApiOperation({
+    summary: 'SSE stream（按连接 actor 授权过滤；types/topics 为偏好过滤，与可见性取交集）',
+  })
   @ApiQuery({ name: 'types', required: false, description: '订阅事件类型，逗号分隔（偏好过滤）' })
   @ApiQuery({ name: 'topics', required: false, description: '订阅话题 ID，逗号分隔（偏好过滤）' })
   stream(

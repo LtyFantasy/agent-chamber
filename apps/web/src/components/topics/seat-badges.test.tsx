@@ -59,6 +59,25 @@ jest.mock('@/lib/api', () => ({
       listSeats: jest.fn(),
     },
   },
+  // 值域常量（与 api.ts 单源一致；组件 statusBadgeClass 消费）
+  SEAT_LIFECYCLE_STATUSES: ['active', 'paused', 'parked', 'offline', 'removed'],
+  SEAT_LIFECYCLE_STATUS: {
+    ACTIVE: 'active',
+    PAUSED: 'paused',
+    PARKED: 'parked',
+    OFFLINE: 'offline',
+    REMOVED: 'removed',
+  },
+  // 值域常量（与 api.ts 单源一致；内嵌 RunnerConnectGuide 的 runner 在线判定消费）
+  RUNNER_STATUS: { ONLINE: 'online', OFFLINE: 'offline' },
+  // 值域常量（与 api.ts 单源一致；内嵌 RunnerConnectGuide 的 presence 存活判定消费）
+  PRESENCE_PHASE: {
+    THINKING: 'thinking',
+    TOOL: 'tool',
+    REPLYING: 'replying',
+    IDLE: 'idle',
+    OFFLINE: 'offline',
+  },
 }));
 
 // 全局 confirm mock：resolve 值控制「确认/取消」分支（异步确认需 await act 结算）

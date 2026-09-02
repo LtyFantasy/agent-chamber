@@ -44,6 +44,8 @@ export class AddIdempotencyResponseSnapshot1787360000000 implements MigrationInt
     await queryRunner.query(
       `ALTER TABLE "idempotency_records" DROP COLUMN IF EXISTS "response_snapshot"`,
     );
-    await queryRunner.query(`ALTER TABLE "idempotency_records" DROP COLUMN IF EXISTS "request_hash"`);
+    await queryRunner.query(
+      `ALTER TABLE "idempotency_records" DROP COLUMN IF EXISTS "request_hash"`,
+    );
   }
 }

@@ -68,6 +68,7 @@ import {
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 
 /**
@@ -175,7 +176,7 @@ export class MilestoneService {
       // newData 白名单 {milestoneId, name, version?, status?}（决策 6；body/deployMeta 不入）
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'milestone',
+        entityType: AUDIT_ENTITY_TYPE.MILESTONE,
         entityId: saved.id,
         actorId: actor.id,
         newData: {
@@ -419,7 +420,7 @@ export class MilestoneService {
       // version?, status?}（决策 6；body/deployMeta 不入）
       await this.auditService.log({
         action: AuditAction.UPDATE,
-        entityType: 'milestone',
+        entityType: AUDIT_ENTITY_TYPE.MILESTONE,
         entityId: saved.id,
         actorId: actor.id,
         newData: {
@@ -543,7 +544,7 @@ export class MilestoneService {
       // {milestoneId, name, status: deployed}（决策 6；deployMeta 不入）
       await this.auditService.log({
         action: AuditAction.UPDATE,
-        entityType: 'milestone',
+        entityType: AUDIT_ENTITY_TYPE.MILESTONE,
         entityId: saved.id,
         actorId: actor.id,
         newData: { milestoneId: saved.id, name: saved.name, status: MilestoneStatus.DEPLOYED },
@@ -601,7 +602,7 @@ export class MilestoneService {
     // 审计（Phase 2）：DELETE + milestone；newData 白名单 {milestoneId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'milestone',
+      entityType: AUDIT_ENTITY_TYPE.MILESTONE,
       entityId: id,
       actorId: actor.id,
       newData: { milestoneId: id, name: milestone.name },

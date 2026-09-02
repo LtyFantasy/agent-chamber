@@ -3,7 +3,7 @@
 import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { MotionConfig, motion } from 'framer-motion';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { useAuthStore } from '@/stores/auth.store';
 import { Api } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -12,6 +12,7 @@ import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Avatar } from '@/components/ui/avatar';
 import { AmbientGlow } from '@/components/layout/ambient-glow';
+import { topicStatusMap as statusMap } from '@/lib/status-visuals';
 import { formatRelativeTime, cn } from '@/lib/utils';
 import { fadeSlideUp, staggerContainer, useCountUp } from '@/lib/animations';
 import {
@@ -24,22 +25,6 @@ import {
   Trophy,
   Flame,
 } from 'lucide-react';
-
-const statusMap: Record<
-  string,
-  {
-    labelKey: string;
-    variant: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning';
-  }
-> = {
-  draft: { labelKey: 'topics.status.draft', variant: 'secondary' },
-  open: { labelKey: 'topics.status.open', variant: 'default' },
-  active: { labelKey: 'topics.status.active', variant: 'success' },
-  voting: { labelKey: 'topics.status.voting', variant: 'warning' },
-  paused: { labelKey: 'topics.status.paused', variant: 'warning' },
-  closed: { labelKey: 'topics.status.closed', variant: 'destructive' },
-  archived: { labelKey: 'topics.status.archived', variant: 'outline' },
-};
 
 /**
  * StatNumber — 统计卡大数字，挂载时从 0 滚动到目标值。
@@ -56,6 +41,7 @@ const RECENT_ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 export function AdminDashboard() {
   const { user } = useAuthStore();
   const t = useTranslations('dashboard');
+  const locale = useLocale();
   const tGlobal = useTranslations();
 
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -234,9 +220,9 @@ export function AdminDashboard() {
                               </p>
                             </div>
                           </div>
-                          <Badge variant="outline">
+                          <Badge variant="outline" className="whitespace-nowrap">
                             {activity.lastActiveAt
-                              ? formatRelativeTime(activity.lastActiveAt)
+                              ? formatRelativeTime(activity.lastActiveAt, locale)
                               : t('neverActive')}
                           </Badge>
                         </div>
@@ -362,9 +348,9 @@ export function AdminDashboard() {
                             </Badge>
                             <span className="text-xs text-muted-foreground">
                               {topic.lastMessageAt
-                                ? formatRelativeTime(topic.lastMessageAt)
+                                ? formatRelativeTime(topic.lastMessageAt, locale)
                                 : topic.updatedAt
-                                  ? formatRelativeTime(topic.updatedAt)
+                                  ? formatRelativeTime(topic.updatedAt, locale)
                                   : ''}
                             </span>
                           </div>

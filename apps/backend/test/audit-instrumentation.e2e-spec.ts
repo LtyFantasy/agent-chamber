@@ -216,6 +216,22 @@ describe('活动日志插桩（Phase 2）— 真实 PG 集成', () => {
     if (created.auditIds.length > 0) {
       await ds.getRepository(AuditLog).delete({ id: In(created.auditIds) });
     }
+    // 补漏：service 自动写的 audit 行（topic create / topic_participant create）——
+    // 断言只收集了部分行，按本套件实体 id 全量清理（08-29 全量跑实测残留 4 行，
+    // 挤占 activity-logs 套件 admin 全量查询的 20 条窗口）
+    if (created.topicIds.length > 0) {
+      await ds
+        .getRepository(AuditLog)
+        .createQueryBuilder()
+        .delete()
+        .where('entity_id = ANY(:ids)', { ids: created.topicIds })
+        .execute();
+      // topic_participant 行 entity_id 是 participant（非 topic），按 new_data->>'topicId' 匹配
+      await ds.query(
+        `DELETE FROM audit_logs WHERE entity_type = 'topic_participant' AND new_data->>'topicId' = ANY($1)`,
+        [created.topicIds],
+      );
+    }
     for (const pid of created.participantIds) {
       await ds
         .getRepository(TopicParticipant)

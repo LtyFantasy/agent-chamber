@@ -21,7 +21,7 @@
 
 'use client';
 
-import { useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useTranslations } from 'next-intl';
 import { Upload, X, AlertTriangle, CheckCircle, FileText } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -111,7 +111,6 @@ function sliceFiles(files: PendingFile[]): PendingFile[][] {
 
 export interface BatchUploadDialogProps {
   spaceId: string;
-  existingPaths: string[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onUploaded: () => void;
@@ -127,10 +126,12 @@ export interface BatchUploadDialogProps {
  * 4. 「开始上传」→ 按 content 累加 ≤3MB 且 ≤50 篇切片
  * 5. 逐片顺序 `await` POST batch 端点，显示进度
  * 6. 结束汇总：created/updated/unchanged/failed 计数 + failed 列表
+ *
+ * 覆盖标记（v1.70.0-dev 懒加载改造）：on-open 按 pathPrefix 分页拉取已存在路径
+ * （有界——最多 5 页 500 条；超出边界的冲突标记可能漏标，属已知权衡）。
  */
 export function BatchUploadDialog({
   spaceId,
-  existingPaths,
   open,
   onOpenChange,
   onUploaded,
@@ -143,6 +144,30 @@ export function BatchUploadDialog({
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [summary, setSummary] = useState<BatchUpsertResponse['summary'] | null>(null);
   const [failedItems, setFailedItems] = useState<BatchDocResult[]>([]);
+  /** 已存在路径（on-open 有界拉取；空 = 未拉取/拉取失败，冲突标记降级为空） */
+  const [existingPaths, setExistingPaths] = useState<string[]>([]);
+
+  /** on-open 拉取已存在路径（pathPrefix='' 根目录 = 全空间；分页有界，防全量拉取） */
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      const paths: string[] = [];
+      try {
+        for (let page = 1; page <= 5; page++) {
+          const res = await Api.docs.listDocs(spaceId, { pathPrefix: '', page, pageSize: 100 });
+          paths.push(...res.items.map((d) => d.path));
+          if (!res.hasNext || paths.length >= res.total) break;
+        }
+      } catch {
+        // 拉取失败：冲突标记降级为空（不阻塞上传流程）
+      }
+      if (!cancelled) setExistingPaths(paths);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, spaceId]);
 
   /** 重置所有状态 */
   const reset = useCallback(() => {
@@ -252,6 +277,7 @@ export function BatchUploadDialog({
         failed += res.summary.failed;
 
         for (const item of res.results) {
+          // eslint-disable-next-line rulesdir/no-magic-string-compare -- batch 单项结果状态（'created'|'updated'|'unchanged'|'failed'，本地 BatchDocResult 类型），非 WebhookStatus
           if (item.status === 'failed') {
             allFailed.push(item);
           }
@@ -385,6 +411,7 @@ export function BatchUploadDialog({
         )}
 
         {/* ── 完成汇总 ── */}
+        {/* eslint-disable-next-line rulesdir/no-magic-string-compare -- 对话框本地状态机阶段（UploadPhase），非 TaskStatus */}
         {phase === 'done' && summary && (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-2 text-sm">
@@ -444,6 +471,7 @@ export function BatchUploadDialog({
             {t('start')}
           </Button>
         )}
+        {/* eslint-disable-next-line rulesdir/no-magic-string-compare -- 对话框本地状态机阶段（UploadPhase），非 TaskStatus */}
         {phase === 'done' && (
           <>
             <Button variant="outline" onClick={reset}>

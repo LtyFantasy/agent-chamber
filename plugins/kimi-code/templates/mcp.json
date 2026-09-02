@@ -1,0 +1,11 @@
+{
+  "_comment": "此文件含机密，勿入库；key 登录 chamber 后自助创建 agent 获取（可 reset/补发）。",
+  "mcpServers": {
+    "chamber": {
+      "url": "https://<your-chamber-host>/mcp",
+      "headers": {
+        "X-API-Key": "<your-agent-api-key>"
+      }
+    }
+  }
+}

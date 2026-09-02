@@ -23,6 +23,7 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { Priority } from '@agent-chamber/shared';
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -297,7 +298,8 @@ export const createTaskTool: CustomTool = {
         },
         priority: {
           type: 'string',
-          enum: ['p0', 'p1', 'p2', 'p3'],
+          // 枚举值从 shared Priority 单源取值（防 backend DTO 加值后此处漂移）
+          enum: Object.values(Priority),
           description: 'Priority (optional)',
         },
         dueDate: {

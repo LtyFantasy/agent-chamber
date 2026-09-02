@@ -1,10 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { Visibility } from '@agent-chamber/shared';
+import { Visibility, ResourceType } from '@agent-chamber/shared';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { formatRelativeTime } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -36,6 +36,7 @@ type BindType = 'none' | 'topic' | 'board';
 export default function DocsPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('docs');
+  const locale = useLocale();
   const tGlobal = useTranslations();
 
   // ── 新建空间表单状态（脏状态本地 useState，铁律 #4） ──
@@ -60,12 +61,12 @@ export default function DocsPage() {
   const { data: topicsData } = useQuery({
     queryKey: ['topics', 'list'],
     queryFn: () => Api.topics.list({ pageSize: 100 }),
-    enabled: createOpen && bindType === 'topic',
+    enabled: createOpen && bindType === ResourceType.TOPIC,
   });
   const { data: boardsData } = useQuery({
     queryKey: ['boards', 'list'],
     queryFn: () => Api.boards.list({ pageSize: 100 }),
-    enabled: createOpen && bindType === 'board',
+    enabled: createOpen && bindType === ResourceType.BOARD,
   });
 
   /** mutation 错误统一提示：优先透传服务端 message（范式照抄 task-detail-panel.tsx），兜底领域文案 */
@@ -112,8 +113,8 @@ export default function DocsPage() {
       name: newName,
       description: newDesc || undefined,
       visibility: newVisibility,
-      topicId: bindType === 'topic' && bindTargetId ? bindTargetId : undefined,
-      boardId: bindType === 'board' && bindTargetId ? bindTargetId : undefined,
+      topicId: bindType === ResourceType.TOPIC && bindTargetId ? bindTargetId : undefined,
+      boardId: bindType === ResourceType.BOARD && bindTargetId ? bindTargetId : undefined,
     });
   };
 
@@ -153,10 +154,10 @@ export default function DocsPage() {
                   <div className="flex items-start justify-between">
                     <CardTitle className="text-lg flex items-center">
                       {space.name}
-                      {space.visibility === 'private' && (
+                      {space.visibility === Visibility.PRIVATE && (
                         <Lock className="ml-2 h-4 w-4 text-amber-500" />
                       )}
-                      {(space.visibility === 'open' || !space.visibility) && (
+                      {(space.visibility === Visibility.OPEN || !space.visibility) && (
                         <Globe className="ml-2 h-4 w-4 text-emerald-500" />
                       )}
                     </CardTitle>
@@ -213,7 +214,7 @@ export default function DocsPage() {
                     </span>
                     {space.updatedAt && (
                       <span className="text-xs text-muted-foreground">
-                        {formatRelativeTime(space.updatedAt)}
+                        {formatRelativeTime(space.updatedAt, locale)}
                       </span>
                     )}
                   </div>
@@ -297,7 +298,7 @@ export default function DocsPage() {
               >
                 <option value="">{t('form.selectTarget')}</option>
                 {/* 两路分开渲染：Topic 用 title、Board 用 name，规避联合类型窄化 */}
-                {bindType === 'topic'
+                {bindType === ResourceType.TOPIC
                   ? (topicsData?.items ?? []).map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.title}

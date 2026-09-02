@@ -13,6 +13,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   // 支持 {param} 简单插值（测试文案用简版占位，与 en.json 的 ICU 语法无关）
   useTranslations: (ns?: string) => (key: string, params?: Record<string, string | number>) => {
     const fullKey = ns ? `${ns}.${key}` : key;

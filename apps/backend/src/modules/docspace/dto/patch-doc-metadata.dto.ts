@@ -36,6 +36,7 @@ import {
   Length,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { DOC_TITLE_MAX_LENGTH, DOC_SUMMARY_MAX_LENGTH } from '@agent-chamber/shared';
 
 /**
  * PATCH /docs/:id/metadata 请求体（v1.61.0 批次 2，metadata-only 写通道）
@@ -68,26 +69,27 @@ export class PatchDocMetadataDto {
   @ApiPropertyOptional({
     description:
       'New title (≤200 chars). Absent = keep current; null = 400 (three-state partial semantics).',
-    maxLength: 200,
+    maxLength: DOC_TITLE_MAX_LENGTH,
   })
   // 三态区分：undefined 跳过校验（缺席=不动）；null 进入校验被 @IsString 拒绝 400。
   // ⚠️ 禁止换回 @IsOptional（null 会被当缺席静默跳过，破坏三态契约——见 AGENT-HOOK）
   @ValidateIf((_o, value) => value !== undefined)
   @IsString()
-  // docs.title 列为 varchar(200)，超长必须在 DTO 层 400，禁止透传 PG 22001 → 500（铁律 21）
-  @MaxLength(200)
+  // docs.title 列为 varchar(200)，超长必须在 DTO 层 400，禁止透传 PG 22001 → 500（铁律 21）；
+  // 列长单源 = shared DOC_TITLE_MAX_LENGTH（review-0831 任务 e013af33 收敛）
+  @MaxLength(DOC_TITLE_MAX_LENGTH)
   title?: string;
 
   @ApiPropertyOptional({
     description:
       'New summary (≤500 chars). Absent = keep current; empty string = store empty; ' +
       'null = 400 (three-state partial semantics).',
-    maxLength: 500,
+    maxLength: DOC_SUMMARY_MAX_LENGTH,
   })
   @ValidateIf((_o, value) => value !== undefined)
   @IsString()
-  // docs.summary 列为 varchar(500)，同 upsert 契约
-  @MaxLength(500)
+  // docs.summary 列为 varchar(500)，同 upsert 契约；列长单源 = shared DOC_SUMMARY_MAX_LENGTH
+  @MaxLength(DOC_SUMMARY_MAX_LENGTH)
   summary?: string;
 
   @ApiPropertyOptional({

@@ -90,6 +90,7 @@ import {
   ActorType,
   ErrorCode,
   EventType,
+  ResourceType,
   TaskDependencyType,
   TaskStatus,
 } from '@agent-chamber/shared';
@@ -111,6 +112,7 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 import type { PaginatedResponse, TaskSummary } from '@agent-chamber/shared';
 import type { TaskDocLinkItem } from '@agent-chamber/shared';
@@ -330,12 +332,14 @@ export class TaskService {
       // split 抛错），故 CASE 经 addSelect 命名列 + orderBy 别名。别名必须全小写：
       // getManyAndCount 回捞实体的主查询把 orderBy 键原样拼 SQL（不 escape），
       // 大写别名会被 PG 折叠成小写导致 "column does not exist"（真 PG 实测）。
+      // CASE 状态字面量经 shared TaskStatus 枚举模板插值（受信代码无注入面；
+      // review-0831 任务 e013af33 收敛，生成 SQL 与现状逐字一致）
       qb.addSelect(
         `CASE task.status
-          WHEN 'in_progress' THEN 0
-          WHEN 'todo' THEN 1
-          WHEN 'blocked' THEN 2
-          WHEN 'backlog' THEN 3
+          WHEN '${TaskStatus.IN_PROGRESS}' THEN 0
+          WHEN '${TaskStatus.TODO}' THEN 1
+          WHEN '${TaskStatus.BLOCKED}' THEN 2
+          WHEN '${TaskStatus.BACKLOG}' THEN 3
           ELSE 4 END`,
         'status_priority_order',
       )
@@ -539,6 +543,73 @@ export class TaskService {
     };
   }
 
+  /**
+   * 解析创建任务的目标 Board（B-58 权限前置检查用，与 create() 的 boardId 解析顺序
+   * 逐字对齐，避免 controller 重复实现解析逻辑造成漂移）：
+   * ① listId/statusName 都缺 → 400（与 create 契约一致）
+   * ② statusName 路径 → 要求 boardId，resolveListIdByStatusName 回填 dto.listId
+   *    （副作用与 create 一致；controller 先调本方法后 create 再跑解析是幂等的）
+   * ③ boardId 显式 → 校验 Board 存在并返回
+   * ④ 仅 listId → 从 list→board 推断（list 的 board 软删/缺失时无法判定权限 → 404）
+   * @param dto 创建任务 DTO（statusName 路径会回填 dto.listId）
+   * @returns 目标 Board 实体（不存在抛 404）
+   */
+  async resolveCreateBoard(dto: CreateTaskDto): Promise<Board> {
+    if (!dto.listId && !dto.statusName) {
+      throw new BadRequestException({
+        message: 'Either listId or statusName is required',
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+    if (!dto.listId && dto.statusName) {
+      if (!dto.boardId) {
+        throw new BadRequestException({
+          message: 'boardId is required when resolving the target list by statusName',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
+      const resolved = await this.resolveListIdByStatusName(dto.statusName, dto.boardId);
+      dto.listId = resolved.listId;
+    }
+    if (dto.boardId) {
+      return this.resourceValidator.exists(this.boardRepo, dto.boardId, ErrorCode.BOARD_NOT_FOUND);
+    }
+    const list = await this.boardListRepo.findOne({
+      where: { id: dto.listId },
+      relations: ['board'],
+    });
+    if (!list) {
+      throw new NotFoundException({
+        message: 'Board list not found',
+        code: ErrorCode.LIST_NOT_FOUND,
+      });
+    }
+    if (!list.board) {
+      // list 存在但 board 软删/缺失：create 会照常落库（boardId 仍可派生），但权限
+      // 无法判定——安全默认拒绝（404，与 ensureCan read 语义一致，不泄露存在性）
+      throw new NotFoundException({
+        message: 'Board not found',
+        code: ErrorCode.BOARD_NOT_FOUND,
+      });
+    }
+    return list.board;
+  }
+
+  /**
+   * 解析 Task 所属 Board（B-58 批量权限前置检查用；orphan task 无 listId 返回 null =
+   * 公开，与 TaskPolicy 的 orphan 语义一致）
+   * @param task 已加载的 Task 实体
+   * @returns 所属 Board 实体；orphan task 或 list 的 board 软删/缺失返回 null
+   */
+  async resolveTaskBoard(task: Task): Promise<Board | null> {
+    if (!task.listId) return null;
+    const list = await this.boardListRepo.findOne({
+      where: { id: task.listId },
+      relations: ['board'],
+    });
+    return list?.board ?? null;
+  }
+
   async create(dto: CreateTaskDto, actorId?: string, actorType?: ActorType) {
     // ── statusName → listId 解析（与 MCP create_task 的 resolveList 契约对齐）──
     // 契约：listId 与 statusName 必须至少提供一个（都缺 → 400）；同时提供时 listId 优先、
@@ -631,7 +702,7 @@ export class TaskService {
       // 触发事件（boardId 复用本地推断值，Task 实体不存储 boardId）
       await this.eventService.create({
         eventType: EventType.TASK_UPDATE,
-        resourceType: 'task',
+        resourceType: ResourceType.TASK,
         resourceId: savedTask.id,
         topicId: topicId ?? undefined,
         boardId: boardId ?? undefined,
@@ -659,7 +730,7 @@ export class TaskService {
       // assigneeId?}（决策 6；description/customFields 不入）
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'task',
+        entityType: AUDIT_ENTITY_TYPE.TASK,
         entityId: savedTask.id,
         actorId: actorId ?? null,
         newData: {
@@ -701,7 +772,7 @@ export class TaskService {
       // 事务成功后执行副作用（事件、活跃时间、活动日志）
       await this.eventService.create({
         eventType: EventType.TASK_UPDATE,
-        resourceType: 'task',
+        resourceType: ResourceType.TASK,
         resourceId: savedTask.id,
         topicId: topicId ?? undefined,
         boardId: boardId ?? undefined,
@@ -726,7 +797,7 @@ export class TaskService {
       // 返回，不落审计——决策 2「幂等 replay 不重复记」）；载荷与无幂等键路径一致
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'task',
+        entityType: AUDIT_ENTITY_TYPE.TASK,
         entityId: savedTask.id,
         actorId: actorId ?? null,
         newData: {
@@ -973,7 +1044,7 @@ export class TaskService {
     });
     await this.eventService.create({
       eventType: EventType.TASK_UPDATE,
-      resourceType: 'task',
+      resourceType: ResourceType.TASK,
       resourceId: saved.id,
       topicId: updatedList?.board?.topicId ?? undefined,
       boardId: updatedList?.boardId ?? undefined,
@@ -1020,7 +1091,7 @@ export class TaskService {
     // status?/listId?/assigneeId? 前后值}（决策 6；description/customFields 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'task',
+      entityType: AUDIT_ENTITY_TYPE.TASK,
       entityId: saved.id,
       actorId: actorId ?? null,
       newData: {
@@ -1213,7 +1284,7 @@ export class TaskService {
       // ── 事务提交后副作用（照 update() 对 description 变更的既有行为）──
       await this.eventService.create({
         eventType: EventType.TASK_UPDATE,
-        resourceType: 'task',
+        resourceType: ResourceType.TASK,
         resourceId: id,
         topicId: topicId ?? undefined,
         boardId: boardId ?? undefined,
@@ -1240,7 +1311,7 @@ export class TaskService {
       // newData 白名单 {taskId, title}（决策 6——description 正文不入）
       await this.auditService.log({
         action: AuditAction.UPDATE,
-        entityType: 'task',
+        entityType: AUDIT_ENTITY_TYPE.TASK,
         entityId: id,
         actorId: actor.id,
         newData: { taskId: id, title },
@@ -1320,9 +1391,14 @@ export class TaskService {
       task.status = list.mappedStatus;
       autoStatus = true;
 
-      // 状态机不变量
+      // 状态机不变量（与 update() 930-936 双向语义对齐，B-60）：
+      // status=done ⇔ completedAt 非空——离开 DONE 必须反向清理，否则
+      // board digest recentDone 段（status=DONE + completedAt 非空）口径被污染
       if (task.status === TaskStatus.DONE) {
         task.completedAt = new Date();
+      }
+      if (task.status !== TaskStatus.DONE && oldStatus === TaskStatus.DONE) {
+        task.completedAt = null;
       }
       if (task.status === TaskStatus.IN_PROGRESS && !task.startedAt) {
         task.startedAt = new Date();
@@ -1333,7 +1409,7 @@ export class TaskService {
 
     await this.eventService.create({
       eventType: EventType.TASK_UPDATE,
-      resourceType: 'task',
+      resourceType: ResourceType.TASK,
       resourceId: saved.id,
       topicId: list.board?.topicId ?? undefined,
       boardId: list.boardId ?? undefined,
@@ -1458,7 +1534,7 @@ export class TaskService {
     // {taskId, commentId}（决策 6——content 显式黑名单，正文永不入审计）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'task_comment',
+      entityType: AUDIT_ENTITY_TYPE.TASK_COMMENT,
       entityId: saved.id,
       actorId: authorId,
       newData: { taskId: id, commentId: saved.id },
@@ -1566,7 +1642,7 @@ export class TaskService {
     // 提前返回不记；newData 白名单 {taskId, docId}；entityId=docId（复合主键无 id 列）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'doc_link',
+      entityType: AUDIT_ENTITY_TYPE.DOC_LINK,
       entityId: docId,
       actorId: actor.id,
       newData: { taskId, docId },

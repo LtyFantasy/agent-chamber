@@ -14,6 +14,7 @@ export { PatchDocContentDto } from './patch-doc-content.dto';
 export { AppendDocDto } from './append-doc.dto';
 export { PatchDocMetadataDto } from './patch-doc-metadata.dto';
 export { QueryDocDto } from './query-doc.dto';
+export { QueryDocTreeDto, DOC_TREE_SORT_VALUES, DocTreeSort } from './query-doc-tree.dto';
 export { DocOverviewQueryDto } from './doc-overview.dto';
 export { DocSearchDto } from './doc-search.dto';
 export { AddDocLinkDto } from './doc-link.dto';
@@ -24,6 +25,10 @@ export { UpdateDocRouteDto } from './update-doc-route.dto';
 export { QueryDocRouteDto } from './query-doc-route.dto';
 export { RepoManifestDto, RepoManifestFileConstraint } from './repo-manifest.dto';
 export { TransferCreatorDto } from './transfer-creator.dto';
+export { UpsertDiagramDto } from './upsert-diagram.dto';
+export { PatchDiagramDto, DiagramPatchItemDto } from './patch-diagram.dto';
+export { ValidateDiagramDto, ValidateDiagramPatchItemDto } from './validate-diagram.dto';
+export { DiagramHtmlQueryDto } from './diagram-html-query.dto';
 export {
   ImportDocBundleDto,
   BundleSpaceMetaDto,

@@ -51,4 +51,30 @@ describe('QueryTopicDto', () => {
     const errors = await validate(dto);
     expect(errors).toHaveLength(0);
   });
+
+  // v1.70 mine 布尔 query：'true'/'false' 严格解析，其余值 400（对齐项目布尔 query 惯例）
+  it("should parse mine='true' to boolean true", async () => {
+    const dto = plainToInstance(QueryTopicDto, { mine: 'true' });
+    expect(dto.mine).toBe(true);
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("should parse mine='false' to boolean false", async () => {
+    const dto = plainToInstance(QueryTopicDto, { mine: 'false' });
+    expect(dto.mine).toBe(false);
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("should reject non-boolean mine value (e.g. '1') — 不静默当 false", async () => {
+    const dto = plainToInstance(QueryTopicDto, { mine: '1' });
+    const errors = await validate(dto);
+    expect(errors.some((e) => e.property === 'mine' && e.constraints?.isBoolean)).toBe(true);
+  });
+
+  it('should default mine to undefined when absent', async () => {
+    const dto = plainToInstance(QueryTopicDto, {});
+    expect(dto.mine).toBeUndefined();
+  });
 });

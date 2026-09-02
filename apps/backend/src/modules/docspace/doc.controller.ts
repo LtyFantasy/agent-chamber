@@ -9,12 +9,18 @@
  *     双端点——单文档 + 空间全量，write 权限，对齐 routes/recheck 先例）
  *   - 补充: plan patriot-cyclone-deadman.md §2.1（v1.61.0 批次 2：PATCH /docs/:id/metadata
  *     metadata-only 写通道——Partial 三态/hash 必填/native-only/category 解析开关）
+ *   - 补充: plan docspace-lazy-tree-v1.md（v1.70.0-dev：GET /doc-spaces/:id/docs/tree
+ *     懒加载目录树 + /docs/facets 聚合计数——只读端点，权限与 findAll 同款
+ *     ensureCan(space, actor ?? null, 'read')；字面路由与既有 :docId 参数路由无冲突）
  *
  * [踩坑索引]
  *   - Hument 事故（topic msg 6dbc4da3）：stale position fail-open → fail-closed
  *     （2026-08-16）：GET sections @ApiOperation 删掉 "stable cross-update" 失实措辞；
  *     PATCH sections 透传 expectedSectionHash、新增 PATCH /docs/:id/content（match 模式），
  *     前提校验失败 = 409 DOC_CONTENT_CONFLICT / 多命中 = 409 RESOURCE_CONFLICT
+ *   - tree/facets SQL 形态硬约束（plan A1/A2）：WHERE 只用 LIKE（禁止 substring 进
+ *     WHERE）、substring/split_part 只进 SELECT/GROUP BY、plen 由 service JS 算好整数
+ *     传入——改 SQL 前先读 doc.service.ts findTree 注释与 plan「SQL 形态硬约束」节
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #21(双层校验) #22(findOne必须判空)
  *
@@ -41,7 +47,7 @@ import {
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import { ErrorCode } from '@agent-chamber/shared';
+import { ErrorCode, DOC_SOURCE_NATIVE } from '@agent-chamber/shared';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
@@ -53,6 +59,7 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import {
   UpsertDocDto,
   QueryDocDto,
+  QueryDocTreeDto,
   DocSearchDto,
   BatchUpsertDocsDto,
   DocDetailQueryDto,
@@ -196,6 +203,90 @@ export class DocController {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
     return this.docService.findAll(spaceId, query);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('doc-spaces/:id/docs/tree')
+  @ApiOperation({
+    summary: 'Get lazy directory tree at a prefix (folders + direct docs)',
+    description:
+      'Lazy directory browsing (v1.70.0-dev): returns the direct sub-folders of the given ' +
+      'prefix (with recursive docCount/latestDocAt aggregation) plus the direct docs ' +
+      'attached at this level (slim projection, paginated). ' +
+      'prefix defaults to "" (root level); server normalizes it (leading "/" stripped, ' +
+      'trailing "/" appended when non-empty). sort=recent (default, folders by ' +
+      'latestDocAt DESC) | name (folders by segment name ASC). ' +
+      'docsLimit max 200 / foldersLimit max 500 (400 when exceeded). ' +
+      'Requires the same read permission as the space.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'prefix',
+    required: false,
+    description: 'Path prefix (default "" = root level)',
+    type: String,
+  })
+  @ApiQuery({
+    name: 'sort',
+    required: false,
+    description: 'recent (default) | name',
+    enum: ['recent', 'name'],
+  })
+  @ApiQuery({
+    name: 'docsLimit',
+    required: false,
+    description: 'Max direct docs (default 50, max 200)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'docsOffset',
+    required: false,
+    description: 'Docs offset (default 0)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'foldersLimit',
+    required: false,
+    description: 'Max folders (default 200, max 500)',
+    type: Number,
+  })
+  @ApiQuery({
+    name: 'foldersOffset',
+    required: false,
+    description: 'Folders offset (default 0)',
+    type: Number,
+  })
+  @ApiResponse({ status: 200, description: 'Directory tree returned successfully' })
+  @ApiResponse({ status: 400, description: 'VALIDATION_ERROR: limit exceeded or malformed query' })
+  async findTree(
+    @Param('id', ParseUUIDPipe) spaceId: string,
+    @Query() query: QueryDocTreeDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docService.findTree(spaceId, query);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('doc-spaces/:id/docs/facets')
+  @ApiOperation({
+    summary: 'Get space-wide aggregation counts (types / tags / categories)',
+    description:
+      'Space-wide facet counts (v1.70.0-dev): types = GROUP BY doc_type (non-empty), ' +
+      'tags = unnest(tags) GROUP BY, categories = JOIN doc_categories (soft-deleted ' +
+      'filtered). Only non-deleted docs are counted. Replaces client-side full-list ' +
+      'aggregation. Requires the same read permission as the space.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Facet counts returned successfully' })
+  async findFacets(
+    @Param('id', ParseUUIDPipe) spaceId: string,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docService.findFacets(spaceId);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -621,7 +712,7 @@ export class DocController {
       id,
       position,
       dto.content,
-      source ?? 'native',
+      source ?? DOC_SOURCE_NATIVE,
       actor,
       dto.expectedSectionHash,
       dto.clientRequestId,
@@ -689,7 +780,7 @@ export class DocController {
       id,
       dto.oldString,
       dto.newString,
-      source ?? 'native',
+      source ?? DOC_SOURCE_NATIVE,
       actor,
       dto.clientRequestId,
     );
@@ -761,7 +852,7 @@ export class DocController {
     return this.docService.appendDoc(
       id,
       { content: dto.content, position: dto.position, headingPath: dto.headingPath },
-      source ?? 'native',
+      source ?? DOC_SOURCE_NATIVE,
       actor,
       dto.clientRequestId,
     );

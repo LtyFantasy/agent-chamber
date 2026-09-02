@@ -59,6 +59,10 @@ export type RoundtablePermissionRequestStatus =
  * - 不建 DB 级物理 FK（D-B1-2 惯例：裸 uuid + 索引，仅 TypeORM 导航）
  */
 @Entity('roundtable_permission_requests')
+// 复合索引（对齐 AddRoundtablePermissionRequests migration 手写定义，查询面 = 按 topic/seat 查 + status 过滤 pending）：
+// 实体曾误声明为单列索引，generate 会反复 DROP+CREATE 同义对象（漂移治理 94502fef）
+@Index('idx_roundtable_perm_reqs_seat_status', ['seatId', 'status'])
+@Index('idx_roundtable_perm_reqs_topic_status', ['topicId', 'status'])
 export class RoundtablePermissionRequest {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -70,12 +74,10 @@ export class RoundtablePermissionRequest {
 
   /** 发起请求的座位（设计 §5 topic_id/seat_id FK；D-B1-2：裸 uuid + 索引，仅导航） */
   @Column({ type: 'uuid', nullable: false, name: 'seat_id' })
-  @Index('idx_roundtable_perm_reqs_seat_status')
   seatId: string;
 
   /** 所属圆桌 topic（冗余落库：座位可能被移除，审批归属仍需可查；同 D-B1-2 惯例） */
   @Column({ type: 'uuid', nullable: false, name: 'topic_id' })
-  @Index('idx_roundtable_perm_reqs_topic_status')
   topicId: string;
 
   /** 工具摘要（ToolBrief，契约①原样透传；web 展示 + 公告摘要数据源） */

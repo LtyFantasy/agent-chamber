@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { Bot } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ActorType } from '@/types';
 
 /**
  * =============================================================================
@@ -119,7 +120,7 @@ function Avatar({
     lg: 'h-2.5 w-2.5',
     xl: 'h-2.5 w-2.5',
   };
-  const showBadge = actorType === 'agent' && size !== 'xs' && !deleted;
+  const showBadge = actorType === ActorType.AGENT && size !== 'xs' && !deleted;
 
   const fallbackText = fallback
     ? fallback

@@ -147,10 +147,8 @@
   },
   "topics": {
     "status": {
-      "draft": "Draft",
       "open": "Open",
       "active": "Active",
-      "voting": "Voting",
       "paused": "Paused",
       "closed": "Closed",
       "archived": "Archived"
@@ -165,7 +163,6 @@
     "viewDetail": "View details",
     "notFound": "Topic not found",
     "backToList": "Back to topic list",
-    "publish": "Publish",
     "pause": "Pause",
     "resume": "Resume",
     "closeTopic": "Close",
@@ -689,7 +686,10 @@
       "browse": "Browse",
       "viewModeTree": "Tree",
       "viewModeCategory": "Category",
-      "docMatches": "Document matches"
+      "docMatches": "Document matches",
+      "docLinkNotFound": "Document not found or has been deleted",
+      "loadMore": "Load more",
+      "loadMoreFolders": "Load more folders"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",
@@ -711,6 +711,19 @@
       "notChecked": "Not yet checked",
       "copied": "Copied",
       "checkedAt": "Checked at: {time}"
+    },
+    "diagram": {
+      "viewerTitle": "Diagram preview",
+      "loadFailed": "Failed to load diagram",
+      "loadFailedDesc": "The diagram snapshot could not be loaded. Please retry, or re-save the diagram through an agent tool.",
+      "infoCard": "Diagram Info",
+      "qualityProfile": "Quality",
+      "renderedAt": "Rendered",
+      "htmlBytes": "Snapshot size",
+      "compositionErrors": "Errors",
+      "compositionWarnings": "Warnings",
+      "fullscreen": "Fullscreen",
+      "exitFullscreen": "Exit fullscreen"
     },
     "members": {
       "title": "Members",
@@ -781,6 +794,8 @@
       "discardConfirm": "You have unsaved changes. Discard them?",
       "pathConflict": "Path already exists, choose another",
       "pathCheckFailed": "Could not verify path uniqueness, please try again",
+      "overwriteTitle": "Path already exists",
+      "overwriteConfirm": "A document already exists at this path. Saving will overwrite it. Continue?",
       "contentLoadError": "Failed to load the original document",
       "contentLoadErrorDesc": "Check your connection and retry, or exit editing",
       "exitEdit": "Exit editing"

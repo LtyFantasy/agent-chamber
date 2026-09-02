@@ -1,4 +1,4 @@
-import { isExternalHref, resolveDocPath, PLATFORM_DOC_LINK_RE } from './doc-link';
+import { isExternalHref, resolveDocPath, resolveDocHref, PLATFORM_DOC_LINK_RE } from './doc-link';
 
 /** 测试用 path → id 映射（模拟空间文档列表） */
 const pathToId = new Map<string, string>([
@@ -92,5 +92,27 @@ describe('resolveDocPath（v1.61.0 严格 POSIX 源目录解析，与后端 link
     '', // 空 href
   ])('非职责范围 %s 返回 undefined（不干预）', (href) => {
     expect(resolveDocPath(href, pathToId, 'docs/spec.md')).toBeUndefined();
+  });
+});
+
+describe('resolveDocHref（懒加载版路径解析：只做路径数学，不依赖文档列表）', () => {
+  it('与 resolveDocPath 同源：根绝对/源相对/上溯/越界判定一致', () => {
+    expect(resolveDocHref('/docs/architecture.md', 'docs/spec.md')).toBe('docs/architecture.md');
+    expect(resolveDocHref('./spec.md', 'docs/README.md')).toBe('docs/spec.md');
+    expect(resolveDocHref('../guides/t.md', 'docs/spec.md')).toBe('guides/t.md');
+    expect(resolveDocHref('../../t.md', 'docs/spec.md')).toBeNull();
+  });
+
+  it('剥离 # 锚点后返回纯路径', () => {
+    expect(resolveDocHref('/docs/spec.md#error-codes', 'docs/README.md')).toBe('docs/spec.md');
+  });
+
+  it.each([
+    '#section', // 纯锚点
+    'images/logo.png', // 非 .md 相对路径
+    'assets/', // 目录
+    '', // 空 href
+  ])('非职责范围 %s 返回 undefined（不干预）', (href) => {
+    expect(resolveDocHref(href, 'docs/spec.md')).toBeUndefined();
   });
 });

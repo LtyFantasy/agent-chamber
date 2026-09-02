@@ -61,6 +61,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   useTranslations: (ns?: string) => (key: string, params?: Record<string, string | number>) => {
     const fullKey = ns ? `${ns}.${key}` : key;
     let text = messages[fullKey] ?? fullKey;
@@ -74,6 +76,9 @@ jest.mock('next-intl', () => ({
 }));
 
 jest.mock('@/lib/api', () => ({
+  // setAuthHooks：auth.store.ts 模块加载时调用（review-0831 任务 04e8d744 拆环注入），
+  // mock 缺此导出会 TypeError: setAuthHooks is not a function
+  setAuthHooks: jest.fn(),
   Api: {
     users: { list: jest.fn() },
     agents: { list: jest.fn() },
@@ -119,8 +124,11 @@ function makeLog(overrides: Partial<ActivityLogItem> & { withIp?: boolean } = {}
     source: 'api',
   };
   if (!withIp) {
-    delete base.ipAddress;
-    delete base.userAgent;
+    // 模拟非 admin 响应服务端剔除 ipAddress/userAgent（SCOP 决策 7，最小披露）——
+    // 类型契约上两字段非可选（ActivityLogItem extends AuditLog），delete 需经 Partial 断言；
+    // 运行时语义不变（键被真实删除，page.tsx 的 'ipAddress' in log 存在性判断依赖此）。
+    delete (base as Partial<ActivityLogItem>).ipAddress;
+    delete (base as Partial<ActivityLogItem>).userAgent;
   }
   return { ...base, ...rest };
 }

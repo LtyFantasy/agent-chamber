@@ -25,8 +25,9 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Priority, TaskStatus } from '@agent-chamber/shared';
+import { AgentStatus, ActivityAction } from '@/types';
 import { Api } from '@/lib/api';
 import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -89,6 +90,7 @@ export function TaskDetailPanel({
   const queryClient = useQueryClient();
   const router = useRouter();
   const t = useTranslations('tasks');
+  const locale = useLocale();
   const tGlobal = useTranslations();
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
   // 不防则连点排队两个确认框——确认两次 = 重复删除任务）
@@ -117,7 +119,7 @@ export function TaskDetailPanel({
     // listAll 循环翻页拉全：单页 pageSize:100 在 >100 个 agent 时静默丢数据（评审 M-e 同类缺口 B6）
     queryFn: () => Api.agents.listAll(),
   });
-  const activeAgents = (agentsData ?? []).filter((a) => a.status === 'active');
+  const activeAgents = (agentsData ?? []).filter((a) => a.status === AgentStatus.ACTIVE);
 
   /** 看板详情（「所在列」显示 +「在看板中查看」链接） */
   const { data: boardData } = useQuery({
@@ -409,13 +411,13 @@ export function TaskDetailPanel({
               <Copy className="h-3 w-3" />
             </button>
           </div>
-          <div className="flex items-center gap-3">
-            <span title={formatDate(task.createdAt)}>
-              {t('created', { time: formatRelativeTime(task.createdAt) })}
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="truncate" title={formatDate(task.createdAt, locale)}>
+              {t('created', { time: formatRelativeTime(task.createdAt, locale) })}
             </span>
             <span className="text-border">·</span>
-            <span title={formatDate(task.updatedAt)}>
-              {t('updated', { time: formatRelativeTime(task.updatedAt) })}
+            <span className="truncate" title={formatDate(task.updatedAt, locale)}>
+              {t('updated', { time: formatRelativeTime(task.updatedAt, locale) })}
             </span>
           </div>
         </div>
@@ -584,7 +586,7 @@ export function TaskDetailPanel({
                       <Clock className="h-3 w-3" />
                       {t('attributes.dueDate')}
                     </span>
-                    <span>{formatDate(task.dueDate)}</span>
+                    <span>{formatDate(task.dueDate, locale)}</span>
                   </div>
                 )}
                 <div className="flex items-center justify-between">
@@ -593,12 +595,12 @@ export function TaskDetailPanel({
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-muted-foreground">{t('attributes.createdAt')}</span>
-                  <span>{formatDate(task.createdAt)}</span>
+                  <span>{formatDate(task.createdAt, locale)}</span>
                 </div>
                 {task.updatedAt && (
                   <div className="flex items-center justify-between">
                     <span className="text-muted-foreground">{t('attributes.updatedAt')}</span>
-                    <span>{formatDate(task.updatedAt)}</span>
+                    <span>{formatDate(task.updatedAt, locale)}</span>
                   </div>
                 )}
                 {task.topicId && topicData && (
@@ -871,12 +873,13 @@ export function TaskDetailPanel({
                         <span className={`font-medium ${a.actorDeletedAt ? 'opacity-60' : ''}`}>
                           {a.actorName}
                         </span>{' '}
-                        {a.action === 'created' && t('activity.action.created')}
-                        {a.action === 'updated' && t('activity.action.updated')}
-                        {a.action === 'moved' && t('activity.action.moved')}
-                        {a.action === 'assigned' && t('activity.action.assigned')}
-                        {a.action === 'commented' && t('activity.action.commented')}
-                        {a.action === 'status_changed' && t('activity.action.status_changed')}
+                        {a.action === ActivityAction.CREATED && t('activity.action.created')}
+                        {a.action === ActivityAction.UPDATED && t('activity.action.updated')}
+                        {a.action === ActivityAction.MOVED && t('activity.action.moved')}
+                        {a.action === ActivityAction.ASSIGNED && t('activity.action.assigned')}
+                        {a.action === ActivityAction.COMMENTED && t('activity.action.commented')}
+                        {a.action === ActivityAction.STATUS_CHANGED &&
+                          t('activity.action.status_changed')}
                         {![
                           'created',
                           'updated',
@@ -887,7 +890,7 @@ export function TaskDetailPanel({
                         ].includes(a.action) && a.action}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {formatRelativeTime(a.createdAt)}
+                        {formatRelativeTime(a.createdAt, locale)}
                       </p>
                     </div>
                   </div>

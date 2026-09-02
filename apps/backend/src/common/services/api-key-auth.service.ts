@@ -43,12 +43,12 @@ import { AgentStatus, ErrorCode } from '@agent-chamber/shared';
  * 审计插桩塞进 newData（{keyId, keyPrefix, agentId}），「我的哪把 key 做了什么」
  * 可答。仅前缀不涉密；完整 apiKey 明文禁止入审计字段。
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface AgentPayload {
   id: string;
   name: string;
   ownerId: string;
-  permissions: Record<string, any>;
+  // 与 src/types/express.d.ts 的 request.agent.permissions 契约一致（均为 Record<string, unknown>）
+  permissions: Record<string, unknown>;
   /** 本次认证所用 API Key 的前缀（rawKey.substring(0,8)，如 'ask_abcD'；可选——兼容 WS/其他构造方） */
   keyPrefix?: string;
 }

@@ -1,0 +1,10 @@
+{
+  "_comment": "此文件含机密，勿入库；key 登录 chamber 后自助创建 agent 获取。boardId/docSpaceId/topicId 可省略（走 mcpServer 指针）；apiBaseUrl 建议恒显式写；apiKey 仅 REST-only 或显式覆盖时填。",
+  "schemaVersion": 1,
+  "boardId": "<your-board-id>",
+  "docSpaceId": "<your-docspace-id>",
+  "topicId": "<your-topic-id>",
+  "mcpServer": "chamber",
+  "apiBaseUrl": "https://<your-chamber-host>/api/v1",
+  "apiKey": ""
+}

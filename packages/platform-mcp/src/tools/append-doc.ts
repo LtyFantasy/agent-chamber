@@ -26,6 +26,7 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { APPEND_POSITION_VALUES } from '@agent-chamber/shared';
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -140,7 +141,8 @@ export const appendDocTool: CustomTool = {
         },
         position: {
           type: 'string',
-          enum: ['end', 'under-heading'],
+          // 枚举值从 shared APPEND_POSITION_VALUES 单源取值（防 backend DTO 加值后此处漂移）
+          enum: [...APPEND_POSITION_VALUES],
           description:
             "Append position: 'end' (document end, default) | 'under-heading' (end of the " +
             'target heading subtree). Defaults to end.',

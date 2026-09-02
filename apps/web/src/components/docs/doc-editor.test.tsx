@@ -19,6 +19,8 @@ const messages: Record<string, string> = {
   discardConfirm: 'You have unsaved changes. Discard them?',
   pathConflict: 'Path already exists, choose another',
   pathCheckFailed: 'Could not verify path uniqueness, please try again',
+  overwriteTitle: 'Path already exists',
+  overwriteConfirm: 'A document already exists at this path. Saving will overwrite it. Continue?',
 };
 
 jest.mock('next-intl', () => ({
@@ -65,7 +67,6 @@ function renderCreateEditor(overrides: Partial<Parameters<typeof DocEditor>[0]> 
       mode="create"
       spaceId="space-1"
       initialContent=""
-      existingPaths={[]}
       saving={false}
       onSave={onSave}
       onCancel={onCancel}
@@ -83,37 +84,46 @@ function typePathAndSave(path: string) {
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 }
 
-describe('DocEditor 新建文档路径冲突预检', () => {
+describe('DocEditor 新建文档路径冲突预检（v1.70.0-dev 单条精确校验 + 覆盖确认）', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockConfirm.mockReset();
   });
-  it('精确校验命中已存在路径时拦截保存并提示', async () => {
-    // existingPaths 本地列表未覆盖（模拟 >100 篇空间截断盲区），精确校验命中
+
+  it('精确校验命中已存在路径 + 确认取消 → 拦截保存并提示', async () => {
+    mockConfirm.mockResolvedValue(false);
     mockListDocs.mockResolvedValue({ items: [{ id: 'd1', path: 'guides/dup.md' }], total: 1 });
     const { onSave } = renderCreateEditor();
 
     typePathAndSave('guides/dup.md');
 
     await waitFor(() => {
+      expect(mockListDocs).toHaveBeenCalledWith('space-1', { path: 'guides/dup.md' });
+    });
+    // 撞 path 弹覆盖确认；取消 → 显示冲突错误、不保存
+    expect(mockConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ description: messages.overwriteConfirm }),
+    );
+    await waitFor(() => {
       expect(screen.getByText('Path already exists, choose another')).toBeInTheDocument();
     });
-    expect(mockListDocs).toHaveBeenCalledWith('space-1', { path: 'guides/dup.md' });
     expect(onSave).not.toHaveBeenCalled();
   });
 
-  it('本地 existingPaths 命中时快速拦截（不发精确校验请求）', async () => {
-    const { onSave } = renderCreateEditor({ existingPaths: ['guides/dup.md'] });
+  it('精确校验命中已存在路径 + 确认覆盖 → 放行保存（将覆盖已有文档）', async () => {
+    mockConfirm.mockResolvedValue(true);
+    mockListDocs.mockResolvedValue({ items: [{ id: 'd1', path: 'guides/dup.md' }], total: 1 });
+    const { onSave } = renderCreateEditor();
 
     typePathAndSave('guides/dup.md');
 
     await waitFor(() => {
-      expect(screen.getByText('Path already exists, choose another')).toBeInTheDocument();
+      expect(onSave).toHaveBeenCalledWith({ path: 'guides/dup.md', content: '' });
     });
-    expect(mockListDocs).not.toHaveBeenCalled();
-    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.queryByText('Path already exists, choose another')).not.toBeInTheDocument();
   });
 
-  it('路径未冲突时放行保存', async () => {
+  it('路径未冲突时放行保存（不弹确认）', async () => {
     mockListDocs.mockResolvedValue({ items: [], total: 0 });
     const { onSave } = renderCreateEditor();
 
@@ -122,6 +132,7 @@ describe('DocEditor 新建文档路径冲突预检', () => {
     await waitFor(() => {
       expect(onSave).toHaveBeenCalledWith({ path: 'guides/new.md', content: '' });
     });
+    expect(mockConfirm).not.toHaveBeenCalled();
   });
 
   it('精确校验请求失败时阻塞保存并提示重试（宁可误拦，不可静默覆盖）', async () => {
@@ -155,7 +166,6 @@ describe('DocEditor 脏状态退出守卫（全局 confirm 替换 window.confirm
         spaceId="space-1"
         initialContent="original"
         initialPath="docs/a.md"
-        existingPaths={[]}
         saving={false}
         onSave={onSave}
         onCancel={onCancel}
@@ -175,7 +185,6 @@ describe('DocEditor 脏状态退出守卫（全局 confirm 替换 window.confirm
         spaceId="space-1"
         initialContent="original"
         initialPath="docs/a.md"
-        existingPaths={[]}
         saving={false}
         onSave={jest.fn()}
         onCancel={onCancel}

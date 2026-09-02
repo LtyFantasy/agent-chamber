@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -44,6 +44,7 @@ export default function AgentKeysPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('agents.keys');
+  const locale = useLocale();
   const tCommon = useTranslations('common');
 
   const [agent, setAgent] = useState<AgentDetail | null>(null);
@@ -250,7 +251,7 @@ export default function AgentKeysPage() {
                           </code>
                         </td>
                         <td className="p-4 align-middle text-muted-foreground">
-                          {formatRelativeTime(key.createdAt)}
+                          {formatRelativeTime(key.createdAt, locale)}
                         </td>
                         <td className="p-4 align-middle">
                           <Badge variant={isActive ? 'success' : 'secondary'}>

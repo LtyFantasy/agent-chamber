@@ -10,7 +10,7 @@ import {
   Min,
   Max,
 } from 'class-validator';
-import { Visibility, TopicConfigInput } from '@agent-chamber/shared';
+import { Visibility, TopicConfigInput, TopicKind, WakePolicy } from '@agent-chamber/shared';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class TopicConfigDto implements TopicConfigInput {
@@ -60,13 +60,13 @@ export class TopicConfigDto implements TopicConfigInput {
    * （互转在 M2 推迟清单）。写 entity 列，不进 settings。
    */
   @IsOptional()
-  @IsIn(['normal', 'roundtable'])
+  @IsIn(Object.values(TopicKind))
   @ApiPropertyOptional({
-    enum: ['normal', 'roundtable'],
+    enum: Object.values(TopicKind),
     description: 'Topic kind: normal (default) | roundtable',
-    example: 'roundtable',
+    example: TopicKind.ROUNDTABLE,
   })
-  kind?: 'normal' | 'roundtable';
+  kind?: TopicKind;
 
   /**
    * 圆桌唤醒策略（设计 §6，r4 + R1 拍板）：'mention'（缺省——仅 @座位/@all 唤醒）/
@@ -74,13 +74,13 @@ export class TopicConfigDto implements TopicConfigInput {
    * 且未显式给定时由 service 缺省 'mention'。普通桌按「配置原样存储」透传。
    */
   @IsOptional()
-  @IsIn(['mention', 'broadcast'])
+  @IsIn(Object.values(WakePolicy))
   @ApiPropertyOptional({
-    enum: ['mention', 'broadcast'],
+    enum: Object.values(WakePolicy),
     description: 'Roundtable wake policy: mention (default) | broadcast',
-    example: 'mention',
+    example: WakePolicy.MENTION,
   })
-  wakePolicy?: 'mention' | 'broadcast';
+  wakePolicy?: WakePolicy;
 
   /**
    * 圆桌安全阀阈值（设计 §6，M2 阶段 4 落地）：topic 内座位间连续非沉默轮次

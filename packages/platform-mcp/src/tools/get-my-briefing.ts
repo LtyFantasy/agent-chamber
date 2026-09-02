@@ -3,9 +3,12 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: .kimi/plan-mcp-phase2.md §3.3 ①
- *   - 补充: docs/platform-mcp.md §2.1 + 看板任务 fdc1851b（Batch F：me 投影 + 紧凑序列化）
- *   - 补充: plan forge-jubilee-robin（WS-C：两段式编排 + 12 字段投影 + unread/blockers 降级）
+ *   - 主文档: 线上 docs/api-definition.md §5 Agents（briefing 端点小节）
+ *   - 补充: plan captain-atom-crimson-avenger-rocket-dc.md §2.4 — MCP 薄透传
+ *     （编排/投影/降级已后端化 AgentService.getMyBriefing，本层退化为单次
+ *     GET /agents/me/briefing 透传）
+ *   - 历史: plan forge-jubilee-robin（WS-C 两段式编排 + 12 字段投影 + 降级，
+ *     2026-08-29 后端化后本层不再实现）
  *
  * [踩坑索引] -
  *
@@ -23,46 +26,11 @@
 
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient, PlatformApiError } from '../platform-client';
-import { omitFields, truncateField, SNIPPET_MAX_CHARS } from './project';
 import { TaskStatus } from '@agent-chamber/shared';
 
-/**
- * 活跃任务缺省状态集（get_my_briefing 的 active tasks 口径）。
- *
- * backlog 是平台的默认待办状态（看板默认列），必须纳入活跃任务，
- * 否则 Agent 会漏掉尚未开工的已分配任务（本地集成验证实测暴露）。
- * 调用方可传 statuses 覆盖（替换而非追加，缺省保持本集合）。
- */
-const DEFAULT_ACTIVE_STATUSES: TaskStatus[] = [
-  TaskStatus.BACKLOG,
-  TaskStatus.TODO,
-  TaskStatus.IN_PROGRESS,
-  TaskStatus.BLOCKED,
-];
-
-/** 任务/动态数量钳制边界（WS-C 编排层补钳制，现状无钳） */
+/** 任务/动态数量钳制边界（透传前钳制，后端 DTO 越界 400 严格语义） */
 const LIMIT_MIN = 1;
 const LIMIT_MAX = 50;
-
-/**
- * activeTasks 12 字段白名单（plan forge-jubilee-robin 目标契约，用户拍板 r2）。
- *
- * 只透传 Agent 消费模型需要的字段；description/list/board/customFields/position
- * 等多余键一律剔除（87% 的 72K 体积来自每条 task 重复内嵌完整 list.board）。
- */
-const ACTIVE_TASK_KEPT_FIELDS = [
-  'id',
-  'title',
-  'status',
-  'priority',
-  'labels',
-  'boardId',
-  'boardName',
-  'listId',
-  'listName',
-  'dueDate',
-  'updatedAt',
-] as const;
 
 /**
  * 数量参数钳制：非数字/非有限值回退缺省，其余钳到 [1, 50]。
@@ -78,15 +46,16 @@ function clampLimit(raw: unknown, fallback: number): number {
 }
 
 /**
- * get_my_briefing — Agent 启动简报
+ * get_my_briefing — Agent 启动简报（薄透传 GET /agents/me/briefing）
  *
  * 一次调用建立工作上下文：获取当前 Agent 信息、活跃任务、未读计数、近期动态。
  * 替代 get_me + list my tasks + get my activities + unread 多次原子调用。
  *
- * WS-C（plan forge-jubilee-robin）两段式编排：
- * - 阶段 1：me 先行（tasks 的 assigneeId 依赖 me.id），随后 tasks/activities/unread 三路并行
- * - 阶段 2：tasks 非空时补查 blockers（GET /tasks/blockers/batch?ids=<csv>）
- * - unread/blockers 均为非关键路径：失败降级省略对应字段，不挂主流程
+ * 编排已后端化（AgentService.getMyBriefing，v1.65 report_task_result 先例）：
+ * - 后端负责 me 白名单投影（omit avatarUrl/apiKeyPrefix）、activeTasks 12 字段
+ *   投影 + hasBlockers 补查、recentActivities content 截断、unread/blockers
+ *   非关键路径降级（键省略）
+ * - 本层只做参数校验/钳制 + 单次请求 + 响应透传，成功路径输出契约逐字段不变
  */
 export const getMyBriefingTool: CustomTool = {
   tool: {
@@ -111,7 +80,11 @@ Response contract:
 - recentActivities: my recent output; content truncated to maxContentLength
   chars (default 300, 0=full, max 50000) with per-item contentTruncated.
   Full text via follow_up_task / task_controller_get_comments /
-  topic_controller_get_messages.`,
+  topic_controller_get_messages.
+
+Degradation semantics: unreadCounts/hasBlockers keys are OMITTED on
+non-critical-path failure (≠ no unread / no blockers); [] means truly no
+unread.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -149,7 +122,7 @@ Response contract:
 
     // maxContentLength：recentActivities content 截断长度（可选，缺省 300 行为不变）。
     // 防御性解析（MCP 层无 DTO 校验，必须 handler 内兜底，照 get-topic-digest 先例）：
-    // 非数字/负数按缺省 300 处理（undefined → 截断侧用默认值）；>50000 钳到 50000
+    // 非数字/负数按缺省 300 处理（undefined → 不传，后端用缺省）；>50000 钳到 50000
     // （防止放量返回超长字符串）；0 是合法值 = 不截断返全文。
     let maxContentLength: number | undefined;
     const rawMaxContentLength = args.maxContentLength;
@@ -163,8 +136,8 @@ Response contract:
 
     // 格式校验（铁律 #21）：statuses 必须是合法 TaskStatus 枚举值数组。
     // automcp 不做运行时参数校验，非法值在此快速失败返回 400，不发起任何请求。
-    // 空数组同样拒绝——替换默认集后 status 参数为空，后端 /tasks 会退化为
-    // "全部状态"查询，静默违背 active tasks 语义（禁止静默语义漂移）。
+    // 空数组同样拒绝——替换默认集后 status 参数为空，后端会退化为"全部状态"
+    // 查询，静默违背 active tasks 语义（禁止静默语义漂移）。
     if (statuses !== undefined) {
       const valid =
         Array.isArray(statuses) &&
@@ -189,101 +162,34 @@ Response contract:
         };
       }
     }
-    // 传入时替换默认集合（join 成后端 /tasks 的逗号分隔 status 参数）
-    const statusParam = statuses
-      ? (statuses as string[]).join(',')
-      : DEFAULT_ACTIVE_STATUSES.join(',');
+
+    // 薄透传：非 undefined 字段原样转发（statuses 数组 → 逗号分隔字符串，照
+    // report-task-result 字段透传方式）。缺省不传 → 后端用缺省集
+    // （backlog/todo/in_progress/blocked）与缺省 limit，行为与旧编排等价。
+    const params: Record<string, unknown> = {};
+    if (statuses !== undefined) params.statuses = (statuses as string[]).join(',');
+    if (args.taskLimit !== undefined) params.taskLimit = taskLimit;
+    if (args.activityLimit !== undefined) params.activityLimit = activityLimit;
+    if (maxContentLength !== undefined) params.maxContentLength = maxContentLength;
 
     try {
-      // 阶段 1：me 先行（tasks 的 assigneeId 依赖 me.id），随后 tasks/activities/unread 三路并行。
-      // unread 是非关键路径：.catch 降级为 undefined（省略 unreadCounts 字段，防部署时序
-      // 404 拖垮整个 briefing，对齐 get-topic-digest 先例）。Promise.resolve 包裹：
-      // 保证非 promise 返回值（如测试 mock）也不会同步抛 TypeError。
-      const me = await client.request<Record<string, unknown>>('GET', '/agents/me');
-      const [activeTasks, recentActivities, unread] = await Promise.all([
-        client.request<{ items: unknown[]; total: number }>('GET', '/tasks', {
-          params: {
-            assigneeId: me.id as string,
-            status: statusParam,
-            pageSize: taskLimit,
-            // WS-A 新增 opt-in 排序：in_progress > todo > blocked > backlog > 其余
-            sort: 'statusPriority',
-          },
-        }),
-        client.request<unknown[]>('GET', '/agents/me/activities', {
-          params: { limit: activityLimit },
-        }),
-        Promise.resolve(client.request<unknown[]>('GET', '/agents/me/unread')).catch(
-          () => undefined,
-        ),
-      ]);
-
-      // 阶段 2：blockers 补查（GET /tasks/blockers/batch?ids=<csv>，返回 Record<taskId, boolean>）。
-      // 非关键路径：失败降级为 undefined（hasBlockers 省略，不挂主流程）；空 items 跳过。
-      const taskItems = Array.isArray(activeTasks.items) ? activeTasks.items : [];
-      let blockersMap: Record<string, boolean> | undefined;
-      if (taskItems.length > 0) {
-        const ids = taskItems
-          .map((t) => (t as Record<string, unknown>).id as string)
-          .filter(Boolean)
-          .join(',');
-        blockersMap = await Promise.resolve(
-          client.request<Record<string, boolean>>('GET', '/tasks/blockers/batch', {
-            params: { ids },
-          }),
-        ).catch(() => undefined);
-      }
-
-      // activeTasks：12 字段白名单投影 + hasBlockers 合并（map 缺失/降级时省略该键，
-      // 不补 false——未知 ≠ 无 blocker）
-      const items = taskItems.map((t) => {
-        const task = t !== null && typeof t === 'object' ? (t as Record<string, unknown>) : {};
-        const projected: Record<string, unknown> = {};
-        for (const field of ACTIVE_TASK_KEPT_FIELDS) {
-          if (task[field] !== undefined) {
-            projected[field] = task[field];
-          }
-        }
-        if (blockersMap !== undefined) {
-          const hasBlockers = blockersMap[task.id as string];
-          if (hasBlockers !== undefined) {
-            projected.hasBlockers = hasBlockers;
-          }
-        }
-        return projected;
+      const result = await client.request<Record<string, unknown>>('GET', '/agents/me/briefing', {
+        params,
       });
-
-      // recentActivities：原形状透传，仅逐项截断 content（无 content 的 task 型条目
-      // 经 truncateField 的 typeof string 检查天然豁免，不打 contentTruncated）
-      const activities = Array.isArray(recentActivities)
-        ? recentActivities.map((a) => {
-            const item =
-              a !== null && typeof a === 'object' ? { ...(a as Record<string, unknown>) } : {};
-            truncateField(item, 'content', maxContentLength ?? SNIPPET_MAX_CHARS);
-            return item;
-          })
-        : recentActivities;
-
-      const result: Record<string, unknown> = {
-        me: omitFields(me, ['avatarUrl', 'apiKeyPrefix']),
-        // 只透传 {items, total}，砍分页信封其余键（page/pageSize/totalPages/hasNext/hasPrev）
-        activeTasks: { items, total: activeTasks.total },
-        ...(unread !== undefined ? { unreadCounts: unread } : {}),
-        recentActivities: activities,
-      };
-
       return {
         content: [
           {
             type: 'text',
-            // Batch F（看板任务 fdc1851b）：me 剔除 avatarUrl/apiKeyPrefix（人类 UI / 认证元数据，
-            // 对 Agent 消费无价值），其余字段原样保留；全量输出改紧凑序列化（去 pretty-print 缩进）
+            // 响应原样透传（紧凑序列化，无 pretty-print 缩进）
             text: JSON.stringify(result),
           },
         ],
       };
     } catch (err: unknown) {
-      return handlePlatformError(err, 'get_me');
+      // failedStep 从 'get_me' 改为 'get_my_briefing' 是刻意修正（2026-08-29）：
+      // 编排时代任何步骤失败都误标 get_me（旧实现 get-my-briefing.ts:286），
+      // 薄透传后单一端点，failedStep 必须指向真实端点
+      return handlePlatformError(err, 'get_my_briefing');
     }
   },
 };

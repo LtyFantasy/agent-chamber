@@ -28,7 +28,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Wrench, MessageSquare, ShieldQuestion } from 'lucide-react';
 import type { RoundtableSeatItem } from '@/lib/api';
 import { formatRelativeTime } from '@/lib/utils';
@@ -58,6 +58,7 @@ interface SeatPresencePopoverProps {
  */
 export function SeatPresencePopover({ seat, open, onClose }: SeatPresencePopoverProps) {
   const t = useTranslations('topics');
+  const locale = useLocale();
   const containerRef = useRef<HTMLDivElement>(null);
 
   /** 点击外部关闭（mousedown：先于容器内按钮 click 判定，避免打开即关的闪烁） */
@@ -124,7 +125,7 @@ export function SeatPresencePopover({ seat, open, onClose }: SeatPresencePopover
                     )}
                   </div>
                   <span className="shrink-0 text-[10px] text-muted-foreground/70">
-                    {formatRelativeTime(item.at)}
+                    {formatRelativeTime(item.at, locale)}
                   </span>
                 </li>
               );
@@ -144,7 +145,7 @@ export function SeatPresencePopover({ seat, open, onClose }: SeatPresencePopover
           <p className="text-[11px] text-muted-foreground" data-testid="seat-presence-usage">
             {t('seatPresence.usage', { used: lastUsage.used, size: lastUsage.size })}
             <span className="ml-1 text-muted-foreground/70">
-              · {formatRelativeTime(lastUsage.at)}
+              · {formatRelativeTime(lastUsage.at, locale)}
             </span>
           </p>
         )}

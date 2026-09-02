@@ -4,6 +4,7 @@ import { TopicService } from './topic.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import {
   TopicStatus,
   ActorType,
@@ -75,6 +76,9 @@ describe('TopicController', () => {
       ],
     })
       .overrideGuard(JwtOrApiKeyGuard)
+      .useValue({ canActivate: () => true })
+      // JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起），单测 override 掉
+      .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
       .compile();
 

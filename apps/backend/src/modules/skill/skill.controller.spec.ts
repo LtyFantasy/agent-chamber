@@ -20,7 +20,7 @@
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
 import { SkillController } from './skill.controller';
 import { SkillService } from './skill.service';
 import { SkillDetailDto, SkillListItemDto } from './skill.dto';
@@ -83,19 +83,15 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
-      await controller.findOne('agent-chamber', undefined as unknown as string, res, req);
+      // JSON 分支返回 detail 由全局 ResponseInterceptor 包装（review-0831 任务
+      // bbd175dc 子项 3：手工信封已删，controller 不再写 res.json）
+      const result = await controller.findOne('agent-chamber', undefined as unknown as string, res);
 
       expect(service.findOne).toHaveBeenCalledWith('agent-chamber');
       expect(service.getRaw).not.toHaveBeenCalled();
-      expect(res.json).toHaveBeenCalledWith({
-        code: 200,
-        message: 'success',
-        data: detail,
-        timestamp: expect.any(String),
-        requestId: 'req-123',
-      });
+      expect(result).toBe(detail);
+      expect(res.json).not.toHaveBeenCalled();
     });
 
     it('should return raw markdown when format=raw', async () => {
@@ -107,41 +103,14 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
-      await controller.findOne('agent-chamber', 'raw', res, req);
+      await controller.findOne('agent-chamber', 'raw', res);
 
       expect(service.getRaw).toHaveBeenCalledWith('agent-chamber');
       expect(service.findOne).not.toHaveBeenCalled();
       expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'text/markdown; charset=utf-8');
       expect(res.send).toHaveBeenCalledWith(rawContent);
       expect(res.json).not.toHaveBeenCalled();
-    });
-
-    it('should use unknown requestId when requestId is missing', async () => {
-      const detail: SkillDetailDto = {
-        name: 'agent-chamber',
-        description: 'Main skill.',
-        version: '1.0.0',
-        updatedAt: '2026-06-17',
-        content: '# Main Skill\n',
-      };
-      service.findOne.mockResolvedValue(detail);
-
-      const res = {
-        setHeader: jest.fn(),
-        send: jest.fn(),
-        json: jest.fn(),
-      } as unknown as Response;
-      const req = {} as unknown as Request;
-
-      await controller.findOne('agent-chamber', undefined as unknown as string, res, req);
-
-      expect(res.json).toHaveBeenCalledWith(
-        expect.objectContaining({
-          requestId: 'unknown',
-        }),
-      );
     });
 
     it('should propagate NotFoundException from service', async () => {
@@ -152,10 +121,9 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
       await expect(
-        controller.findOne('missing-skill', undefined as unknown as string, res, req),
+        controller.findOne('missing-skill', undefined as unknown as string, res),
       ).rejects.toThrow(NotFoundException);
     });
   });
@@ -199,25 +167,20 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
-      await controller.findSubSkill(
+      // JSON 分支返回 detail 由全局 ResponseInterceptor 包装（review-0831 任务
+      // bbd175dc 子项 3：手工信封已删，controller 不再写 res.json）
+      const result = await controller.findSubSkill(
         'agent-chamber',
         'taskboard',
         undefined as unknown as string,
         res,
-        req,
       );
 
       expect(service.findSubSkill).toHaveBeenCalledWith('agent-chamber', 'taskboard');
       expect(service.getSubRaw).not.toHaveBeenCalled();
-      expect(res.json).toHaveBeenCalledWith({
-        code: 200,
-        message: 'success',
-        data: detail,
-        timestamp: expect.any(String),
-        requestId: 'req-123',
-      });
+      expect(result).toBe(detail);
+      expect(res.json).not.toHaveBeenCalled();
     });
 
     it('should return raw markdown when format=raw', async () => {
@@ -229,9 +192,8 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
-      await controller.findSubSkill('agent-chamber', 'taskboard', 'raw', res, req);
+      await controller.findSubSkill('agent-chamber', 'taskboard', 'raw', res);
 
       expect(service.getSubRaw).toHaveBeenCalledWith('agent-chamber', 'taskboard');
       expect(service.findSubSkill).not.toHaveBeenCalled();
@@ -248,16 +210,9 @@ describe('SkillController', () => {
         send: jest.fn(),
         json: jest.fn(),
       } as unknown as Response;
-      const req = { requestId: 'req-123' } as unknown as Request;
 
       await expect(
-        controller.findSubSkill(
-          'agent-chamber',
-          'missing',
-          undefined as unknown as string,
-          res,
-          req,
-        ),
+        controller.findSubSkill('agent-chamber', 'missing', undefined as unknown as string, res),
       ).rejects.toThrow(NotFoundException);
     });
   });

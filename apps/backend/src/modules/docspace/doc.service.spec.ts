@@ -13,6 +13,7 @@ import { ErrorCode, AuditAction, ActorType, EventType } from '@agent-chamber/sha
 import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { EventService } from '../event/event.service';
 import { RouteHealthService } from './route-health.service';
+import { DiagramRendererService } from './diagram-renderer.service';
 import type { BatchUpsertItemDto } from './dto';
 
 describe('DocService', () => {
@@ -28,6 +29,8 @@ describe('DocService', () => {
   let idempotencyRepo: jest.Mocked<Partial<Repository<IdempotencyRecord>>>;
   let eventService: { create: jest.Mock };
   let routeHealthService: { recheckSpace: jest.Mock };
+  // Diagram IR v1 渲染门 mock：diagram 分支用例在 beforeEach/具体用例里设置返回值
+  let diagramRenderer: { validateAndRender: jest.Mock };
   let mockTransaction: jest.Mock;
 
   /** 冲刷 setImmediate 队列：让 upsert/remove 里 fire-and-forget 的异步任务先于本回调执行 */
@@ -109,6 +112,8 @@ describe('DocService', () => {
       setParameter: jest.fn().mockReturnThis(),
       setLock: jest.fn().mockReturnThis(),
       groupBy: jest.fn().mockReturnThis(),
+      addGroupBy: jest.fn().mockReturnThis(),
+      from: jest.fn().mockReturnThis(),
       innerJoin: jest.fn().mockReturnThis(),
       execute: jest.fn().mockResolvedValue({ affected: 1 }),
       update: jest.fn().mockReturnThis(),
@@ -137,6 +142,8 @@ describe('DocService', () => {
       createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
       manager: {
         transaction: mockTransaction as any,
+        // findTree folders total 子查询 COUNT 走 manager QB（无主 FROM，见 service 注释）
+        createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
       },
     } as unknown as jest.Mocked<Repository<Doc>>;
 
@@ -191,6 +198,8 @@ describe('DocService', () => {
       recheckSpace: jest.fn().mockResolvedValue({ rechecked: 0, broken: 0 }),
     };
 
+    diagramRenderer = { validateAndRender: jest.fn() };
+
     service = new DocService(
       docRepo,
       sectionRepo,
@@ -202,6 +211,7 @@ describe('DocService', () => {
       eventService as unknown as EventService,
       routeHealthService as unknown as RouteHealthService,
       idempotencyRepo as unknown as Repository<IdempotencyRecord>,
+      diagramRenderer as unknown as DiagramRendererService,
     );
   });
 
@@ -1373,6 +1383,195 @@ describe('DocService', () => {
       expect(qb.andWhere).toHaveBeenCalledWith('(d.title ILIKE :q OR d.path ILIKE :q)', {
         q: '%日记%',
       });
+    });
+  });
+
+  // ─── findTree（v1.70.0-dev 懒加载目录树）────────────────────
+
+  describe('findTree', () => {
+    /**
+     * 构造 findTree 三查询 mock：folders 明细（getRawMany）/ folders total
+     * （getRawOne 子查询 COUNT，走 manager QB）/ docs（getManyAndCount 双查）。
+     * folderQb 补 offset/limit（共享 createMockQueryBuilder 无此二方法）。
+     */
+    function mockTreeQueries(opts: {
+      folderRows?: any[];
+      folderTotal?: string;
+      docs?: Doc[];
+      docTotal?: number;
+    }) {
+      const folderQb = createMockQueryBuilder([], 0);
+      folderQb.getRawMany = jest.fn().mockResolvedValue(opts.folderRows ?? []);
+      folderQb.offset = jest.fn().mockReturnThis();
+      folderQb.limit = jest.fn().mockReturnThis();
+      const totalQb = createMockQueryBuilder([], 0);
+      totalQb.getRawOne = jest.fn().mockResolvedValue({ total: opts.folderTotal ?? '0' });
+      const docQb = createMockQueryBuilder(opts.docs ?? [], opts.docTotal ?? 0);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(folderQb)
+        .mockReturnValueOnce(docQb);
+      (docRepo.manager.createQueryBuilder as jest.Mock).mockReturnValue(totalQb);
+      return { folderQb, totalQb, docQb };
+    }
+
+    it('root level: normalizes empty prefix, returns folders + direct docs', async () => {
+      const { folderQb, docQb } = mockTreeQueries({
+        folderRows: [
+          { name: 'memory', docCount: '3', latestDocAt: new Date('2026-08-29T00:00:00Z') },
+        ],
+        folderTotal: '1',
+        docs: [makeDoc({ path: 'root.md' })],
+        docTotal: 1,
+      });
+
+      const result = await service.findTree('space-1', {});
+
+      expect(result.prefix).toBe('');
+      expect(result.folders.items).toEqual([
+        { path: 'memory/', name: 'memory', docCount: 3, latestDocAt: '2026-08-29T00:00:00.000Z' },
+      ]);
+      expect(result.folders.total).toBe(1);
+      expect(result.folders.hasMore).toBe(false);
+      expect(result.docs.items[0].path).toBe('root.md');
+      expect(result.docs.total).toBe(1);
+      expect(result.docs.hasMore).toBe(false);
+
+      // SQL 形状硬约束（plan A1/A2）：WHERE 只用 LIKE + ESCAPE，显式软删过滤
+      expect(folderQb.where).toHaveBeenCalledWith('d.space_id = :spaceId', { spaceId: 'space-1' });
+      expect(folderQb.andWhere).toHaveBeenCalledWith('d.deleted_at IS NULL');
+      expect(folderQb.andWhere).toHaveBeenCalledWith(
+        "d.path LIKE :escapedPrefix || '%' ESCAPE '\\'",
+        { escapedPrefix: '' },
+      );
+      expect(folderQb.andWhere).toHaveBeenCalledWith(
+        "d.path LIKE :escapedPrefix || '%/%' ESCAPE '\\'",
+        { escapedPrefix: '' },
+      );
+      // substring/split_part 只进 SELECT/GROUP BY；plen 根层 = 1（PG 1-based）
+      expect(folderQb.select).toHaveBeenCalledWith(
+        "split_part(substring(d.path from :plen::int), '/', 1)",
+        'name',
+      );
+      expect(folderQb.groupBy).toHaveBeenCalledWith(
+        "split_part(substring(d.path from :plen::int), '/', 1)",
+      );
+      expect(folderQb.setParameter).toHaveBeenCalledWith('plen', 1);
+      // docs：NOT LIKE 排除更深层（直挂文档）
+      expect(docQb.andWhere).toHaveBeenCalledWith(
+        "d.path NOT LIKE :escapedPrefix || '%/%' ESCAPE '\\'",
+        { escapedPrefix: '' },
+      );
+    });
+
+    it('normalizes prefix: strips leading / and appends trailing /', async () => {
+      const { folderQb, docQb } = mockTreeQueries({});
+      await service.findTree('space-1', { prefix: '/memory' });
+
+      expect(folderQb.andWhere).toHaveBeenCalledWith(
+        "d.path LIKE :escapedPrefix || '%' ESCAPE '\\'",
+        { escapedPrefix: 'memory/' },
+      );
+      expect(docQb.andWhere).toHaveBeenCalledWith(
+        "d.path NOT LIKE :escapedPrefix || '%/%' ESCAPE '\\'",
+        { escapedPrefix: 'memory/' },
+      );
+      // plen = 'memory/'.length + 1 = 8（跳过 "memory/" 本身，从下一段开始取）
+      expect(folderQb.setParameter).toHaveBeenCalledWith('plen', 8);
+    });
+
+    it('escapes LIKE metacharacters in prefix input', async () => {
+      const { folderQb } = mockTreeQueries({});
+      await service.findTree('space-1', { prefix: 'a%b_c\\d' });
+
+      // \ % _ 逐字符转义（照抄 findAll 先例），归一化补尾部 /
+      expect(folderQb.andWhere).toHaveBeenCalledWith(
+        "d.path LIKE :escapedPrefix || '%' ESCAPE '\\'",
+        { escapedPrefix: 'a\\%b\\_c\\\\d/' },
+      );
+    });
+
+    it('clamps docsLimit/foldersLimit to hard caps (defense in depth)', async () => {
+      const { folderQb, docQb } = mockTreeQueries({});
+      await service.findTree('space-1', { docsLimit: 999, foldersLimit: 999 });
+
+      expect(docQb.take).toHaveBeenCalledWith(200);
+      expect(folderQb.limit).toHaveBeenCalledWith(500);
+    });
+
+    it('folders total comes from subquery COUNT (getRawOne)', async () => {
+      const { totalQb } = mockTreeQueries({ folderTotal: '42' });
+      const result = await service.findTree('space-1', {});
+
+      expect(result.folders.total).toBe(42);
+      // 子查询 COUNT：from 以 subQuery 工厂形式调用（不拉全量分组行）
+      expect(totalQb.from).toHaveBeenCalled();
+    });
+
+    it('hasMore reflects offset + page size vs total', async () => {
+      mockTreeQueries({
+        folderRows: [{ name: 'a', docCount: '1', latestDocAt: new Date() }],
+        folderTotal: '3',
+        docs: [makeDoc()],
+        docTotal: 5,
+      });
+      const result = await service.findTree('space-1', { foldersOffset: 1, docsOffset: 1 });
+
+      expect(result.folders.hasMore).toBe(true);
+      expect(result.docs.hasMore).toBe(true);
+    });
+
+    it('sort=name orders folders by segment name ASC', async () => {
+      const { folderQb } = mockTreeQueries({});
+      await service.findTree('space-1', { sort: 'name' });
+      expect(folderQb.orderBy).toHaveBeenCalledWith('name', 'ASC');
+    });
+
+    it('sort=recent (default) orders folders by latestDocAt DESC', async () => {
+      const { folderQb } = mockTreeQueries({});
+      await service.findTree('space-1', {});
+      expect(folderQb.orderBy).toHaveBeenCalledWith('MAX(d.updated_at)', 'DESC');
+    });
+  });
+
+  // ─── findFacets（v1.70.0-dev 聚合计数）────────────────────
+
+  describe('findFacets', () => {
+    it('aggregates types / tags / categories with counts', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([
+        { value: 'guide', count: '3' },
+        { value: 'memory', count: '2' },
+      ]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'diary', count: '4' }]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([{ slug: 'docs', name: 'Docs', count: '5' }]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      const result = await service.findFacets('space-1');
+
+      expect(result.types).toEqual([
+        { value: 'guide', count: 3 },
+        { value: 'memory', count: 2 },
+      ]);
+      expect(result.tags).toEqual([{ value: 'diary', count: 4 }]);
+      expect(result.categories).toEqual([{ slug: 'docs', name: 'Docs', count: 5 }]);
+
+      // SQL 形状：types 非空过滤 + 软删过滤；tags unnest；categories join 软删过滤
+      expect(typeQb.andWhere).toHaveBeenCalledWith('d.doc_type IS NOT NULL');
+      expect(typeQb.andWhere).toHaveBeenCalledWith("d.doc_type <> ''");
+      expect(typeQb.groupBy).toHaveBeenCalledWith('d.doc_type');
+      expect(tagQb.select).toHaveBeenCalledWith('unnest(d.tags)', 'value');
+      expect(tagQb.groupBy).toHaveBeenCalledWith('unnest(d.tags)');
+      expect(catQb.leftJoin).toHaveBeenCalledWith(
+        'doc_categories',
+        'dc',
+        'dc.id = d.category_id AND dc.deleted_at IS NULL',
+      );
+      expect(catQb.andWhere).toHaveBeenCalledWith('dc.id IS NOT NULL');
     });
   });
 
@@ -4116,6 +4315,478 @@ describe('DocService', () => {
       expect(sectionRepo.save).not.toHaveBeenCalled();
       expect(sectionRepo.createQueryBuilder).not.toHaveBeenCalled();
       expect(versionRepo.save).not.toHaveBeenCalled();
+    });
+
+    // ── D10 docType 双向守卫（Diagram IR v1，plan §0 D10 / §3.3）─────────
+
+    it('D10：docType → diagram 转换被 metadata 通道拒绝（400 DIAGRAM_DOC_TYPE_LOCKED）', async () => {
+      const doc = makeDoc({ contentHash: HASH, docType: 'guide' });
+      mockFindById(doc);
+      mockMetadataTx(doc);
+
+      await expect(
+        service.patchMetadata(
+          'doc-1',
+          { docType: 'diagram', expectedContentHash: HASH },
+          { id: 'actor-1', type: ActorType.HUMAN },
+        ),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED },
+      });
+    });
+
+    it('D10：diagram → 其他 docType 转换同样被拒绝（双向）', async () => {
+      const doc = makeDoc({ contentHash: HASH, docType: 'diagram', diagramType: 'architecture' });
+      mockFindById(doc);
+      mockMetadataTx(doc);
+
+      await expect(
+        service.patchMetadata(
+          'doc-1',
+          { docType: 'note', expectedContentHash: HASH },
+          { id: 'actor-1', type: ActorType.HUMAN },
+        ),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED },
+      });
+    });
+
+    it('D10 不过度拦截：非 diagram 之间的 docType 变更照常允许', async () => {
+      const doc = makeDoc({ contentHash: HASH, docType: 'guide' });
+      mockFindById(doc);
+      const fresh = makeDoc({ contentHash: HASH, docType: 'note' });
+      const { setMock } = mockMetadataTx(doc, fresh);
+
+      const result = await service.patchMetadata(
+        'doc-1',
+        { docType: 'note', expectedContentHash: HASH },
+        { id: 'actor-1', type: ActorType.HUMAN },
+      );
+      expect(result.changedFields).toEqual(['docType']);
+      expect((setMock.mock.calls[0][0] as Record<string, unknown>).docType).toBe('note');
+    });
+  });
+
+  // ─── Diagram IR 分支（plan §3.3 / §6.1）────────────────────
+
+  describe('upsert — Diagram IR 分支', () => {
+    /** 合法 IR（architecture 最小集） */
+    const IR = {
+      schema_version: 1,
+      diagram_type: 'architecture',
+      meta: { title: '平台架构' },
+      components: [{ id: 'api', type: 'backend', label: 'API Server', pos: [40, 40] }],
+      connections: [],
+    };
+    const canonical = JSON.stringify(IR, null, 2);
+    const crypto = require('crypto') as typeof import('crypto');
+    const canonicalHash = crypto.createHash('sha256').update(canonical).digest('hex');
+
+    const artifacts = {
+      html: '<html><body><svg></svg></body></html>',
+      meta: {
+        engine: 'archify',
+        rendererVersion: '2.16.0-dev.0',
+        qualityProfile: 'standard',
+        checks: [{ name: 'single_svg', ok: true }],
+        composition: { errors: 0, warnings: 0 },
+        renderedAt: '2026-08-30T00:00:00.000Z',
+        htmlBytes: 40,
+        htmlSha256: 'f'.repeat(64),
+      },
+      checks: [{ name: 'single_svg', ok: true }],
+      composition: { errors: 0, warnings: 0 },
+    };
+
+    /** 存量 diagram 文档工厂 */
+    const makeDiagramDoc = (overrides: Partial<Doc> = {}) =>
+      makeDoc({
+        docType: 'diagram',
+        diagramType: 'architecture',
+        renderedHtml: artifacts.html,
+        renderMeta: artifacts.meta as unknown as Record<string, unknown>,
+        contentHash: canonicalHash,
+        linkHealth: { total: 0, broken: [], checkedAt: '2026-08-30T00:00:00Z' },
+        ...overrides,
+      });
+
+    /**
+     * 定制 upsert 事务 mock：按实体分派捕获 save/create（Doc/DocSection/DocVersion），
+     * 供断言三列写入、合成节形状与版本行不落版。
+     */
+    function mockDiagramUpsertTx() {
+      const docSaveSpy = jest.fn((x: unknown) => Promise.resolve(x));
+      const docCreateSpy = jest.fn((x: unknown) => x);
+      const sectionSaveSpy = jest.fn((x: unknown) => Promise.resolve(x));
+      const versionSaveSpy = jest.fn((x: unknown) => Promise.resolve(x));
+      mockTransaction.mockImplementation((fn: any) =>
+        fn({
+          getRepository: jest.fn((entity: unknown) => {
+            if (entity === DocVersion) {
+              return {
+                create: jest.fn((x: unknown) => x),
+                save: versionSaveSpy,
+                createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+              };
+            }
+            if (entity === DocSection) {
+              return {
+                create: jest.fn((x: unknown) => x),
+                save: sectionSaveSpy,
+                createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+              };
+            }
+            return {
+              create: docCreateSpy,
+              save: docSaveSpy,
+              createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+            };
+          }),
+        }),
+      );
+      return { docSaveSpy, docCreateSpy, sectionSaveSpy, versionSaveSpy };
+    }
+
+    beforeEach(() => {
+      diagramRenderer.validateAndRender.mockResolvedValue(artifacts);
+    });
+
+    it('create：规范化 + 渲染门 + 三列写入 + 单节合成 + title/summary 从 ir.meta 派生', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+      const tx = mockDiagramUpsertTx();
+
+      // 刻意用紧凑 JSON 写入（同语义异格式）——落库必须是规范化 2 空格形态
+      const result = await service.upsert('space-1', {
+        path: 'docs/arch.diagram.json',
+        content: JSON.stringify(IR),
+        docType: 'diagram',
+      });
+
+      // 渲染门恰好一次，入参为解析后对象
+      expect(diagramRenderer.validateAndRender).toHaveBeenCalledTimes(1);
+      expect(diagramRenderer.validateAndRender.mock.calls[0][0]).toEqual(IR);
+
+      // 三列写入 + title/summary 派生 + contentHash 对规范化形态生效
+      expect(tx.docCreateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          docType: 'diagram',
+          diagramType: 'architecture',
+          renderedHtml: artifacts.html,
+          renderMeta: artifacts.meta,
+          title: '平台架构',
+          summary: 'architecture 图：平台架构',
+          contentHash: canonicalHash,
+        }),
+      );
+      // 单节合成：1 节 / level 0 / headingPath=null / content=规范化 IR 全文
+      expect(tx.sectionSaveSpy).toHaveBeenCalledTimes(1);
+      const sections = tx.sectionSaveSpy.mock.calls[0][0] as {
+        position: number;
+        headingLevel: number;
+        headingPath: string | null;
+        headingText: string | null;
+        isContinuation: boolean;
+        content: string;
+      }[];
+      expect(sections).toHaveLength(1);
+      expect(sections[0]).toEqual(
+        expect.objectContaining({
+          position: 0,
+          headingLevel: 0,
+          headingPath: null,
+          headingText: null,
+          isContinuation: false,
+          content: canonical,
+        }),
+      );
+      // 版本行落版（新建 hashChanged=true）
+      expect(tx.versionSaveSpy).toHaveBeenCalledTimes(1);
+      // 响应携带图信息
+      expect((result as { diagramType?: string }).diagramType).toBe('architecture');
+      expect((result as { render?: { htmlSha256: string } }).render?.htmlSha256).toBe(
+        'f'.repeat(64),
+      );
+    });
+
+    it('无 ir.meta.title 时 title 回退 path、summary 为「<type> 图」（不写 JSON 首段）', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+      const tx = mockDiagramUpsertTx();
+      const noTitleIr = { ...IR, meta: {} };
+
+      await service.upsert('space-1', {
+        path: 'docs/no-title.diagram.json',
+        content: JSON.stringify(noTitleIr),
+        docType: 'diagram',
+      });
+
+      expect(tx.docCreateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'docs/no-title.diagram.json',
+          summary: 'architecture 图',
+        }),
+      );
+    });
+
+    it('规范化幂等 + R1 零渲染回归：同语义异格式 IR 二次 upsert → unchanged:true 且不触发渲染', async () => {
+      const existing = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([existing], 1),
+      );
+      const tx = mockDiagramUpsertTx();
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/arch.diagram.json',
+        content: JSON.stringify(IR), // 紧凑形态，规范化后与库存 canonical 同 hash
+        // docType 省略——effectiveDocType 继承现存 'diagram'
+      });
+
+      expect(result.unchanged).toBe(true);
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+      expect(tx.sectionSaveSpy).not.toHaveBeenCalled();
+      expect(tx.versionSaveSpy).not.toHaveBeenCalled();
+      // unchanged 早退也携带图信息（库存快照元数据）
+      expect((result as { diagramType?: string }).diagramType).toBe('architecture');
+      expect((result as { render?: { qualityProfile: string } }).render?.qualityProfile).toBe(
+        'standard',
+      );
+    });
+
+    it('docType 迁出（显式非 diagram）：三列同置 null 且不触发渲染', async () => {
+      const existing = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([existing], 1),
+      );
+      const tx = mockDiagramUpsertTx();
+
+      await service.upsert('space-1', {
+        path: 'docs/arch.diagram.json',
+        content: '# 迁移为 markdown\n\n正文。',
+        docType: 'note',
+      });
+
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+      expect(tx.docSaveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          docType: 'note',
+          diagramType: null,
+          renderedHtml: null,
+          renderMeta: null,
+        }),
+      );
+    });
+
+    it('forceRechunk：hash 未变也重渲染刷新快照，且不写版本行', async () => {
+      const existing = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([existing], 1),
+      );
+      const tx = mockDiagramUpsertTx();
+
+      const result = await service.upsert('space-1', {
+        path: 'docs/arch.diagram.json',
+        content: canonical,
+        forceRechunk: true,
+      });
+
+      expect(diagramRenderer.validateAndRender).toHaveBeenCalledTimes(1);
+      expect(result.rechunked).toBe(true);
+      // 快照被本次渲染产物刷新
+      expect(tx.docSaveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ renderedHtml: artifacts.html, renderMeta: artifacts.meta }),
+      );
+      // 版本契约 = contentHash 变化才落版
+      expect(tx.versionSaveSpy).not.toHaveBeenCalled();
+    });
+
+    it('R3 前置拒绝：meta.repository → 422 且零渲染（诊断指路移除字段）', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+      const withRepo = {
+        ...IR,
+        meta: {
+          ...IR.meta,
+          repository: { url: 'https://github.com/a/b', revision: 'x'.repeat(40) },
+        },
+      };
+
+      try {
+        await service.upsert('space-1', {
+          path: 'docs/arch.diagram.json',
+          content: JSON.stringify(withRepo),
+          docType: 'diagram',
+        });
+        fail('should have thrown');
+      } catch (err) {
+        const res = (
+          err as {
+            getResponse?: () => {
+              code: number;
+              data: { stage: string; diagnostics: { code: string; message: string }[] };
+            };
+          }
+        ).getResponse?.();
+        expect(res?.code).toBe(ErrorCode.DIAGRAM_VALIDATION_FAILED);
+        expect(res?.data.stage).toBe('schema');
+        expect(res?.data.diagnostics[0].code).toBe('platform/repository-evidence-unsupported');
+        expect(res?.data.diagnostics[0].message).toContain('平台渲染环境不支持仓库证据');
+      }
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('R3 前置拒绝：components[].sources 非空同样拒绝（第二触发面）', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+      const withSources = {
+        ...IR,
+        components: [{ ...IR.components[0], sources: [{ path: 'src/api.ts', line: 1 }] }],
+      };
+
+      await expect(
+        service.upsert('space-1', {
+          path: 'docs/arch.diagram.json',
+          content: JSON.stringify(withSources),
+          docType: 'diagram',
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DIAGRAM_VALIDATION_FAILED,
+          data: { stage: 'schema' },
+        },
+      });
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('IR JSON 解析失败 → 422 stage:parse（input/json-parse 诊断），零渲染', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+
+      await expect(
+        service.upsert('space-1', {
+          path: 'docs/broken.diagram.json',
+          content: '{ not json',
+          docType: 'diagram',
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DIAGRAM_VALIDATION_FAILED,
+          data: { stage: 'parse', diagnostics: [{ code: 'input/json-parse' }] },
+        },
+      });
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('diagram_type 非法 → 400 VALIDATION_ERROR 列支持类型', async () => {
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
+
+      await expect(
+        service.upsert('space-1', {
+          path: 'docs/x.diagram.json',
+          content: JSON.stringify({ ...IR, diagram_type: 'mindmap' }),
+          docType: 'diagram',
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.VALIDATION_ERROR,
+          data: {
+            supportedTypes: ['architecture', 'workflow', 'sequence', 'dataflow', 'lifecycle'],
+          },
+        },
+      });
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('防呆矩阵：diagram doc 上通用 upsert 传 markdown 内容（docType 省略）→ 422 parse（fail-closed 不误腐化）', async () => {
+      const existing = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([existing], 1),
+      );
+
+      await expect(
+        service.upsert('space-1', {
+          path: 'docs/arch.diagram.json',
+          content: '# 这是 markdown 不是 IR',
+        }),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DIAGRAM_VALIDATION_FAILED, data: { stage: 'parse' } },
+      });
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    // ── D9 三拒绝（M-b 落点回归：400 DIAGRAM_DOC_TYPE_LOCKED 而非 422 parse）──
+
+    it('D9：patchSection 对 diagram doc → 400 DIAGRAM_DOC_TYPE_LOCKED（指路 patch_diagram）', async () => {
+      const doc = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+
+      await expect(
+        service.patchSection('doc-1', 0, '{"ir":"fragment"}', 'native'),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED },
+      });
+      expect(diagramRenderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('D9：patchByMatch 对 diagram doc → 400 DIAGRAM_DOC_TYPE_LOCKED', async () => {
+      const doc = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+
+      await expect(service.patchByMatch('doc-1', '"label"', '"x"', 'native')).rejects.toMatchObject(
+        {
+          response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED },
+        },
+      );
+    });
+
+    it('D9：appendDoc 对 diagram doc → 400 DIAGRAM_DOC_TYPE_LOCKED', async () => {
+      const doc = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+
+      await expect(
+        service.appendDoc('doc-1', { content: '\nmore' }, 'native'),
+      ).rejects.toMatchObject({
+        response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED },
+      });
+    });
+
+    // ── 读路径透传（toSummary / findOne，§4.3）──
+
+    it('findAll：DocSummary 透传 diagramType（列表免解析 IR）', async () => {
+      const doc = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+
+      const result = await service.findAll('space-1', {});
+      expect(result.items[0].diagramType).toBe('architecture');
+    });
+
+    it('findOne：DocDetail.diagram 透传渲染元数据摘要；非 diagram 不携带该键', async () => {
+      const doc = makeDiagramDoc();
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder(
+          [
+            makeSection({
+              headingPath: null,
+              headingText: null,
+              headingLevel: 0,
+              content: canonical,
+            }),
+          ],
+          1,
+        ),
+      );
+
+      const detail = await service.findOne('doc-1');
+      expect(detail.diagram).toEqual({
+        diagramType: 'architecture',
+        qualityProfile: 'standard',
+        renderedAt: '2026-08-30T00:00:00.000Z',
+        htmlBytes: 40,
+        composition: { errors: 0, warnings: 0 },
+      });
+      expect(detail.diagramType).toBe('architecture');
+
+      const plain = makeDoc({ docType: 'guide' });
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([plain], 1));
+      const plainDetail = await service.findOne('doc-1');
+      expect(plainDetail.diagram).toBeUndefined();
+      expect(plainDetail.diagramType).toBeNull();
     });
   });
 });

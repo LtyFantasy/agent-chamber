@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Card, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -21,6 +21,7 @@ import { AlertCircle, BookOpen, ChevronRight } from 'lucide-react';
  */
 export default function SkillListPage() {
   const t = useTranslations('skills');
+  const locale = useLocale();
 
   const {
     data: skills,
@@ -77,7 +78,9 @@ export default function SkillListPage() {
                       <CardDescription>{skill.description}</CardDescription>
                     </div>
                     <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <span>{t('updated', { time: formatRelativeTime(skill.updatedAt) })}</span>
+                      <span>
+                        {t('updated', { time: formatRelativeTime(skill.updatedAt, locale) })}
+                      </span>
                       <ChevronRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
                     </div>
                   </div>

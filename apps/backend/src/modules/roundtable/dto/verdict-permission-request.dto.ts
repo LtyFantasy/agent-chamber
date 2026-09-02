@@ -14,7 +14,8 @@ export class VerdictPermissionRequestDto {
   @IsNotEmpty()
   @MaxLength(100)
   @ApiProperty({
-    description: '选中的审批选项 id（必须 ∈ 请求 options 的 id/optionId，ACP 三选：approve_once / approve_always / reject）',
+    description:
+      '选中的审批选项 id（必须 ∈ 请求 options 的 id/optionId，ACP 三选：approve_once / approve_always / reject）',
     example: 'approve_once',
   })
   optionId: string;

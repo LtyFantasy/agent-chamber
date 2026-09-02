@@ -1,0 +1,14 @@
+{
+  "name": "@agent-chamber/diagram",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendored archify diagram renderers (architecture / workflow / sequence / dataflow / lifecycle) — zero-dependency pure .mjs, no build step. See NOTICE for vendored-from declaration and local patch list.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs"
+  }
+}

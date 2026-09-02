@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import { MotionConfig, motion } from 'framer-motion';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { useAuthStore } from '@/stores/auth.store';
 import { Api } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -14,10 +14,12 @@ import { formatRelativeTime, cn } from '@/lib/utils';
 import { fadeSlideUp, staggerContainer } from '@/lib/animations';
 import { Bot, MessageSquare, KanbanSquare, ArrowRight, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { AgentStatus } from '@/types';
 
 export function EditorDashboard() {
   const { user } = useAuthStore();
   const t = useTranslations('dashboard');
+  const locale = useLocale();
 
   const { data: agents, isLoading: agentsLoading } = useQuery({
     queryKey: ['agents'],
@@ -189,9 +191,9 @@ export function EditorDashboard() {
                         <span className="truncate text-sm font-medium">{topic.title}</span>
                         <span className="shrink-0 text-xs text-muted-foreground">
                           {topic.lastMessageAt
-                            ? formatRelativeTime(topic.lastMessageAt)
+                            ? formatRelativeTime(topic.lastMessageAt, locale)
                             : topic.updatedAt
-                              ? formatRelativeTime(topic.updatedAt)
+                              ? formatRelativeTime(topic.updatedAt, locale)
                               : ''}
                         </span>
                       </Link>
@@ -244,15 +246,15 @@ export function EditorDashboard() {
                         <span
                           className={cn(
                             'flex shrink-0 items-center gap-1.5 text-xs',
-                            agent.status === 'active'
+                            agent.status === AgentStatus.ACTIVE
                               ? 'text-emerald-300'
                               : 'text-muted-foreground',
                           )}
                         >
-                          {agent.status === 'active' && (
+                          {agent.status === AgentStatus.ACTIVE && (
                             <span className="animate-breathing h-1.5 w-1.5 rounded-full bg-emerald-400" />
                           )}
-                          {agent.status === 'active' ? t('online') : agent.status}
+                          {agent.status === AgentStatus.ACTIVE ? t('online') : agent.status}
                         </span>
                       </Link>
                     ))}

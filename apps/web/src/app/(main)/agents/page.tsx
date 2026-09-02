@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Avatar } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
@@ -20,9 +20,9 @@ import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
 import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth.store';
-import { UserRole } from '@/types';
+import { UserRole, AgentStatus } from '@/types';
 import { Plus, Power, Trash2, KeyRound, Pencil, Eye } from 'lucide-react';
-import type { Agent, AgentDeletionImpact } from '@/types';
+import type { Agent } from '@/types';
 
 const AGENT_STATUS_LABEL_KEY = {
   active: 'agents.status.active',
@@ -32,6 +32,7 @@ const AGENT_STATUS_LABEL_KEY = {
 
 export default function AgentsPage() {
   const t = useTranslations('agents');
+  const locale = useLocale();
   const tCommon = useTranslations('common');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tGlobal = useTranslations() as any;
@@ -269,7 +270,9 @@ export default function AgentsPage() {
                       </td>
                       {isAdmin && <td className="p-4 align-middle">{agent.ownerName ?? '-'}</td>}
                       <td className="p-4 align-middle">
-                        <Badge variant={agent.status === 'active' ? 'success' : 'secondary'}>
+                        <Badge
+                          variant={agent.status === AgentStatus.ACTIVE ? 'success' : 'secondary'}
+                        >
                           {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
                           {tGlobal(
                             AGENT_STATUS_LABEL_KEY[
@@ -302,10 +305,10 @@ export default function AgentsPage() {
                       <td className="p-4 align-middle">{agent.topicCount ?? 0}</td>
                       <td className="p-4 align-middle">{agent.messageCount ?? 0}</td>
                       <td className="p-4 align-middle text-muted-foreground">
-                        {formatRelativeTime(agent.lastActiveAt)}
+                        {formatRelativeTime(agent.lastActiveAt, locale)}
                       </td>
                       <td className="p-4 align-middle text-muted-foreground">
-                        {formatDate(agent.createdAt)}
+                        {formatDate(agent.createdAt, locale)}
                       </td>
                       <td className="p-4 align-middle">
                         <div className="flex items-center justify-end gap-2">

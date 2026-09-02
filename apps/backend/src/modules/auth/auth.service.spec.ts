@@ -3,7 +3,7 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository, ObjectLiteral } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
-import { UnauthorizedException, ConflictException } from '@nestjs/common';
+import { UnauthorizedException, ConflictException, ForbiddenException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { Hash } from 'crypto';
@@ -502,6 +502,24 @@ describe('AuthService', () => {
         source: 'api',
       });
       expect(result).toBe(true);
+    });
+
+    it('should reject logout with undefined userId (agent identity path, B-57)', async () => {
+      // B-57 回归：agent 用 API Key 调 logout 时 request.user 不存在 →
+      // @CurrentUser('userId') 为 undefined → fail-closed 拒绝，禁止静默成功
+      // （旧实现：update criteria 绑定 SQL NULL 恒不命中 + 审计 entityId 违反
+      // NOT NULL 落库失败被 fail-open 吞掉，logout 空操作却返回 true）
+      await expect(
+        service.logout(undefined as unknown as string, 'some-refresh-token'),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockRefreshTokenRepo.update).not.toHaveBeenCalled();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('should reject logout with empty userId (B-57)', async () => {
+      await expect(service.logout('', 'some-refresh-token')).rejects.toThrow(ForbiddenException);
+      expect(mockRefreshTokenRepo.update).not.toHaveBeenCalled();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
   });
 });

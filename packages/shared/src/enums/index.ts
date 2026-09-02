@@ -14,11 +14,14 @@ export enum ApiKeyStatus {
   REVOKED = 'revoked',
 }
 
+/**
+ * 话题状态（2026-08-31 死契约清理：删除 DRAFT/VOTING——topic 现实定位 = 常驻聊天室，
+ * create 恒写 ACTIVE，draft/voting 无入口死状态；生产实证 10 个 topic 全部 active。
+ * 流转矩阵见 topic.service.ts TOPIC_STATUS_TRANSITIONS）
+ */
 export enum TopicStatus {
-  DRAFT = 'draft',
   OPEN = 'open',
   ACTIVE = 'active',
-  VOTING = 'voting',
   PAUSED = 'paused',
   CLOSED = 'closed',
   ARCHIVED = 'archived',
@@ -104,6 +107,22 @@ export enum EventType {
   DOC_MOVED = 'doc_moved',
 }
 
+/**
+ * 事件资源类型（events.resourceType 值域；review-0831 任务 8fab2a9d 枚举化）
+ * - 与 EventType 同等级的外部契约字段（events/SSE API 载荷顶层），此前无枚举保护；
+ *   全仓 eventService.create 调用点实测取值集合 = {task, topic, message, board, doc}。
+ * - ⚠️ 与 audit.entityType（开放 free varchar，写入侧已知取值清单 AUDIT_ENTITY_TYPES）
+ *   是两套词汇：audit 专有值（board_list/board_member/topic_participant 等）不入本枚举。
+ * - DTO 校验保持 @IsString() 开放（外部契约不变），本枚举供内部写入点命名引用。
+ */
+export enum ResourceType {
+  TASK = 'task',
+  TOPIC = 'topic',
+  MESSAGE = 'message',
+  BOARD = 'board',
+  DOC = 'doc',
+}
+
 export enum ActorType {
   HUMAN = 'human',
   AGENT = 'agent',
@@ -162,6 +181,20 @@ export enum BoardMemberRole {
 }
 
 /**
+ * DocSpace 成员角色（doc_space_members.role 值域；review-0831 任务 a8a295df 枚举化）
+ * - editor: 可编辑空间内容（文档/分类），由 addEditor 授予，或 create() 时 creator 自动写入
+ * - member: 只读访问，由 inviteAgent 授予
+ * creator 行约定：role='editor' 且 invitedBy=null（非授予产生），removeEditor/uninviteAgent
+ * 对 creator 拒绝操作。值域与 BoardMemberRole 相同但语义独立（docspace 成员体系专属枚举，
+ * 此前 service 裸字面量 + 借用 BoardMemberRole 比较，见 docspace.service.ts）。
+ * role 列是裸 varchar(20)，新增枚举值无需 migration
+ */
+export enum DocSpaceMemberRole {
+  EDITOR = 'editor',
+  MEMBER = 'member',
+}
+
+/**
  * 话题参与者角色（v1.46 TOPIC-PERM 新增 editor，对齐 Board/DocSpace）
  * - moderator: 创建者行标记（topic_participants 中 creator 的 role，历史约定）
  * - editor: 可编辑话题内容字段（title/description）；结构字段/状态流转/成员管理仍 creator-only
@@ -198,10 +231,10 @@ export enum ErrorCode {
   ACTOR_NOT_FOUND = 1010,
 
   // Topic (2000-2099)
+  // ⚠️ 2001（TOPIC_ALREADY_CLOSED）/ 2003（TOPIC_CANNOT_SEND_MESSAGE）/ 4002（TASK_MOVE_INVALID_LIST）
+  //    已退役（2026-08-31 死契约清理），编号永不复用——占位防复用
   TOPIC_NOT_FOUND = 2000,
-  TOPIC_ALREADY_CLOSED = 2001,
   TOPIC_ALREADY_ARCHIVED = 2002,
-  TOPIC_CANNOT_SEND_MESSAGE = 2003,
 
   // Message (2100-2199)
   MESSAGE_NOT_FOUND = 2100,
@@ -216,7 +249,6 @@ export enum ErrorCode {
   // Task (4000-4099)
   TASK_NOT_FOUND = 4000,
   TASK_STATUS_INVALID = 4001,
-  TASK_MOVE_INVALID_LIST = 4002,
   TASK_DEPENDENCY_CYCLE = 4003,
   TASK_DEPENDENCY_SELF = 4004,
   TASK_DEPENDENCY_NOT_FOUND = 4005,
@@ -267,6 +299,14 @@ export enum ErrorCode {
   DOC_ROUTE_NOT_FOUND = 10008,
   /** 409 — 文档写前提校验失败（stale expectedContentHash / expectedSectionHash，调用方须重读后重试） */
   DOC_CONTENT_CONFLICT = 10009,
+  /** 422 — Diagram IR 校验/渲染门不过（parse/schema/render/composition 阶段），data 带 {stage, diagnostics[]} 修复凭据 */
+  DIAGRAM_VALIDATION_FAILED = 10010,
+  /** 422 — diagram JSON patch 应用失败（指针不存在/类型不符/根操作），data 带 {pointer, reason, supportedOps} */
+  DIAGRAM_PATCH_FAILED = 10011,
+  /** 400 — markdown 写通道触及 diagram doc（patch_section/patch_match/append/metadata docType 双向转换）或图工具命中非 diagram doc */
+  DIAGRAM_DOC_TYPE_LOCKED = 10012,
+  /** 409 — 存量 diagram doc 无渲染快照（历史数据），指路 re-upsert / forceRechunk 重渲染 */
+  DIAGRAM_SNAPSHOT_MISSING = 10013,
 
   // Roundtable (11000-11099)
   /** 404 — 审批请求不存在（裁决/查询目标缺失） */
@@ -276,3 +316,73 @@ export enum ErrorCode {
   /** 409 — 同一 topic 下该 actor 已有 active 座位（r17 唯一约束：一 agent 一 topic 一 active 座位；removed 软删豁免可重建） */
   ROUNDTABLE_SEAT_BIND_ACTOR_CONFLICT = 11002,
 }
+
+/**
+ * 话题类型（topics.kind 列值域，设计 docs/roundtable-design.md §5；review-0831 任务 150bf876）
+ * - normal：普通话题（缺省，存量行零感知）
+ * - roundtable：圆桌模式（席位 + 会话层规则 wakePolicy/攒批生效）
+ * 创建后不可变——update 忽略 kind，normal↔roundtable 互转在 M2 推迟清单
+ */
+export enum TopicKind {
+  NORMAL = 'normal',
+  ROUNDTABLE = 'roundtable',
+}
+
+/**
+ * 圆桌唤醒策略（topic.settings.wakePolicy 值域，设计 §6，r4 + R1 拍板）
+ * - mention：仅 @座位label / @all 唤醒对应座位（缺省，新桌默认省钱安全）
+ * - broadcast：新消息唤醒全部 active 座位（高强度讨论桌可选）
+ * 普通话题（kind=normal）不消费该值，但按「配置原样存储」语义照常写入 settings
+ */
+export enum WakePolicy {
+  MENTION = 'mention',
+  BROADCAST = 'broadcast',
+}
+
+/**
+ * 圆桌座位生命周期状态值域（roundtable_seats.status，五值全量；review-0831 任务 150bf876）
+ * - active：座位已启用、待 runner 认领（默认）
+ * - paused：暂停（座位管理操作 M3 落地）
+ * - parked：非唤醒消息暂存（攒批收集器语义）
+ * - offline：runner 断连/主动离线
+ * - removed：软删（M3 阶段 3 座位移除，行保留供溯源）
+ * ⚠️ 与协议包 SEAT_RUNTIME_STATUSES（online/busy/offline，SeatEvent 运行态）是两套词汇，勿混
+ */
+export const SEAT_LIFECYCLE_STATUSES = ['active', 'paused', 'parked', 'offline', 'removed'] as const;
+
+/** 圆桌座位生命周期状态类型 */
+export type SeatLifecycleStatus = (typeof SEAT_LIFECYCLE_STATUSES)[number];
+
+/**
+ * 命名访问视图（单源派生自 SEAT_LIFECYCLE_STATUSES；与 docspace CODE_ENTRY_TYPE 同款
+ * 「值域数组 + 命名化派生」模式，供 entity/query/save 命名引用）
+ */
+export const SEAT_LIFECYCLE_STATUS = {
+  ACTIVE: SEAT_LIFECYCLE_STATUSES[0],
+  PAUSED: SEAT_LIFECYCLE_STATUSES[1],
+  PARKED: SEAT_LIFECYCLE_STATUSES[2],
+  OFFLINE: SEAT_LIFECYCLE_STATUSES[3],
+  REMOVED: SEAT_LIFECYCLE_STATUSES[4],
+} as const;
+
+/**
+ * 座位实时相位值域（M4b-1 presence 派生视图，不落库；review-0831 任务 150bf876）
+ * - thinking：思考中（busy 相位 / activity 边沿）
+ * - tool：工具调用中（带 toolTitle）
+ * - replying：回复中（message_chunk 流式增量）
+ * - idle：空闲（message_complete 终结）
+ * - offline：离线（runner 断连/主动报离线）
+ */
+export const PRESENCE_PHASES = ['thinking', 'tool', 'replying', 'idle', 'offline'] as const;
+
+/** 座位实时相位类型 */
+export type PresencePhase = (typeof PRESENCE_PHASES)[number];
+
+/** 命名访问视图（单源派生自 PRESENCE_PHASES，供 presence 比较/赋值命名引用） */
+export const PRESENCE_PHASE = {
+  THINKING: PRESENCE_PHASES[0],
+  TOOL: PRESENCE_PHASES[1],
+  REPLYING: PRESENCE_PHASES[2],
+  IDLE: PRESENCE_PHASES[3],
+  OFFLINE: PRESENCE_PHASES[4],
+} as const;

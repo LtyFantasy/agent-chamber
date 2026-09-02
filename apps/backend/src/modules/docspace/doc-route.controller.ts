@@ -43,6 +43,7 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { CreateDocRouteDto, UpdateDocRouteDto, QueryDocRouteDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 
 /**
@@ -125,7 +126,7 @@ export class DocRouteController {
     // 覆写全部路由 health jsonb）；轻量 newData {spaceId, rechecked: true}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'doc_space',
+      entityType: AUDIT_ENTITY_TYPE.DOC_SPACE,
       entityId: spaceId,
       actorId: actor.id,
       newData: { spaceId, rechecked: true },
@@ -202,7 +203,7 @@ export class DocRouteController {
     // 决策 2）；newData 白名单 {routeId, spaceId, intent}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'doc_route',
+      entityType: AUDIT_ENTITY_TYPE.DOC_ROUTE,
       entityId: id,
       actorId: actor.id,
       newData: { routeId: id, spaceId: route.spaceId, intent: route.intent },

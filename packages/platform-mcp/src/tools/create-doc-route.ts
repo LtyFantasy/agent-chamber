@@ -23,6 +23,7 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { DOC_ROUTE_CODE_ENTRY_TYPES } from '@agent-chamber/shared';
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -147,7 +148,8 @@ export const createDocRouteTool: CustomTool = {
         },
         codeEntryType: {
           type: 'string',
-          enum: ['exact', 'pattern'],
+          // 枚举值从 shared DOC_ROUTE_CODE_ENTRY_TYPES 单源取值（防 backend DTO 加值后此处漂移）
+          enum: [...DOC_ROUTE_CODE_ENTRY_TYPES],
           description:
             'Optional: codeEntry kind (default "exact"). "exact" = precise file/dir path, health ' +
             'recheck validates it against the repo manifest. "pattern" = glob-style pattern ' +

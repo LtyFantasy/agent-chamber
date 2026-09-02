@@ -46,6 +46,7 @@ import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocSpaceService } from '../src/modules/docspace/docspace.service';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { DocRouteService } from '../src/modules/docspace/doc-route.service';
 import { DocBundleService } from '../src/modules/docspace/doc-bundle.service';
 import { Doc } from '../src/database/entities/doc.entity';
@@ -81,8 +82,12 @@ const DB_CONFIG = {
 /** 本次运行的唯一后缀：隔离测试数据，防与开发库真实文档互相污染 */
 const RUN = `bundle-e2e-${Date.now()}`;
 
-/** 固定测试 actor（docs.created_by 为 uuid 列，upsert 缺省 'system' 字面量会被 PG 拒绝） */
-const testActor = { id: '00000000-0000-4000-8000-0000000000aa', type: ActorType.HUMAN };
+/**
+ * 固定测试 actor（docs.created_by 为 uuid 列，upsert 缺省 'system' 字面量会被 PG 拒绝）。
+ * 本套件专用哨兵 id（不与 docspace-move/patch-metadata 共用 '...00aa'）：afterAll 按
+ * actorId 清理 audit_logs 时并行安全，不误删其他套件行（08-29 套件污染修复）
+ */
+const testActor = { id: '00000000-0000-4000-8000-0000000000a4', type: ActorType.HUMAN };
 
 /** 固定空间 creator（doc_spaces.creator_id 为 uuid 列） */
 const spaceCreator = '00000000-0000-4000-8000-0000000000ee';
@@ -201,6 +206,8 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       eventStub,
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
+      // Diagram IR v1：bundle 回导 diagram 的重校验重渲染由 docspace-diagram e2e 覆盖；本套件桩件仅防构造参数缺失
+      { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
     );
     docRouteService = new DocRouteService(
       ds.getRepository(DocRoute),
@@ -335,6 +342,11 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       }
       await ds.getRepository(DocSpace).delete({ id: srcSpaceId });
     }
+    // upsert/importBundle 写 audit_logs（actorId = testActor.id）——必须同步清理，否则
+    // 残留行会挤占 activity-logs 套件 admin 全量查询的 20 条窗口（createdAt DESC）导致
+    // 其 row-B/row-D/row-E 被挤出分页（08-29 实测 82+ 行污染）。按 actorId 删（本套件
+    // 专用哨兵 actor，并行安全），覆盖用例内临时 doc 的 audit 行
+    await ds.getRepository(AuditLog).delete({ actorId: testActor.id });
     await ds.destroy();
   }, 30000);
 

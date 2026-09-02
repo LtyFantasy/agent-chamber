@@ -23,6 +23,7 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { TaskStatus } from '@agent-chamber/shared';
 
 /**
  * report_task_result — 任务结果汇报（薄透传 POST /tasks/:id/report）
@@ -57,7 +58,8 @@ export const reportTaskResultTool: CustomTool = {
         status: {
           type: 'string',
           description: 'Target status (required)',
-          enum: ['backlog', 'todo', 'in_progress', 'review', 'done', 'blocked', 'archived'],
+          // 枚举值从 shared TaskStatus 单源取值（防 backend DTO 加值后此处漂移）
+          enum: Object.values(TaskStatus),
         },
         comment: {
           type: 'string',

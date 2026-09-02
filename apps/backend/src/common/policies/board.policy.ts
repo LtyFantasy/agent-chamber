@@ -35,7 +35,7 @@ import { BoardMember } from '../../database/entities/board-member.entity';
 import { UnifiedActor } from '../types/actor.types';
 import { ResourceAction } from './resource-action.type';
 import { OwnerProxyService, isOwnerProxyCandidate } from '../services/owner-proxy.service';
-import { Visibility, UserRole } from '@agent-chamber/shared';
+import { Visibility, UserRole, BoardMemberRole } from '@agent-chamber/shared';
 
 /**
  * Board 权限策略（Batch 2：Board 权限自治；v1.37：owner 代理）
@@ -86,7 +86,8 @@ export class BoardPolicy {
       memberRole = member?.role ?? null;
     }
     const isMember = memberRole !== null;
-    const isEditor = memberRole === 'editor';
+    // board_members.role 实体类型为 string，值域对齐 BoardMemberRole 枚举
+    const isEditor = memberRole === BoardMemberRole.EDITOR;
 
     switch (action) {
       case 'read':

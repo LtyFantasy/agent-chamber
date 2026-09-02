@@ -5,6 +5,7 @@ import { UserController } from './user.controller';
 import { UserService } from './user.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 
 describe('UserController', () => {
   let controller: UserController;
@@ -24,7 +25,11 @@ describe('UserController', () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [UserController],
       providers: [{ provide: UserService, useValue: mockService }],
-    }).compile();
+    })
+      // JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起），单测 override 掉
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = moduleRef.get<UserController>(UserController);
     service = moduleRef.get<UserService>(UserService) as unknown as typeof service;

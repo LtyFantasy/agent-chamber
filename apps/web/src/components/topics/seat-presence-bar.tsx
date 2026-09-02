@@ -42,7 +42,7 @@ import { useTranslations } from 'next-intl';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AxiosError } from 'axios';
 import { Crown } from 'lucide-react';
-import { Api, type RoundtableSeatItem } from '@/lib/api';
+import { Api, PRESENCE_PHASE, type RoundtableSeatItem } from '@/lib/api';
 import { useSeatPresence } from '@/lib/use-seat-presence';
 import { confirm, toast } from '@/lib/notify';
 import { Avatar } from '@/components/ui/avatar';
@@ -50,8 +50,12 @@ import { Badge } from '@/components/ui/badge';
 import { SeatPresencePopover } from '@/components/topics/seat-presence-popover';
 import type { TopicParticipant } from '@/types';
 
-/** busy 相位集合（后端 cancel busy 门控同规：thinking/tool/replying 才可取消） */
-const BUSY_PHASES = ['thinking', 'tool', 'replying'] as const;
+/** busy 相位集合（后端 cancel busy 门控同规：thinking/tool/replying 才可取消；派生自 PRESENCE_PHASE 命名对象） */
+const BUSY_PHASES = [
+  PRESENCE_PHASE.THINKING,
+  PRESENCE_PHASE.TOOL,
+  PRESENCE_PHASE.REPLYING,
+] as const;
 
 interface SeatPresenceBarProps {
   /** 圆桌 topic UUID（seats 查询 key 前缀 + cancel 端点目标） */
@@ -160,35 +164,36 @@ export function SeatPresenceBar({
   const renderPresenceBadge = (seat: RoundtableSeatItem) => {
     const phase = seat.presence?.phase;
     if (!phase) return null;
-    if (phase === 'thinking') {
+    if (phase === PRESENCE_PHASE.THINKING) {
+      // thinking（presence 相位值域单源见 api.ts PRESENCE_PHASE）
       return (
         <PresencePill
           testId={`presence-thinking-${seat.id}`}
         >{`◉ ${t('seatPresence.thinking')}`}</PresencePill>
       );
     }
-    if (phase === 'tool' && seat.presence?.toolTitle) {
+    if (phase === PRESENCE_PHASE.TOOL && seat.presence?.toolTitle) {
       return (
         <PresencePill testId={`presence-tool-${seat.id}`} className="max-w-40 truncate">
           {`🔧 ${seat.presence.toolTitle}`}
         </PresencePill>
       );
     }
-    if (phase === 'replying') {
+    if (phase === PRESENCE_PHASE.REPLYING) {
       return (
         <PresencePill
           testId={`presence-replying-${seat.id}`}
         >{`▌ ${t('seatPresence.replying')}`}</PresencePill>
       );
     }
-    if (phase === 'idle' && isLastTurnSilent(seat)) {
+    if (phase === PRESENCE_PHASE.IDLE && isLastTurnSilent(seat)) {
       return (
         <PresencePill testId={`presence-silent-${seat.id}`} className="text-muted-foreground">
           {`💤 ${t('seatPresence.silent')}`}
         </PresencePill>
       );
     }
-    if (phase === 'offline') {
+    if (phase === PRESENCE_PHASE.OFFLINE) {
       return (
         <PresencePill testId={`presence-offline-${seat.id}`} className="text-muted-foreground">
           {t('seatPresence.offline')}

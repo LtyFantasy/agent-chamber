@@ -173,11 +173,24 @@ export class DashboardService {
     return items.sort((a, b) => b.activityScore - a.activityScore).slice(0, 5);
   }
 
+  /**
+   * 最近活跃话题（admin 仪表盘，最多 5 条）。
+   * 接口瘦身二期：投影 {id, title, status, lastMessageAt, updatedAt}——
+   * admin-dashboard.tsx:363-368 只读 lastMessageAt（优先）/updatedAt（回落），
+   * 全量 Topic 实体（agenda/settings jsonb 等）对消费端无价值。
+   */
   async recentTopics() {
-    return this.topicRepo.find({
+    const topics = await this.topicRepo.find({
       order: { updatedAt: 'DESC' },
       take: 5,
     });
+    return topics.map((t) => ({
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      lastMessageAt: t.lastMessageAt,
+      updatedAt: t.updatedAt,
+    }));
   }
 
   /**

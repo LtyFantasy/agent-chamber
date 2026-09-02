@@ -93,6 +93,34 @@ fi
 set_env ADMIN_EMAIL "$ADMIN_EMAIL"
 set_env ADMIN_PASSWORD "$ADMIN_PASSWORD"
 
+# ---------- 3.5 构建镜像源自动回落 ----------
+# 官方源（alpine CDN / npmjs）不通或过慢时自动把国内镜像写入 .env（compose 构建经
+# ${APK_MIRROR:-}/${NPM_REGISTRY:-} 插值拾取）。用户显式设置（shell env 或 .env
+# 已有非空值）时绝不覆盖；官方源通畅则保持默认零注入。
+# 背景：2026-08-28 v1.69.0 从零冒烟实测官方源 1-73KB/s 反复超时挂死，
+# aliyun apk 2.5MB/s / npmmirror 可用（详见线上 docs/oss-dual-repo.md §9.3）
+mirror_probe() { # mirror_probe URL → 0=通畅(≥100KiB/s) 1=不可达或过慢
+  local speed
+  speed="$(curl -sfL -o /dev/null -m 10 -w '%{speed_download}' "$1" 2>/dev/null)" || return 1
+  [[ -n "$speed" && "${speed%.*}" -ge 102400 ]]
+}
+if [[ -z "${APK_MIRROR:-}" ]] && ! grep -q '^APK_MIRROR=.' .env; then
+  if mirror_probe "https://dl-cdn.alpinelinux.org/alpine/MIRRORS.txt"; then
+    info "alpine 官方源通畅，构建不注入镜像源"
+  else
+    set_env APK_MIRROR "mirrors.aliyun.com"
+    warn "alpine 官方源不可达/过慢，已回落镜像 mirrors.aliyun.com（写入 .env，手动改值即可覆盖）"
+  fi
+fi
+if [[ -z "${NPM_REGISTRY:-}" ]] && ! grep -q '^NPM_REGISTRY=.' .env; then
+  if mirror_probe "https://registry.npmjs.org/"; then
+    info "npm 官方源通畅，构建不注入镜像源"
+  else
+    set_env NPM_REGISTRY "https://registry.npmmirror.com"
+    warn "npm 官方源不可达/过慢，已回落镜像 registry.npmmirror.com（写入 .env，手动改值即可覆盖）"
+  fi
+fi
+
 # ---------- 4. 构建并启动 ----------
 info "开始构建并启动容器（首次构建需要几分钟）..."
 docker compose up -d --build

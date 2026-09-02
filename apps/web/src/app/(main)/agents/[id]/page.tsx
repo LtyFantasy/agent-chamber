@@ -3,7 +3,7 @@
 import { useParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -39,6 +39,7 @@ export default function AgentDetailPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('agents.detail');
+  const locale = useLocale();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tGlobal = useTranslations() as any;
 
@@ -129,7 +130,7 @@ export default function AgentDetailPage() {
           </div>
           {agent.lastActiveAt && (
             <p className="text-sm text-muted-foreground mt-1">
-              {t('lastActive', { time: formatDate(agent.lastActiveAt) })}
+              {t('lastActive', { time: formatDate(agent.lastActiveAt, locale) })}
             </p>
           )}
         </div>

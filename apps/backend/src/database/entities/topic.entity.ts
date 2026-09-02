@@ -36,7 +36,7 @@ import {
   OneToMany,
   Index,
 } from 'typeorm';
-import { TopicStatus, ActorType } from '@agent-chamber/shared';
+import { TopicStatus, ActorType, TopicKind } from '@agent-chamber/shared';
 import { TopicParticipant } from './topic-participant.entity';
 import { Message } from './message.entity';
 import { Board } from './board.entity';
@@ -62,7 +62,8 @@ export class Topic {
     type: 'enum',
     enum: TopicStatus,
     enumName: 'topic_status',
-    default: TopicStatus.DRAFT,
+    // 2026-08-31 死契约清理：draft 已删，create 恒写 ACTIVE，默认值对齐实体语义
+    default: TopicStatus.ACTIVE,
   })
   status: TopicStatus;
 
@@ -75,9 +76,10 @@ export class Topic {
    * 'normal' = 普通话题（缺省，存量行零感知）；'roundtable' = 圆桌模式（席位 +
    * 会话层规则 wakePolicy/攒批生效）。创建后不可变——update 忽略 kind，
    * normal↔roundtable 互转在 M2 推迟清单（避免 topic 生命周期中途语义突变）。
+   * 值域单源 TopicKind（shared enums）。
    */
-  @Column({ type: 'varchar', length: 20, nullable: false, default: 'normal' })
-  kind: 'normal' | 'roundtable';
+  @Column({ type: 'varchar', length: 20, nullable: false, default: TopicKind.NORMAL })
+  kind: TopicKind;
 
   @Column({ type: 'uuid', nullable: false, name: 'creator_id' })
   creatorId: string;

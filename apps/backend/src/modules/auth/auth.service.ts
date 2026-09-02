@@ -21,7 +21,12 @@
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
@@ -35,6 +40,7 @@ import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
 import { UserRole, AgentStatus, ErrorCode, ActorType, AuditAction } from '@agent-chamber/shared';
 import type { AuthResponse } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 
 @Injectable()
 export class AuthService {
@@ -71,7 +77,7 @@ export class AuthService {
     const actor = new Actor();
     actor.type = ActorType.HUMAN;
     actor.displayName = dto.name;
-    actor.status = 'active';
+    actor.status = AgentStatus.ACTIVE;
     await this.userRepo.manager.save(actor);
 
     const user = this.userRepo.create({
@@ -89,7 +95,7 @@ export class AuthService {
     // newData 白名单 {userId, username}（决策 6）——passwordHash/email 不入
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: user.id,
       actorId: operatorActorId ?? user.id,
       newData: { userId: user.id, username: user.username },
@@ -136,7 +142,7 @@ export class AuthService {
     // newData 白名单 {userId, username}——失败 login 记不了（entity_id NOT NULL）
     await this.auditService.log({
       action: AuditAction.LOGIN,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: user.id,
       actorId: user.id,
       newData: { userId: user.id, username: user.username },
@@ -186,6 +192,18 @@ export class AuthService {
   }
 
   async logout(userId: string, refreshToken?: string) {
+    // B-57 兜底（铁律 #21 第二层：service 负责业务存在性）：userId 为空（如 agent
+    // 身份调 logout——B-59 后 guard 只挂 request.agent，request.user 不存在）→
+    // fail-closed 明确拒绝，禁止静默成功。旧实现 userId=undefined 时
+    // refreshTokenRepo.update 的 criteria 绑定 SQL NULL 恒不命中（撤销 0 行），
+    // 且审计 entityId=undefined 违反 NOT NULL 落库失败被 fail-open 吞掉——
+    // logout 实际是空操作却返回成功。
+    if (!userId) {
+      throw new ForbiddenException({
+        message: 'Logout requires a human (JWT) session',
+        code: ErrorCode.FORBIDDEN,
+      });
+    }
     if (refreshToken) {
       const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
       await this.refreshTokenRepo.update({ tokenHash, userId }, { revokedAt: new Date() });
@@ -194,7 +212,7 @@ export class AuthService {
     // 审计（决策 8）：LOGOUT 行，actor=实体=登出用户自身
     await this.auditService.log({
       action: AuditAction.LOGOUT,
-      entityType: 'user',
+      entityType: AUDIT_ENTITY_TYPE.USER,
       entityId: userId,
       actorId: userId,
       newData: { userId },

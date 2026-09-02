@@ -36,9 +36,13 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
 import { DocRouteService } from './doc-route.service';
+import { CODE_ENTRY_TYPE } from './doc-constants';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { DOC_BUNDLE_FORMAT_VERSION, ImportDocBundleDto } from './dto';
 import type { BundleRouteItemDto, CreateDocRouteDto } from './dto';
+// review-0831 任务 bbd175dc 子项 2：批量 per-item 错误提取唯一实现（本文件 errorOf
+// 已收敛至 doc-error.helper，与 doc.service.batchUpsert 共用同一 { message, code } 契约）
+import { errorOf } from './doc-error.helper';
 
 // ─── Bundle 形状（formatVersion 1，任务 T6）──────────────────────
 //
@@ -151,18 +155,6 @@ export interface DocSpaceImportBundleResult {
   categories: DocBundleCategoryImportSection;
   routes: DocBundleRouteImportSection;
   spaceMeta: DocBundleSpaceMetaResult;
-}
-
-/**
- * 抽取 per-item 错误形状（与 batchUpsert 的 error 形状一致：
- * { message, code }——code 取 NestJS HttpException.response.code，无则省略）。
- */
-function errorOf(err: unknown): { message: string; code?: number } {
-  const httpErr = err as { response?: { message?: string; code?: number }; message?: string };
-  return {
-    message: httpErr.response?.message ?? httpErr.message ?? 'Unknown error',
-    code: httpErr.response?.code,
-  };
 }
 
 /**
@@ -469,7 +461,7 @@ export class DocBundleService {
           secondaryDocId,
           secondaryHeadingPath: item.secondaryHeadingPath ?? null,
           codeEntry: item.codeEntry ?? null,
-          codeEntryType: item.codeEntryType ?? 'exact',
+          codeEntryType: item.codeEntryType ?? CODE_ENTRY_TYPE.EXACT,
           sortOrder: item.sortOrder ?? 0,
         } as CreateDocRouteDto;
 

@@ -36,6 +36,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   // 无命名空间前缀 mock（同 collapsible-markdown.test.tsx 先例）：
   // t('message.x') 直接按 'message.x' 查快照；tGlobal('topics.messageType.x') 按全键查
   useTranslations: () => (key: string) => messages[key] ?? key,

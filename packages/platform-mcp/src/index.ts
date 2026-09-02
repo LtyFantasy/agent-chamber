@@ -57,9 +57,14 @@ import { patchDocMetadataTool } from './tools/patch-doc-metadata';
 import { appendDocTool } from './tools/append-doc';
 import { patchTaskDescriptionTool } from './tools/patch-task-description';
 import { getMyActivityTool } from './tools/get-my-activity';
+import { listDocTreeTool } from './tools/list-doc-tree';
+import { upsertDiagramTool } from './tools/upsert-diagram';
+import { readDiagramTool } from './tools/read-diagram';
+import { patchDiagramTool } from './tools/patch-diagram';
+import { validateDiagramTool } from './tools/validate-diagram';
 
 /**
- * 33 个业务语义化高层 MCP tools
+ * 38 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号；新工具追加在尾部，不打乱既有编号）：
@@ -102,7 +107,20 @@ import { getMyActivityTool } from './tools/get-my-activity';
  * （活动日志系统 Phase 3（plan shadowcat-sunspot-catwoman）：查询当前 actor 的
  * 审计时间线——自证「我的 key 做了什么」；entityType/action/from/to 过滤 +
  * limit 默认 20 clamp [1,50]；响应带 total/hasNext 指导翻页；防误导两句
- * （覆盖起点 + 空结果≠未发生）固化在 description；对应 REST GET /activity-logs）
+ * （覆盖起点 + 空结果≠未发生）固化在 description；对应 REST GET /activity-logs）→
+ * ㉞ list_doc_tree
+ * （v1.70.0-dev 懒加载目录树 Phase 3：DocSpace 分层目录钻取——一次调用只返
+ * 「当前层」直接子目录（递归 docCount/latestDocAt 聚合）+ 直挂文档 slim 分页，
+ * 用 folder.path 作下一次 prefix 下钻；与 list_docs 平铺清单互补，大空间
+ * 目录发现免全量拉取；对应 REST GET /doc-spaces/:id/docs/tree）→
+ * ㉟ upsert_diagram → ㊱ read_diagram → ㊲ patch_diagram → ㊳ validate_diagram
+ * （Diagram IR v1 Phase 2，plan diagram-ir-v1-plan：docType='diagram' 图文档四件套——
+ * 服务端 fail-closed 渲染门（schema/geometry/composition 不过不入库）；upsert = 5 型
+ * 选型 + quality_profile 门（showcase=0 警告）；read = 解析后 IR 对象 + contentHash
+ * 乐观锁 token；patch = RFC 6901/6902 子集原子应用 + expectedContentHash 必填；
+ * validate = dry-run 零副作用修复凭据；错误消费分层键名 details（非 data）；
+ * 对应 REST PUT /doc-spaces/:id/diagrams、GET /docs/:id/diagram、
+ * PATCH /docs/:id/diagram、POST /doc-spaces/:id/diagrams/validate）
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -138,4 +156,9 @@ export const customTools: CustomTool[] = [
   appendDocTool,
   patchTaskDescriptionTool,
   getMyActivityTool,
+  listDocTreeTool,
+  upsertDiagramTool,
+  readDiagramTool,
+  patchDiagramTool,
+  validateDiagramTool,
 ];

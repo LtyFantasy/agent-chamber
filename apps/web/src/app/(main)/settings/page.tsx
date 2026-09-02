@@ -6,6 +6,7 @@ import type { AxiosError } from 'axios';
 import { useAuthStore } from '@/stores/auth.store';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { UserRole } from '@/types';
 import type { ApiResponse, User as UserDto } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -218,7 +219,7 @@ export default function SettingsPage() {
                   <p className="font-medium">{displayUser?.name}</p>
                   <p className="text-sm text-muted-foreground">{displayUser?.email}</p>
                   <Badge variant="outline" className="mt-1">
-                    {displayUser?.role === 'admin'
+                    {displayUser?.role === UserRole.ADMIN
                       ? t('role.admin')
                       : displayUser?.role || t('role.user')}
                   </Badge>

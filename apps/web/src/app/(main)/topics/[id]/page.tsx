@@ -5,9 +5,20 @@ import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import type { Message, Board } from '@/types';
+import {
+  ActorType,
+  AgentStatus,
+  EventType,
+  ParticipantStatus,
+  TaskStatus,
+  TopicParticipantRole,
+  UserRole,
+  Visibility,
+} from '@/types';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
-import { Api } from '@/lib/api';
+import { Api, SEAT_LIFECYCLE_STATUS } from '@/lib/api';
+import { TopicKind } from '@agent-chamber/shared';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { confirm, toast } from '@/lib/notify';
 import { useEventPoll } from '@/lib/use-event-poll';
@@ -38,6 +49,8 @@ import { SeatBadges } from '@/components/topics/seat-badges';
 import { SeatManagement } from '@/components/topics/seat-management';
 import { SeatPresenceBar } from '@/components/topics/seat-presence-bar';
 import { TopicComposer } from '@/components/topics/topic-composer';
+// 话题状态操作按钮组（前端债包批次 4 子项 2 commit 7 抽取自本页 renderStatusActions）
+import { TopicStatusActions } from '@/components/topics/topic-status-actions';
 import {
   ArrowLeft,
   AlertCircle,
@@ -139,7 +152,7 @@ export default function TopicDetailPage() {
   // filterSender 变体一起刷新；轮询生命周期由 useEventPoll 内部管理，页面不关心。
   useEventPoll({
     onEvent: (event) => {
-      if (event.eventType === 'new_message' && event.topicId === id) {
+      if (event.eventType === EventType.NEW_MESSAGE && event.topicId === id) {
         void queryClient.invalidateQueries({ queryKey: ['topics', 'messages', id] });
       }
     },
@@ -248,13 +261,6 @@ export default function TopicDetailPage() {
   /** 取消邀请人类用户（从参与者中移除） */
   const uninviteUserMutation = useMutation({
     mutationFn: (userId: string) => Api.topics.uninviteUser(id, { userId }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['topics', 'detail', id] });
-    },
-  });
-
-  const openMutation = useMutation({
-    mutationFn: () => Api.topics.open(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['topics', 'detail', id] });
     },
@@ -429,7 +435,7 @@ export default function TopicDetailPage() {
   }, [messagesLoading, allMessages.length, isAuthenticated, id]);
 
   /** 圆桌 @ 补全候选源（M2 web 批次）：仅 kind='roundtable' 拉座位，active 座位 label 作为 mentionTargets */
-  const isRoundtable = topic?.kind === 'roundtable';
+  const isRoundtable = topic?.kind === TopicKind.ROUNDTABLE;
   const { data: seatsData } = useQuery({
     queryKey: ['roundtable', 'seats', id],
     queryFn: () => Api.roundtable.listSeats(id),
@@ -438,7 +444,9 @@ export default function TopicDetailPage() {
   });
   const mentionTargets = useMemo(() => {
     if (!isRoundtable) return null;
-    return (seatsData ?? []).filter((s) => s.status === 'active').map((s) => s.label);
+    return (seatsData ?? [])
+      .filter((s) => s.status === SEAT_LIFECYCLE_STATUS.ACTIVE)
+      .map((s) => s.label);
   }, [isRoundtable, seatsData]);
 
   // ── MembersSheet 数据装配（批次 C1：内联成员 Sheet → 共享组件；页面层负责
@@ -447,19 +455,19 @@ export default function TopicDetailPage() {
   /** 参与者管理权限闸（照抄原内联 Sheet 各 section 的 gate：平台 admin ｜ topic
    *  创建者/owner 代理——体验层闸，后端同样 403） */
   const canManage =
-    currentUser?.role === 'admin' ||
+    currentUser?.role === UserRole.ADMIN ||
     isCreatorOrOwner(topic?.creatorId, currentUser?.id, myAgentIds);
 
   /** 活跃参与者 → MemberItem（role 归一：非 moderator 一律 member，与旧 Badge 取反一致） */
   const memberItems = useMemo((): MemberItem[] => {
     if (!topic) return [];
     return (topic.participants ?? [])
-      .filter((p) => p.status === 'active')
+      .filter((p) => p.status === ParticipantStatus.ACTIVE)
       .map((p) => ({
         actorId: p.participantId,
         name: p.name,
         actorType: p.participantType,
-        role: p.role === 'moderator' ? 'moderator' : 'member',
+        role: p.role === TopicParticipantRole.MODERATOR ? 'moderator' : 'member',
         avatarUrl: p.avatarUrl ?? undefined,
         // 已删除信号透传（统一批 B）：软删 actor 带 deletedAt → member-row 灰化+badge
         deletedAt: p.deletedAt ?? null,
@@ -476,7 +484,7 @@ export default function TopicDetailPage() {
   const invitedItems = useMemo((): MemberItem[] => {
     if (!topic) return [];
     return (topic.participants ?? [])
-      .filter((p) => p.status === 'invited')
+      .filter((p) => p.status === ParticipantStatus.INVITED)
       .map((p) => ({
         actorId: p.participantId,
         name: p.name,
@@ -495,7 +503,7 @@ export default function TopicDetailPage() {
     if (!topic) return [];
     const involvedAgentIds = new Set(
       (topic.participants ?? [])
-        .filter((p) => p.participantType === 'agent' && p.status !== 'left')
+        .filter((p) => p.participantType === ActorType.AGENT && p.status !== ParticipantStatus.LEFT)
         .map((p) => p.participantId),
     );
     (topic.invitedAgentIds ?? []).forEach((id) => {
@@ -504,7 +512,7 @@ export default function TopicDetailPage() {
       }
     });
     return (agentsData ?? [])
-      .filter((a) => a.status === 'active' && !involvedAgentIds.has(a.id))
+      .filter((a) => a.status === AgentStatus.ACTIVE && !involvedAgentIds.has(a.id))
       .map((a) => ({
         actorId: a.id,
         name: a.name,
@@ -518,10 +526,10 @@ export default function TopicDetailPage() {
   /** 可邀请人类（仅 private topic 传：排除已在 participants 的任何状态人类 +
    *  当前用户；non-private 返回 undefined → 组件不渲染人类区） */
   const humanCandidates = useMemo((): MemberItem[] | undefined => {
-    if (!topic || topic.visibility !== 'private') return undefined;
+    if (!topic || topic.visibility !== Visibility.PRIVATE) return undefined;
     const participantUserIds = new Set(
       (topic.participants ?? [])
-        .filter((p) => p.participantType === 'human')
+        .filter((p) => p.participantType === ActorType.HUMAN)
         .map((p) => p.participantId),
     );
     return (usersData?.items ?? [])
@@ -550,7 +558,9 @@ export default function TopicDetailPage() {
   const leftSeats = useMemo(() => {
     if (!isRoundtable || !topic) return [];
     const activeParticipantIds = new Set(
-      (topic.participants ?? []).filter((p) => p.status === 'active').map((p) => p.participantId),
+      (topic.participants ?? [])
+        .filter((p) => p.status === ParticipantStatus.ACTIVE)
+        .map((p) => p.participantId),
     );
     return (seatsData ?? []).filter(
       (s) => s.config?.bindActorId && !activeParticipantIds.has(s.config.bindActorId),
@@ -631,10 +641,11 @@ export default function TopicDetailPage() {
    *  （组件切回主视图并清空选择）；任一失败 reject（组件留在邀请视图保留选择）+
    *  失败汇总 toast（成功 N / 失败 M） */
   const handleInvite = async (actorIds: string[], kind: 'agent' | 'human') => {
-    const mutation = kind === 'agent' ? inviteAgentMutation : inviteUserMutation;
+    const mutation = kind === ActorType.AGENT ? inviteAgentMutation : inviteUserMutation;
     const results = await Promise.allSettled(
       actorIds.map((actorId) => mutation.mutateAsync(actorId)),
     );
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- PromiseSettledResult 内置状态（'fulfilled'|'rejected'），非圆桌权限请求状态
     const failed = results.filter((r) => r.status === 'rejected').length;
     const succeeded = results.length - failed;
     if (failed > 0) {
@@ -648,7 +659,7 @@ export default function TopicDetailPage() {
   /** 移除活跃成员（组件 AlertDialog 确认后回调）：按类型分发端点与旧 UI 一致——
    *  agent → removeParticipant；human → uninviteUser */
   const handleRemoveMember = (actorId: string) => {
-    if (participantTypeById.get(actorId) === 'human') {
+    if (participantTypeById.get(actorId) === ActorType.HUMAN) {
       uninviteUserMutation.mutate(actorId);
     } else {
       removeParticipantMutation.mutate({ participantId: actorId });
@@ -659,93 +670,11 @@ export default function TopicDetailPage() {
    *  当前后端 invite-user 直落 active，invited 区理论只含 agent；按类型路由避免
    *  误用 uninvite-agent 对用户 id 触发 AGENT_NOT_FOUND 404） */
   const handleCancelInvite = (actorId: string) => {
-    if (participantTypeById.get(actorId) === 'human') {
+    if (participantTypeById.get(actorId) === ActorType.HUMAN) {
       uninviteUserMutation.mutate(actorId);
     } else {
       uninviteAgentMutation.mutate(actorId);
     }
-  };
-
-  const renderStatusActions = () => {
-    const status = topic.status;
-
-    if (status === 'archived') {
-      return null;
-    }
-
-    const buttons: React.ReactNode[] = [];
-
-    if (status === 'draft') {
-      buttons.push(
-        <Button
-          key="open"
-          size="sm"
-          variant="default"
-          onClick={() => openMutation.mutate()}
-          isLoading={openMutation.isPending}
-        >
-          {t('publish')}
-        </Button>,
-      );
-    }
-
-    if (status === 'active') {
-      buttons.push(
-        <Button
-          key="pause"
-          size="sm"
-          variant="outline"
-          onClick={() => pauseMutation.mutate()}
-          isLoading={pauseMutation.isPending}
-          className="w-full justify-start"
-        >
-          {t('pause')}
-        </Button>,
-      );
-    }
-
-    if (status === 'paused') {
-      buttons.push(
-        <Button
-          key="resume"
-          size="sm"
-          variant="outline"
-          onClick={() => resumeMutation.mutate()}
-          isLoading={resumeMutation.isPending}
-          className="w-full justify-start"
-        >
-          {t('resume')}
-        </Button>,
-      );
-    }
-
-    if (status !== 'closed') {
-      buttons.push(
-        <Button
-          key="close"
-          size="sm"
-          variant="secondary"
-          onClick={() => openConfirm('close')}
-          className="w-full justify-start"
-        >
-          {t('closeTopic')}
-        </Button>,
-      );
-    }
-
-    buttons.push(
-      <Button
-        key="archive"
-        size="sm"
-        variant="outline"
-        onClick={() => openConfirm('archive')}
-        className="w-full justify-start"
-      >
-        {t('archive')}
-      </Button>,
-    );
-
-    return <div className="flex flex-col gap-1">{buttons}</div>;
   };
 
   return (
@@ -763,7 +692,7 @@ export default function TopicDetailPage() {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h1 className="text-lg md:text-2xl font-bold truncate">{topic.title}</h1>
-            {topic.visibility === 'private' && (
+            {topic.visibility === Visibility.PRIVATE && (
               <Badge
                 variant="outline"
                 className="shrink-0 gap-1 text-amber-300 border-amber-500/40 bg-amber-500/10"
@@ -771,7 +700,7 @@ export default function TopicDetailPage() {
                 <Lock className="h-3 w-3" /> {t('visibility.private')}
               </Badge>
             )}
-            {topic.visibility === 'open' && (
+            {topic.visibility === Visibility.OPEN && (
               <Badge
                 variant="outline"
                 className="shrink-0 gap-1 text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
@@ -780,7 +709,7 @@ export default function TopicDetailPage() {
               </Badge>
             )}
             {/* 圆桌标识 badge（v1.49.0，与列表页卡片同款紫色系） */}
-            {topic.kind === 'roundtable' && (
+            {topic.kind === TopicKind.ROUNDTABLE && (
               <Badge
                 variant="outline"
                 className="shrink-0 gap-1 text-violet-300 border-violet-500/40 bg-violet-500/10"
@@ -801,9 +730,11 @@ export default function TopicDetailPage() {
           <Users className="h-3.5 w-3.5" />
           {(() => {
             const participants = topic.participants || [];
-            const activeCount = participants.filter((p) => p.status === 'active').length;
+            const activeCount = participants.filter(
+              (p) => p.status === ParticipantStatus.ACTIVE,
+            ).length;
             const invitedCount =
-              participants.filter((p) => p.status === 'invited').length ||
+              participants.filter((p) => p.status === ParticipantStatus.INVITED).length ||
               (topic.invitedAgentIds || []).length;
             const total = activeCount + invitedCount;
             return total > 0 ? t('people', { count: total }) : t('participants');
@@ -839,7 +770,16 @@ export default function TopicDetailPage() {
           {/* 浮层属壳层元素：glass 玻璃化（允许 blur），替代不透明 bg-background */}
           <div className="absolute right-0 top-full mt-1 w-40 rounded-md glass shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
             <div className="p-1">
-              {renderStatusActions()}
+              <TopicStatusActions
+                status={topic.status}
+                onPause={() => pauseMutation.mutate()}
+                pausePending={pauseMutation.isPending}
+                onResume={() => resumeMutation.mutate()}
+                resumePending={resumeMutation.isPending}
+                onClose={() => openConfirm('close')}
+                onArchive={() => openConfirm('archive')}
+                t={t}
+              />
               <Button size="sm" variant="ghost" onClick={openEdit} className="w-full justify-start">
                 <Pencil className="h-4 w-4 mr-2" /> {tGlobal('common.edit')}
               </Button>
@@ -857,7 +797,7 @@ export default function TopicDetailPage() {
         enabled={isRoundtable}
         participants={topic.participants}
         canManage={
-          currentUser?.role === 'admin' ||
+          currentUser?.role === UserRole.ADMIN ||
           isCreatorOrOwner(topic.creatorId, currentUser?.id, myAgentIds)
         }
       />
@@ -911,7 +851,7 @@ export default function TopicDetailPage() {
           )
         }
         renderRowExtra={(seat) =>
-          isRoundtable && seat.actorType === 'agent' ? (
+          isRoundtable && seat.actorType === ActorType.AGENT ? (
             <SeatBadges
               topicId={id}
               seats={(seatsData ?? []).filter((s) => s.config?.bindActorId === seat.actorId)}
@@ -960,7 +900,9 @@ export default function TopicDetailPage() {
                   src={sender.senderAvatar}
                   fallback={sender.senderName}
                   size="sm"
-                  actorType={sender.senderType === 'agent' ? 'agent' : 'human'}
+                  actorType={
+                    sender.senderType === ActorType.AGENT ? ActorType.AGENT : ActorType.HUMAN
+                  }
                   seed={sender.senderId}
                 />
                 <span
@@ -1037,11 +979,11 @@ export default function TopicDetailPage() {
                     >
                       <span
                         className={`h-2 w-2 rounded-full shrink-0 ${
-                          t.status === 'done'
+                          t.status === TaskStatus.DONE
                             ? 'bg-green-500'
-                            : t.status === 'in_progress'
+                            : t.status === TaskStatus.IN_PROGRESS
                               ? 'bg-amber-500'
-                              : t.status === 'blocked'
+                              : t.status === TaskStatus.BLOCKED
                                 ? 'bg-red-500'
                                 : 'bg-blue-500'
                         }`}
@@ -1274,18 +1216,20 @@ export default function TopicDetailPage() {
                   variants={fadeSlideUp}
                   initial={entryAnimReadyRef.current && !shouldReduceMotion ? 'hidden' : false}
                   animate="show"
-                  className={`group flex gap-2 md:gap-3 ${msg.senderType === 'human' ? 'flex-row-reverse' : ''} ${
-                    msg.senderType === 'system' ? 'w-full justify-center' : ''
+                  className={`group flex gap-2 md:gap-3 ${msg.senderType === ActorType.HUMAN ? 'flex-row-reverse' : ''} ${
+                    msg.senderType === ActorType.SYSTEM ? 'w-full justify-center' : ''
                   }`}
                 >
-                  {msg.senderType !== 'system' && (
+                  {msg.senderType !== ActorType.SYSTEM && (
                     // 已删除降级（统一批 B）：头像 hover 提示（senderName 灰化在气泡内）
                     <div className="shrink-0">
                       <Avatar
                         src={msg.senderAvatar}
                         fallback={msg.senderName}
                         size="sm"
-                        actorType={msg.senderType === 'agent' ? 'agent' : 'human'}
+                        actorType={
+                          msg.senderType === ActorType.AGENT ? ActorType.AGENT : ActorType.HUMAN
+                        }
                         seed={msg.senderId}
                         title={msg.deletedAt ? t('message.deletedSenderTitle') : undefined}
                       />

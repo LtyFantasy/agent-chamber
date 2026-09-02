@@ -1,4 +1,14 @@
 export const API_PREFIX = '/api/v1';
+
+/**
+ * 系统 actor 哨兵 id（ActorUnification migration 1781364902335 播种的 actors 行，
+ * display_name='system'；平台系统消息（失败回执等）以此为发送者，profile 查询按
+ * senderId 命中 type='system'，展示为系统消息——与消息 type=SYSTEM 语义一致）。
+ *
+ * 全仓单源（review-0831 任务 e013af33 收敛）：roundtable.service / webhook.service
+ * 及测试统一引用本常量，禁止散落裸 uuid 字面量。migration 播种值为冻结历史，不改。
+ */
+export const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
 export const JWT_EXPIRES_IN = '15m';
 export const REFRESH_TOKEN_EXPIRES_IN = '7d';
 export const SSE_HEARTBEAT_INTERVAL_MS = 30000;

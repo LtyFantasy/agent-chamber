@@ -23,7 +23,11 @@ describe('AdminUserController', () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [AdminUserController],
       providers: [{ provide: UserService, useValue: mockService }],
-    }).compile();
+    })
+      // JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起），单测 override 掉
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = moduleRef.get<AdminUserController>(AdminUserController);
     service = moduleRef.get<UserService>(UserService) as unknown as typeof service;

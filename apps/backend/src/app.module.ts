@@ -38,7 +38,6 @@ import { CommonModule } from './common/common.module';
 
 import databaseConfig from './config/database.config';
 import jwtConfig from './config/jwt.config';
-import appConfig from './config/app.config';
 
 import * as entities from './database/entities';
 
@@ -66,7 +65,9 @@ import { HealthModule } from './health/health.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [databaseConfig, jwtConfig, appConfig],
+      // app.config 已删除（review-0831 任务 e013af33：apiPrefix/port 死配置零消费，
+      // 端口由 main.ts process.env.PORT 直读，前缀由 shared API_PREFIX 单源）
+      load: [databaseConfig, jwtConfig],
     }),
     // 事件总线（M1 圆桌计划决策 2）：@nestjs/event-emitter forRoot() 默认 global: true，
     // 注册一次全模块可注入 EventEmitter2。EventService.create() 末尾 emit('event.created')，

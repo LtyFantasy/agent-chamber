@@ -79,8 +79,9 @@ export class UserController {
     @CurrentUser() user: { userId: string } | undefined,
     @Query() query: { page?: string | number; pageSize?: string | number; q?: string },
   ) {
-    // 仅对人类（JWT）开放：JwtAuthGuard 对携带 X-API-Key 的请求直接放行但不挂载 request.user，
-    // 故 user 缺失即代表 API key agent 调用 → 403。邀请下拉仅人类 UI 使用，Agent 无业务场景。
+    // 仅对人类（JWT）开放：JwtAuthGuard 对携带 X-API-Key 的请求走真实 API Key 认证
+    // 并挂 request.agent（不挂 request.user，B-59 起不再「放行不认证」），故 user 缺失
+    // 即代表 API key agent 调用 → 403。邀请下拉仅人类 UI 使用，Agent 无业务场景。
     if (!user) {
       throw new ForbiddenException({
         message: 'This endpoint is restricted to human (JWT) authentication',

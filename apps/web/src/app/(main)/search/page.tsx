@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
 import { EmptyState } from '@/components/ui/empty-state';
+import { taskStatusMap, taskPriorityMap } from '@/lib/status-visuals';
 import { formatRelativeTime } from '@/lib/utils';
 import { Search, MessageSquare, ClipboardList, FileText, User } from 'lucide-react';
 import Link from 'next/link';
@@ -21,30 +22,7 @@ import type {
   PaginatedResponse,
   DocSearchHitWithSpace,
 } from '@/types';
-
-const taskStatusMap: Record<
-  string,
-  {
-    labelKey: string;
-    variant: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning';
-  }
-> = {
-  backlog: { labelKey: 'tasks.status.backlog', variant: 'secondary' },
-  todo: { labelKey: 'tasks.status.todo', variant: 'default' },
-  in_progress: { labelKey: 'tasks.status.in_progress', variant: 'warning' },
-  review: { labelKey: 'tasks.status.review', variant: 'outline' },
-  done: { labelKey: 'tasks.status.done', variant: 'success' },
-  blocked: { labelKey: 'tasks.status.blocked', variant: 'destructive' },
-  archived: { labelKey: 'tasks.status.archived', variant: 'secondary' },
-};
-
-// 优先级徽章：半透明语义色（对齐 ui-design-system §2.2 与看板任务卡同款配色）
-const taskPriorityMap: Record<string, { label: string; color: string }> = {
-  p0: { label: 'P0', color: 'bg-red-500/15 text-red-300' },
-  p1: { label: 'P1', color: 'bg-orange-500/15 text-orange-300' },
-  p2: { label: 'P2', color: 'bg-blue-500/15 text-blue-300' },
-  p3: { label: 'P3', color: 'bg-muted/50 text-muted-foreground' },
-};
+import { ActorType } from '@/types';
 
 /** 将 <<<...>>> 标记替换为高亮 HTML */
 function renderHighlight(highlight: string | null): JSX.Element | string {
@@ -84,6 +62,7 @@ export default function SearchPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const t = useTranslations('search');
+  const locale = useLocale();
   const tGlobal = useTranslations();
 
   const urlQ = searchParams.get('q') || '';
@@ -271,18 +250,18 @@ export default function SearchPage() {
                 </Badge>
               )}
               <span className="ml-2 text-xs text-muted-foreground">
-                {message.senderType === 'human'
+                {message.senderType === ActorType.HUMAN
                   ? t('sender.human')
-                  : message.senderType === 'agent'
+                  : message.senderType === ActorType.AGENT
                     ? t('sender.agent')
-                    : message.senderType === 'system'
+                    : message.senderType === ActorType.SYSTEM
                       ? t('sender.system')
                       : message.senderType}
               </span>
             </div>
           </div>
-          <span className="text-xs text-muted-foreground">
-            {formatRelativeTime(message.createdAt)}
+          <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">
+            {formatRelativeTime(message.createdAt, locale)}
           </span>
         </div>
       </CardHeader>
@@ -332,7 +311,9 @@ export default function SearchPage() {
                 {t('assigned')}
               </span>
             )}
-            <span className="text-muted-foreground">{formatRelativeTime(task.createdAt)}</span>
+            <span className="text-muted-foreground">
+              {formatRelativeTime(task.createdAt, locale)}
+            </span>
           </div>
           {task.descriptionSnippet && (
             <p className="mt-2 text-sm text-muted-foreground line-clamp-2">

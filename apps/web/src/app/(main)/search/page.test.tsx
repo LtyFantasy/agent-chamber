@@ -10,7 +10,7 @@
  * 搜索）+ mock Api.search.query 返回固定结果；文案用 en.json 快照。
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import SearchPage from './page';
 import { Api } from '@/lib/api';
 import type { SearchResult } from '@/types';
@@ -32,6 +32,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   useTranslations: (ns?: string) => (key: string, params?: Record<string, string | number>) => {
     const fullKey = ns ? `${ns}.${key}` : key;
     let text = messages[fullKey] ?? fullKey;

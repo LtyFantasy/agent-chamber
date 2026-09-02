@@ -316,7 +316,24 @@ describe('DashboardService', () => {
 
   describe('recentTopics', () => {
     it('should return top 5 recent topics ordered by updatedAt desc', async () => {
-      const topics = [{ id: 't1' }, { id: 't2' }] as Topic[];
+      const topics = [
+        {
+          id: 't1',
+          title: 'T1',
+          status: 'active',
+          lastMessageAt: new Date('2026-08-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-02T00:00:00.000Z'),
+          agenda: ['a1'], // 投影外字段不应泄漏
+          settings: { visibility: 'private' },
+        },
+        {
+          id: 't2',
+          title: 'T2',
+          status: 'open',
+          lastMessageAt: null,
+          updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      ] as unknown as Topic[];
       mockTopicRepo.find.mockResolvedValue(topics);
 
       const result = await service.recentTopics();
@@ -325,7 +342,25 @@ describe('DashboardService', () => {
         order: { updatedAt: 'DESC' },
         take: 5,
       });
-      expect(result).toEqual(topics);
+      // 投影 {id,title,status,lastMessageAt,updatedAt}：admin-dashboard 读 lastMessageAt（优先）/updatedAt（回落）
+      expect(result).toEqual([
+        {
+          id: 't1',
+          title: 'T1',
+          status: 'active',
+          lastMessageAt: new Date('2026-08-02T00:00:00.000Z'),
+          updatedAt: new Date('2026-08-02T00:00:00.000Z'),
+        },
+        {
+          id: 't2',
+          title: 'T2',
+          status: 'open',
+          lastMessageAt: null,
+          updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      ]);
+      expect(result[0]).not.toHaveProperty('agenda');
+      expect(result[0]).not.toHaveProperty('settings');
     });
   });
 });

@@ -23,6 +23,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ErrorCode } from '@agent-chamber/shared';
 import { Actor } from '../../database/entities/actor.entity';
+import { buildAvatarUrl } from './avatar.constants';
 
 /**
  * SVG 头像原文体积上限（字节）。
@@ -68,7 +69,7 @@ export class AvatarService {
       });
     }
 
-    const avatarUrl = `/api/v1/avatars/${actorId}.svg`;
+    const avatarUrl = buildAvatarUrl(actorId);
     actor.avatarSvg = svg;
     actor.avatarUrl = avatarUrl;
     await this.actorRepo.save(actor);

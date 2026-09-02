@@ -29,6 +29,7 @@ import {
   ManyToOne,
   JoinColumn,
 } from 'typeorm';
+import { SEAT_LIFECYCLE_STATUS } from '@agent-chamber/shared';
 import { Topic } from './topic.entity';
 import { RoundtableRunner } from './roundtable-runner.entity';
 
@@ -46,11 +47,22 @@ import { RoundtableRunner } from './roundtable-runner.entity';
  *   上行与 seat.inject 下行各自独立递增编号，hello 对账后按缺口重放
  * - runner_id nullable：未绑 = 离线座位（座位已创建、等待 runner 认领）
  * - status 用 varchar 而非 PG enum（对齐 actors.status 惯例）：active / paused /
- *   parked / offline（座位管理操作 M3 落地，M1 只落 active）
+ *   parked / offline / removed（座位管理操作 M3 落地，M1 只落 active；removed 为
+ *   M3 阶段 3 座位移除软删值，值域单源 SEAT_LIFECYCLE_STATUSES，见 shared enums）
  * - coordinator = 主脑座位标记（设计 §6，M3 只做标记/标识/公告）
  * - 座位发言落 messages 表（metadata.seatLabel 标记子身份），本表不动消息结构
  */
 @Entity('roundtable_seats')
+// 部分唯一索引（对齐 AddRoundtableSeatBindActorUnique migration 手写定义，r17 拍板：
+// 一 agent 一 topic 一 active 座位，WHERE status != 'removed' 豁免软删）。
+// ⚠️ DB 实际为表达式索引 (topic_id, config->>'bindActorId')，TypeORM 无法声明表达式列
+// 且加载时表达式列丢失（attnum=0 不参与列集合比对），故声明 ['topicId'] + where 即可
+// 与 DB 收敛（diff 不比较 where 字符串）；实体曾完全未声明 → generate 反复 DROP 该唯一
+// 约束（漂移治理 94502fef）
+@Index('uq_roundtable_seats_topic_bind_actor', ['topicId'], {
+  unique: true,
+  where: `status != '${SEAT_LIFECYCLE_STATUS.REMOVED}'`,
+})
 export class RoundtableSeat {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -97,8 +109,8 @@ export class RoundtableSeat {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   state: Record<string, any>;
 
-  /** 生命周期状态：active / paused / parked / offline（默认 active：座位已启用、待 runner 认领） */
-  @Column({ type: 'varchar', length: 20, nullable: false, default: 'active' })
+  /** 生命周期状态：active / paused / parked / offline / removed（默认 active：座位已启用、待 runner 认领；值域单源 SEAT_LIFECYCLE_STATUSES） */
+  @Column({ type: 'varchar', length: 20, nullable: false, default: SEAT_LIFECYCLE_STATUS.ACTIVE })
   status: string;
 
   /** 主脑座位标记（设计 §6：主脑调度指令必须 topic 明说可观测） */

@@ -58,7 +58,8 @@ export const getMyActivityTool: CustomTool = {
     name: 'get_my_activity',
     description:
       'Query my activity log (audit trail of operations performed by the current actor). ' +
-      'Filters: entityType / action / from / to; limit 1~50 (default 20). ' +
+      'Filters: entityType / action / from / to; limit 1~50 (default 20) — ' +
+      'limit maps to REST pageSize. ' +
       'Response: {items, total, page, pageSize, totalPages, hasNext, hasPrev, scope} — ' +
       'hasNext=true means older records remain (narrow the from window to page further). ' +
       'IMPORTANT COVERAGE: (a) only operations AFTER this feature was deployed are ' +

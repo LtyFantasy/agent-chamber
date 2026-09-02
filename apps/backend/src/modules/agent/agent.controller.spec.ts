@@ -35,6 +35,25 @@ describe('AgentController', () => {
     findMyTopics: jest.fn(),
     findMyActivities: jest.fn(),
     findMyUnreadCounts: jest.fn(),
+    getMyBriefing: jest.fn(),
+    // 白名单裁剪的真实实现（AGENT-FIELD-WHITELIST 教训：controller 层 spec 断言
+    // 裁剪行为，mock 必须复刻 14 字段白名单，否则 findAll 等既有断言失真）
+    pickPublicAgentFields: jest.fn((agent: Record<string, unknown>) => ({
+      id: agent.id,
+      name: agent.name,
+      avatarUrl: agent.avatarUrl,
+      status: agent.status,
+      ownerId: agent.ownerId,
+      ownerName: agent.ownerName,
+      description: agent.description,
+      descriptionSnippet: agent.descriptionSnippet,
+      capabilities: agent.capabilities,
+      createdAt: agent.createdAt,
+      lastActiveAt: agent.lastActiveAt,
+      topicCount: agent.topicCount,
+      messageCount: agent.messageCount,
+      apiKeyPrefix: agent.apiKeyPrefix,
+    })),
     getDeletionImpact: jest.fn(),
   };
 
@@ -84,16 +103,12 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      expect(
-        await controller.findAll({ page: 1, status: 'active' }, { headers: {} }, mockActor),
-      ).toEqual(result);
+      expect(await controller.findAll({ page: 1, status: 'active' }, mockActor)).toEqual(result);
       expect(service.findAll).toHaveBeenCalledWith({ page: 1, status: 'active' });
     });
 
     it('should reject Agent (API Key) requests', async () => {
-      await expect(
-        controller.findAll({}, { headers: { 'x-api-key': 'test-key' } }, mockAgentActor),
-      ).rejects.toThrow('Permission denied');
+      await expect(controller.findAll({}, mockAgentActor)).rejects.toThrow('Permission denied');
     });
 
     it('should keep lastActiveAt/createdAt in admin list response (regression: pickPublicAgentFields whitelist)', async () => {
@@ -122,7 +137,7 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      const res = await controller.findAll({}, { headers: {} }, mockActor);
+      const res = await controller.findAll({}, mockActor);
 
       const item = res.items[0] as Record<string, unknown>;
       expect(item.lastActiveAt).toBe('2026-08-10T04:05:21.000Z');
@@ -154,7 +169,7 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      const res = await controller.findAll({}, { headers: {} }, mockActor);
+      const res = await controller.findAll({}, mockActor);
 
       const item = res.items[0] as Record<string, unknown>;
       expect(item.descriptionSnippet).toBe('A brief introduction of the agent...');
@@ -188,11 +203,7 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      const response = await controller.findAll(
-        { page: 1, status: 'active' },
-        { headers: {} },
-        nonAdminActor,
-      );
+      const response = await controller.findAll({ page: 1, status: 'active' }, nonAdminActor);
 
       // Non-admin calls service with ownerId = actor.id
       expect(service.findAll).toHaveBeenCalledWith({
@@ -231,7 +242,7 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      const response = await controller.findAll({ page: 1 }, { headers: {} }, nonAdminActor);
+      const response = await controller.findAll({ page: 1 }, nonAdminActor);
 
       const item = response.items[0] as Record<string, unknown>;
       expect(item.descriptionSnippet).toBe('Short introduction');
@@ -272,11 +283,7 @@ describe('AgentController', () => {
       };
       service.findAll.mockResolvedValue(result);
 
-      const response = await controller.findAll(
-        { page: 1, status: 'active' },
-        { headers: {} },
-        mockActor,
-      );
+      const response = await controller.findAll({ page: 1, status: 'active' }, mockActor);
 
       const expectedPublicAgent = {
         id: 'agent-1',
@@ -691,8 +698,8 @@ describe('AgentController', () => {
       const result = { items: [], count: 0 };
       service.findMyActivities.mockResolvedValue(result);
 
-      expect(await controller.getMyActivities(mockAgentActor, { limit: '20' })).toBe(result);
-      expect(service.findMyActivities).toHaveBeenCalledWith(mockAgentActor.id, { limit: '20' });
+      expect(await controller.getMyActivities(mockAgentActor, { limit: 20 })).toBe(result);
+      expect(service.findMyActivities).toHaveBeenCalledWith(mockAgentActor.id, { limit: 20 });
     });
 
     it('should call service.findMyActivities with empty query when not provided', async () => {
@@ -711,6 +718,76 @@ describe('AgentController', () => {
 
       expect(await controller.getMyUnread(mockAgentActor)).toBe(result);
       expect(service.findMyUnreadCounts).toHaveBeenCalledWith(mockAgentActor.id);
+    });
+  });
+
+  describe('getMyBriefing', () => {
+    it('should delegate to service.getMyBriefing and return briefing with me whitelist-cropped (12-field full set, no auth/sensitive fields)', async () => {
+      const briefing = {
+        me: {
+          id: 'agent-1',
+          name: 'Test Agent',
+          avatarUrl: 'https://example.com/avatar.png',
+          status: 'active',
+          ownerId: 'user-1',
+          ownerName: 'Test Owner',
+          description: 'A test agent',
+          descriptionSnippet: 'A test agent',
+          capabilities: ['chat'],
+          createdAt: new Date('2024-01-01'),
+          lastActiveAt: null,
+          topicCount: 5,
+          messageCount: 100,
+          apiKeyPrefix: 'ask_xxxx',
+          // 敏感字段：白名单最后一道裁剪必须剥离（AGENT-FIELD-WHITELIST 教训）
+          webhookSecret: 'super-secret',
+          systemPrompt: 'secret prompt',
+          modelConfig: { model: 'gpt-4' },
+          rateLimit: 100,
+        },
+        activeTasks: { items: [], total: 0 },
+        unreadCounts: [{ topicId: 'topic-1', topicName: 'T1', unreadCount: 3 }],
+        recentActivities: [],
+      };
+      service.getMyBriefing.mockResolvedValue(briefing);
+
+      const query = { taskLimit: 5, statuses: ['todo', 'in_progress'] as never };
+      const res = await controller.getMyBriefing(mockAgentActor, query);
+
+      // 委托
+      expect(service.getMyBriefing).toHaveBeenCalledWith(mockAgentActor, query);
+
+      // me：12 字段全集（14 白名单 - avatarUrl - apiKeyPrefix），非子集断言
+      const me = res.me as Record<string, unknown>;
+      expect(Object.keys(me).sort()).toEqual([
+        'capabilities',
+        'createdAt',
+        'description',
+        'descriptionSnippet',
+        'id',
+        'lastActiveAt',
+        'messageCount',
+        'name',
+        'ownerId',
+        'ownerName',
+        'status',
+        'topicCount',
+      ]);
+      expect(me.id).toBe('agent-1');
+      expect(me.topicCount).toBe(5);
+      expect(me.messageCount).toBe(100);
+      // 认证元数据 + 敏感字段剥离
+      expect(me.avatarUrl).toBeUndefined();
+      expect(me.apiKeyPrefix).toBeUndefined();
+      expect(me.webhookSecret).toBeUndefined();
+      expect(me.systemPrompt).toBeUndefined();
+      expect(me.modelConfig).toBeUndefined();
+      expect(me.rateLimit).toBeUndefined();
+
+      // 其余键原样透传
+      expect(res.activeTasks).toEqual({ items: [], total: 0 });
+      expect(res.unreadCounts).toEqual([{ topicId: 'topic-1', topicName: 'T1', unreadCount: 3 }]);
+      expect(res.recentActivities).toEqual([]);
     });
   });
 });

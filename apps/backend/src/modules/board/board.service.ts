@@ -9,6 +9,8 @@
  *   D5: canAccess()/effectiveVisibility() 已从 Service 删除，权限检查迁移到 Controller。
  *         Service 只做业务：findById() + enrich()。见 memory/2026-06-05.md
  *   BoardDetail 与 tasks 解耦：findById 不再 join tasks，taskCount 通过 QueryBuilder 聚合。
+ *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyBoardIds
+ *         （creator+member 去 open 源，admin 不短路）。缓存键 board:mine:<actorKey> 前缀隔离。
  *
  * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create/update补齐)
  *
@@ -67,7 +69,10 @@ import {
   MilestoneStatus,
   BoardMemberRole,
   EventType,
+  ResourceType,
   Priority,
+  SEAT_LIFECYCLE_STATUS,
+  TopicKind,
 } from '@agent-chamber/shared';
 import type {
   BoardDetail,
@@ -338,16 +343,20 @@ export class BoardService {
   /**
    * 列表查询：在 Service 层按 Actor 权限做 IN 过滤，保证分页 total 与 items 同源。
    * 不再 join tasks，改为批量聚合查询 taskCount / completedTaskCount。
-   * @param query - 分页/话题过滤条件
-   * @param actor - 当前统一身份；Admin 不过滤，非 Admin 用白名单 IN 过滤
+   * @param query - 分页/话题过滤条件；mine=true 时走 AccessQueryService.getMyBoardIds
+   *   （creator+member 去 open 源，admin 不短路——admin 求 mine 也只是 creator/member 身份）
+   * @param actor - 当前统一身份；Admin 不过滤（mine=false 时返回 null → 全量），
+   *   非 Admin 用白名单 IN 过滤
    */
   async findAll(
-    query: { page?: number; pageSize?: number; topicId?: string } = {},
+    query: { page?: number; pageSize?: number; topicId?: string; mine?: boolean } = {},
     actor?: UnifiedActor,
   ) {
-    const { page = 1, pageSize = 20, topicId } = query;
+    const { page = 1, pageSize = 20, topicId, mine = false } = query;
 
-    const accessibleBoardIds = await this.accessQuery.getAccessibleBoardIds(actor);
+    const accessibleBoardIds = mine
+      ? await this.accessQuery.getMyBoardIds(actor)
+      : await this.accessQuery.getAccessibleBoardIds(actor);
     // 非 Admin 且白名单为空时直接返回空分页，避免生成空 IN () 导致 SQL 错误
     if (accessibleBoardIds && accessibleBoardIds.length === 0) {
       return {
@@ -361,10 +370,7 @@ export class BoardService {
       };
     }
 
-    const qb = this.boardRepo
-      .createQueryBuilder('board')
-      .leftJoinAndSelect('board.lists', 'list')
-      .where('board.deleted_at IS NULL');
+    const qb = this.boardRepo.createQueryBuilder('board').where('board.deleted_at IS NULL');
 
     if (accessibleBoardIds) {
       qb.andWhere('board.id IN (:...accessibleBoardIds)', { accessibleBoardIds });
@@ -402,6 +408,42 @@ export class BoardService {
       ]),
     );
 
+    // 跨 board 批量查询 lists（接口瘦身二期：不再 leftJoinAndSelect board.lists，
+    // 改由 1 条批量查询供给——禁止 join 与批量查询双跑；SQL 层过滤软删列，
+    // 修正旧实现 BoardList.deletedAt select:false 导致 JS 过滤恒真的软删列泄漏）
+    const lists =
+      boardIds.length > 0
+        ? await this.listRepo
+            .createQueryBuilder('list')
+            .where('list.board_id IN (:...boardIds)', { boardIds })
+            .andWhere('list.deleted_at IS NULL')
+            .orderBy('list.position', 'ASC')
+            .addOrderBy('list.createdAt', 'ASC')
+            .getMany()
+        : [];
+    const listsByBoard = new Map<string, BoardList[]>();
+    for (const l of lists) {
+      const arr = listsByBoard.get(l.boardId) ?? [];
+      arr.push(l);
+      listsByBoard.set(l.boardId, arr);
+    }
+
+    // 批量 task count per list（按 listId group by，供 lists 摘要 taskCount；
+    // 口径差注记：per-list 仅计非软删列，board 级 taskCount 为全列口径）
+    const listIds = lists.map((l) => l.id);
+    const listTaskCounts =
+      listIds.length > 0
+        ? await this.taskRepo
+            .createQueryBuilder('task')
+            .select('task.list_id', 'listId')
+            .addSelect('COUNT(*)', 'count')
+            .where('task.list_id IN (:...listIds)', { listIds })
+            .andWhere('task.deleted_at IS NULL')
+            .groupBy('task.list_id')
+            .getRawMany()
+        : [];
+    const listCountMap = new Map(listTaskCounts.map((c) => [c.listId, parseInt(c.count, 10)]));
+
     // 批量查询 memberCount per board（从 board_members 表）
     const memberCounts =
       boardIds.length > 0
@@ -417,26 +459,31 @@ export class BoardService {
 
     // 计算 listCount / taskCount / completedTaskCount / memberCount
     const enrichedItems = items.map((b) => {
-      const activeLists = b.lists?.filter((l) => !l.deletedAt) ?? [];
       const counts = countMap.get(b.id);
+      const boardLists = listsByBoard.get(b.id) ?? [];
 
-      const sortedLists = b.lists
-        ? [...b.lists].sort((a, b) => {
-            const posDiff = (a.position ?? 0) - (b.position ?? 0);
-            if (posDiff !== 0) return posDiff;
-            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-          })
-        : b.lists;
-
-      const { description, ...rest } = b;
+      // settings 从响应剔除（web 列表页零消费；顶层 visibility 拍平保留）
+      const { description, settings, ...rest } = b;
       void description;
+      void settings;
 
       return {
         ...rest,
-        lists: sortedLists,
+        // lists 摘要投影 = findLists 项形状原样（与详情端点一致优先于精确子集）
+        lists: boardLists.map((l) => ({
+          id: l.id,
+          boardId: l.boardId,
+          name: l.name,
+          position: l.position,
+          color: l.color,
+          mappedStatus: l.mappedStatus,
+          taskCount: listCountMap.get(l.id) ?? 0,
+          createdAt: l.createdAt,
+          updatedAt: l.updatedAt,
+        })),
         taskCount: counts?.total ?? 0,
         completedTaskCount: counts?.completed ?? 0,
-        listCount: activeLists.length,
+        listCount: boardLists.length,
         visibility: b.settings?.visibility,
         memberCount: memberCountMap.get(b.id) ?? 0,
         descriptionSnippet: description?.slice(0, 200) ?? null,
@@ -807,11 +854,11 @@ export class BoardService {
     // count()/getCount() 隐式加 deleted_at IS NULL）。
     // topicCount：topics.kind='roundtable' 全平台计数（kind 创建后不可变，阶段 1）
     const roundtableTopicCount = await this.topicRepo.count({
-      where: { kind: 'roundtable' },
+      where: { kind: TopicKind.ROUNDTABLE },
     });
-    // seatCount：active 状态座位数（status 枚举 active/paused/parked/offline，默认 active）
+    // seatCount：active 状态座位数（status 枚举 active/paused/parked/offline/removed，默认 active）
     const roundtableSeatCount = await this.seatRepo.count({
-      where: { status: 'active' },
+      where: { status: SEAT_LIFECYCLE_STATUS.ACTIVE },
     });
     // 座位 state 计数求和用 JS 内存累加（座位量小，禁止 jsonb 聚合 SQL——stage 7 口径
     // 拍板）；state 为 jsonb 默认 '{}'，阶段 4 落计数前的历史座位缺键，?? 0 兜底
@@ -929,7 +976,7 @@ export class BoardService {
     metrics: Record<string, unknown>,
   ): Promise<{ metrics: Record<string, unknown> | null }> {
     // 原生 query：TypeORM 实体级 update 无法表达 jsonb_set 片段，且会整体覆盖 settings
-    const rows: Array<{ settings?: Record<string, any> | null }> = await this.boardRepo.query(
+    const rows: Array<{ settings?: Record<string, unknown> | null }> = await this.boardRepo.query(
       `UPDATE boards SET settings = jsonb_set(settings, '{metrics}', $1::jsonb) WHERE id = $2 RETURNING settings`,
       [JSON.stringify(metrics), boardId],
     );
@@ -1209,7 +1256,7 @@ export class BoardService {
     // 发射 AGENT_JOINED 事件
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
-      resourceType: 'board',
+      resourceType: ResourceType.BOARD,
       resourceId: id,
       actorId: agentId,
       topicId: board.topicId ?? undefined,
@@ -1257,7 +1304,7 @@ export class BoardService {
     // 发射 AGENT_LEFT 事件
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'board',
+      resourceType: ResourceType.BOARD,
       resourceId: id,
       actorId: agentId,
       topicId: board.topicId ?? undefined,
@@ -1299,7 +1346,7 @@ export class BoardService {
     // 发射 AGENT_JOINED 事件
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
-      resourceType: 'board',
+      resourceType: ResourceType.BOARD,
       resourceId: id,
       actorId: agentId,
       topicId: board.topicId ?? undefined,
@@ -1352,7 +1399,7 @@ export class BoardService {
     // 发射 AGENT_LEFT 事件
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'board',
+      resourceType: ResourceType.BOARD,
       resourceId: id,
       actorId: agentId,
       topicId: board.topicId ?? undefined,

@@ -30,7 +30,7 @@ export class UpdateTopicDto implements UpdateTopicInput {
   @IsEnum(TopicStatus)
   @ApiPropertyOptional({
     enum: Object.values(TopicStatus),
-    description: 'Topic status, one of: draft, open, active, voting, paused, closed, archived',
+    description: 'Topic status, one of: open, active, paused, closed, archived',
     example: TopicStatus.ACTIVE,
   })
   status?: TopicStatus;

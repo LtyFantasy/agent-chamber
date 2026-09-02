@@ -21,6 +21,7 @@
  */
 
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
+import { DOC_SOURCE_NATIVE } from '@agent-chamber/shared';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 
@@ -275,7 +276,7 @@ export const importDocsTool: CustomTool = {
       const item: Record<string, unknown> = {
         path: doc.path,
         content: doc.content,
-        source: 'native',
+        source: DOC_SOURCE_NATIVE,
       };
       if (doc.title !== undefined) item.title = doc.title;
       if (doc.summary !== undefined) item.summary = doc.summary;

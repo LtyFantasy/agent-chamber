@@ -47,7 +47,7 @@ import { DocSearchService } from '../docspace/doc-search.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
-import { SearchQueryDto, SearchType } from './dto';
+import { SearchQueryDto } from './dto';
 import type { PaginatedResponse, DocSearchHitWithSpace } from '@agent-chamber/shared';
 
 /** 全局搜索文档一路的固定返回条数（对齐空间内搜索 MAX_LIMIT=20，非分页 MVP 决策） */
@@ -176,13 +176,13 @@ export class SearchService {
       Promise<DocSearchHitWithSpace[]> | undefined,
     ] = [undefined, undefined, undefined];
 
-    if (type === SearchType.ALL || type === SearchType.MESSAGES) {
+    if (type === 'all' || type === 'messages') {
       promises[0] = this.searchMessages(q, page, pageSize, actor);
     }
-    if (type === SearchType.ALL || type === SearchType.TASKS) {
+    if (type === 'all' || type === 'tasks') {
       promises[1] = this.searchTasks(q, page, pageSize, actor);
     }
-    if (type === SearchType.ALL || type === SearchType.DOCS) {
+    if (type === 'all' || type === 'docs') {
       promises[2] = this.searchDocs(q, actor);
     }
 

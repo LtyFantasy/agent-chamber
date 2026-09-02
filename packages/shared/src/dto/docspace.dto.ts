@@ -142,6 +142,44 @@ export interface UpsertDocInput {
 }
 
 /**
+ * 文档源哨兵值：'native'（平台 API/MCP 可写；review-0831 任务 8fab2a9d 上移 shared 单源）
+ * - source 是开放字符串（ingest 来源如 'git:xxx' 不枚举），但 'native' 是保留语义值——
+ *   native-only 写通道（patch/append/move/delete 的 source 隔离检查）的判别点，
+ *   拼错无编译期保护，故收口为常量供全仓引用。
+ * - 原 backend 模块常量 docspace/doc-constants.ts 已改 re-export 保持兼容。
+ */
+export const DOC_SOURCE_NATIVE = 'native' as const;
+
+/**
+ * 文档摘要列长上限（docs.summary varchar(500)；review-0831 任务 e013af33 收敛）
+ *
+ * 单源供三处引用：entity 列长装饰器 / UpsertDocDto @MaxLength / service 截断
+ * （extractFirstParagraph 与 diagram summary 派生）。⚠️ 改此值必须配套 TypeORM
+ * migration 变更 docs.summary 列长（生产库禁止直接改列，铁律 §0.2）。
+ */
+export const DOC_SUMMARY_MAX_LENGTH = 500;
+
+/**
+ * 文档标题列长上限（docs.title varchar(200)；review-0831 任务 e013af33 收敛）
+ *
+ * 单源供三处引用：entity 列长装饰器 / UpsertDocDto @MaxLength / service 截断
+ * （IR meta.title 派生）。⚠️ 改此值必须配套 TypeORM migration 变更 docs.title
+ * 列长（生产库禁止直接改列，铁律 §0.2）。
+ */
+export const DOC_TITLE_MAX_LENGTH = 200;
+
+/**
+ * 追加位置（POST /docs/:id/append 的 position 参数）
+ *
+ * - 'end'（缺省）：追加到文档末尾；
+ * - 'under-heading'：追加到指定 heading 小节子树末尾（需配 headingPath 精确匹配）。
+ */
+export type AppendPosition = 'end' | 'under-heading';
+
+/** AppendPosition 合法值清单（DTO @IsIn 校验与 swagger enum 共用，单一事实来源） */
+export const APPEND_POSITION_VALUES: readonly AppendPosition[] = ['end', 'under-heading'];
+
+/**
  * 追加文档内容输入（POST /docs/:id/append，v1.65.0 消费者反馈批 7601e2f5）
  *
  * 语义：一步把 content 追加到文档末尾（position='end'，默认）或指定 heading 小节
@@ -152,7 +190,7 @@ export interface AppendDocInput {
   /** 追加的 Markdown 内容（非空、非全空白；可自带标题行触发新 section） */
   content: string;
   /** 追加位置：'end'（文档末尾，默认）| 'under-heading'（指定小节子树末尾） */
-  position?: 'end' | 'under-heading';
+  position?: AppendPosition;
   /** position='under-heading' 时必填：目标节的 heading_path 精确匹配（0 命中 404 / 多命中 409） */
   headingPath?: string;
 }

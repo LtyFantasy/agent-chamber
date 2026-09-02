@@ -55,20 +55,17 @@ function posixDirname(p: string): string {
 }
 
 /**
- * 相对 .md 路径 → 空间内文档 id（严格源目录解析，与后端 resolveHrefToDocPath 同源）。
+ * 相对 .md 链接 → 空间内文档路径（严格源目录解析，与后端 resolveHrefToDocPath 同源）。
+ *
+ * 与 resolveDocPath 的分工：本函数只做「路径数学」（不依赖任何文档列表），
+ * 返回解析后的空间内路径；命中与否由调用方查表或 ?path= 异步解析。
  *
  * @param href       - markdown 链接原始 href（可含 # 锚点、/ 根绝对、./ ../ 相对前缀）
- * @param pathToId   - 空间内文档 path → id 映射（由调用方从文档列表构建）
- * @param sourcePath - 承载该链接的文档自身 path（解析基准源目录，与后端调用点同源；
- *                     阅读态组件传当前文档 path）
- * @returns 命中返回 docId；未命中返回 null（断链——含越出空间根的不可达解析）；
+ * @param sourcePath - 承载该链接的文档自身 path（解析基准源目录，与后端调用点同源）
+ * @returns 解析后的空间内路径（如 'docs/architecture.md'）；越出空间根（不可达）返回 null；
  *          非 .md 相对路径 / 纯锚点返回 undefined（不属于本解析器职责，调用方不干预）
  */
-export function resolveDocPath(
-  href: string,
-  pathToId: ReadonlyMap<string, string>,
-  sourcePath: string,
-): string | null | undefined {
+export function resolveDocHref(href: string, sourcePath: string): string | null | undefined {
   // 剥离 # 锚点（如 /docs/spec.md#error-codes）
   const stripped = href.split('#')[0];
   // 纯 #anchor / 空 href：同页跳转，不归本解析器管
@@ -90,7 +87,31 @@ export function resolveDocPath(
   if (!resolved || resolved === '.') {
     return undefined;
   }
+  // 越出空间根（normalize 结果以 .. 开头）→ 不可达 → 断链
+  if (resolved.startsWith('..')) {
+    return null;
+  }
+  return resolved;
+}
 
-  // 单候选择：精确等值命中；越界（.. 开头）恒不命中 → null（断链）
+/**
+ * 相对 .md 路径 → 空间内文档 id（严格源目录解析，与后端 resolveHrefToDocPath 同源）。
+ *
+ * @param href       - markdown 链接原始 href（可含 # 锚点、/ 根绝对、./ ../ 相对前缀）
+ * @param pathToId   - 空间内文档 path → id 映射（由调用方从文档列表构建）
+ * @param sourcePath - 承载该链接的文档自身 path（解析基准源目录，与后端调用点同源；
+ *                     阅读态组件传当前文档 path）
+ * @returns 命中返回 docId；未命中返回 null（断链——含越出空间根的不可达解析）；
+ *          非 .md 相对路径 / 纯锚点返回 undefined（不属于本解析器职责，调用方不干预）
+ */
+export function resolveDocPath(
+  href: string,
+  pathToId: ReadonlyMap<string, string>,
+  sourcePath: string,
+): string | null | undefined {
+  const resolved = resolveDocHref(href, sourcePath);
+  if (resolved === undefined) return undefined;
+  if (resolved === null) return null;
+  // 单候选择：精确等值命中；未收录 → null（断链）
   return pathToId.get(resolved) ?? null;
 }

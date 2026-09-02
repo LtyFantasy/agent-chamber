@@ -1,4 +1,11 @@
-import { MessageType, Visibility, ParticipantStatus } from '../enums';
+import {
+  MessageType,
+  TopicKind,
+  TopicStatus,
+  Visibility,
+  ParticipantStatus,
+  WakePolicy,
+} from '../enums';
 
 /**
  * 话题参与者
@@ -34,20 +41,20 @@ export interface Topic {
   title: string;
   /** 描述摘要片段：≤200 字符截断，无描述时 null，仅列表视图返回 */
   descriptionSnippet?: string | null;
-  /** 话题状态 */
-  status: 'draft' | 'open' | 'active' | 'voting' | 'paused' | 'closed' | 'archived';
+  /** 话题状态（值域单源 TopicStatus，2026-08-31 起删 draft/voting 死值） */
+  status: TopicStatus;
   /**
    * 话题类型：normal（普通，缺省）/ roundtable（圆桌，设计 docs/roundtable-design.md §5）。
    * 由 topics.kind 列透传（entity spread 自动带上），web/digest 据此渲染圆桌 UI。
    */
-  kind?: 'normal' | 'roundtable';
+  kind?: TopicKind;
   /**
    * 圆桌唤醒策略 effective 值（派生字段，仅详情视图且 kind='roundtable' 时返回）：
    * settings.wakePolicy 显式值优先，缺省 'mention'——与 roundtable.service
    * resolveWakePolicy 同规（设计 docs/roundtable-design.md §6 路由与唤醒策略）。
    * normal topic 不输出该字段。
    */
-  wakePolicy?: 'mention' | 'broadcast';
+  wakePolicy?: WakePolicy;
   /** 话题类型 */
   type?: string;
   /** 可见性 */

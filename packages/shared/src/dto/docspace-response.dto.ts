@@ -4,7 +4,7 @@
  * 定义列表/详情视图、搜索命中、概览等响应 Shape。
  * 遵循项目惯例：列表视图不含大字段（description 摘要化、不含 content）。
  */
-import { Visibility } from '../enums';
+import { DocSpaceMemberRole, Visibility } from '../enums';
 
 // ─── DocSpace ────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ export interface DocSpaceMemberDto {
   /** 软删时间；非空 = 该成员已删除，actorName 仍可显示（历史归因保留） */
   deletedAt?: string | null;
   /** 角色：editor | member */
-  role: string;
+  role: DocSpaceMemberRole;
   /** 邀请者 Actor ID */
   invitedBy?: string | null;
   /** 加入时间 */
@@ -116,6 +116,11 @@ export interface DocSummary {
   summary?: string | null;
   /** 文档类型 */
   docType?: string | null;
+  /**
+   * 图类型（Diagram IR v1；仅 docType='diagram' 时非空）。
+   * 从 IR diagram_type 反正范化的 docs.diagram_type 列直读——列表/过滤免解析 IR。
+   */
+  diagramType?: string | null;
   /** 标签 */
   tags?: string[];
   /** 文档来源 */
@@ -269,6 +274,19 @@ export interface DocDetail extends DocSummary {
   /** 链接健康巡检结果（v1.35 Docs D1 Wave A；NULL = 尚未检查） */
   linkHealth?: LinkHealth | null;
   /**
+   * 图信息摘要（Diagram IR v1；仅 docType='diagram' 时携带，免二次请求拿渲染元数据）。
+   * 取自 docs.render_meta（qualityProfile 为服务端注入后的生效值；composition =
+   * checker composition.summary 的 errors/warnings 计数）。无 html 字段——快照走
+   * GET /docs/:id/diagram.html 单独取（select:false 大字段）。
+   */
+  diagram?: {
+    diagramType: string | null;
+    qualityProfile?: string;
+    renderedAt?: string;
+    htmlBytes?: number;
+    composition?: { errors: number; warnings: number };
+  } | null;
+  /**
    * 响应模式（增量字段，向后兼容——老客户端无此字段时按 outline 处理）：
    * - 'full'：无定位调用（无 position/headingPath）+ 小文档（tokenEstimate > 0 且 ≤ 阈值）
    *   时内联全文，`content` 同时返回；
@@ -421,6 +439,111 @@ export interface DocFullContent {
   contentHash?: string | null;
 }
 
+// ─── Doc Tree / Facets（懒加载目录树，v1.70.0-dev）────────────
+
+/**
+ * 目录树子目录项（GET /doc-spaces/:id/docs/tree 的 folders.items 元素）
+ *
+ * 语义：prefix 下**当前层**的直接子目录（不含孙目录——孙目录由下一层
+ * prefix 请求展开）；docCount/latestDocAt 为**递归后代**聚合（含子目录内
+ * 全部未删文档），供左栏展示规模与排序。
+ */
+export interface DocTreeFolder {
+  /** 子目录完整路径（含尾部 /，如 "memory/2026-08-29/"）——下一层请求的 prefix */
+  path: string;
+  /** 子目录段名（末段，如 "2026-08-29"） */
+  name: string;
+  /** 该子目录下（含递归后代）未删文档数 */
+  docCount: number;
+  /** 该子目录下（含递归后代）最近更新的未删文档时间（ISO 8601；无文档时 null） */
+  latestDocAt: string | null;
+}
+
+/**
+ * 目录树直挂文档项（GET /doc-spaces/:id/docs/tree 的 docs.items 元素，slim 投影）
+ *
+ * 只保留左栏渲染与跳转所需字段（id/path/title/docType/updatedAt）——
+ * 明细走 read_doc / list_docs 全字段通道（响应体积规范 §7.4a）。
+ */
+export interface DocTreeDoc {
+  /** 文档 ID */
+  id: string;
+  /** 文档路径 */
+  path: string;
+  /** 文档标题 */
+  title: string;
+  /** 文档类型（可空） */
+  docType?: string | null;
+  /** 更新时间 */
+  updatedAt?: string | Date;
+}
+
+/**
+ * 目录树分页信封（folders/docs 共用）
+ *
+ * total = 当前层全量计数（不受 limit/offset 影响），hasMore = 是否还有下一页。
+ */
+export interface DocTreePage<T> {
+  /** 当前页条目 */
+  items: T[];
+  /** 当前层全量计数 */
+  total: number;
+  /** 是否还有下一页（offset + items.length < total） */
+  hasMore: boolean;
+}
+
+/**
+ * 目录树响应（GET /doc-spaces/:id/docs/tree）
+ *
+ * 分层浏览契约：folders = 当前层直接子目录（分页），docs = 当前层直挂文档
+ * （slim 分页）；子目录内容由下一层请求（prefix = folder.path）展开。
+ */
+export interface DocTreeResponse {
+  /** 归一化后的前缀（去前导 /、非空补尾部 /；根层为 ""） */
+  prefix: string;
+  /** 当前层子目录（分页） */
+  folders: DocTreePage<DocTreeFolder>;
+  /** 当前层直挂文档（slim，分页） */
+  docs: DocTreePage<DocTreeDoc>;
+}
+
+/**
+ * 聚合计数项（facets 的 types/tags 共用）
+ */
+export interface DocFacetCount {
+  /** 聚合值（doc_type 或 tag 原文） */
+  value: string;
+  /** 命中未删文档数 */
+  count: number;
+}
+
+/**
+ * 分类聚合计数项（facets 的 categories 元素）
+ */
+export interface DocFacetCategoryCount {
+  /** 分类 slug */
+  slug: string;
+  /** 分类名称 */
+  name: string;
+  /** 命中未删文档数 */
+  count: number;
+}
+
+/**
+ * 全空间聚合计数响应（GET /doc-spaces/:id/docs/facets）
+ *
+ * 替代前端全量列表聚合：types = GROUP BY doc_type（非空）；tags = unnest(tags)
+ * GROUP BY；categories = JOIN doc_categories（含软删过滤）。全部只统计未删文档。
+ */
+export interface DocFacetsResponse {
+  /** 文档类型聚合（按 count DESC，同 count 按 value ASC） */
+  types: DocFacetCount[];
+  /** 标签聚合（按 count DESC，同 count 按 value ASC） */
+  tags: DocFacetCount[];
+  /** 分类聚合（按 count DESC，同 count 按 slug ASC） */
+  categories: DocFacetCategoryCount[];
+}
+
 // ─── Search ──────────────────────────────────────────────
 
 /**
@@ -439,6 +562,18 @@ export const DOC_SEARCH_SORT_VALUES: readonly DocSearchSort[] = [
   'createdAt_desc',
   'createdAt_asc',
 ];
+
+/**
+ * 目录树排序模式（GET /doc-spaces/:id/docs/tree 的 sort 参数，v1.70.0-dev）
+ *
+ * - recent（缺省）：目录按 latestDocAt DESC（最近更新在前）；
+ * - name：目录按段名 ASC（字典序）。
+ * 只影响 folders 排序；docs 恒按 path ASC。
+ */
+export const DOC_TREE_SORT_VALUES = ['recent', 'name'] as const;
+
+/** DOC_TREE_SORT_VALUES 元素联合（'recent' | 'name'） */
+export type DocTreeSort = (typeof DOC_TREE_SORT_VALUES)[number];
 
 /**
  * 文档搜索命中项
@@ -516,6 +651,19 @@ export const DOC_ROUTE_CODE_ENTRY_TYPES = ['exact', 'pattern'] as const;
 
 /** codeEntryType 取值联合（'exact' | 'pattern'） */
 export type DocRouteCodeEntryType = (typeof DOC_ROUTE_CODE_ENTRY_TYPES)[number];
+
+/**
+ * codeEntryType 命名访问视图（单源派生自 DOC_ROUTE_CODE_ENTRY_TYPES；review-0831
+ * 任务 a8a295df 自 backend doc-constants.ts 上移——与 DOC_SOURCE_NATIVE 同款
+ * 「值域数组 + 命名化派生」模式，供 service 写入口/比较命名引用）
+ */
+export const CODE_ENTRY_TYPE = {
+  EXACT: DOC_ROUTE_CODE_ENTRY_TYPES[0],
+  PATTERN: DOC_ROUTE_CODE_ENTRY_TYPES[1],
+} as const;
+
+/** codeEntryType 命名视图联合类型（与 DocRouteCodeEntryType 等价，供类型标注复用） */
+export type CodeEntryType = (typeof CODE_ENTRY_TYPE)[keyof typeof CODE_ENTRY_TYPE];
 
 /**
  * 意图路由（doc_routes，v1.42 批次 B5）
@@ -827,6 +975,18 @@ export const DOC_VERSION_SOURCES = ['upsert', 'patch', 'import', 'append'] as co
 
 /** 版本来源联合（'upsert' | 'patch' | 'import' | 'append'） */
 export type DocVersionSource = (typeof DOC_VERSION_SOURCES)[number];
+
+/**
+ * 版本来源命名访问视图（单源派生自 DOC_VERSION_SOURCES；review-0831 任务 a8a295df
+ * 补建——与 CODE_ENTRY_TYPE / SEAT_LIFECYCLE_STATUS 同款「值域数组 + 命名化派生」模式，
+ * 供 doc.service/diagram.service 写入口命名引用，替代裸字面量）
+ */
+export const DOC_VERSION_SOURCE = {
+  UPSERT: DOC_VERSION_SOURCES[0],
+  PATCH: DOC_VERSION_SOURCES[1],
+  IMPORT: DOC_VERSION_SOURCES[2],
+  APPEND: DOC_VERSION_SOURCES[3],
+} as const;
 
 /**
  * 文档版本摘要（GET /docs/:id/versions 列表项，不含 content 全文）

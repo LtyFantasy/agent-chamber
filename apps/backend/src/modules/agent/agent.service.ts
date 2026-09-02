@@ -43,15 +43,92 @@ import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
-import { AgentStatus, ErrorCode, ActorType, AuditAction } from '@agent-chamber/shared';
+import {
+  AgentStatus,
+  ErrorCode,
+  ActorType,
+  AuditAction,
+  TaskStatus,
+  ParticipantStatus,
+  SEAT_LIFECYCLE_STATUS,
+} from '@agent-chamber/shared';
 import type {
   PaginatedResponse,
   Agent as AgentDto,
   AgentDeletionImpact,
   TopicUnreadCount,
 } from '@agent-chamber/shared';
-import { CreateAgentDto, UpdateAgentDto, AgentHeartbeatDto, CreateAgentKeyDto } from './dto';
+import {
+  CreateAgentDto,
+  UpdateAgentDto,
+  AgentHeartbeatDto,
+  CreateAgentKeyDto,
+  BriefingQueryDto,
+  MyActivitiesQueryDto,
+} from './dto';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
+import { buildAvatarUrl } from '../avatars/avatar.constants';
+import { TaskService } from '../task/task.service';
+import { TaskDependencyService } from '../task/task-dependency.service';
+import { UnifiedActor } from '../../common/types/actor.types';
+
+/**
+ * 活跃任务缺省状态集（getMyBriefing 的 active tasks 口径，与 MCP get_my_briefing
+ * 缺省一致）。backlog 是平台的默认待办状态（看板默认列），必须纳入活跃任务，
+ * 否则 Agent 会漏掉尚未开工的已分配任务。调用方可传 statuses 覆盖（替换而非追加）。
+ */
+const DEFAULT_ACTIVE_STATUSES: TaskStatus[] = [
+  TaskStatus.BACKLOG,
+  TaskStatus.TODO,
+  TaskStatus.IN_PROGRESS,
+  TaskStatus.BLOCKED,
+];
+
+/**
+ * activeTasks 12 字段白名单（plan captain-atom-crimson-avenger-rocket-dc §2.3，
+ * 与 MCP get-my-briefing.ts ACTIVE_TASK_KEPT_FIELDS 逐字段一致）。
+ *
+ * 只透传 Agent 消费模型需要的字段；description/list/board/customFields/position
+ * 等多余键一律剔除。hasBlockers 为阶段 2 补查合并，不在本常量内。
+ */
+const ACTIVE_TASK_KEPT_FIELDS = [
+  'id',
+  'title',
+  'status',
+  'priority',
+  'labels',
+  'boardId',
+  'boardName',
+  'listId',
+  'listName',
+  'dueDate',
+  'updatedAt',
+] as const;
+
+/**
+ * 通用字段截断（truncateField 后端等价物，语义照 platform-mcp project.ts:49-62）。
+ *
+ * 语义：
+ * - slice 裸截断，无省略号
+ * - maxChars=0 是「不截断」哨兵，跳过
+ * - 仅 typeof string 的字段参与——无 content 的 task 型 activity 天然豁免
+ * - 标记命名统一 = `{field}Truncated`（content → contentTruncated），挂条目级
+ *
+ * @param obj      - 目标对象（原地修改）
+ * @param field    - 要截断的字段名
+ * @param maxChars - 截断上限（字符）；0 = 不截断返全文
+ */
+function truncateField(obj: Record<string, unknown>, field: string, maxChars: number): void {
+  if (
+    maxChars !== 0 &&
+    typeof obj[field] === 'string' &&
+    (obj[field] as string).length > maxChars
+  ) {
+    obj[field] = (obj[field] as string).slice(0, maxChars);
+    obj[`${field}Truncated`] = true;
+  }
+}
 
 @Injectable()
 export class AgentService {
@@ -63,6 +140,8 @@ export class AgentService {
     @InjectRepository(RoundtableSeat)
     private seatRepo: Repository<RoundtableSeat>,
     private readonly auditService: AuditService,
+    private readonly taskService: TaskService,
+    private readonly taskDependencyService: TaskDependencyService,
   ) {}
 
   async findAll(query: {
@@ -105,12 +184,12 @@ export class AgentService {
 
     if (agentIds.length > 0) {
       // topic_participants.is_active 已删除（ConsolidateMembership），改用 status 列：
-      // 旧 is_active=true 等价于 status IN ('invited','active')
+      // 旧 is_active=true 等价于 status IN ('invited','active')（枚举插值，review-0831 任务 e013af33）
       const topicCounts = (await this.agentRepo.manager.query(
         `SELECT tp.participant_id as "agentId", COUNT(tp.topic_id) as count
          FROM topic_participants tp
          INNER JOIN topics t ON t.id = tp.topic_id
-         WHERE tp.participant_id = ANY($1) AND tp.status IN ('invited', 'active') AND t.deleted_at IS NULL
+         WHERE tp.participant_id = ANY($1) AND tp.status IN ('${ParticipantStatus.INVITED}', '${ParticipantStatus.ACTIVE}') AND t.deleted_at IS NULL
          GROUP BY tp.participant_id`,
         [agentIds],
       )) as Array<{ agentId: string; count: string }>;
@@ -254,7 +333,7 @@ export class AgentService {
     const countResult = await this.agentRepo.manager.query(
       `SELECT COUNT(*) as total FROM topics t
        INNER JOIN topic_participants tp ON tp.topic_id = t.id
-       WHERE tp.participant_id = $1 AND tp.status IN ('invited', 'active') AND t.deleted_at IS NULL`,
+       WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}', '${ParticipantStatus.ACTIVE}') AND t.deleted_at IS NULL`,
       [agentId],
     );
     const total = parseInt(countResult[0].total, 10);
@@ -264,7 +343,7 @@ export class AgentService {
       `SELECT t.id, t.title, t.status, t.creator_id as "creatorId", t.created_at as "createdAt", t.updated_at as "updatedAt"
        FROM topics t
        INNER JOIN topic_participants tp ON tp.topic_id = t.id
-       WHERE tp.participant_id = $1 AND tp.status IN ('invited', 'active') AND t.deleted_at IS NULL
+       WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}', '${ParticipantStatus.ACTIVE}') AND t.deleted_at IS NULL
        ORDER BY t.updated_at DESC
        LIMIT $2 OFFSET $3`,
       [agentId, pageSizeNum, offset],
@@ -282,48 +361,96 @@ export class AgentService {
     };
   }
 
-  async findMyActivities(agentId: string, query: { limit?: string | number }) {
-    const { limit = 20 } = query;
-    const take = Math.min(Math.max(+limit, 1), 100);
+  /**
+   * 我的活动流（GET /agents/me/activities，接口瘦身二期：裸数组 → 标准分页信封）。
+   *
+   * 真分页实现：三表各取 page*pageSize 条（offset 0）→ 内存合并排序 → 按页切片；
+   * total = 三表 count 之和（3 条 count 查询）。
+   * 取舍注记：查询量随页号线性增长（无跨表游标分页），体量小可接受。
+   * 合并排序必须带全序 tie-break (createdAt, type, id)——同 createdAt 跨表记录
+   * 在页边界排序不稳定会重复/漏条（三表 SQL 已 select id）。
+   * 顺带收益：旧 limit='abc' → NaN → SQL 500，DTO 校验后变 400（改进非回归）。
+   *
+   * @param agentId 当前 agent id
+   * @param query page/pageSize（pageSize 优先；limit 仅在 pageSize 缺省时生效，别名映射）
+   */
+  async findMyActivities(agentId: string, query: MyActivitiesQueryDto) {
+    const pageNum = Math.max(1, Math.floor(query.page ?? 1));
+    const pageSizeNum = Math.min(Math.max(Math.floor(query.pageSize ?? query.limit ?? 20), 1), 100);
+    const fetchLimit = pageNum * pageSizeNum;
 
-    // Recent messages sent by this agent
-    const messages = await this.agentRepo.manager.query(
-      `SELECT 'message' as type, id, topic_id as "topicId", content, created_at as "createdAt"
-       FROM messages
-       WHERE sender_id = $1 AND deleted_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT $2`,
-      [agentId, take],
-    );
+    // 三表各取 page*pageSize 条（offset 0，与旧 limit 语义兼容：page=1 时等价）
+    const [messages, tasks, comments, messageCount, taskCount, commentCount] = await Promise.all([
+      this.agentRepo.manager.query(
+        `SELECT 'message' as type, id, topic_id as "topicId", content, created_at as "createdAt"
+         FROM messages
+         WHERE sender_id = $1 AND deleted_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [agentId, fetchLimit],
+      ),
+      // Task entity has no creator_id
+      this.agentRepo.manager.query(
+        `SELECT 'task' as type, id, title, status, created_at as "createdAt", updated_at as "updatedAt"
+         FROM tasks
+         WHERE assignee_id = $1 AND deleted_at IS NULL
+         ORDER BY updated_at DESC
+         LIMIT $2`,
+        [agentId, fetchLimit],
+      ),
+      this.agentRepo.manager.query(
+        `SELECT 'comment' as type, id, task_id as "taskId", content, created_at as "createdAt"
+         FROM task_comments
+         WHERE author_id = $1 AND deleted_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [agentId, fetchLimit],
+      ),
+      this.agentRepo.manager.query(
+        `SELECT COUNT(*)::int AS total FROM messages WHERE sender_id = $1 AND deleted_at IS NULL`,
+        [agentId],
+      ),
+      this.agentRepo.manager.query(
+        `SELECT COUNT(*)::int AS total FROM tasks WHERE assignee_id = $1 AND deleted_at IS NULL`,
+        [agentId],
+      ),
+      this.agentRepo.manager.query(
+        `SELECT COUNT(*)::int AS total FROM task_comments WHERE author_id = $1 AND deleted_at IS NULL`,
+        [agentId],
+      ),
+    ]);
 
-    // Recent tasks assigned to this agent (Task entity has no creator_id)
-    const tasks = await this.agentRepo.manager.query(
-      `SELECT 'task' as type, id, title, status, created_at as "createdAt", updated_at as "updatedAt"
-       FROM tasks
-       WHERE assignee_id = $1 AND deleted_at IS NULL
-       ORDER BY updated_at DESC
-       LIMIT $2`,
-      [agentId, take],
-    );
-
-    // Recent comments by this agent
-    const comments = await this.agentRepo.manager.query(
-      `SELECT 'comment' as type, id, task_id as "taskId", content, created_at as "createdAt"
-       FROM task_comments
-       WHERE author_id = $1 AND deleted_at IS NULL
-       ORDER BY created_at DESC
-       LIMIT $2`,
-      [agentId, take],
-    );
-
-    // Merge and sort by createdAt DESC
+    // 合并排序：createdAt DESC + 全序 tie-break (type, id)
     const all = [...messages, ...tasks, ...comments];
     all.sort(
-      (a: { createdAt: string | Date }, b: { createdAt: string | Date }) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      (
+        a: { createdAt: string | Date; type: string; id: string },
+        b: { createdAt: string | Date; type: string; id: string },
+      ) => {
+        const timeDiff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        if (timeDiff !== 0) return timeDiff;
+        if (a.type !== b.type) return a.type < b.type ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      },
     );
 
-    return all.slice(0, take);
+    const total =
+      parseInt(messageCount[0]?.total ?? '0', 10) +
+      parseInt(taskCount[0]?.total ?? '0', 10) +
+      parseInt(commentCount[0]?.total ?? '0', 10);
+    const start = (pageNum - 1) * pageSizeNum;
+    const items = all.slice(start, start + pageSizeNum);
+    const totalPages = Math.ceil(total / pageSizeNum);
+
+    return {
+      items,
+      total,
+      page: pageNum,
+      pageSize: pageSizeNum,
+      totalPages,
+      hasNext: pageNum < totalPages,
+      hasPrev: pageNum > 1,
+    };
   }
 
   /**
@@ -352,13 +479,187 @@ export class AgentService {
        LEFT JOIN messages a ON a.id = tp.last_read_message_id AND a.deleted_at IS NULL
        LEFT JOIN messages m ON m.topic_id = tp.topic_id AND m.deleted_at IS NULL
          AND (a.id IS NULL OR (m.created_at, m.id) > (a.created_at, a.id))
-       WHERE tp.participant_id = $1 AND tp.status IN ('invited','active')
+       WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}','${ParticipantStatus.ACTIVE}')
        GROUP BY t.id, t.title
        HAVING COUNT(m.id) > 0
        ORDER BY "unreadCount" DESC, t.updated_at DESC
        LIMIT 50`,
       [actorId],
     ) as Promise<TopicUnreadCount[]>;
+  }
+
+  /**
+   * 从 Agent 对象中提取公开字段，过滤敏感配置信息（AGENT-FIELD-WHITELIST 白名单）。
+   *
+   * 公开字段：id, name, avatarUrl, status, ownerId, ownerName, description, descriptionSnippet,
+   *          capabilities, createdAt, lastActiveAt, topicCount, messageCount, apiKeyPrefix
+   * 过滤字段：webhookUrl, webhookSecret, systemPrompt, modelConfig, rateLimit,
+   *          webhookEvents, webhookTimeoutMs, webhookRetryMax
+   *
+   * topicCount / messageCount 为 service 层附加的统计字段，一并保留。
+   * apiKeyPrefix 用于列表页展示，仅在当前用户为所有者时暴露。
+   * descriptionSnippet 为 service 层 findAll 剥离完整 description 后的摘要片段（列表场景）；
+   * create/findOne 等单条路径无该字段（值为 undefined，JSON 序列化时被丢弃，无副作用）。
+   *
+   * 2026-08-29 从 controller 私有方法提升为 service 公开方法（plan
+   * captain-atom-crimson-avenger-rocket-dc §2.3）：controller 与 getMyBriefing 共用，
+   * 白名单是响应字段的最后一道裁剪——字段变更必须三处同改（service 产出 + 共享 DTO +
+   * 白名单），并配 controller 层 spec 断言（service 层单测测不出白名单裁剪）。
+   *
+   * @param agent 原始 Agent 对象（实体或 service 产出对象）
+   * @returns 仅含白名单字段的 plain object
+   */
+  pickPublicAgentFields(agent: Record<string, unknown>) {
+    return {
+      id: agent.id,
+      name: agent.name,
+      avatarUrl: agent.avatarUrl,
+      status: agent.status,
+      ownerId: agent.ownerId,
+      ownerName: agent.ownerName,
+      description: agent.description,
+      descriptionSnippet: agent.descriptionSnippet,
+      capabilities: agent.capabilities,
+      createdAt: agent.createdAt,
+      lastActiveAt: agent.lastActiveAt,
+      topicCount: agent.topicCount,
+      messageCount: agent.messageCount,
+      apiKeyPrefix: agent.apiKeyPrefix,
+    };
+  }
+
+  /**
+   * =============================================================================
+   * AGENT-CODE-HOOK | getMyBriefing（GET /agents/me/briefing）
+   * =============================================================================
+   * [功能概念]
+   *   - Agent 启动简报：一次调用建立工作上下文（me + activeTasks + unreadCounts
+   *     + recentActivities），REST 冷启动路径的核心端点
+   *
+   * [代码职责]
+   *   - 编排下沉（v1.65 report_task_result 先例）：me 先行 → tasks/activities/unread
+   *     三路并行 → blockers 补查；降级语义（键省略）在此实现
+   *
+   * [权威文档]
+   *   - 主文档: 线上 docs/api-definition.md §5 Agents（briefing 端点小节）
+   *   - 补充: plan captain-atom-crimson-avenger-rocket-dc.md §2.3 — 编排结构钉死项
+   *
+   * [关键不变量]
+   *   - me 必须走 pickPublicAgentFields 白名单 + omit avatarUrl/apiKeyPrefix，
+   *     禁止塞 findOne 整实体（webhookSecret/systemPrompt/modelConfig/rateLimit 会出网）
+   *   - 12 字段投影 null 保留语义（!== undefined 判断，null 字段保留）
+   *   - 降级 = 键省略：unread 失败 → unreadCounts 键省略；blockers 失败 →
+   *     hasBlockers 键省略（不补 false——未知 ≠ 无 blocker）；不挂整体
+   *   - 读操作不落审计行（与 digest/overview 一致）
+   *
+   * [关联代码]
+   *   - task.service.ts findAll — tasks 数据源（statusPriority 排序 + board 可见性过滤）
+   *   - task-dependency.service.ts hasBlockers — blockers 批量补查
+   *   - packages/platform-mcp get-my-briefing.ts — MCP 侧编排（本方法后端化后
+   *     退化为薄透传，成功路径输出契约逐字段不变）
+   *
+   * [修改检查]
+   *   □ 已读 [权威文档]，确认修改符合设计意图
+   *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+   *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+   *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
+   * =============================================================================
+   */
+  async getMyBriefing(
+    actor: UnifiedActor,
+    query: BriefingQueryDto,
+  ): Promise<{
+    me: Record<string, unknown>;
+    activeTasks: { items: Record<string, unknown>[]; total: number };
+    unreadCounts?: TopicUnreadCount[];
+    recentActivities: unknown[];
+  }> {
+    // 阶段 1：me 先行（tasks 的 assigneeId 依赖 me.id）。
+    // me 数据源与 GET /agents/me 同源（findOne + pickPublicAgentFields 白名单，
+    // PM R-6：统计字段 topicCount/messageCount 在场），再 omit avatarUrl/apiKeyPrefix
+    // （人类 UI / 认证元数据，对 Agent 消费无价值，与 MCP Batch F 一致）。
+    const agent = await this.findOne(actor.id);
+    const me = this.pickPublicAgentFields(agent as unknown as Record<string, unknown>);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { avatarUrl: _avatarUrl, apiKeyPrefix: _apiKeyPrefix, ...meBriefing } = me;
+
+    // 阶段 2：tasks / activities / unread 三路并行。
+    // unread 是非关键路径：.catch 降级为 undefined（省略 unreadCounts 字段，防部署
+    // 时序 404 拖垮整个 briefing，对齐 MCP 现状 get-my-briefing.ts:216-219）。
+    // Promise.resolve 包裹：保证非 promise 返回值（如测试 mock）也不会同步抛 TypeError。
+    const [tasksResult, recentActivities, unread] = await Promise.all([
+      this.taskService.findAll(
+        {
+          assigneeId: actor.id,
+          status: query.statuses ?? DEFAULT_ACTIVE_STATUSES,
+          pageSize: query.taskLimit ?? 20,
+          // WS-A 新增 opt-in 排序：in_progress > todo > blocked > backlog > 其余
+          sort: 'statusPriority',
+        },
+        actor,
+      ),
+      this.findMyActivities(actor.id, { pageSize: query.activityLimit ?? 10 }),
+      Promise.resolve(this.findMyUnreadCounts(actor.id)).catch(() => undefined),
+    ]);
+
+    // 阶段 3：blockers 补查（TaskDependencyService.hasBlockers，返回 Record<taskId, boolean>）。
+    // 非关键路径：失败降级为 undefined（hasBlockers 省略，不挂主流程）；空 items 跳过。
+    const taskItems = Array.isArray(tasksResult.items) ? tasksResult.items : [];
+    let blockersMap: Record<string, boolean> | undefined;
+    if (taskItems.length > 0) {
+      blockersMap = await Promise.resolve(
+        this.taskDependencyService.hasBlockers(
+          taskItems
+            .map((t) => (t as unknown as Record<string, unknown>).id as string)
+            .filter(Boolean),
+        ),
+      ).catch(() => undefined);
+    }
+
+    // activeTasks：12 字段白名单投影 + hasBlockers 合并（map 缺失/降级时省略该键，
+    // 不补 false——未知 ≠ 无 blocker）。null 保留语义：!== undefined 判断，null 字段保留。
+    const items = taskItems.map((t) => {
+      const task =
+        t !== null && typeof t === 'object' ? (t as unknown as Record<string, unknown>) : {};
+      const projected: Record<string, unknown> = {};
+      for (const field of ACTIVE_TASK_KEPT_FIELDS) {
+        if (task[field] !== undefined) {
+          projected[field] = task[field];
+        }
+      }
+      if (blockersMap !== undefined) {
+        const hasBlockers = blockersMap[task.id as string];
+        if (hasBlockers !== undefined) {
+          projected.hasBlockers = hasBlockers;
+        }
+      }
+      return projected;
+    });
+
+    // recentActivities：信封化后取 .items 数组，原形状透传（briefing 字段形状不变，
+    // 仅数据源从裸数组变为信封），逐项截断 content（无 content 的 task 型条目
+    // 经 truncateField 的 typeof string 检查天然豁免，不打 contentTruncated）。
+    // maxContentLength 防御性钳制（DTO 已 400 拦截越界，此处兜底直接调 service 的场景）：
+    // 负数 → 0（不截断），>50000 → 50000（防止放量返回超长字符串）。
+    const maxContentLength = Math.max(0, Math.min(query.maxContentLength ?? 300, 50000));
+    const activityItems = (
+      recentActivities && Array.isArray((recentActivities as { items?: unknown[] }).items)
+        ? (recentActivities as { items: Record<string, unknown>[] }).items.map((a) => {
+            const item =
+              a !== null && typeof a === 'object' ? { ...(a as Record<string, unknown>) } : {};
+            truncateField(item, 'content', maxContentLength);
+            return item;
+          })
+        : recentActivities
+    ) as unknown[];
+
+    return {
+      me: meBriefing,
+      // 只透传 {items, total}，砍分页信封其余键（page/pageSize/totalPages/hasNext/hasPrev）
+      activeTasks: { items, total: tasksResult.total },
+      ...(unread !== undefined ? { unreadCounts: unread } : {}),
+      recentActivities: activityItems,
+    };
   }
 
   async create(ownerId: string, dto: CreateAgentDto) {
@@ -408,7 +709,7 @@ export class AgentService {
       agent.avatarUrl = dto.avatar;
       // 联动清理：avatar 被清空或改为非本站 SVG 短链（外部 URL）时，
       // actors.avatar_svg 已成无引用的孤儿数据，一并清除，回落确定性生成头像
-      if (agent.actor && dto.avatar !== `/api/v1/avatars/${agent.actor.id}.svg`) {
+      if (agent.actor && dto.avatar !== buildAvatarUrl(agent.actor.id)) {
         agent.actor.avatarSvg = null;
       }
     }
@@ -469,11 +770,12 @@ export class AgentService {
     // findOne 对软删 agent 抛 404（前置判空，铁律 #22）
     await this.findOne(id);
 
-    // 前三个 count 走 raw SQL（参照 findAll :90-105 批量范式；单 agent 场景直接 COUNT）
+    // 前三个 count 走 raw SQL（参照 findAll :90-105 批量范式；单 agent 场景直接 COUNT）。
+    // 状态字面量经 shared 枚举模板插值（受信代码无注入面；review-0831 任务 e013af33 收敛）
     const [openTaskCount, messageCount, topicCount] = await Promise.all([
       this.agentRepo.manager.query<Array<{ count: string }>>(
         `SELECT COUNT(id) as count FROM tasks
-         WHERE assignee_id = $1 AND status NOT IN ('done', 'archived') AND deleted_at IS NULL`,
+         WHERE assignee_id = $1 AND status NOT IN ('${TaskStatus.DONE}', '${TaskStatus.ARCHIVED}') AND deleted_at IS NULL`,
         [id],
       ),
       this.agentRepo.manager.query<Array<{ count: string }>>(
@@ -483,7 +785,7 @@ export class AgentService {
       ),
       this.agentRepo.manager.query<Array<{ count: string }>>(
         `SELECT COUNT(topic_id) as count FROM topic_participants
-         WHERE participant_id = $1 AND status IN ('invited', 'active')`,
+         WHERE participant_id = $1 AND status IN ('${ParticipantStatus.INVITED}', '${ParticipantStatus.ACTIVE}')`,
         [id],
       ),
     ]);
@@ -492,7 +794,7 @@ export class AgentService {
     const seatCount = await this.seatRepo
       .createQueryBuilder('seat')
       .where("seat.config->>'bindActorId' = :id", { id })
-      .andWhere("seat.status != 'removed'")
+      .andWhere(`seat.status != '${SEAT_LIFECYCLE_STATUS.REMOVED}'`)
       .getCount();
 
     return {
@@ -599,7 +901,7 @@ export class AgentService {
     // controller 不可得）；newData 白名单 {keyId, keyPrefix, agentId}（决策 9，非明文）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'api_key',
+      entityType: AUDIT_ENTITY_TYPE.API_KEY,
       entityId: keyId,
       actorId: operatorActorId ?? key.agentId,
       newData: { keyId: key.id, keyPrefix: key.keyPrefix, agentId: key.agentId },

@@ -21,8 +21,7 @@
  * =============================================================================
  */
 
-/** API 路径前缀常量（与 lib/api.ts 的 API_BASE_URL 缺省值同源；剥后缀时精确匹配） */
-const API_V1_SUFFIX = '/api/v1';
+import { API_PREFIX } from '@agent-chamber/shared';
 
 /**
  * 推导「平台根 URL」——runner 拨号与下载资产（install-runner.sh / integrations 指南）
@@ -39,11 +38,11 @@ const API_V1_SUFFIX = '/api/v1';
  * @returns 平台根 URL（无尾斜杠）
  */
 export function getRunnerPlatformUrl(): string {
-  const apiBase = process.env.NEXT_PUBLIC_API_URL || '/api/v1';
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || API_PREFIX;
   if (apiBase.startsWith('http://') || apiBase.startsWith('https://')) {
     // 绝对值：剥 /api/v1 后缀（允许尾斜杠变体，如 http://host:8743/api/v1/）
     const trimmed = apiBase.replace(/\/+$/, '');
-    return trimmed.endsWith(API_V1_SUFFIX) ? trimmed.slice(0, -API_V1_SUFFIX.length) : trimmed;
+    return trimmed.endsWith(API_PREFIX) ? trimmed.slice(0, -API_PREFIX.length) : trimmed;
   }
   // 相对路径（/api/v1）或空：取当前 origin（web 与 API 同源拓扑）
   return window.location.origin.replace(/\/+$/, '');

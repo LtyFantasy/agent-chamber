@@ -39,6 +39,7 @@ import { Event } from '../../database/entities/event.entity';
 import { WebhookDelivery } from '../../database/entities/webhook-delivery.entity';
 import { Message } from '../../database/entities/message.entity';
 import { WebhookStatus } from '@agent-chamber/shared';
+import { SEAT_RUNTIME_STATUS } from '@agent-chamber/roundtable-protocol';
 import type { ApiLogListResponse, InjectionOverview, SystemOverview } from '@agent-chamber/shared';
 import { ApiLogQueryDto } from './dto/api-log-query.dto';
 import { SseService } from '../sse/sse.service';
@@ -219,8 +220,8 @@ export class MonitoringService {
       generatedAt: new Date().toISOString(),
       runners: {
         total: runners.length,
-        online: runners.filter((r) => r.status === 'online').length,
-        offline: runners.filter((r) => r.status !== 'online').length,
+        online: runners.filter((r) => r.status === SEAT_RUNTIME_STATUS.ONLINE).length,
+        offline: runners.filter((r) => r.status !== SEAT_RUNTIME_STATUS.ONLINE).length,
         items: runners.map((r) => ({
           id: r.id,
           name: r.name,

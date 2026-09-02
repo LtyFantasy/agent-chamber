@@ -1,5 +1,9 @@
-import { IsString, IsOptional, IsEnum, IsNumber } from 'class-validator';
-import { AgendaItemInput } from '@agent-chamber/shared';
+import { IsString, IsOptional, IsIn, IsNumber } from 'class-validator';
+import {
+  AGENDA_ITEM_STATUS_VALUES,
+  AgendaItemInput,
+  AgendaItemStatus,
+} from '@agent-chamber/shared';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class AgendaItemDto implements AgendaItemInput {
@@ -12,13 +16,13 @@ export class AgendaItemDto implements AgendaItemInput {
   @ApiProperty({ description: 'Title', example: 'Example title' })
   title: string;
 
-  @IsEnum(['pending', 'in_progress', 'completed'] as const)
+  @IsIn(AGENDA_ITEM_STATUS_VALUES)
   @ApiProperty({
-    enum: ['pending', 'in_progress', 'completed'],
+    enum: AGENDA_ITEM_STATUS_VALUES,
     description: 'Status',
     example: 'pending',
   })
-  status: 'pending' | 'in_progress' | 'completed';
+  status: AgendaItemStatus;
 
   @IsOptional()
   @IsString()

@@ -1,11 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ForbiddenException, BadRequestException } from '@nestjs/common';
 import { TaskController } from './task.controller';
 import { TaskService } from './task.service';
 import { TaskDependencyService } from './task-dependency.service';
 import { MilestoneService } from './milestone.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { AuditService } from '../audit/audit.service';
-import { ActorType, UserRole, TaskStatus, TaskDependencyType } from '@agent-chamber/shared';
+import {
+  ActorType,
+  UserRole,
+  TaskStatus,
+  TaskDependencyType,
+  ErrorCode,
+} from '@agent-chamber/shared';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 
 describe('TaskController', () => {
@@ -22,6 +29,9 @@ describe('TaskController', () => {
     findById: jest.fn(),
     findOne: jest.fn(),
     create: jest.fn(),
+    batchCreate: jest.fn(),
+    resolveCreateBoard: jest.fn(),
+    resolveTaskBoard: jest.fn(),
     update: jest.fn(),
     patchDescription: jest.fn(),
     remove: jest.fn(),
@@ -54,6 +64,7 @@ describe('TaskController', () => {
 
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
+    can: jest.fn().mockResolvedValue(true),
   };
   const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
 
@@ -119,13 +130,54 @@ describe('TaskController', () => {
   });
 
   describe('create', () => {
-    it('should call service.create with dto and actor', async () => {
+    it('should ensure write permission on resolved board then create', async () => {
       const dto = { title: 'New Task', boardId: 'board-1', listId: 'list-1' };
+      const board = { id: 'board-1' };
       const result = { id: 'task-1', title: 'New Task' };
+      service.resolveCreateBoard.mockResolvedValue(board);
       service.create.mockResolvedValue(result);
 
       expect(await controller.create(dto, mockActor)).toBe(result);
+      expect(service.resolveCreateBoard).toHaveBeenCalledWith(dto);
+      expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
       expect(service.create).toHaveBeenCalledWith(dto, mockActor.id, mockActor.type);
+    });
+
+    it('should propagate ForbiddenException when actor lacks board write (B-58)', async () => {
+      const dto = { title: 'New Task', boardId: 'board-1', listId: 'list-1' };
+      const board = { id: 'board-1' };
+      service.resolveCreateBoard.mockResolvedValue(board);
+      permService.ensureCan.mockRejectedValueOnce(
+        new ForbiddenException({
+          message: 'Access denied: write on Board',
+          code: ErrorCode.PERMISSION_DENIED,
+        }),
+      );
+
+      await expect(controller.create(dto, mockActor)).rejects.toThrow(ForbiddenException);
+      expect(service.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('batchCreate', () => {
+    it('should ensure write permission on each distinct board then batch create', async () => {
+      const dto = {
+        tasks: [
+          { title: 'T1', boardId: 'board-1', listId: 'list-1' },
+          { title: 'T2', boardId: 'board-1', listId: 'list-2' },
+          { title: 'T3', boardId: 'board-2', listId: 'list-3' },
+        ],
+      };
+      const result = { items: [], count: 3 };
+      service.resolveCreateBoard.mockImplementation((t: any) => Promise.resolve({ id: t.boardId }));
+      service.batchCreate.mockResolvedValue(result);
+
+      expect(await controller.batchCreate(dto as any, mockActor)).toBe(result);
+      // 同 board 去重：board-1 只校验一次，board-2 校验一次
+      expect(permService.ensureCan).toHaveBeenCalledTimes(2);
+      expect(permService.ensureCan).toHaveBeenCalledWith({ id: 'board-1' }, mockActor, 'write');
+      expect(permService.ensureCan).toHaveBeenCalledWith({ id: 'board-2' }, mockActor, 'write');
+      expect(service.batchCreate).toHaveBeenCalledWith(dto, mockActor.id, mockActor.type);
     });
   });
 
@@ -279,11 +331,14 @@ describe('TaskController', () => {
   });
 
   describe('getComments', () => {
-    it('should call service.getComments with id and default limit', async () => {
+    it('should ensure read permission then call service.getComments with id and default limit', async () => {
+      const task = { id: 'task-1' };
       const result = [{ id: 'comment-1', content: 'Test' }];
+      service.findById.mockResolvedValue(task);
       service.getComments.mockResolvedValue(result);
 
-      expect(await controller.getComments('task-1')).toBe(result);
+      expect(await controller.getComments('task-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'read');
       expect(service.getComments).toHaveBeenCalledWith('task-1', undefined);
     });
   });
@@ -303,22 +358,70 @@ describe('TaskController', () => {
   });
 
   describe('getActivities', () => {
-    it('should call service.getActivities with id and default limit', async () => {
+    it('should ensure read permission then call service.getActivities with id and default limit', async () => {
+      const task = { id: 'task-1' };
       const result = [{ id: 'activity-1', action: 'created' }];
+      service.findById.mockResolvedValue(task);
       service.getActivities.mockResolvedValue(result);
 
-      expect(await controller.getActivities('task-1')).toBe(result);
+      expect(await controller.getActivities('task-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'read');
       expect(service.getActivities).toHaveBeenCalledWith('task-1', undefined);
     });
   });
 
+  describe('findDependencies', () => {
+    it('should ensure read permission then return dependencies', async () => {
+      const task = { id: 'task-1' };
+      const result = [{ id: 'dep-1', taskId: 'task-1' }];
+      service.findById.mockResolvedValue(task);
+      mockDepService.findDependencies.mockResolvedValue(result);
+
+      expect(await controller.findDependencies('task-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'read');
+      expect(mockDepService.findDependencies).toHaveBeenCalledWith('task-1');
+    });
+  });
+
+  describe('findDependents', () => {
+    it('should ensure read permission then return dependents', async () => {
+      const task = { id: 'task-1' };
+      const result = [{ id: 'dep-1', dependsOnTaskId: 'task-1' }];
+      service.findById.mockResolvedValue(task);
+      mockDepService.findDependents.mockResolvedValue(result);
+
+      expect(await controller.findDependents('task-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'read');
+      expect(mockDepService.findDependents).toHaveBeenCalledWith('task-1');
+    });
+  });
+
+  describe('findBlockers', () => {
+    it('should ensure read permission then return blockers', async () => {
+      const task = { id: 'task-1' };
+      const result = [{ id: 'dep-1', taskId: 'task-1' }];
+      service.findById.mockResolvedValue(task);
+      mockDepService.findBlockers.mockResolvedValue(result);
+
+      expect(await controller.findBlockers('task-1', mockActor)).toBe(result);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'read');
+      expect(mockDepService.findBlockers).toHaveBeenCalledWith('task-1');
+    });
+  });
+
   describe('addDependency', () => {
-    it('should add dependency and audit CREATE + task_dependency', async () => {
+    it('should ensure write on both task and dependsOnTask boards then add dependency and audit', async () => {
       const dto = { dependsOnTaskId: 'task-2', type: TaskDependencyType.BLOCKS };
+      const task = { id: 'task-1' };
+      const dependsOnTask = { id: 'task-2' };
       const result = { id: 'dep-1', taskId: 'task-1', dependsOnTaskId: 'task-2', type: 'blocks' };
+      service.findById.mockResolvedValueOnce(task).mockResolvedValueOnce(dependsOnTask);
       mockDepService.addDependency.mockResolvedValue(result);
 
       expect(await controller.addDependency('task-1', dto, mockActor)).toBe(result);
+      // B-58：跨 board 依赖边保守选择——两端 board 都校验 write
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
+      expect(permService.ensureCan).toHaveBeenCalledWith(dependsOnTask, mockActor, 'write');
       expect(mockDepService.addDependency).toHaveBeenCalledWith('task-1', dto);
       expect(auditService.log).toHaveBeenCalledWith({
         action: 'create',
@@ -332,10 +435,13 @@ describe('TaskController', () => {
   });
 
   describe('removeDependency', () => {
-    it('should remove dependency and audit DELETE + task_dependency', async () => {
+    it('should ensure write permission then remove dependency and audit', async () => {
+      const task = { id: 'task-1' };
+      service.findById.mockResolvedValue(task);
       mockDepService.removeDependency.mockResolvedValue(true);
 
       expect(await controller.removeDependency('task-1', 'dep-1', mockActor)).toBe(true);
+      expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
       expect(mockDepService.removeDependency).toHaveBeenCalledWith('task-1', 'dep-1');
       expect(auditService.log).toHaveBeenCalledWith({
         action: 'delete',
@@ -345,6 +451,71 @@ describe('TaskController', () => {
         newData: { taskId: 'task-1', dependsOnTaskId: 'dep-1' },
         source: 'api',
       });
+    });
+  });
+
+  describe('batchBlockers', () => {
+    // B-61：ids 段必须合法 UUID（格式校验 400 先于权限 403）；以下用例全部用合法
+    // UUID 假值，避免被格式校验提前拦截（否则会污染 findById Once-mock 队列）
+    const uuidA = '11111111-1111-4111-8111-111111111111';
+    const uuidB = '22222222-2222-4222-8222-222222222222';
+    const uuidC = '33333333-3333-4333-8333-333333333333';
+
+    it('should reject invalid UUID segment with 400 VALIDATION_ERROR (B-61)', async () => {
+      await expect(controller.batchBlockers(`${uuidA},not-a-uuid`, mockActor)).rejects.toThrow(
+        BadRequestException,
+      );
+      // 格式校验先于权限校验：非法段不得触发 findById / 权限判定
+      expect(service.findById).not.toHaveBeenCalled();
+      expect(permService.can).not.toHaveBeenCalled();
+    });
+
+    it('should ensure read on each distinct board then return blocker map', async () => {
+      const task1 = { id: uuidA, listId: 'list-1' };
+      const task2 = { id: uuidB, listId: 'list-2' };
+      const task3 = { id: uuidC, listId: 'list-3' };
+      const result = { [uuidA]: false, [uuidB]: true, [uuidC]: false };
+      service.findById
+        .mockResolvedValueOnce(task1)
+        .mockResolvedValueOnce(task2)
+        .mockResolvedValueOnce(task3);
+      service.resolveTaskBoard
+        .mockResolvedValueOnce({ id: 'board-1' })
+        .mockResolvedValueOnce({ id: 'board-1' }) // task-2 同 board-1 → 去重
+        .mockResolvedValueOnce({ id: 'board-2' });
+      mockDepService.hasBlockers.mockResolvedValue(result);
+
+      expect(await controller.batchBlockers(`${uuidA},${uuidB},${uuidC}`, mockActor)).toBe(result);
+      // 去重后只校验 board-1 / board-2 两个 board
+      expect(permService.can).toHaveBeenCalledTimes(2);
+      expect(permService.can).toHaveBeenCalledWith({ id: 'board-1' }, mockActor, 'read');
+      expect(permService.can).toHaveBeenCalledWith({ id: 'board-2' }, mockActor, 'read');
+      expect(mockDepService.hasBlockers).toHaveBeenCalledWith([uuidA, uuidB, uuidC]);
+    });
+
+    it('should throw 403 when any distinct board is not readable (B-58)', async () => {
+      const task1 = { id: uuidA, listId: 'list-1' };
+      const task2 = { id: uuidB, listId: 'list-2' };
+      service.findById.mockResolvedValueOnce(task1).mockResolvedValueOnce(task2);
+      service.resolveTaskBoard
+        .mockResolvedValueOnce({ id: 'board-1' })
+        .mockResolvedValueOnce({ id: 'board-2' });
+      permService.can.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+
+      await expect(controller.batchBlockers(`${uuidA},${uuidB}`, mockActor)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(mockDepService.hasBlockers).not.toHaveBeenCalled();
+    });
+
+    it('should skip orphan tasks (public) in permission check', async () => {
+      const task1 = { id: uuidA, listId: null };
+      service.findById.mockResolvedValueOnce(task1);
+      service.resolveTaskBoard.mockResolvedValueOnce(null);
+      mockDepService.hasBlockers.mockResolvedValue({ [uuidA]: false });
+
+      expect(await controller.batchBlockers(uuidA, mockActor)).toEqual({ [uuidA]: false });
+      expect(permService.can).not.toHaveBeenCalled();
     });
   });
 

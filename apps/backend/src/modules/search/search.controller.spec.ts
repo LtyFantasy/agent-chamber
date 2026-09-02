@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
-import { SearchQueryDto, SearchType } from './dto';
+import { SearchQueryDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorType } from '@agent-chamber/shared';
@@ -48,7 +48,7 @@ describe('SearchController', () => {
 
       const dto: SearchQueryDto = {
         q: 'hello',
-        type: SearchType.MESSAGES,
+        type: 'messages',
         page: 1,
         pageSize: 20,
       };
@@ -65,7 +65,7 @@ describe('SearchController', () => {
 
       const dto: SearchQueryDto = {
         q: 'test',
-        type: SearchType.ALL,
+        type: 'all',
         page: 1,
         pageSize: 20,
       };
@@ -73,10 +73,7 @@ describe('SearchController', () => {
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
 
       await controller.search(dto, actor);
-      expect(service.search).toHaveBeenCalledWith(
-        expect.objectContaining({ type: SearchType.ALL }),
-        actor,
-      );
+      expect(service.search).toHaveBeenCalledWith(expect.objectContaining({ type: 'all' }), actor);
     });
   });
 });

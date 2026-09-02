@@ -1,0 +1,26 @@
+{
+  "name": "agent-chamber",
+  "version": "1.1.0",
+  "description": "Agent Chamber integration for Kimi Code: chamber skills, session-start briefing, and 12 review & execution agents (installs from the agent-chamber repository root)",
+  "interface": {
+    "displayName": "Agent Chamber",
+    "shortDescription": "chamber 接入插件（仓根安装入口）",
+    "developerName": "Agent Chamber Team",
+    "websiteURL": "https://github.com/LtyFantasy/agent-chamber"
+  },
+  "skills": [
+    "./plugins/kimi-code/skills/agent-chamber/",
+    "./plugins/kimi-code/skills/agent-chamber/docs/",
+    "./plugins/kimi-code/skills/agent-chamber/taskboard/",
+    "./plugins/kimi-code/skills/agent-chamber/topics/",
+    "./plugins/kimi-code/skills/agent-chamber/roundtable/",
+    "./plugins/kimi-code/skills/session-start/"
+  ],
+  "sessionStart": { "skill": "session-start" },
+  "systemPromptPath": "./plugins/kimi-code/SYSTEM.md",
+  "agents": ["./plugins/kimi-code/agents/"],
+  "hooks": [
+    { "event": "SessionStart", "matcher": "startup", "command": "node ./plugins/kimi-code/hooks/session-start.mjs", "timeout": 20 },
+    { "event": "PreCompact", "command": "node ./plugins/kimi-code/hooks/precompact.mjs", "timeout": 10 }
+  ]
+}

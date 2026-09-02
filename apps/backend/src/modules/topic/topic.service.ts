@@ -11,6 +11,9 @@
  *     幂等 replay 不重复记；newData 白名单 {messageId, topicId, topicTitle}，content 黑名单）
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
+ *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyTopicIds
+ *         （creator+participant 去 open 源，participant 口径 = status IN invited/active
+ *         对齐 unread SQL，admin 不短路）。缓存键 topic:mine:<actorKey> 前缀隔离。
  *
  * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(发送即已读+join/邀请游标初始化)
  *
@@ -91,9 +94,12 @@ import {
   TaskStatus,
   ErrorCode,
   EventType,
+  ResourceType,
   ParticipantStatus,
   TopicParticipantRole,
   UserRole,
+  TopicKind,
+  WakePolicy,
 } from '@agent-chamber/shared';
 import type { TopicDetail } from '@agent-chamber/shared';
 import {
@@ -112,6 +118,7 @@ import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 
 /**
@@ -164,6 +171,36 @@ const AUTO_JOIN_PARTICIPANT_SQL = `
       ELSE topic_participants.last_read_message_id
     END
 `;
+
+/**
+ * Topic 状态流转矩阵（保守设计，review-0831 任务 b916d7cc 死契约清理）
+ *
+ * 键 = 当前状态，值 = 允许经 changeStatus 流转到的目标状态集合。
+ * 设计原则（对照 milestone.service RELEASE_TRANSITIONS 先例，铁律 #19 活文档化）：
+ * - 终态保护：closed/archived 不可经端点任意改回——closed 只能经 open 端点重开
+ *   （closed → active），archived 是绝对终态（无出边）；PATCH 直写 status 对
+ *   closed/archived 话题一律 409（见 update()）。
+ * - 幂等：目标状态 == 当前状态 → 200 no-op（重复 close/pause/resume/archive 不报错）。
+ * - 非法流转 → 409 ConflictException（RESOURCE_CONFLICT）。
+ * - 现状语义保留（2026-08-31 拍板「矩阵与现状语义冲突处以现状为准」）：
+ *   · archive 允许任意非终态直接归档（历史行为，web 端 archive 按钮对
+ *     active/paused/closed 均可用，不强制先 close）；
+ *   · open 允许 paused → active（open 兼作激活路径，历史行为，与 resume 并存）；
+ *   · open 允许 closed → active（重开）。
+ * - draft/voting 已删除（2026-08-31 死契约清理），矩阵不含。
+ */
+const TOPIC_STATUS_TRANSITIONS: Record<TopicStatus, readonly TopicStatus[]> = {
+  [TopicStatus.OPEN]: [
+    TopicStatus.ACTIVE,
+    TopicStatus.PAUSED,
+    TopicStatus.CLOSED,
+    TopicStatus.ARCHIVED,
+  ],
+  [TopicStatus.ACTIVE]: [TopicStatus.PAUSED, TopicStatus.CLOSED, TopicStatus.ARCHIVED],
+  [TopicStatus.PAUSED]: [TopicStatus.ACTIVE, TopicStatus.CLOSED, TopicStatus.ARCHIVED],
+  [TopicStatus.CLOSED]: [TopicStatus.ACTIVE, TopicStatus.ARCHIVED],
+  [TopicStatus.ARCHIVED]: [],
+};
 
 @Injectable()
 export class TopicService {
@@ -227,16 +264,21 @@ export class TopicService {
 
   /**
    * 列表查询：在 Service 层按 Actor 权限做 IN 过滤，保证分页 total 与 items 同源。
-   * @param query - 分页/状态/搜索条件
-   * @param actor - 当前统一身份；Admin 不过滤，非 Admin 用白名单 IN 过滤
+   * @param query - 分页/状态/搜索条件；mine=true 时走 AccessQueryService.getMyTopicIds
+   *   （creator+participant 去 open 源，admin 不短路——admin 求 mine 也只是
+   *   creator/participant 身份）
+   * @param actor - 当前统一身份；Admin 不过滤（mine=false 时返回 null → 全量），
+   *   非 Admin 用白名单 IN 过滤
    */
   async findAll(
-    query: { page?: number; pageSize?: number; status?: string; q?: string },
+    query: { page?: number; pageSize?: number; status?: string; q?: string; mine?: boolean },
     actor?: UnifiedActor,
   ) {
-    const { page = 1, pageSize = 20, status = 'active', q } = query;
+    const { page = 1, pageSize = 20, status = 'active', q, mine = false } = query;
 
-    const accessibleTopicIds = await this.accessQuery.getAccessibleTopicIds(actor);
+    const accessibleTopicIds = mine
+      ? await this.accessQuery.getMyTopicIds(actor)
+      : await this.accessQuery.getAccessibleTopicIds(actor);
     // 非 Admin 且白名单为空时直接返回空分页，避免生成空 IN () 导致 SQL 错误
     if (accessibleTopicIds && accessibleTopicIds.length === 0) {
       return {
@@ -269,9 +311,12 @@ export class TopicService {
       .getManyAndCount();
 
     // 从 settings JSONB 提取 visibility 到顶层字段，剔除大文本 description（spec.md §7.4a）
+    // 接口瘦身二期：agenda/settings jsonb 一并剔除（web 列表页零消费，与 boards 策略一致）
     const itemsWithVisibility = items.map((item) => {
-      const { description, ...rest } = item;
+      const { description, agenda, settings, ...rest } = item;
       void description;
+      void agenda;
+      void settings;
       return {
         ...rest,
         visibility: item.settings?.visibility,
@@ -377,14 +422,16 @@ export class TopicService {
     // resolveWakePolicy 同规（真相源，其还处理 normal→broadcast 兜底，本字段只服务
     // web 圆桌 UI 提示，故 normal 不输出）——设计 docs/roundtable-design.md §6。
     const settings = topic.settings as Record<string, unknown> | null | undefined;
-    const wakePolicy = topic.kind === 'roundtable' ? settings?.wakePolicy : undefined;
+    const wakePolicy = topic.kind === TopicKind.ROUNDTABLE ? settings?.wakePolicy : undefined;
     const effectiveWakePolicy =
-      wakePolicy === 'mention' || wakePolicy === 'broadcast' ? wakePolicy : 'mention';
+      wakePolicy === WakePolicy.MENTION || wakePolicy === WakePolicy.BROADCAST
+        ? wakePolicy
+        : WakePolicy.MENTION;
 
     return {
       ...topic,
       invitedAgentIds,
-      ...(topic.kind === 'roundtable' ? { wakePolicy: effectiveWakePolicy } : {}),
+      ...(topic.kind === TopicKind.ROUNDTABLE ? { wakePolicy: effectiveWakePolicy } : {}),
       participants,
       boardCount,
       taskCount,
@@ -417,7 +464,7 @@ export class TopicService {
     // kind 是实体列（不是 settings 键）：从 config 解构出来单独落列；
     // 其余配置（含 wakePolicy）原样铺进 settings jsonb
     const { kind: kindInput, ...restConfig } = createDto.config ?? {};
-    const kind = kindInput ?? 'normal';
+    const kind = kindInput ?? TopicKind.NORMAL;
 
     const settings: Record<string, unknown> = {
       allow_agent_proposal: true,
@@ -427,8 +474,8 @@ export class TopicService {
     };
     // 圆桌唤醒策略缺省 'mention'（设计 docs/roundtable-design.md §6 默认：仅 @唤醒，
     // 新桌默认省钱安全）；普通桌 wakePolicy 原样透传（零感知，无路由逻辑消费该值）
-    if (kind === 'roundtable' && settings.wakePolicy === undefined) {
-      settings.wakePolicy = 'mention';
+    if (kind === TopicKind.ROUNDTABLE && settings.wakePolicy === undefined) {
+      settings.wakePolicy = WakePolicy.MENTION;
     }
 
     // ── 无幂等键：走原路径（零开销） ──
@@ -449,7 +496,7 @@ export class TopicService {
       // {topicId, title, visibility?}（决策 6；description/agenda/settings 不入）
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'topic',
+        entityType: AUDIT_ENTITY_TYPE.TOPIC,
         entityId: savedTopic.id,
         actorId: creatorId,
         newData: {
@@ -555,7 +602,7 @@ export class TopicService {
       // 「幂等 replay 不重复记」）；载荷与无幂等键路径一致
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'topic',
+        entityType: AUDIT_ENTITY_TYPE.TOPIC,
         entityId: savedTopic.id,
         actorId: creatorId,
         newData: {
@@ -597,8 +644,15 @@ export class TopicService {
     const topic = await this.topicRepo.findOne({ where: { id } });
     if (!topic)
       throw new NotFoundException({ message: 'Topic not found', code: ErrorCode.TOPIC_NOT_FOUND });
-    if (topic.status === TopicStatus.CLOSED) {
-      throw new BadRequestException({ message: 'Topic is closed', code: ErrorCode.TOPIC_CLOSED });
+    // 终态保护（review-0831 任务 b916d7cc）：closed/archived 话题整体拒绝 PATCH（409）——
+    // 堵「closed/archived 可经 PATCH 任意改回 active」的洞；状态流转只能走五个专用端点
+    // （close/pause/open/resume/archive，经 changeStatus 矩阵校验）。历史行为：closed 曾
+    // 以 400 TOPIC_CLOSED 拒绝，现统一为 409 RESOURCE_CONFLICT（archived 此前可改，一并收口）。
+    if (topic.status === TopicStatus.CLOSED || topic.status === TopicStatus.ARCHIVED) {
+      throw new ConflictException({
+        message: topic.status === TopicStatus.CLOSED ? 'Topic is closed' : 'Topic is archived',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
     }
 
     // 处理 invitedAgentIds 更新：set invited set via participant table
@@ -680,8 +734,33 @@ export class TopicService {
     return true;
   }
 
+  /**
+   * 状态流转（close/pause/open/resume/archive 五端点共用，review-0831 任务 b916d7cc
+   * 起受 TOPIC_STATUS_TRANSITIONS 矩阵约束）。
+   *
+   * 语义：
+   * - 幂等：目标状态 == 当前状态 → 200 no-op（重复 close/pause/resume/archive 不报错）
+   * - 合法流转：目标状态 ∈ 矩阵[当前状态] → 落库
+   * - 非法流转（含 archived 出边、closed 非重开路径）→ 409 ConflictException
+   *
+   * @param id 话题 ID
+   * @param status 目标状态
+   * @throws NotFoundException 话题不存在
+   * @throws ConflictException 非法流转（RESOURCE_CONFLICT）
+   */
   async changeStatus(id: string, status: TopicStatus) {
     const topic = await this.findById(id);
+    // 幂等：目标 == 当前 → 直接返回（不落库、不报错）
+    if (topic.status === status) {
+      return topic;
+    }
+    const allowed = TOPIC_STATUS_TRANSITIONS[topic.status] ?? [];
+    if (!allowed.includes(status)) {
+      throw new ConflictException({
+        message: `Invalid topic status transition: ${topic.status} -> ${status}`,
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
     topic.status = status;
     return this.topicRepo.save(topic);
   }
@@ -746,7 +825,7 @@ export class TopicService {
 
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: topicId,
       topicId: topicId ?? undefined,
       actorId: participantId,
@@ -758,7 +837,7 @@ export class TopicService {
     // controller 传操作 admin/creator，缺省=participantId）；newData {topicId, participantId}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: participantId,
       actorId: operatorActorId ?? participantId,
       newData: { topicId, participantId },
@@ -841,7 +920,7 @@ export class TopicService {
 
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: topicId,
       topicId: topicId ?? undefined,
       actorId: participantId,
@@ -883,7 +962,7 @@ export class TopicService {
 
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: topicId,
       topicId: topicId ?? undefined,
       actorId: participantId,
@@ -895,7 +974,7 @@ export class TopicService {
     // service 层插桩）；newData {topicId, participantId}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: participantId,
       actorId,
       newData: { topicId, participantId },
@@ -1221,7 +1300,7 @@ export class TopicService {
       // 「幂等 replay 不重复记」）；载荷与 sendMessageInternal 一致
       await this.auditService.log({
         action: AuditAction.CREATE,
-        entityType: 'message',
+        entityType: AUDIT_ENTITY_TYPE.MESSAGE,
         entityId: saved.id,
         actorId: senderId,
         newData: { messageId: saved.id, topicId, topicTitle: topic.title },
@@ -1239,7 +1318,7 @@ export class TopicService {
 
       await this.eventService.create({
         eventType: EventType.NEW_MESSAGE,
-        resourceType: 'message',
+        resourceType: ResourceType.MESSAGE,
         resourceId: saved.id,
         topicId: topic.id ?? undefined,
         actorId: senderId,
@@ -1309,7 +1388,7 @@ export class TopicService {
     // ——content 显式黑名单（决策 6），正文永不入审计
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'message',
+      entityType: AUDIT_ENTITY_TYPE.MESSAGE,
       entityId: saved.id,
       actorId: senderId,
       newData: { messageId: saved.id, topicId, topicTitle: topic.title },
@@ -1335,7 +1414,7 @@ export class TopicService {
     // --- 5.6 触发事件 ---
     await this.eventService.create({
       eventType: EventType.NEW_MESSAGE,
-      resourceType: 'message',
+      resourceType: ResourceType.MESSAGE,
       resourceId: saved.id,
       topicId: topic.id ?? undefined,
       actorId: senderId,
@@ -1645,7 +1724,7 @@ export class TopicService {
     // {messageId, topicId}（决策 6——content 黑名单不入）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'message',
+      entityType: AUDIT_ENTITY_TYPE.MESSAGE,
       entityId: messageId,
       actorId,
       newData: { messageId, topicId },
@@ -1716,7 +1795,7 @@ export class TopicService {
     // 触发事件
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: id,
       topicId: id ?? undefined,
       actorId: agentId,
@@ -1795,7 +1874,7 @@ export class TopicService {
     // 触发事件（与 inviteAgent 同构：editor 提升视为加入事件）
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: id,
       topicId: id ?? undefined,
       actorId: agentId,
@@ -1843,7 +1922,7 @@ export class TopicService {
     // 触发事件
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: id,
       topicId: id ?? undefined,
       actorId: agentId,
@@ -1901,7 +1980,7 @@ export class TopicService {
     // 触发事件
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: id,
       topicId: id ?? undefined,
       actorId: agentId,
@@ -1944,7 +2023,7 @@ export class TopicService {
 
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
-      resourceType: 'topic',
+      resourceType: ResourceType.TOPIC,
       resourceId: topicId,
       topicId: topicId ?? undefined,
       actorId: userId,

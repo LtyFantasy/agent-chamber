@@ -133,6 +133,10 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
           ds.getRepository(User),
         ),
       ),
+      // getMyBriefing 编排依赖（plan captain-atom-crimson-avenger-rocket-dc §2.5 A1）：
+      // 本套件不触达 briefing 路径，mock 即可
+      {} as never, // taskService（未触达）
+      {} as never, // taskDependencyService（未触达）
     );
   }, 30000);
 

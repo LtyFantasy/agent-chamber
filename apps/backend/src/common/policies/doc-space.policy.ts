@@ -24,7 +24,7 @@ import { DocSpaceMember } from '../../database/entities/doc-space-member.entity'
 import { UnifiedActor } from '../types/actor.types';
 import { ResourceAction } from './resource-action.type';
 import { OwnerProxyService, isOwnerProxyCandidate } from '../services/owner-proxy.service';
-import { Visibility, UserRole } from '@agent-chamber/shared';
+import { Visibility, UserRole, DocSpaceMemberRole } from '@agent-chamber/shared';
 
 /**
  * DocSpace 权限策略（v1.37：owner 代理）
@@ -75,7 +75,9 @@ export class DocSpacePolicy {
       memberRole = member?.role ?? null;
     }
     const isMember = memberRole !== null;
-    const isEditor = memberRole === 'editor';
+    // doc_space_members.role 实体类型为 string，值域对齐 DocSpaceMemberRole 枚举
+    // （review-0831 任务 a8a295df 建专属枚举，此前借用 BoardMemberRole 比较）
+    const isEditor = memberRole === DocSpaceMemberRole.EDITOR;
 
     switch (action) {
       case 'read':

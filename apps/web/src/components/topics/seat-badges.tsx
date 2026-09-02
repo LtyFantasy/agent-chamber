@@ -46,7 +46,7 @@ import { useTranslations } from 'next-intl';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { AxiosError } from 'axios';
 import { Crown, Trash2 } from 'lucide-react';
-import { Api, type RoundtableSeatItem } from '@/lib/api';
+import { Api, SEAT_LIFECYCLE_STATUS, type RoundtableSeatItem } from '@/lib/api';
 import { Badge } from '@/components/ui/badge';
 import { confirm } from '@/lib/notify';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -132,7 +132,7 @@ export function SeatBadges({ topicId, seats, canManage = false, onExitGuide }: S
 
   /** 状态徽章样式映射（status 是协议值不翻译；active 主色、offline 灰、其余 outline） */
   const statusBadgeClass = (status: string) =>
-    status === 'active'
+    status === SEAT_LIFECYCLE_STATUS.ACTIVE // 值域单源见 api.ts（shared 派生）
       ? 'border-primary/40 bg-primary/10 text-primary'
       : 'border-border/60 bg-muted/40 text-muted-foreground';
 

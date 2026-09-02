@@ -1121,6 +1121,10 @@ describe('DocSpaceService', () => {
         title: 'API 定义',
         summary: '短摘要',
         docType: null,
+        // Diagram IR v1：docs 表新增三列（entity 非可选属性，字面量 as Doc 需带齐）
+        diagramType: null,
+        renderedHtml: null,
+        renderMeta: null,
         tags: [],
         source: 'native',
         contentHash: null,
@@ -1271,6 +1275,10 @@ describe('DocSpaceService', () => {
         title: `T${i}`,
         summary: '摘'.repeat(500),
         docType: null,
+        // Diagram IR v1：docs 表新增三列（entity 非可选属性，字面量 as Doc 需带齐）
+        diagramType: null,
+        renderedHtml: null,
+        renderMeta: null,
         tags: [],
         source: 'native',
         contentHash: null,
@@ -1310,6 +1318,10 @@ describe('DocSpaceService', () => {
         title: `T${i}`,
         summary: '摘'.repeat(500),
         docType: null,
+        // Diagram IR v1：docs 表新增三列（entity 非可选属性，字面量 as Doc 需带齐）
+        diagramType: null,
+        renderedHtml: null,
+        renderMeta: null,
         tags: [],
         source: 'native',
         contentHash: null,

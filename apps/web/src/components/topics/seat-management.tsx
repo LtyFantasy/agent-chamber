@@ -32,10 +32,10 @@
  */
 
 import { useState } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
 import { Plus, Server } from 'lucide-react';
-import { Api } from '@/lib/api';
+import { Api, RUNNER_STATUS } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { formatRelativeTime } from '@/lib/utils';
@@ -68,6 +68,7 @@ interface SeatManagementProps {
  */
 export function SeatManagement({ topicId, canManage = false, onExitGuide }: SeatManagementProps) {
   const t = useTranslations('topics');
+  const locale = useLocale();
   const [createOpen, setCreateOpen] = useState(false);
 
   const { data: runners } = useQuery({
@@ -121,7 +122,7 @@ export function SeatManagement({ topicId, canManage = false, onExitGuide }: Seat
               {/* 状态点：online 主色 / offline 灰（status 是协议值不翻译） */}
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  r.status === 'online' ? 'bg-emerald-400' : 'bg-muted-foreground/50'
+                  r.status === RUNNER_STATUS.ONLINE ? 'bg-emerald-400' : 'bg-muted-foreground/50'
                 }`}
               />
               <Server className="h-3 w-3 text-muted-foreground" />
@@ -130,7 +131,9 @@ export function SeatManagement({ topicId, canManage = false, onExitGuide }: Seat
                 <span className="text-muted-foreground">{r.vendors.join(', ')}</span>
               )}
               {r.lastSeenAt && (
-                <span className="text-muted-foreground/70">{formatRelativeTime(r.lastSeenAt)}</span>
+                <span className="text-muted-foreground/70">
+                  {formatRelativeTime(r.lastSeenAt, locale)}
+                </span>
               )}
             </span>
           ))}

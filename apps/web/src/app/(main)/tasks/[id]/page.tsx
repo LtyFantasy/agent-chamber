@@ -25,36 +25,12 @@ import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { taskStatusMap as statusMap, taskPriorityMap as priorityMap } from '@/lib/status-visuals';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Loading } from '@/components/ui/loading';
 import { TaskDetailPanel } from '@/components/tasks/task-detail-panel';
 import { ArrowLeft } from 'lucide-react';
-
-/** 任务状态 → 徽章映射（暗色主题半透明语义色） */
-const statusMap: Record<
-  string,
-  {
-    labelKey: string;
-    variant: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning';
-  }
-> = {
-  backlog: { labelKey: 'tasks.status.backlog', variant: 'secondary' },
-  todo: { labelKey: 'tasks.status.todo', variant: 'default' },
-  in_progress: { labelKey: 'tasks.status.in_progress', variant: 'warning' },
-  review: { labelKey: 'tasks.status.review', variant: 'outline' },
-  done: { labelKey: 'tasks.status.done', variant: 'success' },
-  blocked: { labelKey: 'tasks.status.blocked', variant: 'destructive' },
-  archived: { labelKey: 'tasks.status.archived', variant: 'secondary' },
-};
-
-/** 优先级徽章：暗色主题半透明语义色底 + 亮阶文字 */
-const priorityMap: Record<string, { label: string; color: string }> = {
-  p0: { label: 'P0', color: 'bg-red-500/15 text-red-300' },
-  p1: { label: 'P1', color: 'bg-orange-500/15 text-orange-300' },
-  p2: { label: 'P2', color: 'bg-blue-500/15 text-blue-300' },
-  p3: { label: 'P3', color: 'bg-muted/50 text-muted-foreground' },
-};
 
 /**
  * TaskDetailPage — 任务独立详情页

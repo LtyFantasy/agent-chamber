@@ -31,7 +31,7 @@ import { useTranslations } from 'next-intl';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AxiosError } from 'axios';
 import { Check, ChevronDown, ChevronRight } from 'lucide-react';
-import { Api, type RoundtableRunnerItem, type RoundtableSeatItem } from '@/lib/api';
+import { Api, RUNNER_STATUS, type RoundtableRunnerItem, type RoundtableSeatItem } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -182,7 +182,8 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
 
   /** vendor-runner 联动提示：所选 vendor 无任何在线 runner 支持时 amber 提示（不阻断） */
   const vendorHasOnlineRunner = runners.some(
-    (r) => r.status === 'online' && Array.isArray(r.vendors) && r.vendors.includes(vendor),
+    (r) =>
+      r.status === RUNNER_STATUS.ONLINE && Array.isArray(r.vendors) && r.vendors.includes(vendor),
   );
 
   const handleSubmit = () => {

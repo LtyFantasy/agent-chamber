@@ -21,7 +21,15 @@
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Controller, Post, Body, UseGuards, HttpCode, HttpStatus } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Body,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+  ForbiddenException,
+} from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
@@ -33,7 +41,7 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
-import { UserRole } from '@agent-chamber/shared';
+import { UserRole, ErrorCode } from '@agent-chamber/shared';
 
 /**
  * A6 登录/注册限流阈值（防爆破）。
@@ -110,7 +118,19 @@ export class AuthController {
   })
   @ApiResponse({ status: 200, description: 'Logout successful' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
-  async logout(@CurrentUser('sub') userId: string, @Body() body: RefreshTokenDto) {
+  async logout(@CurrentUser('userId') userId: string, @Body() body: RefreshTokenDto) {
+    // B-57（2026-08-31 全仓评审）：@CurrentUser('sub') 恒取不到值（jwt.strategy 与
+    // JwtOrApiKeyGuard 构造的 request.user 形状均为 { userId, email, role, name }，
+    // 无 sub）→ userId 恒 undefined → 撤销 0 行 + 审计 entityId 为 undefined 落库失败
+    // 被 fail-open 吞掉，logout 实际是空操作。改取 'userId'；身份缺失（如 agent 用
+    // API Key 调 logout，B-59 后 guard 只挂 request.agent）→ fail-closed 明确拒绝，
+    // 禁止静默成功（铁律 #21 第一层：controller 负责身份存在性）
+    if (!userId) {
+      throw new ForbiddenException({
+        message: 'Logout requires a human (JWT) session',
+        code: ErrorCode.FORBIDDEN,
+      });
+    }
     return this.authService.logout(userId, body.refreshToken);
   }
 }

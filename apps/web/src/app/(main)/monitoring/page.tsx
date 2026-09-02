@@ -1,9 +1,9 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
-import { Api } from '@/lib/api';
+import { Api, RUNNER_STATUS } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -86,6 +86,7 @@ function AttentionStrip({ overview }: { overview: SystemOverview }) {
 /** 系统信息行：version · commit · uptime（来自 /health 裸响应）+ 数据生成时间 */
 function SystemInfoRow({ generatedAt }: { generatedAt?: string }) {
   const t = useTranslations('monitoring.system');
+  const locale = useLocale();
   const { data: health } = useQuery({
     queryKey: ['monitoring', 'health'],
     queryFn: () => Api.monitoring.getHealth(),
@@ -95,7 +96,7 @@ function SystemInfoRow({ generatedAt }: { generatedAt?: string }) {
     { label: t('version'), value: health?.version ?? '-' },
     { label: t('commit'), value: health?.commit ?? '-' },
     { label: t('uptime'), value: health ? formatUptime(health.uptime) : '-' },
-    { label: t('generatedAt'), value: generatedAt ? formatRelativeTime(generatedAt) : '-' },
+    { label: t('generatedAt'), value: generatedAt ? formatRelativeTime(generatedAt, locale) : '-' },
   ];
   return (
     <Card>
@@ -120,6 +121,7 @@ function SystemInfoRow({ generatedAt }: { generatedAt?: string }) {
 /** 圆桌健康：runner 在线状态 + 座位占用/未消费水位 + 注入管线埋点 */
 function RoundtableSection({ overview }: { overview: SystemOverview }) {
   const t = useTranslations('monitoring.roundtable');
+  const locale = useLocale();
   const { runners, seats, injection } = overview;
   return (
     <div className="grid gap-4 md:grid-cols-2">
@@ -143,7 +145,7 @@ function RoundtableSection({ overview }: { overview: SystemOverview }) {
             {runners.items.map((r) => (
               <div key={r.id} className="flex items-center justify-between text-sm">
                 <div className="flex items-center gap-2">
-                  <Badge variant={r.status === 'online' ? 'success' : 'destructive'}>
+                  <Badge variant={r.status === RUNNER_STATUS.ONLINE ? 'success' : 'destructive'}>
                     {r.status}
                   </Badge>
                   <span className="font-medium">{r.name}</span>
@@ -154,7 +156,7 @@ function RoundtableSection({ overview }: { overview: SystemOverview }) {
                 <span className="text-xs text-muted-foreground">
                   {t('seatCount', { count: r.seatCount })}
                   {' · '}
-                  {r.lastSeenAt ? formatRelativeTime(r.lastSeenAt) : t('neverSeen')}
+                  {r.lastSeenAt ? formatRelativeTime(r.lastSeenAt, locale) : t('neverSeen')}
                 </span>
               </div>
             ))}
@@ -261,6 +263,7 @@ function RoundtableSection({ overview }: { overview: SystemOverview }) {
 /** 事件总线活跃度 + Webhook 投递健康 + SSE 推送连接 */
 function PipelineSection({ overview }: { overview: SystemOverview }) {
   const t = useTranslations('monitoring.pipeline');
+  const locale = useLocale();
   const { events, webhooks, sse } = overview;
   return (
     <div className="grid gap-4 md:grid-cols-2">
@@ -280,7 +283,9 @@ function PipelineSection({ overview }: { overview: SystemOverview }) {
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t('latestEvent')}</span>
               <span>
-                {events.latestEventAt ? formatRelativeTime(events.latestEventAt) : t('noEvents')}
+                {events.latestEventAt
+                  ? formatRelativeTime(events.latestEventAt, locale)
+                  : t('noEvents')}
               </span>
             </div>
           </div>

@@ -920,6 +920,99 @@ describe('TaskService', () => {
     });
   });
 
+  describe('resolveCreateBoard', () => {
+    it('should throw 400 when both listId and statusName are missing', async () => {
+      await expect(service.resolveCreateBoard({ title: 'T' } as CreateTaskDto)).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('should resolve board from explicit boardId', async () => {
+      const board = { id: 'board-1', topicId: 'topic-1' } as Board;
+      mockBoardRepo.findOne.mockResolvedValue(board);
+
+      const result = await service.resolveCreateBoard({
+        title: 'T',
+        boardId: 'board-1',
+        listId: 'list-1',
+      } as CreateTaskDto);
+
+      expect(result).toBe(board);
+      expect(mockBoardRepo.findOne).toHaveBeenCalledWith({ where: { id: 'board-1' } });
+    });
+
+    it('should infer board from listId when boardId is absent', async () => {
+      const board = { id: 'board-2', topicId: 'topic-2' } as Board;
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-2',
+        board,
+      } as BoardList);
+
+      const result = await service.resolveCreateBoard({
+        title: 'T',
+        listId: 'list-1',
+      } as CreateTaskDto);
+
+      expect(result).toBe(board);
+      expect(mockBoardListRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'list-1' },
+        relations: ['board'],
+      });
+    });
+
+    it('should resolve listId via statusName and backfill dto.listId (create 幂等)', async () => {
+      const board = { id: 'board-1', topicId: 'topic-1' } as Board;
+      mockBoardRepo.findOne.mockResolvedValue(board);
+      // resolveListIdByStatusName 走 boardListRepo.find（三层匹配）
+      mockBoardListRepo.find.mockResolvedValue([
+        { id: 'list-done', name: 'Done', mappedStatus: 'done' } as BoardList,
+      ]);
+
+      const dto = { title: 'T', boardId: 'board-1', statusName: 'done' } as CreateTaskDto;
+      const result = await service.resolveCreateBoard(dto);
+
+      expect(result).toBe(board);
+      expect(dto.listId).toBe('list-done');
+    });
+
+    it('should throw 404 when list exists but its board is soft-deleted/missing', async () => {
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-2',
+        board: null,
+      } as unknown as BoardList);
+
+      await expect(
+        service.resolveCreateBoard({ title: 'T', listId: 'list-1' } as CreateTaskDto),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.BOARD_NOT_FOUND } });
+    });
+  });
+
+  describe('resolveTaskBoard', () => {
+    it('should return null for orphan task (no listId)', async () => {
+      // Task.listId 实体类型为 string，但 DB 层允许 NULL（TaskPolicy 的 orphan 分支）
+      const task = createMockTask({ listId: null as unknown as string });
+      expect(await service.resolveTaskBoard(task)).toBeNull();
+    });
+
+    it('should return the board of the task list', async () => {
+      const board = { id: 'board-1' } as Board;
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board,
+      } as BoardList);
+
+      expect(await service.resolveTaskBoard(createMockTask())).toBe(board);
+    });
+
+    it('should return null when list is missing', async () => {
+      mockBoardListRepo.findOne.mockResolvedValue(null);
+      expect(await service.resolveTaskBoard(createMockTask())).toBeNull();
+    });
+  });
+
   describe('create', () => {
     it('should create task and log activity with real actorId', async () => {
       const dto = {
@@ -2171,6 +2264,47 @@ describe('TaskService', () => {
 
       expect(result.status).toBe('in_progress');
       expect(result.startedAt).toBeInstanceOf(Date);
+    });
+
+    it('should clear completedAt when auto-syncing a DONE task to a non-done mappedStatus list (B-60)', async () => {
+      // 铁律 #18：status=done ⇔ completedAt 非空——DONE 任务 move 到 mappedStatus='todo'
+      // 列必须反向清理 completedAt，否则 board digest recentDone 段口径被污染
+      const task = createMockTask({
+        status: TaskStatus.DONE,
+        completedAt: new Date('2024-06-01'),
+      });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-todo',
+        mappedStatus: 'todo',
+      } as BoardList);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+
+      const result = await service.move('task-1', {
+        listId: '3757faa2-9306-4944-99ba-b7588c270970',
+        order: 0,
+      });
+
+      expect(result.status).toBe('todo');
+      expect(result.completedAt).toBeNull();
+    });
+
+    it('should keep completedAt when auto-syncing a non-done task to a done mappedStatus list', async () => {
+      const task = createMockTask({ status: TaskStatus.TODO, completedAt: null });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-done',
+        mappedStatus: 'done',
+      } as BoardList);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+
+      const result = await service.move('task-1', {
+        listId: '3757faa2-9306-4944-99ba-b7588c270970',
+        order: 0,
+      });
+
+      expect(result.status).toBe('done');
+      expect(result.completedAt).toBeInstanceOf(Date);
     });
 
     it('should not change status when target list has no mappedStatus', async () => {

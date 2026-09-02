@@ -34,6 +34,8 @@ import {
   ParticipantStatus,
   Visibility,
   AuditAction,
+  TopicKind,
+  WakePolicy,
 } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
@@ -391,6 +393,9 @@ describe('TopicService', () => {
       // 列表项不含 description 大文本，仅含 descriptionSnippet
       expect(result.items[0]).not.toHaveProperty('description');
       expect(result.items[0]).toHaveProperty('descriptionSnippet');
+      // 接口瘦身二期：agenda/settings jsonb 一并剔除（web 列表页零消费）
+      expect(result.items[0]).not.toHaveProperty('agenda');
+      expect(result.items[0]).not.toHaveProperty('settings');
       expect(result.total).toBe(1);
       expect(result.page).toBe(1);
       expect(result.pageSize).toBe(20);
@@ -454,6 +459,22 @@ describe('TopicService', () => {
         { q: '%test%' },
       );
       expect(result.items).toHaveLength(1);
+    });
+
+    it('should delegate to mine-only whitelist when query.mine is true (v1.70)', async () => {
+      const items = [createMockTopic()];
+      const qbMock = createMockQueryBuilder(items, 1);
+      mockTopicRepo.createQueryBuilder.mockReturnValue(qbMock);
+      mockAccessQuery.getMyTopicIds = jest.fn().mockResolvedValue(['topic-1']);
+
+      const actor = { id: 'user-1', type: ActorType.HUMAN };
+      await service.findAll({ mine: true }, actor);
+
+      expect(mockAccessQuery.getMyTopicIds).toHaveBeenCalledWith(actor);
+      expect(mockAccessQuery.getAccessibleTopicIds).not.toHaveBeenCalled();
+      expect(qbMock.andWhere).toHaveBeenCalledWith('topic.id IN (:...accessibleTopicIds)', {
+        accessibleTopicIds: ['topic-1'],
+      });
     });
 
     it('should ignore status filter when status is all', async () => {
@@ -697,7 +718,7 @@ describe('TopicService', () => {
     // ── kind / wakePolicy 装配（M2 阶段 1：设计 §5/§6） ──
 
     it('create：kind=roundtable 且未显式 wakePolicy → 缺省 mention（设计 §6 默认）', async () => {
-      const dto = { title: 'Roundtable Topic', config: { kind: 'roundtable' as const } };
+      const dto = { title: 'Roundtable Topic', config: { kind: TopicKind.ROUNDTABLE } };
       mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
       mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-rt' }));
       mockParticipantRepo.create.mockReturnValue(createMockParticipant());
@@ -716,7 +737,7 @@ describe('TopicService', () => {
     it('create：kind=roundtable 显式 wakePolicy=broadcast → 原样写入 settings', async () => {
       const dto = {
         title: 'Roundtable Topic',
-        config: { kind: 'roundtable' as const, wakePolicy: 'broadcast' as const },
+        config: { kind: TopicKind.ROUNDTABLE, wakePolicy: WakePolicy.BROADCAST },
       };
       mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
       mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-rt' }));
@@ -759,7 +780,7 @@ describe('TopicService', () => {
     it('create：normal 桌显式 wakePolicy → 原样透传（配置原样存储语义，路由层不消费）', async () => {
       const dto = {
         title: 'Normal Topic',
-        config: { wakePolicy: 'broadcast' as const },
+        config: { wakePolicy: WakePolicy.BROADCAST },
       };
       mockTopicRepo.create.mockReturnValue(createMockTopic(dto));
       mockTopicRepo.save.mockResolvedValue(createMockTopic({ ...dto, id: 'topic-n' }));
@@ -889,11 +910,24 @@ describe('TopicService', () => {
       await expect(service.update('not-found', { title: 'X' })).rejects.toThrow(NotFoundException);
     });
 
-    it('should throw BadRequestException when topic is closed', async () => {
+    it('should throw ConflictException when topic is closed (终态 PATCH 409，review-0831 b916d7cc)', async () => {
       const topic = createMockTopic({ status: TopicStatus.CLOSED });
       mockTopicRepo.findOne.mockResolvedValue(topic);
 
-      await expect(service.update('topic-1', { title: 'X' })).rejects.toThrow(BadRequestException);
+      await expect(service.update('topic-1', { title: 'X' })).rejects.toThrow(ConflictException);
+      await expect(service.update('topic-1', { title: 'X' })).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+    });
+
+    it('should throw ConflictException when topic is archived (终态 PATCH 409，review-0831 b916d7cc)', async () => {
+      const topic = createMockTopic({ status: TopicStatus.ARCHIVED });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+
+      await expect(service.update('topic-1', { title: 'X' })).rejects.toThrow(ConflictException);
+      await expect(service.update('topic-1', { title: 'X' })).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
     });
 
     it('should throw AGENT_NOT_FOUND when invitedAgentIds contains new non-existent agent', async () => {
@@ -1026,11 +1060,13 @@ describe('TopicService', () => {
     it('update：config.kind 忽略（创建后不可变），config.wakePolicy 合并进 settings', async () => {
       // kind 不可变语义：normal↔roundtable 互转在 M2 推迟清单，update 收到的 kind
       // 一律丢弃——存量 seat 归属与会话层规则开关都依赖创建时的 kind
-      const topic = createMockTopic({ kind: 'roundtable' });
+      const topic = createMockTopic({ kind: TopicKind.ROUNDTABLE });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockTopicRepo.save.mockResolvedValue(topic);
 
-      await service.update('topic-1', { config: { kind: 'normal', wakePolicy: 'broadcast' } });
+      await service.update('topic-1', {
+        config: { kind: TopicKind.NORMAL, wakePolicy: WakePolicy.BROADCAST },
+      });
 
       expect(topic.kind).toBe('roundtable'); // entity kind 未被改写
       expect(topic.settings).toMatchObject({ wakePolicy: 'broadcast' });
@@ -1038,11 +1074,11 @@ describe('TopicService', () => {
     });
 
     it('update：仅改 wakePolicy（无 kind）→ settings 合并，kind 不动', async () => {
-      const topic = createMockTopic({ kind: 'roundtable' });
+      const topic = createMockTopic({ kind: TopicKind.ROUNDTABLE });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockTopicRepo.save.mockResolvedValue(topic);
 
-      await service.update('topic-1', { config: { wakePolicy: 'mention' } });
+      await service.update('topic-1', { config: { wakePolicy: WakePolicy.MENTION } });
 
       expect(topic.kind).toBe('roundtable');
       expect(topic.settings).toMatchObject({ wakePolicy: 'mention' });
@@ -1089,6 +1125,89 @@ describe('TopicService', () => {
         NotFoundException,
       );
     });
+
+    // ── 保守流转矩阵配置表（review-0831 任务 b916d7cc；铁律 #19 测试即文档）──
+    // 矩阵定义见 topic.service.ts TOPIC_STATUS_TRANSITIONS。三张表 = 活文档：
+    // 合法流转（目标态 ∈ 矩阵[当前态]）→ 200 + save；幂等重复（目标 == 当前）→ 200 no-op；
+    // 非法流转（目标态 ∉ 矩阵[当前态]，含 archived 出边）→ 409 ConflictException。
+    const LEGAL_TRANSITIONS: Array<[TopicStatus, TopicStatus]> = [
+      // open 端点（目标 ACTIVE）：遗留 open 激活 / paused 激活（现状语义）/ closed 重开
+      [TopicStatus.OPEN, TopicStatus.ACTIVE],
+      [TopicStatus.PAUSED, TopicStatus.ACTIVE],
+      [TopicStatus.CLOSED, TopicStatus.ACTIVE],
+      // close 端点（目标 CLOSED）：open/active/paused 均可关闭
+      [TopicStatus.OPEN, TopicStatus.CLOSED],
+      [TopicStatus.ACTIVE, TopicStatus.CLOSED],
+      [TopicStatus.PAUSED, TopicStatus.CLOSED],
+      // pause 端点（目标 PAUSED）：active/open 可暂停（open 为现状语义保留）
+      [TopicStatus.ACTIVE, TopicStatus.PAUSED],
+      [TopicStatus.OPEN, TopicStatus.PAUSED],
+      // archive 端点（目标 ARCHIVED）：任意非终态直接归档（现状语义保留，不强制先 close）
+      [TopicStatus.OPEN, TopicStatus.ARCHIVED],
+      [TopicStatus.ACTIVE, TopicStatus.ARCHIVED],
+      [TopicStatus.PAUSED, TopicStatus.ARCHIVED],
+      [TopicStatus.CLOSED, TopicStatus.ARCHIVED],
+    ];
+    const IDEMPOTENT_STATUSES: TopicStatus[] = [
+      TopicStatus.OPEN,
+      TopicStatus.ACTIVE,
+      TopicStatus.PAUSED,
+      TopicStatus.CLOSED,
+      TopicStatus.ARCHIVED,
+    ];
+    const ILLEGAL_TRANSITIONS: Array<[TopicStatus, TopicStatus]> = [
+      // archived 是绝对终态：无任何出边
+      [TopicStatus.ARCHIVED, TopicStatus.ACTIVE],
+      [TopicStatus.ARCHIVED, TopicStatus.OPEN],
+      [TopicStatus.ARCHIVED, TopicStatus.PAUSED],
+      [TopicStatus.ARCHIVED, TopicStatus.CLOSED],
+      // closed 只能经 open 重开（→ active）或归档：不可 pause / 回 open
+      [TopicStatus.CLOSED, TopicStatus.PAUSED],
+      [TopicStatus.CLOSED, TopicStatus.OPEN],
+      // 非 open 态不可回 open（open 不是可写目标态）
+      [TopicStatus.PAUSED, TopicStatus.OPEN],
+      [TopicStatus.ACTIVE, TopicStatus.OPEN],
+    ];
+
+    it.each(LEGAL_TRANSITIONS)('合法流转：%s -> %s → 200 且落库', async (from, to) => {
+      const topic = createMockTopic({ status: from });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+
+      const result = await service.changeStatus('topic-1', to);
+
+      expect(topic.status).toBe(to);
+      expect(mockTopicRepo.save).toHaveBeenCalledWith(topic);
+      expect(result).toEqual(topic);
+    });
+
+    it.each(IDEMPOTENT_STATUSES)(
+      '幂等重复：%s -> %s → 200 no-op（不落库不报错）',
+      async (status) => {
+        const topic = createMockTopic({ status });
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+
+        const result = await service.changeStatus('topic-1', status);
+
+        expect(result).toEqual(topic);
+        expect(topic.status).toBe(status);
+        expect(mockTopicRepo.save).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(ILLEGAL_TRANSITIONS)(
+      '非法流转：%s -> %s → 409 ConflictException（RESOURCE_CONFLICT）',
+      async (from, to) => {
+        const topic = createMockTopic({ status: from });
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+
+        await expect(service.changeStatus('topic-1', to)).rejects.toThrow(ConflictException);
+        await expect(service.changeStatus('topic-1', to)).rejects.toMatchObject({
+          response: { code: ErrorCode.RESOURCE_CONFLICT },
+        });
+        expect(mockTopicRepo.save).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('join', () => {
@@ -3781,7 +3900,10 @@ describe('TopicService', () => {
 
     it('should derive wakePolicy for roundtable topic with explicit broadcast setting', async () => {
       // 显式值优先（与 roundtable.service resolveWakePolicy 同规）
-      const topic = createMockTopic({ kind: 'roundtable', settings: { wakePolicy: 'broadcast' } });
+      const topic = createMockTopic({
+        kind: TopicKind.ROUNDTABLE,
+        settings: { wakePolicy: WakePolicy.BROADCAST },
+      });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockBoardRepo.find.mockResolvedValue([]);
       mockBoardRepo.count.mockResolvedValue(0);
@@ -3797,7 +3919,7 @@ describe('TopicService', () => {
     });
 
     it('should default roundtable wakePolicy to mention when settings lack explicit value', async () => {
-      const topic = createMockTopic({ kind: 'roundtable', settings: {} });
+      const topic = createMockTopic({ kind: TopicKind.ROUNDTABLE, settings: {} });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockBoardRepo.find.mockResolvedValue([]);
       mockBoardRepo.count.mockResolvedValue(0);

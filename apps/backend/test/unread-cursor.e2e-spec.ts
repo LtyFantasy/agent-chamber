@@ -90,6 +90,15 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     ownerActorIds: [] as string[],
   };
 
+  /**
+   * 历史消息 created_at 序列全局计数器（模块级，套件内串行执行，无并行共享问题）：
+   * createHistoryMessages 跨调用共享递增——否则每次调用都从 00:00:01 起算，测试④
+   * 邀请前后各建 1 条时 msg1/msg2 created_at 相同，getUnread 行值比较 tie-break 落到
+   * 随机 uuid，约 1/3 概率 msg2.id < msg1.id → unreadCount=0 断言失败（08-29 实测
+   * 1139fde9 偶发）
+   */
+  let historySeq = 0;
+
   beforeAll(async () => {
     ds = new DataSource({
       type: 'postgres',
@@ -252,6 +261,7 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
   /**
    * 建 count 条历史消息，created_at 显式钉到 2024-01-01 起递增（全序确定）；
    * 服务路径新发送的消息 created_at=now() 天然晚于全部历史消息。
+   * 起始秒 = historySeq（跨调用全局递增，见上），保证多次调用间 created_at 严格递增。
    */
   async function createHistoryMessages(
     topicId: string,
@@ -272,11 +282,12 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
       msgs.push(msg);
     }
     for (let i = 0; i < msgs.length; i++) {
-      await ds.query(
-        `UPDATE messages SET created_at = ('2024-01-01T00:00:0' || $2 || '.000Z')::timestamptz WHERE id = $1`,
-        [msgs[i].id, String(i + 1)],
-      );
+      // 完整时间戳参数（非 '00:00:0N' 字符串拼接）：historySeq 递增无个位上限，
+      // 秒数 > 59 时 Date.UTC 自动进位到分钟/小时
+      const ts = new Date(Date.UTC(2024, 0, 1, 0, 0, historySeq + i + 1)).toISOString();
+      await ds.query(`UPDATE messages SET created_at = $2 WHERE id = $1`, [msgs[i].id, ts]);
     }
+    historySeq += count;
     return msgs;
   }
 

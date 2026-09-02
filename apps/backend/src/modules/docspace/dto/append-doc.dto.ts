@@ -28,7 +28,11 @@ import {
   Matches,
   ValidateIf,
 } from 'class-validator';
-import type { AppendDocInput } from '@agent-chamber/shared';
+import {
+  APPEND_POSITION_VALUES,
+  type AppendDocInput,
+  type AppendPosition,
+} from '@agent-chamber/shared';
 
 /**
  * POST /docs/:id/append 请求体（追加写原语，v1.65.0 消费者反馈批 7601e2f5）
@@ -60,11 +64,11 @@ export class AppendDocDto implements AppendDocInput {
     description:
       "Append position: 'end' (document end, default) | 'under-heading' " +
       '(end of the target heading subtree). Defaults to end.',
-    enum: ['end', 'under-heading'],
+    enum: APPEND_POSITION_VALUES,
   })
   @IsOptional()
-  @IsIn(['end', 'under-heading'])
-  position?: 'end' | 'under-heading';
+  @IsIn(APPEND_POSITION_VALUES)
+  position?: AppendPosition;
 
   @ApiPropertyOptional({
     description:

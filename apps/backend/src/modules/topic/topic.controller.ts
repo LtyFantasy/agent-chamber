@@ -61,6 +61,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicStatus, ActorType, ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -121,7 +122,8 @@ export class TopicController {
   @ApiOperation({
     summary: 'List topics',
     description:
-      "List topics with pagination, status filter, and keyword search. Results are filtered by the current actor's permissions.",
+      "List topics with pagination, status filter, and keyword search. Results are filtered by the current actor's permissions. " +
+      'Each item carries visibility/descriptionSnippet; agenda and settings are not exposed (list endpoint only).',
   })
   @ApiQuery({
     name: 'page',
@@ -139,7 +141,7 @@ export class TopicController {
     name: 'status',
     required: false,
     description:
-      'Filter by topic status, one of: draft, open, active, voting, paused, closed, archived, all (no filter). Defaults to active',
+      'Filter by topic status, one of: open, active, paused, closed, archived, all (no filter). Defaults to active',
     enum: [...Object.values(TopicStatus), 'all'],
   })
   @ApiQuery({
@@ -147,6 +149,13 @@ export class TopicController {
     required: false,
     description: 'Search keyword; matches topic title and description',
     type: String,
+  })
+  @ApiQuery({
+    name: 'mine',
+    required: false,
+    description:
+      'Return only topics I created or participate in (invited/active), excluding open-visible-only ones. Default false.',
+    type: Boolean,
   })
   @ApiResponse({ status: 200, description: 'Paginated list of topics' })
   @ApiResponse({ status: 400, description: 'Validation failed (e.g. pageSize exceeds 100)' })
@@ -245,7 +254,7 @@ export class TopicController {
     // controller 调用，决策 2）；newData 白名单 {topicId, title?/status?/visibility?}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: {
@@ -279,7 +288,7 @@ export class TopicController {
     // newData 白名单 {topicId, title}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, title: topic.title },
@@ -307,7 +316,7 @@ export class TopicController {
     // controller 层（changeStatus 无 actor 参数，决策 2）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, status: TopicStatus.CLOSED },
@@ -334,7 +343,7 @@ export class TopicController {
     // 审计（Phase 2）：PAUSE_TOPIC 专用枚举 + topic
     await this.auditService.log({
       action: AuditAction.PAUSE_TOPIC,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, status: TopicStatus.PAUSED },
@@ -346,8 +355,10 @@ export class TopicController {
   @UseGuards(JwtOrApiKeyGuard)
   @Post(':id/open')
   @ApiOperation({
-    summary: 'Open topic (draft → active)',
-    description: 'Activate a draft topic to active status, allowing discussions to begin.',
+    summary: 'Open topic (activate / reopen)',
+    description:
+      'Activate a topic to active status, allowing discussions to begin. ' +
+      'Idempotent on already-active topics; reopens a closed topic; archived topics are rejected (409).',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiResponse({ status: 200, description: 'Topic activated' })
@@ -361,7 +372,7 @@ export class TopicController {
     // 审计（Phase 2）：open 无专门枚举 → UPDATE + topic
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, status: TopicStatus.ACTIVE },
@@ -388,7 +399,7 @@ export class TopicController {
     // 审计（Phase 2）：RESUME_TOPIC 专用枚举 + topic
     await this.auditService.log({
       action: AuditAction.RESUME_TOPIC,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, status: TopicStatus.ACTIVE },
@@ -415,7 +426,7 @@ export class TopicController {
     // 审计（Phase 2）：archive 无专门枚举 → UPDATE + topic
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, status: TopicStatus.ARCHIVED },
@@ -469,7 +480,7 @@ export class TopicController {
     // actor 参数且仅 controller 调用，决策 2）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: actor.id,
       actorId: actor.id,
       newData: { topicId, participantId: actor.id },
@@ -667,7 +678,8 @@ export class TopicController {
   @ApiOperation({
     summary: 'Delete message (soft delete)',
     description:
-      'Soft-delete a specified message. Normally only the message sender or a topic admin can perform this action.',
+      'Soft-delete a specified message. Only the message sender can perform this action ' +
+      '(2026-08-31 拍板：暂不扩 admin 权限，将来圆桌治理需要时再加).',
   })
   @ApiParam({ name: 'topicId', description: 'Topic UUID', type: String })
   @ApiParam({ name: 'messageId', description: 'Message UUID', type: String })
@@ -706,7 +718,7 @@ export class TopicController {
     // {topicId, title}（标题快照便于定位被改议程的话题）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'topic',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC,
       entityId: id,
       actorId: actor.id,
       newData: { topicId: id, title: topic.title },
@@ -739,7 +751,7 @@ export class TopicController {
     // 无 actor 参数，决策 2）；newData {topicId, participantId}
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { topicId: id, participantId: dto.agentId },
@@ -770,7 +782,7 @@ export class TopicController {
     // 审计（Phase 2）：DELETE + topic_participant（uninvite-agent）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { topicId: id, participantId: dto.agentId },
@@ -809,7 +821,7 @@ export class TopicController {
     // 新建行或角色提升均属参与者关系写入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { topicId: id, participantId: dto.agentId },
@@ -844,7 +856,7 @@ export class TopicController {
     // 审计（Phase 2）：DELETE + topic_participant（remove-editor，与 uninvite 同族）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: dto.agentId,
       actorId: actor.id,
       newData: { topicId: id, participantId: dto.agentId },
@@ -899,7 +911,7 @@ export class TopicController {
     // 审计（Phase 2）：DELETE + topic_participant（uninvite-user）
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'topic_participant',
+      entityType: AUDIT_ENTITY_TYPE.TOPIC_PARTICIPANT,
       entityId: dto.userId,
       actorId: actor.id,
       newData: { topicId: id, participantId: dto.userId },

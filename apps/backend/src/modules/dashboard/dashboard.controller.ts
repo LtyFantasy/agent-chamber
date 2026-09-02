@@ -78,7 +78,9 @@ export class DashboardController {
   @Get('recent-topics')
   @ApiOperation({
     summary: 'Get recent topics',
-    description: 'Return the most recently active topic list.',
+    description:
+      'Return the most recently active topic list (up to 5). ' +
+      'Each item is a projection {id, title, status, lastMessageAt, updatedAt}.',
   })
   @ApiResponse({ status: 200, description: 'Recent topic list' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })

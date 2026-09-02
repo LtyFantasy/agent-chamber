@@ -31,7 +31,8 @@ export interface CreateUserRequest {
   email: string;
   name: string;
   password: string;
-  role?: 'admin' | 'editor';
+  // 角色值域单源 = shared UserRole（review-0831 任务 e013af33 收敛，本文件已 re-export）
+  role?: UserRole;
 }
 
 /**
@@ -40,7 +41,8 @@ export interface CreateUserRequest {
  */
 export interface UpdateUserRequest {
   name?: string;
-  role?: 'admin' | 'editor';
+  // 角色值域单源 = shared UserRole（review-0831 任务 e013af33 收敛，本文件已 re-export）
+  role?: UserRole;
   status?: string;
 }
 
@@ -54,10 +56,33 @@ export type { PaginatedResponse } from '@agent-chamber/shared';
 export type { HealthStatus } from '@agent-chamber/shared';
 // 系统观测总览（GET /system/overview，admin-only）
 export type { SystemOverview, RunnerOverviewItem, SeatOverviewItem } from '@agent-chamber/shared';
-export { UserRole } from '@agent-chamber/shared';
+// UserRole 本地 import（CreateUserRequest/UpdateUserRequest 的 role 字段引用，见上）+ re-export
+import { UserRole } from '@agent-chamber/shared';
+export { UserRole };
 
 // 枚举类型
-export { MessageType, BoardMemberRole, ParticipantStatus } from '@agent-chamber/shared';
+export {
+  MessageType,
+  BoardMemberRole,
+  DocSpaceMemberRole,
+  ParticipantStatus,
+} from '@agent-chamber/shared';
+// 枚举类型（review-0831 任务 8b57f5a5 补全：web 侧魔法字符串比较单源化所需）
+export {
+  AgentStatus,
+  TopicStatus,
+  Visibility,
+  TaskStatus,
+  ActorType,
+  EventType,
+  TopicParticipantRole,
+  MilestoneStatus,
+  ActivityAction,
+} from '@agent-chamber/shared';
+// 事件资源类型（review-0831 任务 8fab2a9d：events/SSE resourceType 值域枚举化）
+export { ResourceType } from '@agent-chamber/shared';
+// 文档源哨兵（review-0831 任务 8fab2a9d：上移 shared 后 web 侧改引单源）
+export { DOC_SOURCE_NATIVE } from '@agent-chamber/shared';
 // 活动日志（GET /activity-logs，活动日志系统 Phase 4 web 页）
 export type {
   ActivityLogItem,

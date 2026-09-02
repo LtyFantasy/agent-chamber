@@ -67,6 +67,46 @@ describe('TopicController (e2e)', () => {
       });
   });
 
+  it('GET /topics?mine=true - success（v1.70：mine 参数经 ValidationPipe 绑定为 boolean，缺省行为不变）', async () => {
+    // mine=true 走 AccessQueryService.getMyTopicIds（creator+participant 去 open 源）。
+    // mock 白名单返回空数组 → 空分页（证明参数被接受、管线不 500、响应契约不变）。
+    mockRepos.Topic.createQueryBuilder.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      from: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orWhere: jest.fn().mockReturnThis(),
+      innerJoin: jest.fn().mockReturnThis(),
+      leftJoin: jest.fn().mockReturnThis(),
+      leftJoinAndSelect: jest.fn().mockReturnThis(),
+      addSelect: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      setParameters: jest.fn().mockReturnThis(),
+      skip: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([]),
+      getManyAndCount: jest.fn().mockResolvedValue([[], 0]),
+    });
+
+    return request(app.getHttpServer())
+      .get('/topics?mine=true')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        expect(res.body.data).toHaveProperty('items');
+        expect(res.body.data).toHaveProperty('total', 0);
+      });
+  });
+
+  it('GET /topics?mine=oops - 400（非布尔值被 @IsBoolean 拒绝，不静默当 false）', async () => {
+    return request(app.getHttpServer())
+      .get('/topics?mine=oops')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(400);
+  });
+
   it('POST /topics - success', async () => {
     mockRepos.Topic.create.mockReturnValue({ title: 'Test Topic' });
     mockRepos.Topic.save.mockResolvedValue({

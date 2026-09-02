@@ -32,6 +32,10 @@ import { DocRouteService } from './doc-route.service';
 import { DocRouteController } from './doc-route.controller';
 import { RouteHealthService } from './route-health.service';
 import { DocRoute } from '../../database/entities/doc-route.entity';
+// Diagram IR v1（plan diagram-ir-v1-plan.md §4/§7 Phase 1）
+import { DiagramService } from './diagram.service';
+import { DiagramRendererService } from './diagram-renderer.service';
+import { DiagramController } from './diagram.controller';
 
 @Module({
   imports: [
@@ -67,8 +71,17 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
     DocRouteService,
     RouteHealthService,
     DocBundleService,
+    // Diagram IR v1：渲染门（DocService upsertCore diagram 分支依赖）+ 端点业务服务
+    DiagramRendererService,
+    DiagramService,
   ],
-  controllers: [DocSpaceController, DocController, DocCategoryController, DocRouteController],
+  controllers: [
+    DocSpaceController,
+    DocController,
+    DocCategoryController,
+    DocRouteController,
+    DiagramController,
+  ],
   exports: [DocSpaceService, DocService, DocSearchService, RouteHealthService],
 })
 export class DocSpaceModule {}

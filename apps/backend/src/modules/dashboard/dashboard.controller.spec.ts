@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { DashboardController } from './dashboard.controller';
 import { DashboardService } from './dashboard.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 
 describe('DashboardController', () => {
   let controller: DashboardController;
@@ -17,7 +18,11 @@ describe('DashboardController', () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       controllers: [DashboardController],
       providers: [{ provide: DashboardService, useValue: mockService }],
-    }).compile();
+    })
+      // JwtAuthGuard 构造依赖 ApiKeyAuthService（B-59 起），单测 override 掉
+      .overrideGuard(JwtAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = moduleRef.get<DashboardController>(DashboardController);
     service = moduleRef.get<DashboardService>(DashboardService) as unknown as typeof service;

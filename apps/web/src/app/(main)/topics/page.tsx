@@ -1,11 +1,11 @@
 'use client';
 
 import { useState } from 'react';
-import { Visibility } from '@agent-chamber/shared';
+import { Visibility, TopicKind, WakePolicy } from '@agent-chamber/shared';
 import type { Topic } from '@agent-chamber/shared';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog';
 import { Loading } from '@/components/ui/loading';
 import { EmptyState } from '@/components/ui/empty-state';
+import { topicStatusMap as statusMap } from '@/lib/status-visuals';
 import { formatRelativeTime } from '@/lib/utils';
 import {
   Plus,
@@ -34,25 +35,10 @@ import {
   Globe,
 } from 'lucide-react';
 
-const statusMap: Record<
-  string,
-  {
-    labelKey: string;
-    variant: 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning';
-  }
-> = {
-  draft: { labelKey: 'topics.status.draft', variant: 'secondary' },
-  open: { labelKey: 'topics.status.open', variant: 'default' },
-  active: { labelKey: 'topics.status.active', variant: 'success' },
-  voting: { labelKey: 'topics.status.voting', variant: 'warning' },
-  paused: { labelKey: 'topics.status.paused', variant: 'warning' },
-  closed: { labelKey: 'topics.status.closed', variant: 'destructive' },
-  archived: { labelKey: 'topics.status.archived', variant: 'outline' },
-};
-
 export default function TopicsPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('topics');
+  const locale = useLocale();
   const tGlobal = useTranslations();
   const [createOpen, setCreateOpen] = useState(false);
   const [newTitle, setNewTitle] = useState('');
@@ -61,8 +47,8 @@ export default function TopicsPage() {
   // 圆桌创建入口（v1.49.0）：kind 创建后不可变（后端 topic.service update 忽略 kind），
   // 仅创建表单提供选择；wakePolicy/maxRoundsWithoutHuman 落 topic.settings jsonb，
   // 缺省值由后端兜底（mention / 8），表单留空即不提交
-  const [newKind, setNewKind] = useState<'normal' | 'roundtable'>('normal');
-  const [newWakePolicy, setNewWakePolicy] = useState<'mention' | 'broadcast'>('mention');
+  const [newKind, setNewKind] = useState<TopicKind>(TopicKind.NORMAL);
+  const [newWakePolicy, setNewWakePolicy] = useState<WakePolicy>(WakePolicy.MENTION);
   const [newMaxRounds, setNewMaxRounds] = useState('');
 
   const [editTopic, setEditTopic] = useState<{
@@ -85,8 +71,8 @@ export default function TopicsPage() {
       setCreateOpen(false);
       setNewTitle('');
       setNewDesc('');
-      setNewKind('normal');
-      setNewWakePolicy('mention');
+      setNewKind(TopicKind.NORMAL);
+      setNewWakePolicy(WakePolicy.MENTION);
       setNewMaxRounds('');
     },
   });
@@ -129,9 +115,9 @@ export default function TopicsPage() {
     // 仅圆桌携带 config（普通话题不消费 wakePolicy/maxRounds，保持载荷瘦）；
     // maxRoundsWithoutHuman 留空 = 后端缺省 8，显式 0 = 关闭安全阀（shared DTO 契约）
     const config =
-      newKind === 'roundtable'
+      newKind === TopicKind.ROUNDTABLE
         ? {
-            kind: 'roundtable' as const,
+            kind: TopicKind.ROUNDTABLE,
             wakePolicy: newWakePolicy,
             ...(newMaxRounds.trim() ? { maxRoundsWithoutHuman: Number(newMaxRounds) } : {}),
           }
@@ -211,13 +197,13 @@ export default function TopicsPage() {
                     <div className="flex items-start justify-between gap-2">
                       <CardTitle className="text-lg flex items-center flex-1 min-w-0">
                         <span className="truncate">{topic.title}</span>
-                        {topic.visibility === 'private' && (
+                        {topic.visibility === Visibility.PRIVATE && (
                           <Lock
                             className="ml-2 h-4 w-4 shrink-0 text-amber-500"
                             aria-label={t('visibility.privateAria')}
                           />
                         )}
-                        {topic.visibility === 'open' && (
+                        {topic.visibility === Visibility.OPEN && (
                           <Globe
                             className="ml-2 h-4 w-4 shrink-0 text-emerald-500"
                             aria-label={t('visibility.publicAria')}
@@ -225,7 +211,7 @@ export default function TopicsPage() {
                         )}
                         {/* 圆桌标识 badge（v1.49.0）：紫色系与 visibility（琥珀/绿）、
                             status/unread badge 区分，不抢视觉优先级 */}
-                        {topic.kind === 'roundtable' && (
+                        {topic.kind === TopicKind.ROUNDTABLE && (
                           <Badge
                             variant="outline"
                             className="ml-2 shrink-0 gap-1 border-violet-500/40 bg-violet-500/10 text-violet-300"
@@ -277,7 +263,7 @@ export default function TopicsPage() {
                   </CardHeader>
                   <CardContent>
                     <div className="flex items-center justify-between text-sm text-muted-foreground">
-                      <div className="flex items-center gap-4">
+                      <div className="flex min-w-0 items-center gap-4">
                         <span className="flex items-center gap-1">
                           <Users className="h-4 w-4" />
                           {topic.participantCount ?? 0}
@@ -287,7 +273,9 @@ export default function TopicsPage() {
                           {topic.messageCount ?? 0}
                         </span>
                       </div>
-                      <span>{formatRelativeTime(topic.lastMessageAt)}</span>
+                      <span className="shrink-0 whitespace-nowrap">
+                        {formatRelativeTime(topic.lastMessageAt, locale)}
+                      </span>
                     </div>
                     <div className="mt-4 flex items-center text-sm text-primary">
                       {t('viewDetail')} <ArrowRight className="ml-1 h-4 w-4" />
@@ -359,8 +347,8 @@ export default function TopicsPage() {
                   type="radio"
                   name="kind"
                   value="normal"
-                  checked={newKind === 'normal'}
-                  onChange={() => setNewKind('normal')}
+                  checked={newKind === TopicKind.NORMAL}
+                  onChange={() => setNewKind(TopicKind.NORMAL)}
                 />
                 <MessageSquare className="h-4 w-4 text-muted-foreground" />
                 <span className="text-sm">{t('form.kindNormalDesc')}</span>
@@ -370,15 +358,15 @@ export default function TopicsPage() {
                   type="radio"
                   name="kind"
                   value="roundtable"
-                  checked={newKind === 'roundtable'}
-                  onChange={() => setNewKind('roundtable')}
+                  checked={newKind === TopicKind.ROUNDTABLE}
+                  onChange={() => setNewKind(TopicKind.ROUNDTABLE)}
                 />
                 <UsersRound className="h-4 w-4 text-violet-400" />
                 <span className="text-sm">{t('form.kindRoundtableDesc')}</span>
               </label>
             </div>
           </div>
-          {newKind === 'roundtable' && (
+          {newKind === TopicKind.ROUNDTABLE && (
             <div className="space-y-4 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3">
               <p className="text-xs text-muted-foreground">{t('form.kindImmutableHint')}</p>
               <div className="space-y-2">
@@ -389,8 +377,8 @@ export default function TopicsPage() {
                       type="radio"
                       name="wakePolicy"
                       value="mention"
-                      checked={newWakePolicy === 'mention'}
-                      onChange={() => setNewWakePolicy('mention')}
+                      checked={newWakePolicy === WakePolicy.MENTION}
+                      onChange={() => setNewWakePolicy(WakePolicy.MENTION)}
                     />
                     <span className="text-sm">{t('form.wakeMention')}</span>
                   </label>
@@ -399,8 +387,8 @@ export default function TopicsPage() {
                       type="radio"
                       name="wakePolicy"
                       value="broadcast"
-                      checked={newWakePolicy === 'broadcast'}
-                      onChange={() => setNewWakePolicy('broadcast')}
+                      checked={newWakePolicy === WakePolicy.BROADCAST}
+                      onChange={() => setNewWakePolicy(WakePolicy.BROADCAST)}
                     />
                     <span className="text-sm">{t('form.wakeBroadcast')}</span>
                   </label>

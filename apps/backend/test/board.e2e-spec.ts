@@ -308,6 +308,90 @@ describe('BoardController (e2e)', () => {
       });
   });
 
+  it('GET /boards — 列表项形状：lists 摘要 + visibility 拍平 + 无 settings（接口瘦身二期）', async () => {
+    const board = makeBoard();
+    // accessQuery 白名单查询（observer 非 admin：open 批次 + creator 批次两次
+    // Board.createQueryBuilder）→ findAll 分页查询。
+    // ⚠️ 不能走 test-setup 默认 qb：wrapWithPrototype 会把 getManyAndCount 返回的
+    // items 数组 setPrototypeOf 成 Board.prototype（数组方法丢失），须自定义 qb 对象。
+    const accessQb = {
+      select: jest.fn().mockReturnThis(),
+      leftJoin: jest.fn().mockReturnThis(),
+      innerJoin: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orWhere: jest.fn().mockReturnThis(),
+      setParameter: jest.fn().mockReturnThis(),
+      setParameters: jest.fn().mockReturnThis(),
+      getRawMany: jest.fn().mockResolvedValue([{ id: boardId }]),
+    } as any;
+    mockRepos.Board.createQueryBuilder
+      .mockReturnValueOnce(accessQb)
+      .mockReturnValueOnce(accessQb)
+      .mockReturnValueOnce({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        getManyAndCount: jest.fn().mockResolvedValue([[board], 1]),
+      } as any);
+
+    // board 级 taskCount（innerJoin task.list → groupBy board_id）→ list 级 taskCount（groupBy list_id）
+    const taskQb1 = mockRepos.Task.createQueryBuilder();
+    taskQb1.getRawMany.mockResolvedValue([{ boardId, total: '2', completed: '1' }]);
+    const taskQb2 = mockRepos.Task.createQueryBuilder();
+    taskQb2.getRawMany.mockResolvedValue([{ listId, count: '2' }]);
+    mockRepos.Task.createQueryBuilder.mockReturnValueOnce(taskQb1).mockReturnValueOnce(taskQb2);
+
+    // 跨 board 批量 lists（SQL 层过滤软删列，mock 只给非软删行）
+    const listQb = mockRepos.BoardList.createQueryBuilder();
+    listQb.getMany.mockResolvedValue([makeList()]);
+    mockRepos.BoardList.createQueryBuilder.mockReturnValue(listQb);
+
+    // memberCount
+    const memberQb = mockRepos.BoardMember.createQueryBuilder();
+    memberQb.getRawMany.mockResolvedValue([{ boardId, count: '1' }]);
+    mockRepos.BoardMember.createQueryBuilder.mockReturnValue(memberQb);
+
+    return request(app.getHttpServer())
+      .get('/boards')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(200);
+        const item = res.body.data.items[0];
+        // settings 不再透传；顶层 visibility 拍平保留
+        expect(item).not.toHaveProperty('settings');
+        expect(item.visibility).toBe('open');
+        // lists 摘要形状 = findLists 项形状（含 taskCount），无软删列/实体泄漏
+        expect(item.lists).toEqual([
+          expect.objectContaining({
+            id: listId,
+            boardId,
+            name: 'To Do',
+            position: 1,
+            mappedStatus: 'todo',
+            taskCount: 2,
+          }),
+        ]);
+        expect(item.lists[0]).not.toHaveProperty('deletedAt');
+        expect(item.listCount).toBe(1);
+        expect(item.taskCount).toBe(2);
+        expect(item.completedTaskCount).toBe(1);
+        expect(item.memberCount).toBe(1);
+      });
+  });
+
+  it('GET /boards?mine=oops - 400（非布尔值被 @IsBoolean 拒绝，不静默当 false）', async () => {
+    // ValidationPipe（whitelist + forbidNonWhitelisted + transform）在进入 Controller 前
+    // 拒绝非法 mine 值：@Transform 保留 'oops' 原样 → @IsBoolean 报错 → 400（不静默当 false）
+    return request(app.getHttpServer())
+      .get('/boards?mine=oops')
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(400);
+  });
+
   // ==================== v1.37 owner 代理权限（agent 创建 → owner 人类全通） ====================
 
   const agentCreatorId = '00000000-0000-0000-0000-0000000000bb';
@@ -361,6 +445,33 @@ describe('BoardController (e2e)', () => {
       .expect(404)
       .expect((res: any) => {
         expect(res.body.code).toBe(ErrorCode.BOARD_NOT_FOUND);
+      });
+  });
+
+  it('GET /boards/lists/:id - non-member gets 404 for private board list (B-58)', async () => {
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+    mockRepos.BoardList.findOne.mockResolvedValue(makeList());
+    mockRepos.Board.findOne.mockResolvedValue(makeAgentPrivateBoard());
+
+    return request(app.getHttpServer())
+      .get(`/boards/lists/${listId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.BOARD_NOT_FOUND);
+      });
+  });
+
+  it('GET /boards/lists/:id - member (board creator) gets 200 (B-58)', async () => {
+    mockRepos.BoardList.findOne.mockResolvedValue(makeList());
+    mockRepos.Board.findOne.mockResolvedValue(makeBoard());
+
+    return request(app.getHttpServer())
+      .get(`/boards/lists/${listId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data).toHaveProperty('id', listId);
       });
   });
 
@@ -638,6 +749,10 @@ describe('BoardController (e2e)', () => {
     // statusName 'todo' → mappedStatus ci 精确命中 makeList()（name='To Do', mappedStatus='todo'）
     mockRepos.BoardList.find.mockResolvedValue([makeList()]);
     mockRepos.Board.findOne.mockResolvedValue({ ...makeBoard([makeList()]), id: boardIdV4 });
+    // B-58：POST /tasks/batch 新增 board write 权限校验——dummy guard 注入的 actor
+    // （4000-8000 形状）非 board creator（0000 形状），用 board_members editor 行放行
+    mockRepos.BoardMember.findOne.mockResolvedValue({ boardId, actorId, role: 'editor' });
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
     const task = makeTask({ title: 'From statusName' });
     mockRepos.Task.create.mockReturnValue(task);
     mockRepos.Task.save.mockImplementation(async (t: any) => ({ ...t, id: task.id }));

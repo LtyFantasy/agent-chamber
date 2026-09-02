@@ -57,8 +57,7 @@ export class RepoManifestFileConstraint implements ValidatorConstraintInterface 
     const isAbsolute =
       value.startsWith('/') || // POSIX 绝对路径
       /^[A-Za-z]:[\\/]/.test(value); // Windows 盘符绝对路径（如 C:\）
-    const hasParentTraversal =
-      value.split('/').includes('..') || value.split('\\').includes('..');
+    const hasParentTraversal = value.split('/').includes('..') || value.split('\\').includes('..');
     return !isAbsolute && !hasParentTraversal;
   }
 
@@ -86,8 +85,7 @@ export class RepoManifestDto {
   sha: string;
 
   @ApiProperty({
-    description:
-      'git ls-files 全量相对路径清单（≤20000 条；每条 ≤512、禁绝对路径与 `..` 段）',
+    description: 'git ls-files 全量相对路径清单（≤20000 条；每条 ≤512、禁绝对路径与 `..` 段）',
     example: ['apps/backend/src/app.module.ts', 'docs/architecture.md'],
     type: [String],
   })

@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useTranslations } from 'next-intl';
+import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import {
@@ -36,6 +36,7 @@ export default function SkillDetailPage() {
   const params = useParams();
   const name = params.name as string;
   const t = useTranslations('skills');
+  const locale = useLocale();
 
   /** 复制按钮的临时状态：key -> 是否已复制 */
   const [copiedMap, setCopiedMap] = useState<Record<string, boolean>>({});
@@ -168,7 +169,7 @@ export default function SkillDetailPage() {
                 <div className="flex flex-wrap items-center gap-2 pt-1">
                   {skill.version && <Badge variant="secondary">v{skill.version}</Badge>}
                   <span className="text-xs text-muted-foreground">
-                    {t('updated', { time: formatRelativeTime(skill.updatedAt) })}
+                    {t('updated', { time: formatRelativeTime(skill.updatedAt, locale) })}
                   </span>
                 </div>
               </div>

@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { EventType, WebhookStatus, ErrorCode } from '@agent-chamber/shared';
+import { EventType, WebhookStatus, ErrorCode, SYSTEM_ACTOR_ID } from '@agent-chamber/shared';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { WebhookDelivery } from '../../database/entities/webhook-delivery.entity';
@@ -42,7 +42,8 @@ export class WebhookService {
 
   async test(dto: TestWebhookDto) {
     const log = this.webhookRepo.create({
-      agentId: '00000000-0000-0000-0000-000000000000',
+      // 系统 actor 哨兵（单源 = shared SYSTEM_ACTOR_ID，review-0831 任务 e013af33 收敛）
+      agentId: SYSTEM_ACTOR_ID,
       eventType: EventType.SYSTEM,
       targetUrl: dto.url,
       payload: dto.payload,

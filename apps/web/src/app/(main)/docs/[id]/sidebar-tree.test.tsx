@@ -1,115 +1,268 @@
-import { buildPathTree, type PathTreeNode } from './sidebar-tree';
-import type { DocSummary } from '@/types';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { SidebarTree } from './sidebar-tree';
+import { Api } from '@/lib/api';
 
-/** 目录节点窄化类型（断言用） */
-type FolderNode = Extract<PathTreeNode, { type: 'folder' }>;
+/** 文案快照（同 en.json；未命中 key 回退为完整 key 路径，不影响断言） */
+const messages: Record<string, string> = {
+  'docs.detail.loadMore': 'Load more',
+  'docs.detail.loadMoreFolders': 'Load more folders',
+  'docs.detail.noDocs': 'No docs yet',
+};
 
-/** 最小文档 fixture：title 默认取路径末段，便于按字母序断言 */
-const doc = (id: string, path: string, title?: string): DocSummary => ({
-  id,
-  spaceId: 'space-1',
-  path,
-  title: title ?? path.split('/').pop() ?? path,
+jest.mock('next-intl', () => ({
+  useTranslations: (ns?: string) => (key: string) => {
+    const fullKey = ns ? `${ns}.${key}` : key;
+    return messages[fullKey] ?? fullKey;
+  },
+}));
+
+jest.mock('@/lib/api', () => ({
+  Api: {
+    docs: {
+      getTree: jest.fn(),
+    },
+  },
+}));
+
+const mockGetTree = Api.docs.getTree as jest.Mock;
+
+/** 构造 tree 端点页响应（folders/docs 各自分页信封） */
+const treePage = (
+  prefix: string,
+  folders: { path: string; name: string; docCount: number }[],
+  docs: { id: string; path: string; title: string; docType?: string | null }[],
+  opts: {
+    foldersTotal?: number;
+    foldersHasMore?: boolean;
+    docsTotal?: number;
+    docsHasMore?: boolean;
+  } = {},
+) => ({
+  prefix,
+  folders: {
+    items: folders,
+    total: opts.foldersTotal ?? folders.length,
+    hasMore: opts.foldersHasMore ?? false,
+  },
+  docs: {
+    items: docs,
+    total: opts.docsTotal ?? docs.length,
+    hasMore: opts.docsHasMore ?? false,
+  },
 });
 
-/** 目录节点访问器：断言先行，命中失败即抛错中断（测试内窄化 TS 类型用） */
-function expectFolder(nodes: PathTreeNode[], name: string): FolderNode {
-  const node = nodes.find((n) => n.type === 'folder' && n.name === name);
-  expect(node).toBeDefined();
-  if (!node || node.type !== 'folder') throw new Error(`expected folder "${name}"`);
-  return node;
+function renderTree() {
+  // retry: false —— 查询失败立即进入 isError，避免默认 3 次重试拖慢断言
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <SidebarTree spaceId="space-1" activeDocId={null} onSelectDoc={jest.fn()} />
+    </QueryClientProvider>,
+  );
 }
 
-/** 子树顶层展示序列：folder 显名、file 显标题——用于断言「folder 在前 + 字母序」 */
-const displayOrder = (nodes: PathTreeNode[]) =>
-  nodes.map((n) => (n.type === 'folder' ? n.name : n.doc.title));
-
-describe('buildPathTree（纯函数）', () => {
-  it('空输入返回空树', () => {
-    expect(buildPathTree([])).toEqual([]);
+describe('SidebarTree 懒加载目录树', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    localStorage.clear();
   });
 
-  it('根级散文件（path 无目录前缀）挂树顶并按字母序', () => {
-    const tree = buildPathTree([
-      doc('1', 'z.md', 'Zulu'),
-      doc('2', 'a.md', 'Alpha'),
-      doc('3', 'index.md', 'Index'),
-    ]);
-    expect(tree.map((n) => (n.type === 'file' ? n.doc.id : n.name))).toEqual(['2', '3', '1']);
+  it('根层渲染 folders + docs；文件夹行显示 docCount', async () => {
+    mockGetTree.mockResolvedValue(
+      treePage(
+        '',
+        [{ path: 'docs/', name: 'docs', docCount: 3 }],
+        [{ id: 'doc-2', path: 'README.md', title: 'Readme' }],
+      ),
+    );
+
+    renderTree();
+
+    expect(await screen.findByText('docs')).toBeInTheDocument();
+    expect(screen.getByText('3')).toBeInTheDocument(); // docCount
+    // 行标签（2026-09-02 拍板）：文件名为主（去 .md）；标题≈文件名时去重不显示
+    expect(screen.getByText('README')).toBeInTheDocument();
+    expect(screen.queryByText('Readme')).not.toBeInTheDocument();
+    // 根层只发一次请求（prefix=''）
+    expect(mockGetTree).toHaveBeenCalledTimes(1);
+    expect(mockGetTree).toHaveBeenCalledWith('space-1', expect.objectContaining({ prefix: '' }));
   });
 
-  it('嵌套组装：多层目录按层级归位，folder 计数 = 子树文档总数（含嵌套）', () => {
-    const tree = buildPathTree([
-      doc('1', 'docs/a.md', 'A'),
-      doc('2', 'docs/sub/b.md', 'B'),
-      doc('3', 'docs/sub/deep/c.md', 'C'),
-    ]);
-    expect(tree).toHaveLength(1);
-    const docsFolder = expectFolder(tree, 'docs');
-    expect(docsFolder).toMatchObject({ path: 'docs', count: 3 });
-    expect(displayOrder(docsFolder.children)).toEqual(['sub', 'A']); // folder 在前、file 在后
+  it('目录默认全折叠：展开前不请求子层，点击展开才拉取下一层', async () => {
+    mockGetTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) =>
+      params?.prefix === 'docs/'
+        ? Promise.resolve(
+            treePage('docs/', [], [{ id: 'doc-3', path: 'docs/a.md', title: 'Alpha' }]),
+          )
+        : Promise.resolve(treePage('', [{ path: 'docs/', name: 'docs', docCount: 1 }], [])),
+    );
 
-    const sub = expectFolder(docsFolder.children, 'sub');
-    expect(sub).toMatchObject({ path: 'docs/sub', count: 2 });
-    // sub 内：folder（deep）在前、file（B）在后
-    expect(displayOrder(sub.children)).toEqual(['deep', 'B']);
+    renderTree();
+    await screen.findByText('docs');
 
-    const deep = expectFolder(sub.children, 'deep');
-    expect(deep).toMatchObject({ path: 'docs/sub/deep', count: 1 });
-    expect(displayOrder(deep.children)).toEqual(['C']);
+    // 未展开：子层查询未挂载（只发过根层请求）
+    expect(mockGetTree).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('docs'));
+
+    await waitFor(() => {
+      expect(mockGetTree).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ prefix: 'docs/' }),
+      );
+    });
+    expect(await screen.findByText('Alpha')).toBeInTheDocument();
   });
 
-  it('folder 优先 + 各自字母序（根级与深层各自稳定）', () => {
-    const tree = buildPathTree([
-      doc('1', 'docs/z.md', 'Zulu'),
-      doc('2', 'docs/a.md', 'Alpha'),
-      doc('3', 'docs/ma/m.md', 'M'),
-      doc('4', 'docs/aa/a.md', 'AA'),
-      doc('5', 'root.md', 'Root'),
-      doc('6', 'zzz/x.md', 'X'),
-    ]);
-    // 根级散文件挂树顶；其后根级 folder 按字母序（docs 在 zzz 前）
-    expect(displayOrder(tree)).toEqual(['Root', 'docs', 'zzz']);
+  it('展开态 localStorage 持久化：刷新后保持展开并自动拉取子层（P1）', async () => {
+    mockGetTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) =>
+      params?.prefix === 'docs/'
+        ? Promise.resolve(
+            treePage('docs/', [], [{ id: 'doc-3', path: 'docs/a.md', title: 'Alpha' }]),
+          )
+        : Promise.resolve(treePage('', [{ path: 'docs/', name: 'docs', docCount: 1 }], [])),
+    );
 
-    const docsFolder = expectFolder(tree, 'docs');
-    // docs 层：folder（aa/ma）在前，file（Alpha/Zulu）在后，各自字母序
-    expect(displayOrder(docsFolder.children)).toEqual(['aa', 'ma', 'Alpha', 'Zulu']);
-    expect(docsFolder.count).toBe(4);
+    const first = renderTree();
+    fireEvent.click(await screen.findByText('docs'));
+    await waitFor(() => {
+      expect(mockGetTree).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ prefix: 'docs/' }),
+      );
+    });
+    // 展开态已写入 localStorage
+    expect(JSON.parse(localStorage.getItem('docs:expanded-folders') ?? '[]')).toEqual(['docs/']);
+
+    // 卸载后重新挂载（新 QueryClient 模拟刷新）：挂载即按存储值展开并拉取子层
+    first.unmount();
+    mockGetTree.mockClear();
+    renderTree();
+
+    await waitFor(() => {
+      expect(mockGetTree).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ prefix: 'docs/' }),
+      );
+    });
+    expect(await screen.findByText('Alpha')).toBeInTheDocument();
   });
 
-  it('单层与多层混合：浅目录与深层目录并存、同名目录段各自独立', () => {
-    const tree = buildPathTree([
-      doc('1', 'top.md', 'Top'),
-      doc('2', 'guides/a.md', 'A'),
-      doc('3', 'guides/x/deep.md', 'Deep'),
-      doc('4', 'docs/a.md', 'A2'),
-      doc('5', 'docs/x/b.md', 'B'),
-    ]);
-    expect(displayOrder(tree)).toEqual(['Top', 'docs', 'guides']); // 根级散文件 + folder 字母序
-    // 同名目录段 'x' 在 guides 与 docs 下各自独立（路径前缀不同，不串层）
-    const guides = expectFolder(tree, 'guides');
-    expect(displayOrder(guides.children)).toEqual(['x', 'A']);
-    expect(guides.children[0]).toMatchObject({ path: 'guides/x', count: 1 });
-    const docs = expectFolder(tree, 'docs');
-    expect(displayOrder(docs.children)).toEqual(['x', 'A2']);
-    expect(docs.children[0]).toMatchObject({ path: 'docs/x', count: 1 });
+  it('文档「加载更多」：docs.hasMore 时显示按钮，点击以 docsOffset 翻页（useInfiniteQuery 游标）', async () => {
+    // 首页满额 50 条 → 游标推进到 docsOffset=50；第二页返回剩余 10 条
+    const page1Docs = Array.from({ length: 50 }, (_, i) => ({
+      id: `doc-${i + 1}`,
+      path: `d${i + 1}.md`,
+      title: `D${i + 1}`,
+    }));
+    mockGetTree.mockImplementation((_spaceId: string, params?: { docsOffset?: number }) =>
+      params?.docsOffset === 50
+        ? Promise.resolve(
+            treePage(
+              '',
+              [],
+              Array.from({ length: 10 }, (_, i) => ({
+                id: `doc-${i + 51}`,
+                path: `d${i + 51}.md`,
+                title: `D${i + 51}`,
+              })),
+              { docsTotal: 60, docsHasMore: false },
+            ),
+          )
+        : Promise.resolve(treePage('', [], page1Docs, { docsTotal: 60, docsHasMore: true })),
+    );
+
+    renderTree();
+    fireEvent.click(await screen.findByText('Load more'));
+
+    await waitFor(() => {
+      expect(mockGetTree).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ docsOffset: 50 }),
+      );
+    });
+    expect(await screen.findByText('d51')).toBeInTheDocument(); // 标题≈文件名去重 → 主标签为文件名（去 .md）
   });
 
-  it('同路径前缀共享同一文件夹节点（计数去重不双计）', () => {
-    const tree = buildPathTree([
-      doc('1', 'docs/a.md'),
-      doc('2', 'docs/b.md'),
-      doc('3', 'docs/c.md'),
-    ]);
-    expect(tree).toHaveLength(1);
-    const docsFolder = expectFolder(tree, 'docs');
-    expect(docsFolder.count).toBe(3);
-    expect(docsFolder.children).toHaveLength(3); // 三个文件并列，不再叠加子文件夹
+  it('目录「加载更多」：folders.hasMore 时显示按钮，点击以 foldersOffset 翻页', async () => {
+    // 首页满额 200 个目录 → 游标推进到 foldersOffset=200；第二页返回剩余 1 个
+    const page1Folders = Array.from({ length: 200 }, (_, i) => ({
+      path: `f${String(i).padStart(3, '0')}/`,
+      name: `f${String(i).padStart(3, '0')}`,
+      docCount: 1,
+    }));
+    mockGetTree.mockImplementation((_spaceId: string, params?: { foldersOffset?: number }) =>
+      params?.foldersOffset === 200
+        ? Promise.resolve(
+            treePage('', [{ path: 'zzz/', name: 'zzz', docCount: 1 }], [], {
+              foldersTotal: 201,
+            }),
+          )
+        : Promise.resolve(
+            treePage('', page1Folders, [], { foldersTotal: 201, foldersHasMore: true }),
+          ),
+    );
+
+    renderTree();
+    fireEvent.click(await screen.findByText('Load more folders'));
+
+    await waitFor(() => {
+      expect(mockGetTree).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ foldersOffset: 200 }),
+      );
+    });
+    expect(await screen.findByText('zzz')).toBeInTheDocument();
   });
 
-  it('folders 空目录（无任何文档的路径段）不产出节点', () => {
-    // 所有文档都在根级：dirSegments 为空，不产生任何 folder 节点
-    const tree = buildPathTree([doc('1', 'only.md'), doc('2', 'two.md')]);
-    expect(tree.every((n) => n.type === 'file')).toBe(true);
+  it('行标签：文件名主 + 标题辅双标签；同层 docType 全同时徽标整层降噪', async () => {
+    mockGetTree.mockResolvedValue(
+      treePage(
+        '',
+        [],
+        [
+          { id: 'doc-1', path: 'memory/2026-09-01.md', title: '今日任务', docType: 'memory' },
+          { id: 'doc-2', path: 'memory/2026-09-02.md', title: '三修实录', docType: 'memory' },
+        ],
+      ),
+    );
+
+    renderTree();
+
+    // 文件名主标签（去 .md）+ 标题辅标签同时在场
+    expect(await screen.findByText('2026-09-01')).toBeInTheDocument();
+    expect(screen.getByText('今日任务')).toBeInTheDocument();
+    expect(screen.getByText('2026-09-02')).toBeInTheDocument();
+    expect(screen.getByText('三修实录')).toBeInTheDocument();
+    // 同层全 memory → 徽标整层隐藏（77 个 memory 徽标纯噪声场景）
+    expect(screen.queryByText('memory')).not.toBeInTheDocument();
+  });
+
+  it('徽标：同层 docType 混合时保留（消歧价值所在）', async () => {
+    mockGetTree.mockResolvedValue(
+      treePage(
+        '',
+        [],
+        [
+          { id: 'doc-1', path: 'a.md', title: 'A 文档', docType: 'guide' },
+          { id: 'doc-2', path: 'b.md', title: 'B 文档', docType: 'memory' },
+        ],
+      ),
+    );
+
+    renderTree();
+
+    expect(await screen.findByText('guide')).toBeInTheDocument();
+    expect(screen.getByText('memory')).toBeInTheDocument();
+  });
+
+  it('空空间：根层无 folders/docs 时显示「暂无文档」', async () => {
+    mockGetTree.mockResolvedValue(treePage('', [], []));
+
+    renderTree();
+
+    expect(await screen.findByText('No docs yet')).toBeInTheDocument();
   });
 });

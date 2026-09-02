@@ -32,8 +32,6 @@ export class AddRoundtableSeatBindActorUnique1786202112450 implements MigrationI
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(
-      `DROP INDEX "public"."uq_roundtable_seats_topic_bind_actor"`,
-    );
+    await queryRunner.query(`DROP INDEX "public"."uq_roundtable_seats_topic_bind_actor"`);
   }
 }

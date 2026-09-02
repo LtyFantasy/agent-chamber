@@ -41,6 +41,7 @@ import { ActorType, ErrorCode } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
 import { DocVersion } from '../src/database/entities/doc-version.entity';
@@ -63,8 +64,12 @@ const DB_CONFIG = {
 /** 本次运行的唯一后缀：隔离测试数据，防与开发库真实文档互相污染 */
 const RUN = `patch-e2e-${Date.now()}`;
 
-/** 固定测试 actor（docs.created_by 为 uuid 列，upsert 缺省 'system' 字面量会被 PG 拒绝） */
-const testActor = { id: '00000000-0000-4000-8000-0000000000aa', type: ActorType.HUMAN };
+/**
+ * 固定测试 actor（docs.created_by 为 uuid 列，upsert 缺省 'system' 字面量会被 PG 拒绝）。
+ * 本套件专用哨兵 id（不与 docspace-move/patch-metadata 共用 '...00aa'）：afterAll 按
+ * actorId 清理 audit_logs 时并行安全，不误删其他套件行（08-29 套件污染修复）
+ */
+const testActor = { id: '00000000-0000-4000-8000-0000000000a1', type: ActorType.HUMAN };
 
 describe('DocService.patchSection — 真实 PG 集成（section 重建管线）', () => {
   let ds: DataSource;
@@ -121,6 +126,8 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
       eventStub,
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
+      // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
+      { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
     );
 
     // ── 种子数据：一个空间 + 四个文档（路径带 RUN 后缀隔离）──
@@ -177,6 +184,11 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
     if (spaceId) {
       await ds.getRepository(DocSpace).delete({ id: spaceId });
     }
+    // upsert/patchSection/patchByMatch/delete 写 audit_logs（actorId = testActor.id）——
+    // 必须同步清理，否则残留行会挤占 activity-logs 套件 admin 全量查询的 20 条窗口
+    // （createdAt DESC）导致其 row-B/row-D/row-E 被挤出分页（08-29 实测 82+ 行污染）。
+    // 按 actorId 删（本套件专用哨兵 actor，并行安全），覆盖用例内临时 doc 的 audit 行
+    await ds.getRepository(AuditLog).delete({ actorId: testActor.id });
     await ds.destroy();
   });
 

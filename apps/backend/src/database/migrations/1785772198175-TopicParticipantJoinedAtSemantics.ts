@@ -1,4 +1,4 @@
-import { MigrationInterface, QueryRunner } from "typeorm";
+import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
  * topic_participants.joined_at 语义修复（v1.40）
@@ -20,27 +20,40 @@ import { MigrationInterface, QueryRunner } from "typeorm";
  *    确保现有数据满足表达式
  */
 export class TopicParticipantJoinedAtSemantics1785772198175 implements MigrationInterface {
-    name = 'TopicParticipantJoinedAtSemantics1785772198175'
+  name = 'TopicParticipantJoinedAtSemantics1785772198175';
 
-    public async up(queryRunner: QueryRunner): Promise<void> {
-        // joined_at 可空化：先 DROP DEFAULT 再 DROP NOT NULL
-        await queryRunner.query(`ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" DROP DEFAULT`);
-        await queryRunner.query(`ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" DROP NOT NULL`);
-        // 数据清洗：invited 行的 joined_at 是"邀请时间"（语义 bug 产物），置 NULL
-        await queryRunner.query(`UPDATE "topic_participants" SET "joined_at" = NULL WHERE "status" = 'invited'`);
-        // DB 级不变量：active 行必须有 joined_at（防未来回归）
-        await queryRunner.query(
-            `ALTER TABLE "topic_participants" ADD CONSTRAINT "chk_tp_active_has_joined_at" CHECK (status != 'active' OR joined_at IS NOT NULL)`,
-        );
-    }
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    // joined_at 可空化：先 DROP DEFAULT 再 DROP NOT NULL
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" DROP DEFAULT`,
+    );
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" DROP NOT NULL`,
+    );
+    // 数据清洗：invited 行的 joined_at 是"邀请时间"（语义 bug 产物），置 NULL
+    await queryRunner.query(
+      `UPDATE "topic_participants" SET "joined_at" = NULL WHERE "status" = 'invited'`,
+    );
+    // DB 级不变量：active 行必须有 joined_at（防未来回归）
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" ADD CONSTRAINT "chk_tp_active_has_joined_at" CHECK (status != 'active' OR joined_at IS NOT NULL)`,
+    );
+  }
 
-    public async down(queryRunner: QueryRunner): Promise<void> {
-        await queryRunner.query(`ALTER TABLE "topic_participants" DROP CONSTRAINT "chk_tp_active_has_joined_at"`);
-        // 近似恢复：NULL 回填 now()（精确恢复不可能——原值已不可逆清洗；
-        // 回填的 now() 代表"迁移时点"，语义上近似原 DEFAULT 行为）
-        await queryRunner.query(`UPDATE "topic_participants" SET "joined_at" = now() WHERE "joined_at" IS NULL`);
-        await queryRunner.query(`ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" SET DEFAULT now()`);
-        await queryRunner.query(`ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" SET NOT NULL`);
-    }
-
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" DROP CONSTRAINT "chk_tp_active_has_joined_at"`,
+    );
+    // 近似恢复：NULL 回填 now()（精确恢复不可能——原值已不可逆清洗；
+    // 回填的 now() 代表"迁移时点"，语义上近似原 DEFAULT 行为）
+    await queryRunner.query(
+      `UPDATE "topic_participants" SET "joined_at" = now() WHERE "joined_at" IS NULL`,
+    );
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" SET DEFAULT now()`,
+    );
+    await queryRunner.query(
+      `ALTER TABLE "topic_participants" ALTER COLUMN "joined_at" SET NOT NULL`,
+    );
+  }
 }

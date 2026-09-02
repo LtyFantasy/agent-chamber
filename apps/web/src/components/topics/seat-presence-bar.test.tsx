@@ -49,6 +49,8 @@ const messages: Record<string, string> = {
 };
 
 jest.mock('next-intl', () => ({
+  // 组件新增 useLocale 依赖（formatRelativeTime/formatDate locale 下传），mock 固定 en
+  useLocale: () => 'en',
   useTranslations: (ns?: string) => (key: string, params?: Record<string, string | number>) => {
     const fullKey = ns ? `${ns}.${key}` : key;
     let text = messages[fullKey] ?? fullKey;
@@ -72,6 +74,15 @@ jest.mock('@/lib/api', () => ({
     roundtable: {
       cancelSeat: jest.fn(),
     },
+  },
+  // 值域常量（与 api.ts 单源一致；组件 presence 相位判定消费）
+  PRESENCE_PHASES: ['thinking', 'tool', 'replying', 'idle', 'offline'],
+  PRESENCE_PHASE: {
+    THINKING: 'thinking',
+    TOOL: 'tool',
+    REPLYING: 'replying',
+    IDLE: 'idle',
+    OFFLINE: 'offline',
   },
 }));
 

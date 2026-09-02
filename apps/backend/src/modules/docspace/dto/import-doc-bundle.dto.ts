@@ -36,6 +36,8 @@ import {
   DOC_ROUTE_CODE_ENTRY_TYPES,
   DocRouteCodeEntryType,
   Visibility,
+  DOC_TITLE_MAX_LENGTH,
+  DOC_SUMMARY_MAX_LENGTH,
 } from '@agent-chamber/shared';
 
 /**
@@ -248,16 +250,21 @@ export class BundleDocItemDto {
   @IsString()
   content: string;
 
-  @ApiPropertyOptional({ description: 'Document title', maxLength: 200 })
+  @ApiPropertyOptional({ description: 'Document title', maxLength: DOC_TITLE_MAX_LENGTH })
   @IsOptional()
   @IsString()
-  @MaxLength(200)
+  // docs.title 列长单源 = shared DOC_TITLE_MAX_LENGTH（review-0831 任务 e013af33 收敛）
+  @MaxLength(DOC_TITLE_MAX_LENGTH)
   title?: string;
 
-  @ApiPropertyOptional({ description: 'Curated summary (≤500 chars)', maxLength: 500 })
+  @ApiPropertyOptional({
+    description: 'Curated summary (≤500 chars)',
+    maxLength: DOC_SUMMARY_MAX_LENGTH,
+  })
   @IsOptional()
   @IsString()
-  @MaxLength(500)
+  // docs.summary 列长单源 = shared DOC_SUMMARY_MAX_LENGTH（review-0831 任务 e013af33 收敛）
+  @MaxLength(DOC_SUMMARY_MAX_LENGTH)
   summary?: string;
 
   @ApiPropertyOptional({

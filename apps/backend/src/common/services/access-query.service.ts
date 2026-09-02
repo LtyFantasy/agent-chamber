@@ -6,7 +6,7 @@
  *   - 主文档: docs/architecture.md §7.2 (统一权限模型)
  *   - 补充: docs/spec.md (权限与角色)
  *
- * [踩坑索引] B-50(列表权限过滤) D5(统一权限重构) B2(成员/权限收敛进关系表) OWNER-PROXY(owner代理白名单)
+ * [踩坑索引] B-50(列表权限过滤) D5(统一权限重构) B2(成员/权限收敛进关系表) OWNER-PROXY(owner代理白名单) MINE-QUERY(mine-only变体/缓存键隔离)
  *
  * [铁律关联] #4(文档优先) #17(测试契约) #18(不变量检查)
  *
@@ -64,9 +64,18 @@ const DOC_SPACE_CACHE_PREFIX = 'docspace';
  * - 修改 Policy read 规则时，必须同步更新本服务。
  * - TopicPolicy / BoardPolicy / DocSpacePolicy 方法顶部已加规则同步注释。
  *
+ * mine-only 变体（getMyBoardIds / getMyTopicIds，v1.70 插件绑定推断底座）：
+ * - 语义 = 可见白名单的子集（creator + member/participant，去掉 open 源），随 Policy
+ *   read 规则同步；board 的 creator 路径保留 owner-proxy 名下 agent 创建的语义。
+ * - admin 不短路：admin 求 mine 也只是 creator/member 身份（区别于 getAccessible*
+ *   的 admin → null 全放行）。
+ * - 匿名/缺 actor → []（open 源已排除，"我的"必须有身份）。
+ *
  * 请求级缓存：
  * - 通过 AccessQueryInterceptor + AsyncLocalStorage 实现。
  * - 同一次 HTTP 请求内，同一 Actor 的 Topic/Board/DocSpace 白名单只查一次 DB。
+ * - 缓存键：普通白名单 `topic|board:<actorKey>`；mine 变体 `topic|board:mine:<actorKey>`
+ *   ——mine 前缀隔离，同一请求内 mine 与默认口径互不串缓存。
  * - 单元测试未触发拦截器时，回退到无缓存直接查询。
  */
 @Injectable()
@@ -122,6 +131,23 @@ export class AccessQueryService {
   }
 
   /**
+   * 获取当前 Actor 的「我的」Topic ID 白名单（mine-only，v1.70）
+   *
+   * 语义 = creator（含 owner-proxy 名下 agent 创建的）+ participant（status IN
+   * invited/active），**排除仅因 open 可见的项**；admin 不短路（同样按 creator/
+   * participant 身份计算，与 getAccessibleTopicIds 的 admin→null 全放行不同）。
+   *
+   * 供 GET /topics?mine=true 使用（插件绑定自动推断的"我的"语义底座）。
+   * @param actor 当前统一身份
+   * @returns string[] 始终为数组（匿名/缺 actor → 空数组），调用方按 IN 过滤
+   */
+  async getMyTopicIds(actor?: UnifiedActor): Promise<string[]> {
+    return this.withCache(`${TOPIC_CACHE_PREFIX}:mine:${this.actorKey(actor)}`, () =>
+      this.computeMyTopicIds(actor),
+    );
+  }
+
+  /**
    * 获取当前 Actor 可访问的 Board ID 白名单
    * @param actor 当前统一身份
    * @returns null 表示 Admin 不过滤；string[] 表示需要 IN 过滤的 ID 列表（空数组 = 无权限）
@@ -136,18 +162,32 @@ export class AccessQueryService {
     );
   }
 
-  /** 请求级缓存读取或计算 */
-  private withCache(
-    key: string,
-    compute: () => Promise<string[] | null>,
-  ): Promise<string[] | null> {
+  /**
+   * 获取当前 Actor 的「我的」Board ID 白名单（mine-only，v1.70）
+   *
+   * 语义 = creator(含 owner-proxy 名下 agent 创建的) + member（board_members 行），
+   * **排除仅因 open 可见的项**；admin 不短路（同样按 creator/member 身份计算，
+   * 与 getAccessibleBoardIds 的 admin→null 全放行不同）。
+   *
+   * 供 GET /boards?mine=true 使用（插件绑定自动推断的"我的"语义底座）。
+   * @param actor 当前统一身份
+   * @returns string[] 始终为数组（匿名/缺 actor → 空数组），调用方按 IN 过滤
+   */
+  async getMyBoardIds(actor?: UnifiedActor): Promise<string[]> {
+    return this.withCache(`${BOARD_CACHE_PREFIX}:mine:${this.actorKey(actor)}`, () =>
+      this.computeMyBoardIds(actor),
+    );
+  }
+
+  /** 请求级缓存读取或计算（泛型：mine 变体恒返回 string[]，普通白名单可返回 null） */
+  private withCache<T extends string[] | null>(key: string, compute: () => Promise<T>): Promise<T> {
     const store = this.store.getStore();
     if (!store) {
       // 非 HTTP 请求上下文（如测试、CLI），直接计算不缓存
       return compute();
     }
 
-    const cached = store.get(key);
+    const cached = store.get(key) as Promise<T> | undefined;
     if (cached) {
       return cached;
     }
@@ -163,6 +203,33 @@ export class AccessQueryService {
       return 'anon';
     }
     return `${actor.type}:${actor.id}`;
+  }
+
+  /**
+   * creator 白名单查询构建器（Topic）：creator_id IN (本人 + owner 代理的 agent ids)
+   * 三源白名单与 mine 变体共用（mine 去掉 open 源即本查询 + participant 查询）。
+   */
+  private creatorTopicQb(creatorIds: string[]) {
+    return this.topicRepo
+      .createQueryBuilder('t')
+      .select('t.id', 'id')
+      .where('t.creator_id IN (:...creatorIds)')
+      .andWhere('t.deleted_at IS NULL')
+      .setParameter('creatorIds', creatorIds);
+  }
+
+  /**
+   * participant 白名单查询构建器（Topic）：topic_participants.status IN (invited, active)
+   * （对齐 unread SQL 口径，Batch 2 替代已废弃的 settings.invitedAgentIds jsonb @>）。
+   */
+  private accessibleTopicQb(actorId: string) {
+    return this.participantRepo
+      .createQueryBuilder('tp')
+      .select('tp.topic_id', 'id')
+      .where('tp.participant_id = :actorId')
+      .andWhere('tp.status IN (:...accessibleStatuses)')
+      .setParameter('actorId', actorId)
+      .setParameter('accessibleStatuses', ['invited', 'active']);
   }
 
   /** 计算 Topic 白名单（Admin 已提前返回） */
@@ -181,31 +248,37 @@ export class AccessQueryService {
 
     // v1.37 owner 代理：human actor 的 creator 白名单 = 本人 + 其拥有的 agent id
     const creatorIds = await this.resolveCreatorIds(actor);
-    const creatorTopicQb = this.topicRepo
-      .createQueryBuilder('t')
-      .select('t.id', 'id')
-      .where('t.creator_id IN (:...creatorIds)')
-      .andWhere('t.deleted_at IS NULL')
-      .setParameter('creatorIds', creatorIds);
-
-    // Batch 2: invited + active participants via topic_participants.status
-    // (替代已废弃的 settings.invitedAgentIds/invitedHumanIds jsonb @>)
-    const accessibleTopicQb = this.participantRepo
-      .createQueryBuilder('tp')
-      .select('tp.topic_id', 'id')
-      .where('tp.participant_id = :actorId')
-      .andWhere('tp.status IN (:...accessibleStatuses)')
-      .setParameter('actorId', actor.id)
-      .setParameter('accessibleStatuses', ['invited', 'active']);
 
     const [openRows, creatorRows, accessibleRows] = await Promise.all([
       openTopicQb.getRawMany<{ id: string }>(),
-      creatorTopicQb.getRawMany<{ id: string }>(),
-      accessibleTopicQb.getRawMany<{ id: string }>(),
+      this.creatorTopicQb(creatorIds).getRawMany<{ id: string }>(),
+      this.accessibleTopicQb(actor.id).getRawMany<{ id: string }>(),
     ]);
 
     const ids = new Set<string>();
     [...openRows, ...creatorRows, ...accessibleRows].forEach((row) => ids.add(row.id));
+    return Array.from(ids);
+  }
+
+  /**
+   * 计算「我的」Topic 白名单（mine-only）：creator + participant，无 open 源。
+   * admin 不短路（admin 求 mine 也只是 creator/participant 身份）。
+   */
+  private async computeMyTopicIds(actor?: UnifiedActor): Promise<string[]> {
+    if (!actor?.id || !actor?.type) {
+      return []; // 匿名/缺 actor：无"我的"（open 源已排除）
+    }
+
+    // v1.37 owner 代理：human actor 的 creator 白名单 = 本人 + 其拥有的 agent id
+    const creatorIds = await this.resolveCreatorIds(actor);
+
+    const [creatorRows, accessibleRows] = await Promise.all([
+      this.creatorTopicQb(creatorIds).getRawMany<{ id: string }>(),
+      this.accessibleTopicQb(actor.id).getRawMany<{ id: string }>(),
+    ]);
+
+    const ids = new Set<string>();
+    [...creatorRows, ...accessibleRows].forEach((row) => ids.add(row.id));
     return Array.from(ids);
   }
 
@@ -226,29 +299,63 @@ export class AccessQueryService {
 
     // v1.37 owner 代理：human actor 的 creator 白名单 = 本人 + 其拥有的 agent id
     const creatorIds = await this.resolveCreatorIds(actor);
-    const creatorBoardQb = this.boardRepo
-      .createQueryBuilder('b')
-      .select('b.id', 'id')
-      .where('b.creator_id IN (:...creatorIds)')
-      .andWhere('b.deleted_at IS NULL')
-      .setParameter('creatorIds', creatorIds);
-
-    // Batch 2: board_members 行存在即有 read 权限（替代 jsonb invited/editor + topic 继承）
-    const memberBoardQb = this.memberRepo
-      .createQueryBuilder('bm')
-      .select('bm.board_id', 'id')
-      .where('bm.actor_id = :actorId')
-      .setParameter('actorId', actor.id);
 
     const [openRows, creatorRows, memberRows] = await Promise.all([
       openBoardQb.getRawMany<{ id: string }>(),
-      creatorBoardQb.getRawMany<{ id: string }>(),
-      memberBoardQb.getRawMany<{ id: string }>(),
+      this.creatorBoardQb(creatorIds).getRawMany<{ id: string }>(),
+      this.memberBoardQb(actor.id).getRawMany<{ id: string }>(),
     ]);
 
     const ids = new Set<string>();
     [...openRows, ...creatorRows, ...memberRows].forEach((row) => ids.add(row.id));
     return Array.from(ids);
+  }
+
+  /**
+   * 计算「我的」Board 白名单（mine-only）：creator + member，无 open 源。
+   * admin 不短路（admin 求 mine 也只是 creator/member 身份）。
+   */
+  private async computeMyBoardIds(actor?: UnifiedActor): Promise<string[]> {
+    if (!actor?.id || !actor?.type) {
+      return []; // 匿名/缺 actor：无"我的"（open 源已排除）
+    }
+
+    // v1.37 owner 代理：human actor 的 creator 白名单 = 本人 + 其拥有的 agent id
+    const creatorIds = await this.resolveCreatorIds(actor);
+
+    const [creatorRows, memberRows] = await Promise.all([
+      this.creatorBoardQb(creatorIds).getRawMany<{ id: string }>(),
+      this.memberBoardQb(actor.id).getRawMany<{ id: string }>(),
+    ]);
+
+    const ids = new Set<string>();
+    [...creatorRows, ...memberRows].forEach((row) => ids.add(row.id));
+    return Array.from(ids);
+  }
+
+  /**
+   * creator 白名单查询构建器（Board）：creator_id IN (本人 + owner 代理的 agent ids)，
+   * 保留 owner-proxy 名下 agent 创建的语义。三源白名单与 mine 变体共用。
+   */
+  private creatorBoardQb(creatorIds: string[]) {
+    return this.boardRepo
+      .createQueryBuilder('b')
+      .select('b.id', 'id')
+      .where('b.creator_id IN (:...creatorIds)')
+      .andWhere('b.deleted_at IS NULL')
+      .setParameter('creatorIds', creatorIds);
+  }
+
+  /**
+   * member 白名单查询构建器（Board）：board_members 行存在即有 read 权限
+   * （Batch 2 替代 jsonb invited/editor + topic 继承）。
+   */
+  private memberBoardQb(actorId: string) {
+    return this.memberRepo
+      .createQueryBuilder('bm')
+      .select('bm.board_id', 'id')
+      .where('bm.actor_id = :actorId')
+      .setParameter('actorId', actorId);
   }
 
   /**

@@ -7,8 +7,10 @@
  *   - 补充: docs/api-definition.md §16（upsert 语义：未传字段保留、contentHash no-op、source 隔离）
  *
  * [踩坑索引]
- *   - 新建路径冲突两级预检：existingPaths（前 100 篇）快速拦截 + listDocs({ path }) 精确兜底；
- *     预检与 PUT 之间无锁（TOCTOU），并发覆盖属已知残余风险（后端 create-only 记入 P2 债）
+ *   - 新建路径冲突单条精确校验（v1.70.0-dev 懒加载改造）：?path= 单条校验命中 →
+ *     弹确认「将覆盖已有文档」，确认才放行（旧两级预检 existingPaths 本地列表已删——
+ *     全量列表不再拉取）；预检与 PUT 之间无锁（TOCTOU），并发覆盖属已知残余风险
+ *     （后端 create-only 记入 P2 债）
  *
  * [铁律关联] #1（每次 session 必读 AGENTS.md/INDEX.md） #12（写/改文件分批、匹配现有风格）
  *
@@ -47,9 +49,6 @@ export interface DocEditorProps {
   initialContent: string;
   /** 初始路径：edit 模式传入锁定展示；create 不渲染锁 */
   initialPath?: string;
-  /** create 模式路径冲突第一级快速预检（来自 facetDocs 全量列表，仅前 100 篇——
-   *  未命中还会走 listDocs({ path }) 精确校验兜底，见 handleSave） */
-  existingPaths: string[];
   /** 透传 DocPicker：当前空间绑定的看板 ID（置顶排序） */
   boardId?: string;
   /** 外部 mutation.isPending，用于禁用保存按钮防重复提交 */
@@ -78,7 +77,6 @@ export function DocEditor({
   spaceId,
   initialContent,
   initialPath,
-  existingPaths,
   boardId,
   saving,
   onSave,
@@ -122,11 +120,8 @@ export function DocEditor({
   }, [dirty, onCancel, t, tGlobal]);
 
   /**
-   * 提交保存：create 模式先预检 path 冲突，通过后调用 onSave。
-   * 两级预检：① existingPaths 本地快速拦截（前 100 篇，不发请求）；
-   * ② listDocs({ path }) 精确校验兜底——existingPaths 来自 pageSize=100 的
-   * facetDocs 列表，>100 篇空间本地不全，精确匹配命中即阻止（防静默覆盖已有文档）。
-   * 冲突时设置 pathError 阻止提交。
+   * 提交保存：create 模式先做 ?path= 单条精确校验，撞 path 弹确认「将覆盖已有文档」，
+   * 确认才放行（懒加载改造后不再有全量 existingPaths 本地列表——单条校验即唯一机制）。
    *
    * 残余风险（TOCTOU）：预检与 PUT upsert 之间无锁，并发下仍可能覆盖——
    * 前端仅作缓解；后端 upsert 支持 create-only 模式（409 on existing path）已记入 P2 债。
@@ -139,18 +134,22 @@ export function DocEditor({
         setPathError(t('pathPlaceholder'));
         return;
       }
-      // 第一级：本地列表快速拦截（命中无需发请求）
-      if (existingPaths.includes(normalized)) {
-        setPathError(t('pathConflict'));
-        return;
-      }
-      // 第二级：精确校验（契约支持 path 精确匹配），覆盖本地列表截断的盲区
+      // 单条精确校验（契约支持 path 精确匹配）：命中 → 弹确认，确认才放行覆盖
       setCheckingPath(true);
       try {
         const res = await Api.docs.listDocs(spaceId, { path: normalized });
         if ((res.items?.length ?? 0) > 0) {
-          setPathError(t('pathConflict'));
-          return;
+          const ok = await confirm({
+            title: t('overwriteTitle'),
+            description: t('overwriteConfirm'),
+            confirmText: tGlobal('common.confirm'),
+            cancelText: tGlobal('common.cancel'),
+            confirmVariant: 'danger',
+          });
+          if (!ok) {
+            setPathError(t('pathConflict'));
+            return;
+          }
         }
       } catch {
         // 校验请求失败时阻塞保存并提示重试——宁可误拦，不可静默覆盖
@@ -163,7 +162,7 @@ export function DocEditor({
     } else {
       onSave({ path: initialPath!, content });
     }
-  }, [mode, path, content, existingPaths, initialPath, spaceId, onSave, t]);
+  }, [mode, path, content, initialPath, spaceId, onSave, t, tGlobal]);
 
   /** 路径输入变更时清除冲突错误 */
   const handlePathChange = useCallback(

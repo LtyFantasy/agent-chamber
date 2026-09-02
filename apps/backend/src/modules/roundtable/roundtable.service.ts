@@ -82,10 +82,17 @@ import {
   PaginatedResponse,
   UserRole,
   AuditAction,
+  SEAT_LIFECYCLE_STATUS,
+  PRESENCE_PHASE,
+  TopicKind,
+  WakePolicy,
+  SYSTEM_ACTOR_ID,
+  type PresencePhase,
 } from '@agent-chamber/shared';
 import {
   RULE_HEADER_VERSION,
   SILENT_SENTINEL,
+  SEAT_RUNTIME_STATUS,
   assembleInjectBody,
   buildEnvelope,
   parseSilentReply,
@@ -102,7 +109,10 @@ import {
 } from '@agent-chamber/roundtable-protocol';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
 import { RoundtableRunner } from '../../database/entities/roundtable-runner.entity';
-import { RoundtablePermissionRequest } from '../../database/entities/roundtable-permission-request.entity';
+import {
+  ROUNDTABLE_PERMISSION_REQUEST_STATUSES,
+  RoundtablePermissionRequest,
+} from '../../database/entities/roundtable-permission-request.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
 import { Message } from '../../database/entities/message.entity';
 import { Topic } from '../../database/entities/topic.entity';
@@ -114,13 +124,9 @@ import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { AuditService } from '../audit/audit.service';
+import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { RunnerRegistryService } from './runner-registry.service';
-import {
-  CreateSeatDto,
-  ListSeatsQueryDto,
-  VerdictPermissionRequestDto,
-  ListPermissionRequestsQueryDto,
-} from './dto';
+import { CreateSeatDto, VerdictPermissionRequestDto, ListPermissionRequestsQueryDto } from './dto';
 import { findMentionedLabels, hasAllMention, stripMentionNoise } from './mention';
 
 /** recentInjects ring buffer 容量（M1 计划决策 9：cap 100，`[{seq, messageIds}]`） */
@@ -170,6 +176,26 @@ const VALVE_ANNOUNCE_THROTTLE_MS = RECEIPT_THROTTLE_MS;
 const PERMISSION_ANNOUNCE_THROTTLE_MS = RECEIPT_THROTTLE_MS;
 
 /**
+ * 圆桌权限请求状态命名访问视图（单源 = 实体常量 ROUNDTABLE_PERMISSION_REQUEST_STATUSES，
+ * roundtable-permission-request.entity.ts；本对象仅做命名化派生，不重复定义值域——
+ * 评审任务 ed67b65e 建模块常量，150bf876 收敛为实体单源派生，与 docspace CODE_ENTRY_TYPE
+ * 同款「值域数组 + 命名化派生」模式）：
+ * - pending：待裁决（RT-PERM 语义：幂等键查询必须带 status='pending'）
+ * - orphaned：孤儿作废（裁决人离席等，断连回收置位）
+ * - approved / rejected：已裁决终态（approved 通知 runner 授予座位）
+ */
+export const PERMISSION_REQUEST_STATUS = {
+  PENDING: ROUNDTABLE_PERMISSION_REQUEST_STATUSES[0],
+  ORPHANED: ROUNDTABLE_PERMISSION_REQUEST_STATUSES[3],
+  APPROVED: ROUNDTABLE_PERMISSION_REQUEST_STATUSES[1],
+  REJECTED: ROUNDTABLE_PERMISSION_REQUEST_STATUSES[2],
+} as const;
+
+/** 权限请求状态联合类型 */
+export type PermissionRequestStatus =
+  (typeof PERMISSION_REQUEST_STATUS)[keyof typeof PERMISSION_REQUEST_STATUS];
+
+/**
  * @all 群体唤醒冷却窗口（M3 阶段 3，r13）：per-topic 60 秒——距上次 @all 群体唤醒
  * < 60s 的 @all 消息不再触发群体唤醒（消息正常落库、正常进攒批可见集，只是不唤醒）
  * + 冷却提示（节流，与冷却同周期）。一处常量可配。冷却状态存内存 Map（topicId →
@@ -195,13 +221,6 @@ const MAX_CHUNK_BUFFER_CHARS = 1_000_000;
 
 /** chunk 缓冲超限 warn 节流窗口：每座位 60s 内至多一条（失控 turn 持续超限时防刷屏） */
 const CHUNK_TRIM_WARN_THROTTLE_MS = 60_000;
-
-/**
- * 系统 actor 哨兵 id（ActorUnification migration 1781364902335 播种的 actors 行，
- * display_name='system'；平台系统消息（失败回执等）以此为发送者，profile 查询按
- * senderId 命中 type='system'，展示为系统消息——与消息 type=SYSTEM 语义一致）
- */
-const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
 
 /** 单飞行待发注入：seq 在入队时确定（新注入 = 游标递增；重放 = 历史原 seq） */
 interface PendingInject {
@@ -241,8 +260,8 @@ export interface RecentActivityItem {
  * runner 断连（registry 摘牌）→offline；seat 移除→清条目。
  */
 export interface SeatPresence {
-  /** 相位：thinking 思考中 / tool 工具调用中 / replying 回复中 / idle 空闲 / offline 离线 */
-  phase: 'thinking' | 'tool' | 'replying' | 'idle' | 'offline';
+  /** 相位：thinking 思考中 / tool 工具调用中 / replying 回复中 / idle 空闲 / offline 离线（值域单源 PRESENCE_PHASES，shared enums） */
+  phase: PresencePhase;
   /** 相位变更时间（ISO 8601） */
   at: string;
   /** 工具标题（仅 phase='tool' 时存在；已摘要化，供 chip 展示） */
@@ -465,7 +484,7 @@ export class RoundtableService {
     const existing = await this.seatRepo
       .createQueryBuilder('seat')
       .where('seat.topicId = :topicId', { topicId: dto.topicId })
-      .andWhere("seat.status != 'removed'")
+      .andWhere(`seat.status != '${SEAT_LIFECYCLE_STATUS.REMOVED}'`)
       .andWhere("seat.config->>'bindActorId' = :bindActorId", { bindActorId })
       .getOne();
     if (existing) {
@@ -490,7 +509,7 @@ export class RoundtableService {
       runnerId: null,
       config,
       state: {},
-      status: 'active',
+      status: SEAT_LIFECYCLE_STATUS.ACTIVE,
       coordinator: dto.coordinator ?? false,
       lastEventSeq: '0',
       lastInjectSeq: '0',
@@ -515,7 +534,7 @@ export class RoundtableService {
     // newData 白名单 {seatId, topicId, label, bindActorId}（决策 6——config 不入）
     await this.auditService.log({
       action: AuditAction.CREATE,
-      entityType: 'roundtable_seat',
+      entityType: AUDIT_ENTITY_TYPE.ROUNDTABLE_SEAT,
       entityId: saved.id,
       actorId: actor.id,
       newData: {
@@ -580,6 +599,29 @@ export class RoundtableService {
   }
 
   /**
+   * state 白名单投影（接口瘦身二期，决策 3 白名单方向反转）：
+   * 保留 web/文档契约字段 modelInfo/recentActivity/silentCount/lastUsage
+   * （seat-badges/seat-presence-bar/popover 活消费），仅剔纯内部字段
+   * recentInjects（ring buffer 100）/failedEventSeqs/roundsWithoutHuman/valveTripCount
+   * （web 零消费，grep 实证）。config/presence 整体保留不动。
+   */
+  private static readonly SEAT_STATE_KEEP_KEYS = [
+    'modelInfo',
+    'recentActivity',
+    'silentCount',
+    'lastUsage',
+  ];
+
+  /** 按白名单投影 seat.state（缺失键不补，保持与旧响应同形状） */
+  private projectSeatState(state: Record<string, unknown>): Record<string, unknown> {
+    const projected: Record<string, unknown> = {};
+    for (const key of RoundtableService.SEAT_STATE_KEEP_KEYS) {
+      if (state[key] !== undefined) projected[key] = state[key];
+    }
+    return projected;
+  }
+
+  /**
    * 座位列表（GET /roundtable/seats?topicId=）
    * topic 存在性 + read 权限（ensureCan 'read' 失败统一 404，安全 through obscurity）。
    * 排除 status='removed' 的已移除座位（M3 阶段 3 座位移除：软删语义，行保留供
@@ -593,10 +635,13 @@ export class RoundtableService {
   ): Promise<Array<RoundtableSeat & { presence?: SeatPresence }>> {
     const topic = await this.topicService.findById(topicId);
     await this.permService.ensureCan(topic, actor, 'read');
-    const seats = await this.seatRepo.find({ where: { topicId, status: Not('removed') } });
+    const seats = await this.seatRepo.find({
+      where: { topicId, status: Not(SEAT_LIFECYCLE_STATUS.REMOVED) },
+    });
     return seats.map((seat) => {
       const presence = this.seatPresences.get(seat.id);
-      return presence ? { ...seat, presence } : seat;
+      const projected = { ...seat, state: this.projectSeatState(seat.state ?? {}) };
+      return presence ? { ...projected, presence } : projected;
     });
   }
 
@@ -632,7 +677,7 @@ export class RoundtableService {
       }))
       .sort((a, b) => {
         // online 优先；同状态 lastSeenAt 倒序（null 视为最旧沉底）
-        if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
+        if (a.status !== b.status) return a.status === SEAT_RUNTIME_STATUS.ONLINE ? -1 : 1;
         return (b.lastSeenAt?.getTime() ?? 0) - (a.lastSeenAt?.getTime() ?? 0);
       });
   }
@@ -683,7 +728,7 @@ export class RoundtableService {
     }
     await this.ensureCanManageTopic(seat.topicId, actor);
     // 已移除幂等：重复 DELETE 直接返回（行已不可见，无需再走一遍 revoke/公告）
-    if (seat.status === 'removed') return seat;
+    if (seat.status === SEAT_LIFECYCLE_STATUS.REMOVED) return seat;
 
     const label = seat.label;
     // 下行 revoke（fire-and-forget；信封构造与 seat.assign 同规——seq=0 无对账语义，
@@ -716,7 +761,7 @@ export class RoundtableService {
     this.seatPresences.delete(seat.id);
     this.recentActivityBuffers.delete(seat.id);
 
-    seat.status = 'removed';
+    seat.status = SEAT_LIFECYCLE_STATUS.REMOVED;
     seat.runnerId = null;
     const saved = await this.seatRepo.save(seat);
     this.logger.log(`座位已移除: seat ${seat.id}（${label}）topic ${seat.topicId}`);
@@ -724,7 +769,7 @@ export class RoundtableService {
     // DELETE 提前返回不记；newData 白名单 {seatId, topicId, label}
     await this.auditService.log({
       action: AuditAction.DELETE,
-      entityType: 'roundtable_seat',
+      entityType: AUDIT_ENTITY_TYPE.ROUNDTABLE_SEAT,
       entityId: seat.id,
       actorId: actor.id,
       newData: { seatId: seat.id, topicId: seat.topicId, label },
@@ -817,7 +862,7 @@ export class RoundtableService {
     await this.permService.ensureCan(topic, actor, 'read');
     await this.ensureTopicCreatorOrAdmin(topic, actor);
     const phase = this.seatPresences.get(seat.id)?.phase;
-    if (!phase || phase === 'idle' || phase === 'offline') {
+    if (!phase || phase === PRESENCE_PHASE.IDLE || phase === PRESENCE_PHASE.OFFLINE) {
       throw new ConflictException({
         message: `Seat is not busy (phase=${phase ?? 'unknown'}), cannot cancel`,
         code: ErrorCode.RESOURCE_CONFLICT,
@@ -842,7 +887,7 @@ export class RoundtableService {
     // 在跑会话，属真实写语义）；newData 白名单 {seatId, topicId}
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'roundtable_seat',
+      entityType: AUDIT_ENTITY_TYPE.ROUNDTABLE_SEAT,
       entityId: seat.id,
       actorId: actor.id,
       newData: { seatId: seat.id, topicId: seat.topicId },
@@ -873,7 +918,11 @@ export class RoundtableService {
     // RT-PERM-2：幂等键必须带 status='pending'——requestId 跨 ACP 会话归零复用，
     // 只按 (seatId, requestId) 去重会把重启后的新请求误判为旧行重放（见方法 doc）
     const existing = await this.permReqRepo.findOne({
-      where: { seatId: seat.id, requestId: payload.requestId, status: 'pending' },
+      where: {
+        seatId: seat.id,
+        requestId: payload.requestId,
+        status: PERMISSION_REQUEST_STATUS.PENDING,
+      },
     });
     if (existing) {
       this.logger.debug(
@@ -889,7 +938,7 @@ export class RoundtableService {
           topicId: seat.topicId,
           tool: payload.tool,
           options: payload.options,
-          status: 'pending',
+          status: PERMISSION_REQUEST_STATUS.PENDING,
           verdictOptionId: null,
           resolvedBy: null,
           resolvedAt: null,
@@ -990,7 +1039,7 @@ export class RoundtableService {
         code: ErrorCode.ROUNDTABLE_PERMISSION_REQUEST_NOT_FOUND,
       });
     }
-    if (request.status !== 'pending') {
+    if (request.status !== PERMISSION_REQUEST_STATUS.PENDING) {
       throw new ConflictException({
         message: `Permission request already resolved (status=${request.status})`,
         code: ErrorCode.RESOURCE_CONFLICT,
@@ -1013,7 +1062,10 @@ export class RoundtableService {
         code: ErrorCode.VALIDATION_ERROR,
       });
     }
-    const status = String(option.kind ?? '') === 'reject' ? 'rejected' : 'approved';
+    const status =
+      String(option.kind ?? '') === 'reject'
+        ? PERMISSION_REQUEST_STATUS.REJECTED
+        : PERMISSION_REQUEST_STATUS.APPROVED;
     request.status = status;
     request.verdictOptionId = dto.optionId;
     request.resolvedBy = actor.id;
@@ -1055,7 +1107,7 @@ export class RoundtableService {
     // {requestId, seatId, topicId, status}（决策 6——options/verdictOptionId 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
-      entityType: 'roundtable_request',
+      entityType: AUDIT_ENTITY_TYPE.ROUNDTABLE_REQUEST,
       entityId: request.id,
       actorId: actor.id,
       newData: {
@@ -1084,7 +1136,7 @@ export class RoundtableService {
     status: 'approved' | 'rejected',
     actorName: string,
   ): Promise<void> {
-    const verdictText = status === 'approved' ? '已批准' : '已拒绝';
+    const verdictText = status === PERMISSION_REQUEST_STATUS.APPROVED ? '已批准' : '已拒绝';
     try {
       await this.sendSystemMessage(
         topicId,
@@ -1147,7 +1199,10 @@ export class RoundtableService {
     });
     if (participations.length === 0) return 0;
     return this.permReqRepo.count({
-      where: { topicId: In(participations.map((p) => p.topicId)), status: 'pending' },
+      where: {
+        topicId: In(participations.map((p) => p.topicId)),
+        status: PERMISSION_REQUEST_STATUS.PENDING,
+      },
     });
   }
 
@@ -1180,7 +1235,7 @@ export class RoundtableService {
       });
       if (!message) return; // 铁规③：查不到 = 事务回滚幻影，直接免疫
       const seats = await this.seatRepo.find({
-        where: { topicId: event.topicId, status: 'active' },
+        where: { topicId: event.topicId, status: SEAT_LIFECYCLE_STATUS.ACTIVE },
       });
       if (seats.length === 0) return; // 零座位短路：普通 topic 零开销（不读 topic）
       // 有座位才读 topic（PK 读，无需缓存：注入路径低频、走读一致性即可）
@@ -1215,7 +1270,9 @@ export class RoundtableService {
       // mention 模式对正文剥噪一次（代码块/inline code/引用行内的 @ 不算提及，R5）；
       // system 消息无需剥噪——任何模式都不唤醒，直接短路到 parked
       const mentionText =
-        wakePolicy === 'mention' && !isSystem ? stripMentionNoise(message.content ?? '') : null;
+        wakePolicy === WakePolicy.MENTION && !isSystem
+          ? stripMentionNoise(message.content ?? '')
+          : null;
       // @all 群体唤醒冷却闸（M3 阶段 3，r13）：mention 模式含 @all 的消息受
       // per-topic ALL_WAKE_COOLDOWN_MS（60s）冷却——冷却内 @all 不再触发群体唤醒
       // （消息正常落库、正常进攒批可见集：下方 collectForSeat 以 wake=false 收进
@@ -1254,12 +1311,10 @@ export class RoundtableService {
    * wakePolicy 键，按 broadcast 解析保持 M1 全唤醒语义）。
    * @param topic 已读取的 topic 行（null = 查询未命中，防御按 normal 处理）
    */
-  private resolveWakePolicy(
-    topic: Pick<Topic, 'kind' | 'settings'> | null,
-  ): 'mention' | 'broadcast' {
+  private resolveWakePolicy(topic: Pick<Topic, 'kind' | 'settings'> | null): WakePolicy {
     const v = topic?.settings?.wakePolicy;
-    if (v === 'mention' || v === 'broadcast') return v;
-    return topic?.kind === 'roundtable' ? 'mention' : 'broadcast';
+    if (v === WakePolicy.MENTION || v === WakePolicy.BROADCAST) return v;
+    return topic?.kind === TopicKind.ROUNDTABLE ? WakePolicy.MENTION : WakePolicy.BROADCAST;
   }
 
   /**
@@ -1337,13 +1392,13 @@ export class RoundtableService {
    */
   private decideWake(
     seat: RoundtableSeat,
-    wakePolicy: 'mention' | 'broadcast',
+    wakePolicy: WakePolicy,
     isSystem: boolean,
     mentionText: string | null,
     allWakeSuppressed: boolean,
   ): boolean {
     if (isSystem) return false;
-    if (wakePolicy === 'broadcast') return true;
+    if (wakePolicy === WakePolicy.BROADCAST) return true;
     // mention 模式：mentionText 必非 null（onMessageCreated 仅在 mention 模式且非
     // system 时计算；此处防御性判空，逻辑不可达）
     if (mentionText === null) return false;
@@ -1862,7 +1917,7 @@ export class RoundtableService {
     if (now - (this.receiptThrottle.get(key) ?? 0) < RECEIPT_THROTTLE_MS) return;
     this.receiptThrottle.set(key, now);
     const text =
-      reason === 'offline'
+      reason === SEAT_RUNTIME_STATUS.OFFLINE
         ? `座位 ${seat.label} 当前离线，消息已暂存，上线后送达`
         : `座位 ${seat.label} 排队积压（>${QUEUE_RECEIPT_THRESHOLD}），响应可能延迟`;
     try {
@@ -2029,16 +2084,19 @@ export class RoundtableService {
       case 'status': {
         // M4b-1 presence 映射（R4）：busy → thinking（默认思考相位）；online → idle；
         // offline → offline（runner 主动报离线，与断连摘牌同终点）
-        if (payload.status === 'busy') {
+        if (payload.status === SEAT_RUNTIME_STATUS.BUSY) {
           this.setPresence(seatId, 'thinking');
-        } else if (payload.status === 'offline') {
+        } else if (payload.status === SEAT_RUNTIME_STATUS.OFFLINE) {
           this.setPresence(seatId, 'offline');
         } else {
           this.setPresence(seatId, 'idle');
         }
         // driver 运行时状态 → 座位生命周期状态：offline 落 offline，online/busy 归 active
-        seat.status = payload.status === 'offline' ? 'offline' : 'active';
-        if (seat.status === 'offline') {
+        seat.status =
+          payload.status === SEAT_RUNTIME_STATUS.OFFLINE
+            ? SEAT_LIFECYCLE_STATUS.OFFLINE
+            : SEAT_LIFECYCLE_STATUS.ACTIVE;
+        if (seat.status === SEAT_LIFECYCLE_STATUS.OFFLINE) {
           // 座位 offline：窗口立即封批入 FIFO（RT-BATCH-2；队列保留，重连后 flush）。
           // 座位 revoke API（M3 座位管理）落地时需复用 sealBatch 同规清理。
           void this.sealBatch(seat.id);
@@ -2617,7 +2675,7 @@ export class RoundtableService {
     if (seats.length === 0) return;
     try {
       const pending = await this.permReqRepo.find({
-        where: { seatId: In(seats.map((s) => s.id)), status: 'pending' },
+        where: { seatId: In(seats.map((s) => s.id)), status: PERMISSION_REQUEST_STATUS.PENDING },
       });
       if (pending.length === 0) return;
       const now = new Date();
@@ -2625,7 +2683,7 @@ export class RoundtableService {
       const byTopic = new Map<string, number>();
       let succeeded = 0;
       for (const p of pending) {
-        p.status = 'orphaned';
+        p.status = PERMISSION_REQUEST_STATUS.ORPHANED;
         p.resolvedAt = now;
         const ok = await this.permReqRepo
           .save(p)

@@ -3,6 +3,7 @@
 import { useTranslations } from 'next-intl';
 import { Lock } from 'lucide-react';
 import type { TaskSummary } from '@/types';
+import { priorityColors } from '@/lib/status-visuals';
 
 /**
  * =============================================================================
@@ -17,13 +18,11 @@ import type { TaskSummary } from '@/types';
  * ──────────────────────────────────────────────
  */
 
-/** 任务优先级徽章色 */
-export const priorityColors: Record<string, string> = {
-  p3: 'bg-muted/50 text-muted-foreground',
-  p2: 'bg-blue-500/15 text-blue-300',
-  p1: 'bg-orange-500/15 text-orange-300',
-  p0: 'bg-red-500/15 text-red-300',
-};
+/**
+ * 任务优先级徽章色（唯一源：lib/status-visuals.ts 的 priorityColors 投影，
+ * 防配色漂移——本文件不再持有本地副本，仅 re-export 供 boards 页面等旧消费点兼容）。
+ */
+export { priorityColors };
 
 /** 任务状态 icon key 映射（供 tGlobal 翻译） */
 export const statusLabelKeys: Record<string, string> = {
