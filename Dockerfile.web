@@ -13,6 +13,11 @@ COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./
 COPY apps/web/package.json ./apps/web/
 COPY packages/shared/package.json ./packages/shared/
+# web 类型层依赖 roundtable-protocol（workspace:*，api.ts `import type { SeatVendor }`，
+# review-0831 收窄引入）——其 package.json 不进过滤安装 COPY 集则首次 install 不建
+# workspace 链接、dist 不编译，web 构建类型检查报 Cannot find module
+# （v1.72.2 从零冒烟实证，2026-09-02；同族坑见 Dockerfile.backend roundtable-runner 注）
+COPY packages/roundtable-protocol/package.json ./packages/roundtable-protocol/
 # 原生模块编译工具链：workspace 根 install 会触发 bcrypt 等原生模块的 install
 # 脚本，其 node-pre-gyp 预编译包托管在 github releases，国内拉取偶发
 # socket hang up 时会 --fallback-to-build 走源码编译，alpine 无 python3/make/g++
@@ -25,9 +30,11 @@ COPY . .
 # NEXT_PUBLIC_* 构建期内联：compose 通过 build.args 传入（默认 http://localhost:8743）
 ARG NEXT_PUBLIC_API_URL=http://localhost:8743/api/v1
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
-# 必须先构建 @agent-chamber/shared（web 依赖 workspace:*，其入口是编译产物 dist/；
-# 干净克隆下 dist 不存在，直接 build web 会报 Module not found）——顺序同 Dockerfile.backend
+# 必须先构建 @agent-chamber/shared 与 @agent-chamber/roundtable-protocol（web 依赖
+# workspace:*，入口是编译产物 dist/；干净克隆下 dist 不存在，直接 build web 会报
+# Module not found）——workspace 依赖拓扑序，同 Dockerfile.backend
 RUN pnpm --filter @agent-chamber/shared build
+RUN pnpm --filter @agent-chamber/roundtable-protocol build
 RUN pnpm --filter @agent-chamber/web build
 
 FROM node:22-alpine
