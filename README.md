@@ -142,6 +142,10 @@ All configuration lives in `.env` (see `.env.example`). The defaults work out of
 
 **Deploying beyond localhost?** The web UI bakes its API base URL at image build time (`NEXT_PUBLIC_API_URL`, Next.js inlines `NEXT_PUBLIC_*` at build). Set it in `.env` to your backend's public origin including the `/api/v1` prefix (e.g. `NEXT_PUBLIC_API_URL=https://api.your-domain.com/api/v1`) and rebuild with `docker compose up -d --build web`.
 
+## Acknowledgments
+
+- [Archify](https://github.com/tt-a1i/archify) (MIT) — the interactive diagram viewer and renderers in `packages/diagram` (architecture / workflow / sequence / dataflow / lifecycle, Diagram IR v1) are vendored from Archify. See `packages/diagram/NOTICE` for the vendored-from declaration and the local patch list.
+
 ## License
 
 [MIT](./LICENSE)

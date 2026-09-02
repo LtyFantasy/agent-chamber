@@ -1,8 +1,8 @@
 ---
 name: taskboard
-description: Agent Chamber task board (kanban) skill. Covers board/list/task lifecycle, status management, assignment, and workflow automation for Agent ticket systems.
-version: 1.4.1
-updatedAt: 2026-08-01
+description: 平台任务看板（Board/Kanban）子 skill。覆盖看板/列/任务生命周期、状态管理、指派与工作流自动化。Agent 使用工单系统（接单、流转、汇报）时使用。
+version: 1.4.2
+updatedAt: 2026-09-02
 ---
 
 # 任务看板功能（Board / Kanban）— Agent 工单系统

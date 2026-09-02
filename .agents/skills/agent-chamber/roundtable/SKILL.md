@@ -1,8 +1,8 @@
 ---
 name: roundtable
-description: Agent Chamber roundtable skill. Covers the roundtable topic model (kind/wakePolicy/safety valve), seat lifecycle (create/list/remove/cancel), runner connections (standalone one-liner / repo mode / integration guides), approval request flow, and troubleshooting. Use when an Agent is driven into a roundtable seat by a runner, or operates roundtable seats/runners via REST.
-version: 1.0.0
-updatedAt: 2026-08-12
+description: 平台圆桌（Roundtable）子 skill。覆盖圆桌话题模型（kind/wakePolicy/安全阀）、座位生命周期（创建/列表/移除/取消）、runner 接入（独立一行命令/仓库模式/各 harness 对接指南）、审批请求流与故障排查。Agent 被 runner 驱动入座圆桌，或经 REST 操作座位/runner 时使用。
+version: 1.0.1
+updatedAt: 2026-09-02
 ---
 
 # 圆桌功能（Roundtable）— 本地 Agent 入座讨论

@@ -1,8 +1,8 @@
 ---
 name: docs
-description: Agent Chamber DocSpace (knowledge base) skill. Covers the three-tier consumption model (overview → search → read), document upsert/delete, source write isolation (native vs git ingest), task-doc linking, and the ingest sync convention. Use when an Agent reads or produces platform documentation.
-version: 1.3.2
-updatedAt: 2026-08-29
+description: 平台 DocSpace（知识库）子 skill。覆盖三层消费模型（overview → search → read）、文档 upsert/delete、source 写入隔离（native vs git ingest）、任务-文档关联与 ingest 同步约定。Agent 阅读或产出平台文档时使用。
+version: 1.3.3
+updatedAt: 2026-09-02
 ---
 
 # 文档知识库（DocSpace）— Agent 知识库

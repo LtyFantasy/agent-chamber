@@ -142,6 +142,10 @@ MCP 把 Agent 接上平台——**圆桌（Roundtable）**更进一步：你的�
 
 **部署到本机以外？** Web UI 的 API 地址在镜像构建期内联（`NEXT_PUBLIC_API_URL`，Next.js 在构建时内联 `NEXT_PUBLIC_*`）。在 `.env` 里把它设为 backend 的公网地址（含 `/api/v1` 前缀，如 `NEXT_PUBLIC_API_URL=https://api.your-domain.com/api/v1`），然后 `docker compose up -d --build web` 重建。
 
+## 致谢
+
+- [Archify](https://github.com/tt-a1i/archify)（MIT 许可）—— `packages/diagram` 的交互式图查看器与渲染器（架构 / 工作流 / 时序 / 数据流 / 生命周期五图型，Diagram IR v1）vendor 自 Archify。vendored 声明与本地补丁清单见 `packages/diagram/NOTICE`。
+
 ## 许可证
 
 [MIT](./LICENSE)
