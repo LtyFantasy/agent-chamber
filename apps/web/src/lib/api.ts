@@ -1039,6 +1039,76 @@ const logs = {
 };
 
 // ──────────────────────────────────────────────
+// Attachments（MinIO 媒体附件 P0，plan §5.1）
+// ──────────────────────────────────────────────
+
+/**
+ * 附件元数据（GET /attachments/:id 与 mine 分页项；字段对齐 backend
+ * AttachmentMetadataDto——sizeBytes 为 number，8MiB 规模远低于 2^53 安全）。
+ */
+export interface AttachmentMetadata {
+  id: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  topicId: string | null;
+  docId: string | null;
+  createdAt: string;
+}
+
+/**
+ * POST /attachments 响应形状（plan §3.1 契约钉死，Agent/SKILL 依赖）：
+ * 元数据 + contentUrl（相对路径，axios 实例同源拼接；AttachmentImage 按
+ * 精确前缀识别走鉴权 blob 加载）。
+ */
+export interface UploadAttachmentResponse extends AttachmentMetadata {
+  contentUrl: string;
+}
+
+/** 图片附件白名单（与后端魔数嗅探白名单对齐：png/jpeg/gif/webp；前端提前拦截省一次请求） */
+export const ATTACHMENT_ALLOWED_TYPES: readonly string[] = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+];
+
+/** 单文件上限（与后端 ATTACHMENT_MAX_BYTES 对齐，默认 8MiB） */
+export const ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * alt 文本转义（plan §3.6 钉死：original_name 含 `](` 可破 markdown 语法，
+ * 插入 `![alt](url)` 前必须转义 `[ ] ( )` 四字符）。
+ */
+export function escapeAttachmentAlt(name: string): string {
+  return name.replace(/[\[\]()]/g, (c) => `\\${c}`);
+}
+
+const attachments = {
+  /**
+   * 上传图片附件（绑定 topic 或 doc，恰好一值——应用层强制互斥，plan §0.3）。
+   * FormData 必须覆盖实例默认 Content-Type: application/json——显式声明
+   * multipart/form-data 后 axios 自动追加 boundary（浏览器端由 fetch 兜底）。
+   */
+  upload: (file: File, binding: { topicId?: string; docId?: string }) => {
+    const form = new FormData();
+    form.append('file', file);
+    return apiRequest<UploadAttachmentResponse>('POST', '/attachments', form, {
+      params: binding,
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
+  /** 删除附件（上传者或 admin；存在但无权限同样 404，不泄露存在性） */
+  remove: (id: string) => apiRequest<{ deleted: boolean }>('DELETE', `/attachments/${id}`),
+  /** 我的附件分页（pageSize ≤ 100，后端 @Max(100)） */
+  getMine: (page: number, pageSize: number) =>
+    apiRequest<PaginatedResponse<AttachmentMetadata>>('GET', '/attachments/mine', undefined, {
+      params: { page, pageSize },
+    }),
+};
+
+// ──────────────────────────────────────────────
 // Skills（公开访问，无需认证）
 // ──────────────────────────────────────────────
 
@@ -1106,6 +1176,7 @@ export const Api = {
   webhooks,
   monitoring,
   logs,
+  attachments,
   skills,
 };
 

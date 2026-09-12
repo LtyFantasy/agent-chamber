@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
@@ -256,7 +257,14 @@ export default function AgentsPage() {
                             seed={agent.id}
                           />
                           <div>
-                            <div className="font-medium">{agent.name}</div>
+                            {/* 详情页入口（遥测 follow-up F1）：名字即链接进 /agents/[id] 遥测卡；
+                                只包名字不包整行——避免与行尾操作按钮（编辑/启停/删）事件纠缠 */}
+                            <Link
+                              href={`/agents/${agent.id}`}
+                              className="font-medium underline-offset-4 transition-colors hover:text-primary hover:underline"
+                            >
+                              {agent.name}
+                            </Link>
                             {/* 移动端兜底小字（P1）：桌面由介绍列接管，md 以下才显示 */}
                             <div className="text-xs text-muted-foreground md:hidden">
                               {agent.descriptionSnippet}

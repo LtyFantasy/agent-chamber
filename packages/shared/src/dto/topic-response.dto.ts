@@ -103,6 +103,22 @@ export interface TopicDetail extends Topic {
 }
 
 /**
+ * 消息附件投影条目（P1）：源 = 服务端背书的 metadata.attachments 索引
+ */
+export interface MessageAttachment {
+  /** 附件 ID */
+  id: string;
+  /** 原始文件名 */
+  originalName: string;
+  /** MIME 类型 */
+  mimeType: string;
+  /** 字节数（number，P0 起 sizeBytes 转换点钉死为显式 Number()） */
+  sizeBytes: number;
+  /** 下载/引用直达 URL（相对路径，buildContentUrl 单一拼装点派生） */
+  contentUrl: string;
+}
+
+/**
  * 消息
  * senderName/senderAvatar 由 Service 层注入，Entity 中不存在
  */
@@ -132,6 +148,17 @@ export interface Message {
    * 无该键时字段缺省（普通座位/人类/系统消息响应无此字段，保持载荷瘦）。
    */
   seatCoordinator?: boolean;
+  /**
+   * 附件投影：恒存在数组（无附件 = []），机器消费方免判空、免解析 markdown。
+   * 快照语义：发送时刻索引，不 join 附件表——附件事后删除则 contentUrl 404
+   * （与 content 里 markdown 链接行为一致）。
+   *
+   * 恒存在是机器契约约定（与 seatLabel? 条件缺省的双契约风格区分）：
+   * 展示层 badge 才用 seatLabel 式条件缺省，勿按该先例把本字段"简化"回可选。
+   * 注意：contentUrl 是相对路径——下载需拼 base URL，且 GET /content 端点
+   * 携带消费方凭证（API Key/JWT）鉴权。
+   */
+  attachments: MessageAttachment[];
   /** 消息内容 */
   content: string;
   /** 内容类型 */

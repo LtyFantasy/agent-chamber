@@ -24,6 +24,7 @@
 
 import { posix as pathPosix } from 'path';
 import type { LinkHealth } from '@agent-chamber/shared';
+import { API_PREFIX } from '@agent-chamber/shared';
 
 /**
  * 文档链接健康检查器
@@ -53,6 +54,14 @@ const SKIP_HREF_RE = /^(https?:\/\/|mailto:|#)/i;
 
 /** 平台规范文档链接 /docs/<spaceId>?doc=<docId> */
 const DOC_LINK_RE = /^\/docs\/([^?]+)\?doc=([a-f0-9-]{36})$/i;
+
+/**
+ * 附件内容 URL 前缀（MinIO 媒体附件 P0，plan §4.2）：linkHealth 只检本地文档
+ * 链接，媒体 URL 显式排除——当前 `/api/v1/attachments/...` 本就不命中 .md 判定
+ * （resolveHrefToDocPath 返回 null，评审实证冗余），此显式跳过是防御未来规则
+ * 演变（如 .md 判定放宽）误伤附件链接判 broken。单测锚点见 link-health.spec.ts。
+ */
+const ATTACHMENT_HREF_PREFIX = `${API_PREFIX}/attachments/`;
 
 /**
  * 将 Markdown 代码区域替换为空格，同时保留换行和原文长度。
@@ -272,6 +281,10 @@ export function resolveHrefToDocPath(href: string, sourcePath: string): string |
   // 外部协议（http(s)://、mailto:）不判定——extractDocLinks 入口已跳过，此处兜底
   // （防御未来绕过 extractDocLinks 直接调用本函数的调用点，与 SKIP_HREF_RE 同口径）
   if (/^(https?:\/\/|mailto:)/i.test(href)) return null;
+
+  // 附件内容 URL 显式跳过（plan §4.2：linkHealth 只检本地文档链接，媒体 URL 排除；
+  // 当前本就不命中 .md 判定，此显式跳过防未来规则演变误伤——防御性冗余）
+  if (href.startsWith(ATTACHMENT_HREF_PREFIX)) return null;
 
   // 剥离 # 锚点（如 PROTOCOL.md#section-heading）
   const stripped = href.split('#')[0];

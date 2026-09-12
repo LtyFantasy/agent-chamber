@@ -80,23 +80,31 @@ export interface TopicUnreadCount {
 }
 
 /**
- * Agent 统计
+ * Agent 统计（plan plastic-man-wonder-man-raven.md §1，GET /agents/:id/stats 响应）
+ *
+ * 窗口语义：from/to 可选，默认 from=now-30d、to=now；窗口**仅作用于 dailyActivity**；
+ * from/to 非法 ISO / from > to / 跨度 > 90 天 → 400 VALIDATION_ERROR。period 回显
+ * 有效窗口（UTC 半开区间 [from, to)，date-only 的 to 含当日 = to+1d UTC）。
  */
 export interface AgentStats {
   /** Agent ID */
   agentId: string;
-  /** 统计周期 */
-  period: string;
-  /** 消息数量 */
+  /** 统计周期（回显有效窗口，ISO 字符串；窗口仅作用于 dailyActivity） */
+  period: { from: string; to: string };
+  /** 消息数量（all-time，不含软删） */
   messageCount: number;
-  /** 话题数量 */
+  /** 话题数量（all-time；participant status IN (invited,active) 且 topic 未软删） */
   topicCount: number;
-  /** 任务数量 */
+  /** 任务数量（all-time，不含软删） */
   taskCount: number;
-  /** 平均响应时间 */
+  /** 平均响应时间——恒 0：无数据源、保留字段（前端 falsy → '-'，无假观感） */
   avgResponseTime: number;
-  /** Token 使用量 */
+  /** Token 使用量——恒 0：无数据源、保留字段 */
   tokenUsage: number;
-  /** 每日活动 */
-  dailyActivity: Array<{ date: string; messageCount: number; tokenUsage: number }>;
+  /**
+   * 每日活动（仅含有消息的日期；UTC 日界 to_char(AT TIME ZONE 'UTC','YYYY-MM-DD')；
+   * 日期 DESC）。行结构 {date, messageCount}——tokenUsage 键不再返回：
+   * optional 类型仅保留给旧消费方兼容，前端对 undefined 不渲染 tokens 段。
+   */
+  dailyActivity: Array<{ date: string; messageCount: number; tokenUsage?: number }>;
 }

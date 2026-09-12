@@ -139,7 +139,7 @@ export const importDocsTool: CustomTool = {
                 type: 'string',
                 description:
                   'Optional: prefer controlled vocabulary — ' +
-                  'guide | reference | api | architecture | operations | index | note | memory. ' +
+                  'guide | reference | api | architecture | operations | index | note | memory | diagram. ' +
                   'CONVENTION (effective this version): high-frequency auto-produced docs (diaries/snapshots) MUST be ' +
                   'tagged docType=memory, otherwise they pollute the default global overview; ' +
                   'existing docs are NOT retroactively tagged.',

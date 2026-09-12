@@ -74,6 +74,7 @@ import { RefreshToken } from '../src/database/entities/refresh-token.entity';
 import { Board } from '../src/database/entities/board.entity';
 import { Task } from '../src/database/entities/task.entity';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
+import { Attachment } from '../src/database/entities/attachment.entity';
 import * as bcrypt from 'bcrypt';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
@@ -185,6 +186,8 @@ describe('活动日志插桩（Phase 2）— 真实 PG 集成', () => {
           provide: getRepositoryToken(IdempotencyRecord),
           useValue: ds.getRepository(IdempotencyRecord),
         },
+        // v2 消息附件绑定（plan §4.1）：TopicService 构造末尾追加的 attachmentRepo
+        { provide: getRepositoryToken(Attachment), useValue: ds.getRepository(Attachment) },
         { provide: EventService, useValue: { create: jest.fn().mockResolvedValue({}) } },
         // sendMessage/join/create 路径不消费 AccessQueryService —— 空 mock 即可
         { provide: AccessQueryService, useValue: {} },

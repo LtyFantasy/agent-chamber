@@ -3,13 +3,15 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useState } from 'react';
 import { NotificationHost } from '@/components/ui/notification-host';
+import { ImagePreviewHost } from '@/components/attachments/image-preview-host';
 
 /**
  * 全局 Providers。
  * 主题已收敛为 dark-only（layout.tsx 服务端硬编码 <html class="dark">），
  * 原 ThemeProvider（mode 判断 + mounted hack）已随 theme.store.ts 一并移除，
  * 此处只保留 React Query + 全局通知宿主（NotificationHost：AlertDialog/Toaster
- * 的唯一挂载点，命令式 confirm/toast 经 store 回流到这里渲染）。
+ * 的唯一挂载点，命令式 confirm/toast 经 store 回流到这里渲染）+ 全局图片预览
+ * 宿主（ImagePreviewHost：markdown 图片点击放大的唯一挂载点，批 3 追加）。
  */
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -34,6 +36,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <NotificationHost />
+      <ImagePreviewHost />
       {children}
     </QueryClientProvider>
   );

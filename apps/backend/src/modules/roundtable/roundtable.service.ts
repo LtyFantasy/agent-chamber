@@ -9,7 +9,7 @@
  *     / §7 (seatLabel 身份模型与回声抑制) / §8 (ACP 无 system prompt → 规则头随 inject 装配)
  *     / §6 r5 (攒批管线语义: 座位维度 batchWindowMs 窗口, 0=直通, 到期封批入单飞行 FIFO)
  *     / §6 r6 (唤醒路由落地: mention @label token 精确 + @all / broadcast / system 不唤醒 /
- *     失败回执 / silent 文本兜底 / parked 语义与重启强制封批 / 规则头 v2)
+ *     失败回执 / silent 文本兜底 / parked 语义与重启强制封批 / 规则头 v3)
  *     / §6 r7 (圆桌安全阀: 计数落 seat.state——roundsWithoutHuman/silentCount/valveTripCount；
  *     派生暂停无标志位；人类发言复位不附带唤醒；触发公告在跨过阈值那一 turn + per-topic
  *     节流；0=关闭)
@@ -312,7 +312,7 @@ interface BatchWindow {
  *    === seat.label，§6）→ 唤醒判定（M2 阶段 3：mention @label token 精确 / @all /
  *    broadcast / system 永不唤醒，R1 人机一致不按 senderType 特判）→ per-seat 收集器
  *    （唤醒+可达 → 窗口攒批/直通封批；其余 → parked 躺着）→ 失败回执（唤醒但不可达）
- * 3. 注入装配：规则头（RULE_HEADER_VERSION=2，§6 统一装配——ACP 无 system prompt 通道，
+ * 3. 注入装配：规则头（RULE_HEADER_VERSION=3，§6 统一装配——ACP 无 system prompt 通道，
  *    §8 实测） + assembleInjectBody（r3 冻结 schema，windowMs = 座位配置值；封批多条
  *    ts 升序）→ seat.inject 下行（经 registry.sendToRunner）→ 落 last_inject_seq +
  *    state.recentInjects ring buffer
@@ -1695,40 +1695,27 @@ export class RoundtableService {
 
   /**
    * 圆桌规则头装配（§6：chamber 统一装配，runner 与 prompt 作者禁止改写；版本化
-   * ruleHeaderVersion=2，演进时全平台一致升级——v2（M2 阶段 3）= 新增 @all 显式广播
-   * 令牌说明（R1 用户拍板），v1 = M1 初版）。ACP 无 system prompt 注入通道（§8 实测），
-   * 规则头只能随每次 inject 重复进入上下文——保持精简。
-   * 内容：座位身份（label）、沉默协议（§4 上行约定哨兵）、@提及路由（含 @all 广播
-   * 令牌）、攒批消息体语义（按 from+id 逐条引用）、证据纪律；主脑座位追加主脑版加成
-   * （§6：调度指令必须 topic 明说可观测）。
+   * ruleHeaderVersion，演进时全平台一致升级——v3 = 精简电报体 + 4 处消歧，v2 = @all
+   * 令牌，v1 = M1 初版）。ACP 无 system prompt 注入通道（§8 实测），规则头只能随每次
+   * inject 重复进入上下文——保持精简。
+   * 内容：座位身份（label）+ @路由（含 @all 广播令牌）、沉默协议（§4 上行约定哨兵）、
+   * 下方消息体引用语义（按 from+id 逐条引用，解释 from.seatLabel / from.coordinator）、
+   * 证据纪律；主脑座位追加主脑版加成（§6：调度指令必须 topic 明说可观测）。
    * @param seat 座位（label/coordinator 决定规则头内容）
    * @returns markdown 规则头文本
    */
   buildRuleHeader(seat: { label: string; coordinator: boolean }): string {
     const lines = [
-      `# 圆桌规则头（version ${RULE_HEADER_VERSION}）`,
-      `你的座位标识（seatLabel）是「${seat.label}」。以下是你在圆桌中必须遵守的规则。`,
-      '',
-      '## 身份与路由',
-      `- 你的座位标识：${seat.label}；其他参与者用 @${seat.label} 提及你。`,
-      `- 需要指定接收者时，在回复正文中使用 @座位label（如 @${seat.label}）。`,
-      '- @all 唤醒全部座位，慎用（mention 模式下 @all 是显式广播令牌，人机皆可用）。',
+      `# 圆桌规则（v${RULE_HEADER_VERSION}）`,
+      `- 你的座位：${seat.label}。@路由：正文写 @目标座位label 送达该座位，@all 广播全员（慎用）。`,
       ...(seat.coordinator
         ? [
-            '- 你是**主脑座位**：可发起调度指令；所有调度指令必须写成 topic 中明确可观测的正文（人类与其他座位都能看到）。',
+            '- 你是主脑座位：可发起调度指令；调度指令必须写成 topic 中明确可观测的正文（全员可见）。',
           ]
         : []),
-      '',
-      '## 沉默协议（重要）',
-      `- 无事可说（没有新信息/无需回应）时，整个回复仅回 \`${SILENT_SENTINEL}\`，不得包含任何其他内容。`,
-      '- 其余情况回复为自然 markdown 正文，不做 JSON 约束（正文里藏 JSON 不会触发沉默判定）。',
-      '',
-      '## 注入消息体说明',
-      '- 每次注入携带 JSON 消息体：每条消息含 id 与 from（name/type/seatLabel/coordinator），按 from 与 id 逐条引用回应。',
-      '- 座位发言的 from.seatLabel 标识其身份；你收不到自己的发言（回声抑制），体中出现的必然都是别人的。',
-      '',
-      '## 证据纪律',
-      '- 报告测试/验证结果时必须粘贴原始输出，禁止仅转述结论。',
+      `- 沉默：无事可说时整个回复仅回 \`${SILENT_SENTINEL}\`，别无他字；其余回复为自然 markdown，勿裹 JSON（裹了不判沉默，原样落 topic）。`,
+      '- 下方 JSON 是本批消息（按 ts 升序）：有事时逐条按 from 与 id 引用回应——from.seatLabel=座位身份（null=人类/系统），from.coordinator:true=主脑调度指令；你收不到自己的发言。',
+      '- 证据纪律：报告测试/验证结果必须粘贴原始输出，禁止仅转述结论。',
     ];
     return lines.join('\n');
   }

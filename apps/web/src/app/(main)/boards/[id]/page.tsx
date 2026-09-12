@@ -719,13 +719,13 @@ export default function BoardDetailPage() {
 
   /**
    * 根据当前筛选器构造请求后端的 status 参数。
-   * 空值表示使用后端默认值（todo + in_progress），对应 UI 的「活跃任务」。
+   * 空值表示使用后端默认值（backlog + in_progress），对应 UI 的「活跃任务」。
    * 显式 'all' 才返回全部状态。
    */
   const resolveStatusParam = useCallback((): string | 'all' | undefined => {
     if (statusFilter === 'all') return 'all';
     if (statusFilter) return statusFilter;
-    // 不传 status，后端默认只返回 todo / in_progress
+    // 不传 status，后端默认只返回 backlog / in_progress
     return undefined;
   }, [statusFilter]);
 

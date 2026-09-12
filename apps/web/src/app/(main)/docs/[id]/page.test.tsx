@@ -35,6 +35,10 @@ const messages: Record<string, string> = {
   'docs.diagram.htmlBytes': 'Snapshot size',
   'docs.diagram.compositionErrors': 'Errors',
   'docs.diagram.compositionWarnings': 'Warnings',
+  // 复制 Markdown 按钮（docs.detail 命名空间）
+  'docs.detail.copyMarkdown': 'Copy Markdown',
+  'docs.detail.copied': 'Copied',
+  'docs.detail.copyMarkdownError': 'Copy failed, please retry',
 };
 
 jest.mock('next-intl', () => ({
@@ -835,6 +839,13 @@ describe('DocSpaceDetailPage diagram doc 中栏 iframe 预览（Diagram IR v1）
     expect(within(rightAside).getByText('2')).toBeInTheDocument();
   });
 
+  it('diagram doc：复制 Markdown 按钮隐藏（IR JSON 非 markdown 原文，与 Edit 同规）', async () => {
+    renderPage();
+    await screen.findByTitle('Diagram preview');
+
+    expect(screen.queryByRole('button', { name: 'Copy Markdown' })).not.toBeInTheDocument();
+  });
+
   it('diagram doc 经左栏过滤扁平列表出现时用 Workflow 图标（非 diagram 仍是 FileText）', async () => {
     mockApi.getFacets.mockResolvedValue({
       types: [{ value: 'diagram', count: 1 }],
@@ -865,5 +876,59 @@ describe('DocSpaceDetailPage diagram doc 中栏 iframe 预览（Diagram IR v1）
     expect(screen.queryByTitle('Diagram preview')).not.toBeInTheDocument();
     expect(mockApi.getDocContent).toHaveBeenCalledWith('doc-1');
     expect(mockApi.getDiagramHtml).not.toHaveBeenCalled();
+  });
+});
+
+describe('DocSpaceDetailPage 复制 Markdown 原文按钮', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBase();
+    // clipboard mock 先例照抄 seat-management.test.tsx:172
+    Object.assign(navigator, { clipboard: { writeText: jest.fn().mockResolvedValue(undefined) } });
+  });
+
+  it('点击复制 → getDocContent(docId, true) 拉 full 原文 → writeText 写入 → 按钮变 Copied 态', async () => {
+    mockApi.getDocContent.mockResolvedValue({ content: '# Doc T\nbody', title: 'Doc T' });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy Markdown' }));
+
+    // full=true 契约：与编辑器回写同源（含首标题行）
+    await waitFor(() => {
+      expect(mockApi.getDocContent).toHaveBeenCalledWith('doc-1', true);
+    });
+    // 剪贴板写入完整原文
+    await waitFor(() => {
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith('# Doc T\nbody');
+    });
+    // 反馈态：按钮文案切为 Copied
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+    });
+  });
+
+  it('复制失败 → toast.error 路径；writeText 未被调用；按钮复位可重试', async () => {
+    // 按 full 参数分流：渲染通道（无 full）必须成功才能渲染出 header 复制按钮；
+    // 复制通道（full=true）reject 模拟复制请求失败
+    mockApi.getDocContent.mockImplementation((docId: string, full?: boolean) =>
+      full
+        ? Promise.reject(new Error('network'))
+        : Promise.resolve({ content: '# Doc T\nbody', title: 'Doc T' }),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy Markdown' }));
+
+    await waitFor(() => {
+      expect(mockToastError).toHaveBeenCalledWith({ title: 'Copy failed, please retry' });
+    });
+    // 失败不写剪贴板
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalled();
+    // 按钮复位（copying 已释放）：仍显示 Copy Markdown 且可再次点击重试
+    const retryButton = screen.getByRole('button', { name: 'Copy Markdown' });
+    expect(retryButton).not.toBeDisabled();
+    fireEvent.click(retryButton);
+    // 3 次 = 1 次渲染通道（无 full）+ 2 次复制请求（首次失败 + 重试）
+    await waitFor(() => {
+      expect(mockApi.getDocContent).toHaveBeenCalledTimes(3);
+    });
   });
 });

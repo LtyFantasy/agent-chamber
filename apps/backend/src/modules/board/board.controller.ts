@@ -277,7 +277,7 @@ export class BoardController {
   @ApiOperation({
     summary: 'Get list tasks',
     description:
-      'Get tasks in the specified list. Defaults to todo and in_progress; pass status=all to return all.',
+      'Get tasks in the specified list. Defaults to backlog and in_progress; pass status=all to return all.',
   })
   @ApiParam({ name: 'id', description: 'Board ID (UUID)', type: String })
   @ApiParam({ name: 'listId', description: 'List ID (UUID)', type: String })

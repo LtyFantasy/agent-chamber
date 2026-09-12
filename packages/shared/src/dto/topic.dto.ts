@@ -118,6 +118,14 @@ export interface SendMessageInput {
   replyTo?: string;
   /** 额外元数据 */
   metadata?: Record<string, unknown>;
+  /**
+   * 附件 ID 列表（可选，≤9 个 UUID；MinIO 媒体附件 P0）。
+   * 服务端前置校验：全部存在（未软删）+ 上传者=发送者 + 绑定本 topic，
+   * 通过后写 metadata.attachments=[{id,originalName,mimeType,sizeBytes}] 索引。
+   * 一致性规则：content 是渲染事实，metadata.attachments 是索引，允许不一致
+   * （不校验 content 是否真引用）。
+   */
+  attachmentIds?: string[];
   /** 幂等键（可选，1~64 字符）。同一 actor 重复提交相同 clientRequestId 时返回首个已创建实体 + idempotentReplay 标记 */
   clientRequestId?: string;
 }

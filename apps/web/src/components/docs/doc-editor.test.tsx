@@ -8,6 +8,8 @@ const messages: Record<string, string> = {
   editTab: 'Edit',
   preview: 'Preview',
   insertLink: 'Insert link',
+  insertImage: 'Insert image',
+  imageNeedDoc: 'Save the doc first to insert images',
   path: 'Path',
   pathPlaceholder: 'Enter doc path, e.g. guides/my-doc.md',
   pathHint: 'Path must be unique within the space; existing paths will be overwritten',
@@ -27,17 +29,25 @@ jest.mock('next-intl', () => ({
   useTranslations: () => (key: string) => messages[key] ?? key,
 }));
 
-jest.mock('@/lib/api', () => ({
-  Api: {
-    docs: {
-      listDocs: jest.fn(),
+jest.mock('@/lib/api', () => {
+  const actual = jest.requireActual('@/lib/api');
+  return {
+    ...actual,
+    Api: {
+      docs: {
+        listDocs: jest.fn(),
+      },
+      attachments: {
+        upload: jest.fn(),
+      },
     },
-  },
-}));
+  };
+});
 
 // 全局 confirm mock（脏状态退出守卫用；resolve 值控制「放弃/留下」分支）
 jest.mock('@/lib/notify', () => ({
   confirm: jest.fn(),
+  toast: { error: jest.fn(), warning: jest.fn(), success: jest.fn(), info: jest.fn() },
 }));
 const mockConfirm = confirm as jest.Mock;
 
@@ -57,6 +67,7 @@ jest.mock('remark-gfm', () => ({
 }));
 
 const mockListDocs = Api.docs.listDocs as jest.Mock;
+const mockUpload = Api.attachments.upload as jest.Mock;
 
 /** 渲染 create 模式编辑器的默认 props（测试内按需覆盖） */
 function renderCreateEditor(overrides: Partial<Parameters<typeof DocEditor>[0]> = {}) {
@@ -219,5 +230,124 @@ describe('DocEditor 脏状态退出守卫（全局 confirm 替换 window.confirm
     await act(async () => {});
 
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('DocEditor 图片上传插入（MinIO 媒体附件 P0，plan §5.4）', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  /** 构造最小上传响应（字段对齐 UploadAttachmentResponse 契约） */
+  const uploadRes = (id: string, originalName: string) => ({
+    id,
+    contentUrl: `/api/v1/attachments/${id}/content`,
+    originalName,
+    mimeType: 'image/png',
+    sizeBytes: 1024,
+    sha256: 'a'.repeat(64),
+    topicId: null,
+    docId: 'doc-1',
+    createdAt: '2026-09-09T00:00:00.000Z',
+  });
+
+  it('edit 模式：选图 → upload(docId) → 光标处插入 ![alt](contentUrl)', async () => {
+    mockUpload.mockResolvedValue(uploadRes('att-1', 'photo.png'));
+    const { container } = render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        docId="doc-1"
+        initialContent=""
+        initialPath="docs/a.md"
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+    const ta = screen.getByPlaceholderText('Write Markdown content here...') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: '正文' } });
+    ta.setSelectionRange(2, 2); // 光标移到末尾
+
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      target: { files: [new File(['x'], 'photo.png', { type: 'image/png' })] },
+    });
+
+    await waitFor(() => {
+      expect(mockUpload).toHaveBeenCalledWith(expect.any(File), { docId: 'doc-1' });
+    });
+    await waitFor(() => {
+      expect(ta.value).toBe('正文![photo.png](/api/v1/attachments/att-1/content)');
+    });
+  });
+
+  it('alt 转义：文件名含 `[ ] ( )` 不破 markdown 语法', async () => {
+    mockUpload.mockResolvedValue(uploadRes('att-2', 'a[b](c).png'));
+    const { container } = render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        docId="doc-1"
+        initialContent=""
+        initialPath="docs/a.md"
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+    const ta = screen.getByPlaceholderText('Write Markdown content here...') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: 'x' } });
+    ta.setSelectionRange(1, 1);
+
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      target: { files: [new File(['x'], 'a[b](c).png', { type: 'image/png' })] },
+    });
+
+    await waitFor(() => {
+      expect(ta.value).toBe('x![a\\[b\\]\\(c\\).png](/api/v1/attachments/att-2/content)');
+    });
+  });
+
+  it('create 模式（无 docId）→ 图片按钮禁用（title 提示先保存）', () => {
+    render(
+      <DocEditor
+        mode="create"
+        spaceId="space-1"
+        initialContent=""
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+    const btn = screen.getByRole('button', { name: 'Insert image' });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('title', 'Save the doc first to insert images');
+  });
+
+  it('上传失败 → toast 提示（不插入链接）', async () => {
+    mockUpload.mockRejectedValue(new Error('network'));
+    const { container } = render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        docId="doc-1"
+        initialContent=""
+        initialPath="docs/a.md"
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+    const ta = screen.getByPlaceholderText('Write Markdown content here...') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: 'x' } });
+
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      target: { files: [new File(['x'], 'photo.png', { type: 'image/png' })] },
+    });
+
+    await waitFor(() => {
+      expect(mockUpload).toHaveBeenCalledTimes(1);
+    });
+    expect(ta.value).toBe('x'); // 未插入链接
   });
 });

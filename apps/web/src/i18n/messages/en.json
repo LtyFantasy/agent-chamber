@@ -269,7 +269,9 @@
       "allWakeConfirm": "This will wake all {count} seats. Send anyway?",
       "coordinatorBadge": "Coordinator",
       "coordinatorTitle": "Coordinator seat: dispatch instructions are observable in topic messages",
-      "deletedSenderTitle": "This member has been deleted"
+      "deletedSenderTitle": "This member has been deleted",
+      "send": "Send",
+      "sendFailed": "Failed to send message, please retry"
     },
     "permissionRequest": {
       "title": "{count, plural, one {# pending approval} other {# pending approvals}}",
@@ -689,7 +691,10 @@
       "docMatches": "Document matches",
       "docLinkNotFound": "Document not found or has been deleted",
       "loadMore": "Load more",
-      "loadMoreFolders": "Load more folders"
+      "loadMoreFolders": "Load more folders",
+      "copyMarkdown": "Copy Markdown",
+      "copied": "Copied",
+      "copyMarkdownError": "Copy failed, please retry"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",
@@ -798,7 +803,9 @@
       "overwriteConfirm": "A document already exists at this path. Saving will overwrite it. Continue?",
       "contentLoadError": "Failed to load the original document",
       "contentLoadErrorDesc": "Check your connection and retry, or exit editing",
-      "exitEdit": "Exit editing"
+      "exitEdit": "Exit editing",
+      "insertImage": "Insert image",
+      "imageNeedDoc": "Save the doc first to insert images"
     },
     "upload": {
       "button": "Batch Upload",
@@ -1206,5 +1213,21 @@
     "countSummary": "{count} members",
     "countSummaryWithInvited": "{count} members · {invited} invited",
     "noSearchResults": "No matching members"
+  },
+  "attachments": {
+    "upload": "Upload image",
+    "uploading": "Uploading...",
+    "uploadFailed": "Image upload failed, please retry",
+    "tooLarge": "Image exceeds the 8MiB size limit",
+    "typeNotAllowed": "Only PNG/JPEG/GIF/WebP images are supported",
+    "quotaExceeded": "Storage quota exceeded, please clean up attachments first",
+    "brokenImage": "Image failed to load",
+    "removeChip": "Remove attachment",
+    "confirmRemove": "The attachment will be deleted and the image link in the message will be removed. Remove it?",
+    "removeFailed": "Failed to delete the attachment; you can clean it up later in My Attachments",
+    "preview": "Image preview",
+    "zoomActual": "Actual size",
+    "zoomFit": "Fit to window",
+    "closePreview": "Close preview"
   }
 }

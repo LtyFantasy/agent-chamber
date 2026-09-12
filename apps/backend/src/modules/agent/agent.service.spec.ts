@@ -11,7 +11,8 @@ import { Actor } from '../../database/entities/actor.entity';
 import { User } from '../../database/entities/user.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
-import { AgentStatus, ActorType, AuditAction, TaskStatus } from '@agent-chamber/shared';
+import { AgentHeartbeat } from '../../database/entities/agent-heartbeat.entity';
+import { AgentStatus, ActorType, AuditAction, TaskStatus, ErrorCode } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
 import { TaskService } from '../task/task.service';
 import { TaskDependencyService } from '../task/task-dependency.service';
@@ -45,6 +46,16 @@ function createMockRepo<T extends ObjectLiteral>() {
         }
         return Promise.resolve(entity);
       }),
+      // heartbeat 事务路径用：manager.getRepository(AgentHeartbeat) 取到事务内 repo；
+      // 各用例按需覆写返回值（默认返回带 create/upsert 的 repo mock）
+      getRepository: jest.fn().mockReturnValue({
+        create: jest.fn((entityLike) => entityLike),
+        upsert: jest.fn().mockResolvedValue(undefined),
+      }),
+      // 事务包裹（remove/heartbeat 共用）：默认空实现（不执行回调），
+      // 用例按需覆写为 mockTransactionAndRevoke() 或独立 txManager——避免
+      // 未覆写时把 undefined 传进回调导致误崩
+      transaction: jest.fn(async () => undefined),
     },
     createQueryBuilder: jest.fn(() => ({
       where: jest.fn().mockReturnThis(),
@@ -919,27 +930,150 @@ describe('AgentService', () => {
   });
 
   describe('stats', () => {
-    it('should return agent stats', async () => {
+    /**
+     * 4 路查询返回值按调用顺序队列化：Promise.all 内 messageCount → topicCount → taskCount，
+     * 随后 dailyActivity；其余用例同构。返回调用参数数组供断言。
+     */
+    function mockStatsQueries(
+      rows: Array<Array<{ count: string } | { date: string; messageCount: string }>>,
+    ) {
+      const queryMock = mockAgentRepo.manager.query as jest.Mock;
+      for (const row of rows) {
+        queryMock.mockResolvedValueOnce(row);
+      }
+      return queryMock;
+    }
+
+    it('默认窗口（now-30d ~ now）：四路查询 + period 回显有效窗口', async () => {
       const agent = createMockAgent();
       mockAgentRepo.findOne.mockResolvedValue(agent);
+      const queryMock = mockStatsQueries([
+        [{ count: '3' }],
+        [{ count: '2' }],
+        [{ count: '5' }],
+        [{ date: '2026-09-03', messageCount: '3' }],
+      ]);
 
-      const query = { start: '2024-01-01', end: '2024-01-31' };
-      const result = await service.stats('agent-1', query);
+      const before = Date.now();
+      const result = await service.stats('agent-1', {});
+      const after = Date.now();
+      void after;
 
       expect(mockAgentRepo.findOne).toHaveBeenCalledWith({
         where: { id: 'agent-1' },
         relations: { actor: true },
       });
-      expect(result).toEqual({
-        agentId: 'agent-1',
-        period: query,
-        messageCount: 0,
-        topicCount: 0,
-        taskCount: 0,
-        avgResponseTime: 0,
-        tokenUsage: 0,
-        dailyActivity: [],
+      expect(result.agentId).toBe('agent-1');
+      expect(result.messageCount).toBe(3);
+      expect(result.topicCount).toBe(2);
+      expect(result.taskCount).toBe(5);
+      expect(result.avgResponseTime).toBe(0); // 恒 0：无数据源、保留字段
+      expect(result.tokenUsage).toBe(0);
+      expect(result.dailyActivity).toEqual([{ date: '2026-09-03', messageCount: 3 }]);
+      // 默认窗口：from ≈ now-30d，to ≈ now（±5s 容差）
+      const fromT = new Date(result.period.from).getTime();
+      const toT = new Date(result.period.to).getTime();
+      expect(Math.abs(fromT - (before - 30 * 24 * 3600 * 1000))).toBeLessThan(5000);
+      expect(Math.abs(toT - before)).toBeLessThan(5000);
+      expect(fromT).toBeLessThan(toT);
+      // dailyActivity SQL 参数 = [id, fromEff, toEff]，均为 Date（半开区间 [from, to)）
+      const dailyCall = queryMock.mock.calls[3];
+      expect(dailyCall[0]).toContain(`to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')`);
+      expect(dailyCall[0]).toContain(`ORDER BY date DESC`);
+      expect(dailyCall[1]).toHaveLength(3);
+      expect(dailyCall[1][1]).toBeInstanceOf(Date);
+      expect(dailyCall[1][2]).toBeInstanceOf(Date);
+      // 三路 all-time 计数 SQL 手写软删过滤（message/task）与 topics join（topic）
+      expect(queryMock.mock.calls[0][0]).toContain('deleted_at IS NULL');
+      expect(queryMock.mock.calls[1][0]).toContain('INNER JOIN topics');
+      expect(queryMock.mock.calls[1][0]).toContain('t.deleted_at IS NULL');
+      // QA 补漏：topicCount 的 status IN 口径守卫（防被改成只 'active' 漏计 invited）——
+      // 与 findAll 的同款守卫（本文件 :409）对齐
+      expect(queryMock.mock.calls[1][0]).toContain("tp.status IN ('invited', 'active')");
+      expect(queryMock.mock.calls[2][0]).toContain('deleted_at IS NULL');
+    });
+
+    it('显式窗口 + date-only to 含当日（< to+1d UTC），period 回显有效窗口', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      const queryMock = mockStatsQueries([
+        [{ count: '1' }],
+        [{ count: '1' }],
+        [{ count: '1' }],
+        [],
+      ]);
+
+      const result = await service.stats('agent-1', { from: '2026-09-01', to: '2026-09-03' });
+
+      expect(result.period).toEqual({
+        from: '2026-09-01T00:00:00.000Z',
+        to: '2026-09-04T00:00:00.000Z', // date-only to 含当日 → 上限推进到 to+1d UTC
       });
+      const dailyCall = queryMock.mock.calls[3];
+      expect(dailyCall[1][1]).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+      expect(dailyCall[1][2]).toEqual(new Date('2026-09-04T00:00:00.000Z'));
+      expect(result.dailyActivity).toEqual([]);
+    });
+
+    it('显式 datetime 窗口（带 offset，非 date-only 不推进上限）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      const queryMock = mockStatsQueries([
+        [{ count: '0' }],
+        [{ count: '0' }],
+        [{ count: '0' }],
+        [],
+      ]);
+
+      const result = await service.stats('agent-1', {
+        from: '2026-09-01T08:30:00.000Z',
+        to: '2026-09-03T23:59:59.000Z',
+      });
+
+      expect(result.period).toEqual({
+        from: '2026-09-01T08:30:00.000Z',
+        to: '2026-09-03T23:59:59.000Z', // datetime 直接以解析时刻为半开上限
+      });
+      const dailyCall = queryMock.mock.calls[3];
+      expect(dailyCall[1][1]).toEqual(new Date('2026-09-01T08:30:00.000Z'));
+      expect(dailyCall[1][2]).toEqual(new Date('2026-09-03T23:59:59.000Z'));
+    });
+
+    it('非法 ISO（from=abc）→ 400 VALIDATION_ERROR', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+
+      await expect(service.stats('agent-1', { from: 'abc' })).rejects.toMatchObject({
+        response: { code: ErrorCode.VALIDATION_ERROR },
+      });
+    });
+
+    it('非法 ISO（无 offset 的 datetime 字符串）→ 400 VALIDATION_ERROR', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+
+      // 无 Z/±hh:mm offset 的 datetime 有本地时区歧义，按契约拒绝（RT-STATS-1）
+      await expect(service.stats('agent-1', { to: '2026-09-03T12:00:00' })).rejects.toMatchObject({
+        response: { code: ErrorCode.VALIDATION_ERROR },
+      });
+    });
+
+    it('from > to → 400 VALIDATION_ERROR', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+
+      await expect(
+        service.stats('agent-1', { from: '2026-09-03', to: '2026-09-01' }),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.VALIDATION_ERROR } });
+    });
+
+    it('跨度 > 90 天 → 400 VALIDATION_ERROR', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+
+      await expect(
+        service.stats('agent-1', { from: '2026-01-01', to: '2026-06-01' }),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.VALIDATION_ERROR } });
     });
 
     it('should throw NotFoundException when agent not found', async () => {
@@ -950,26 +1084,137 @@ describe('AgentService', () => {
   });
 
   describe('heartbeat', () => {
-    it('should update lastActiveAt and return agent', async () => {
-      const agent = createMockAgent();
+    /** 事务内 repo 与 txManager 组合 mock（heartbeat 用例共用） */
+    function mockHeartbeatTx() {
+      const heartbeatRepo = {
+        // 参数类型用 Record<string, unknown>，测试里才能安全断言快照行字段
+        create: jest.fn((entityLike: Record<string, unknown>) => entityLike),
+        upsert: jest.fn().mockResolvedValue(undefined),
+      };
+      const txManager = {
+        getRepository: jest.fn().mockReturnValue(heartbeatRepo),
+        save: jest.fn().mockResolvedValue(undefined),
+      };
+      (mockAgentRepo.manager as unknown as { transaction: jest.Mock }).transaction = jest.fn(
+        async (cb: (m: typeof txManager) => Promise<unknown>) => cb(txManager),
+      );
+      return { heartbeatRepo, txManager };
+    }
+
+    it('全量 payload：快照行全字段 + meta 折叠（load/version）+ lastErrorAt 联动 + lastActiveAt 更新', async () => {
+      const agent = createMockAgent({ status: AgentStatus.ACTIVE });
+      agent.lastActiveAt = new Date('2024-01-01');
       mockAgentRepo.findOne.mockResolvedValue(agent);
-      mockAgentRepo.save.mockResolvedValue(agent);
+      const { heartbeatRepo, txManager } = mockHeartbeatTx();
+      const before = Date.now();
 
-      const result = await service.heartbeat('agent-1', {});
-
-      expect(mockAgentRepo.findOne).toHaveBeenCalledWith({
-        where: { id: 'agent-1' },
-        relations: { actor: true },
+      const result = await service.heartbeat('agent-1', {
+        status: AgentStatus.DISABLED,
+        latencyMs: 12,
+        memoryMb: 256,
+        cpuPercent: 3.5,
+        activeTasks: 1,
+        queueDepth: 2,
+        processedEvents: 10,
+        errorCount: 1,
+        lastError: 'upstream timeout',
+        load: 0.8,
+        version: '1.2.3',
+        meta: { region: 'cn' },
+        timestamp: '2026-09-03T00:00:00.000Z',
       });
-      expect(agent.lastActiveAt).toBeInstanceOf(Date);
-      expect(mockAgentRepo.save).toHaveBeenCalledWith(agent);
-      expect(result).toEqual(agent);
+
+      expect(mockAgentRepo.manager.transaction).toHaveBeenCalledTimes(1);
+      expect(txManager.getRepository).toHaveBeenCalledWith(AgentHeartbeat);
+      expect(heartbeatRepo.create).toHaveBeenCalledWith({
+        agentId: 'agent-1',
+        status: AgentStatus.DISABLED,
+        latencyMs: 12,
+        memoryMb: 256,
+        cpuPercent: 3.5,
+        activeTasks: 1,
+        queueDepth: 2,
+        processedEvents: 10,
+        errorCount: 1,
+        lastError: 'upstream timeout',
+        lastErrorAt: new Date('2026-09-03T00:00:00.000Z'), // lastError 非空 → lastErrorAt = timestamp（R8）
+        meta: { region: 'cn', load: 0.8, version: '1.2.3' }, // load/version 折叠进 meta
+        timestamp: new Date('2026-09-03T00:00:00.000Z'),
+      });
+      expect(heartbeatRepo.upsert).toHaveBeenCalledWith(expect.any(Object), ['agentId']);
+      // lastActiveAt = 服务端到达时间 now()，不采用自报 timestamp（防时钟漂移回退；
+      // payload timestamp '2026-09-03T00:00Z' 在过去，若误用会使 lastActiveAt 回退）
+      const after = Date.now();
+      expect(agent.lastActiveAt!.getTime()).toBeGreaterThanOrEqual(before);
+      expect(agent.lastActiveAt!.getTime()).toBeLessThanOrEqual(after + 1000);
+      expect(agent.lastActiveAt).not.toEqual(new Date('2026-09-03T00:00:00.000Z'));
+      // lastActiveAt 更新走事务内 manager.save（A3-1 先例），不落 repo.save
+      expect(txManager.save).toHaveBeenCalledWith(agent);
+      expect(mockAgentRepo.save).not.toHaveBeenCalled();
+      expect(result).toBe(agent);
+    });
+
+    it('部分 payload（快照语义）：status 回退 agent 当前值、省略遥测清空、timestamp=now、lastErrorAt=null', async () => {
+      const agent = createMockAgent({ status: AgentStatus.ACTIVE });
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      const { heartbeatRepo } = mockHeartbeatTx();
+
+      const before = Date.now();
+      await service.heartbeat('agent-1', { latencyMs: 5 });
+      const after = Date.now();
+
+      const snapshot = heartbeatRepo.create.mock.calls[0][0];
+      expect(snapshot.status).toBe(AgentStatus.ACTIVE); // 省略 → 回退 agent 当前 status（NOT NULL 防线）
+      expect(snapshot.latencyMs).toBe(5);
+      expect(snapshot.memoryMb).toBeNull();
+      expect(snapshot.cpuPercent).toBeNull();
+      expect(snapshot.activeTasks).toBe(0);
+      expect(snapshot.queueDepth).toBe(0);
+      expect(snapshot.processedEvents).toBe(0);
+      expect(snapshot.errorCount).toBe(0);
+      expect(snapshot.lastError).toBeNull();
+      expect(snapshot.lastErrorAt).toBeNull(); // lastError 空 → lastErrorAt 空
+      expect(snapshot.meta).toEqual({}); // load/version 未提供 → 不产生键（快照清空语义）
+      expect((snapshot.timestamp as Date).getTime()).toBeGreaterThanOrEqual(before - 1000);
+      expect((snapshot.timestamp as Date).getTime()).toBeLessThanOrEqual(after + 1000);
+      expect(heartbeatRepo.upsert).toHaveBeenCalledWith(expect.any(Object), ['agentId']);
+    });
+
+    it('第二次心跳省略第一次的独有字段 → 快照行显式清空（全列覆盖而非合并）', async () => {
+      const agent = createMockAgent({ status: AgentStatus.ACTIVE });
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      const { heartbeatRepo } = mockHeartbeatTx();
+
+      // 第一拍全量
+      await service.heartbeat('agent-1', {
+        status: AgentStatus.DISABLED,
+        memoryMb: 256,
+        lastError: 'boom',
+        load: 9.9,
+        timestamp: '2026-09-03T00:00:00.000Z',
+      });
+      // 第二拍部分 payload
+      await service.heartbeat('agent-1', { latencyMs: 5 });
+
+      expect(heartbeatRepo.create).toHaveBeenCalledTimes(2);
+      const second = heartbeatRepo.create.mock.calls[1][0];
+      expect(second.status).toBe(AgentStatus.ACTIVE); // 不继承第一拍 DISABLED → agent 当前值
+      expect(second.memoryMb).toBeNull();
+      expect(second.lastError).toBeNull();
+      expect(second.lastErrorAt).toBeNull();
+      expect(second.meta).toEqual({});
+      expect(second.agentId).toBe('agent-1');
+      // 两次 upsert 都落在同一 agentId 冲突路径（每 agent 恒一行）
+      expect(heartbeatRepo.upsert).toHaveBeenNthCalledWith(1, expect.any(Object), ['agentId']);
+      expect(heartbeatRepo.upsert).toHaveBeenNthCalledWith(2, expect.any(Object), ['agentId']);
     });
 
     it('should throw NotFoundException when agent not found', async () => {
       mockAgentRepo.findOne.mockResolvedValue(null);
 
       await expect(service.heartbeat('not-found', {})).rejects.toThrow(NotFoundException);
+      // findOne 判空在前，事务不应被触发
+      expect(mockAgentRepo.manager.transaction).not.toHaveBeenCalled();
     });
   });
 

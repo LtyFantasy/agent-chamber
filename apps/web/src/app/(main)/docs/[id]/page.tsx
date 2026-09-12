@@ -5,7 +5,7 @@ import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigat
 import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
 import { useLocale, useTranslations } from 'next-intl';
 import { Visibility, DOC_TYPE_DIAGRAM, extractLastHeadingSegment } from '@agent-chamber/shared';
-import ReactMarkdown, { type Components } from 'react-markdown';
+import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Link from 'next/link';
 import {
@@ -53,10 +53,10 @@ import { Sheet, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { DocSearchHit } from '@/types';
 import { UserRole, DocSpaceMemberRole, AgentStatus, ActorType, DOC_SOURCE_NATIVE } from '@/types';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
+import { createMarkdownComponents } from '@/lib/markdown-components';
 import { DocEditor } from '@/components/docs/doc-editor';
 import { DiagramViewer } from '@/components/docs/diagram-viewer';
 import { BatchUploadDialog } from '@/components/docs/batch-upload-dialog';
-import { isExternalHref, resolveDocHref, PLATFORM_DOC_LINK_RE } from '@/components/docs/doc-link';
 import { confirm, toast } from '@/lib/notify';
 import { MembersSheet } from '@/components/members/members-sheet';
 import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
@@ -147,6 +147,16 @@ export default function DocSpaceDetailPage() {
   const [newCategoryName, setNewCategoryName] = useState('');
   /** 断链条目复制反馈（1.5s 后复位） */
   const [copiedHref, setCopiedHref] = useState<string | null>(null);
+  /** Markdown 原文复制反馈（1.5s 后复位，范式同 copiedHref） */
+  const [markdownCopied, setMarkdownCopied] = useState(false);
+  /** 复制请求进行中（防连点重复请求；fetchQuery 期间禁用按钮） */
+  const [markdownCopying, setMarkdownCopying] = useState(false);
+  /** 切换文档时复位复制反馈，防 copied 态 bleed 到新文档（copiedHref 靠值比较防，
+   *  布尔态无值可比，copiedHref 复位先例的等价物） */
+  useEffect(() => {
+    setMarkdownCopied(false);
+    setMarkdownCopying(false);
+  }, [selectedDocId]);
   /** 空间设置表单（binding：'none' | 'topic:<id>' | 'board:<id>' 编码） */
   const [spaceForm, setSpaceForm] = useState({
     name: '',
@@ -394,55 +404,14 @@ export default function DocSpaceDetailPage() {
     [router, spaceId, t],
   );
 
-  const markdownComponents = useMemo<Components>(
-    () => ({
-      a: ({ href, children }) => {
-        if (!href) return <span>{children}</span>;
-        if (isExternalHref(href)) {
-          return (
-            <a href={href} target="_blank" rel="noreferrer">
-              {children}
-            </a>
-          );
-        }
-        if (PLATFORM_DOC_LINK_RE.test(href)) {
-          return (
-            <a
-              href={href}
-              onClick={(e) => {
-                e.preventDefault();
-                router.push(href, { scroll: false });
-              }}
-            >
-              {children}
-            </a>
-          );
-        }
-        // 相对 .md 链接：普通链接渲染，点击时异步解析（未加载不预判断链）
-        if (currentDocPath) {
-          const resolved = resolveDocHref(href, currentDocPath);
-          if (resolved !== undefined) {
-            return (
-              <a
-                href={href}
-                onClick={(e) => {
-                  e.preventDefault();
-                  if (resolved === null) {
-                    // 越出空间根的不可达解析：直接判断链
-                    toast.error({ title: t('detail.docLinkNotFound') });
-                  } else {
-                    void handleRelativeDocLink(resolved);
-                  }
-                }}
-              >
-                {children}
-              </a>
-            );
-          }
-        }
-        return <a href={href}>{children}</a>;
-      },
-    }),
+  const markdownComponents = useMemo(
+    () =>
+      createMarkdownComponents({
+        currentDocPath,
+        onPlatformDocLink: (href) => router.push(href, { scroll: false }),
+        onRelativeDocLink: (resolvedPath) => void handleRelativeDocLink(resolvedPath),
+        onBrokenDocLink: () => toast.error({ title: t('detail.docLinkNotFound') }),
+      }),
     [router, currentDocPath, handleRelativeDocLink, t],
   );
 
@@ -716,6 +685,35 @@ export default function DocSpaceDetailPage() {
     pendingHeadingRef.current = hit.headingPath ? extractLastHeadingSegment(hit.headingPath) : null;
     selectDoc(hit.docId);
     setSearchQuery('');
+  };
+
+  /**
+   * 复制 Markdown 原文（full=true 含首标题行 = 平台 canonical 原文，与编辑器回写同源）。
+   * 副作用：网络请求（GET /docs/:id/content?full=true）+ 剪贴板写入；失败 toast 兜底。
+   * 缓存：与编辑器 full 原文查询同 queryKey（['docs','doc-content-full', docId]）共享——
+   * 保存 mutation 已 invalidate 该 key（无陈旧复制）；staleTime:0 覆盖全局 5min 默认，
+   * 多写者场景下每次点击必拉新（复制是低频刻意动作，新鲜度 > 缓存提速）。
+   */
+  const handleCopyMarkdown = async () => {
+    if (!selectedDocId || markdownCopying) return;
+    setMarkdownCopying(true);
+    try {
+      // 与编辑器 full 原文查询同 queryKey 共享缓存；保存 mutation 已 invalidate 该 key（无陈旧复制）
+      const data = await queryClient.fetchQuery({
+        queryKey: ['docs', 'doc-content-full', selectedDocId],
+        queryFn: () => Api.docs.getDocContent(selectedDocId, true),
+        // 评审 R1：覆盖全局 staleTime 5min（providers.tsx:20），每次点击必拉新——
+        // 复制是低频刻意动作，多写者场景下新鲜度 > 缓存提速；同 key 缓存仍服务编辑器秒开
+        staleTime: 0,
+      });
+      await navigator.clipboard.writeText(data.content);
+      setMarkdownCopied(true);
+      setTimeout(() => setMarkdownCopied(false), 1500);
+    } catch {
+      toast.error({ title: t('detail.copyMarkdownError') });
+    } finally {
+      setMarkdownCopying(false);
+    }
   };
 
   if (spaceLoading) {
@@ -1305,6 +1303,7 @@ export default function DocSpaceDetailPage() {
               <DocEditor
                 mode={editing.mode}
                 spaceId={spaceId}
+                docId={editing.mode === 'edit' ? doc?.id : undefined}
                 initialContent={editing.mode === 'edit' ? (docFullContent?.content ?? '') : ''}
                 initialPath={editing.mode === 'edit' ? (doc?.path ?? '') : undefined}
                 boardId={space?.boardId ?? undefined}
@@ -1371,6 +1370,24 @@ export default function DocSpaceDetailPage() {
                       <p className="mt-1 text-sm text-muted-foreground">{doc.summary}</p>
                     )}
                   </div>
+                  {/* 复制 Markdown 原文（full=true 含首 H1；所有读者可见，能看就能复制；
+                      diagram doc 隐藏——其"原文"是 IR JSON 非 markdown，与 Edit 同规） */}
+                  {doc?.docType !== DOC_TYPE_DIAGRAM && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={markdownCopying}
+                      onClick={() => void handleCopyMarkdown()}
+                    >
+                      {markdownCopied ? (
+                        <Check className="mr-1 h-3.5 w-3.5" />
+                      ) : (
+                        <Copy className="mr-1 h-3.5 w-3.5" />
+                      )}
+                      {markdownCopied ? t('detail.copied') : t('detail.copyMarkdown')}
+                    </Button>
+                  )}
                   {canManage &&
                     doc?.source === DOC_SOURCE_NATIVE &&
                     !contentLoading &&

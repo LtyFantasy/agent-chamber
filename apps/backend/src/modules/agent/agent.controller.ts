@@ -526,9 +526,32 @@ export class AgentController {
 
   @UseGuards(JwtOrApiKeyGuard)
   @Get(':id/stats')
-  @ApiOperation({ summary: 'Agent stats', description: 'Get usage statistics for an agent' })
+  @ApiOperation({
+    summary: 'Agent stats',
+    description:
+      'Get usage statistics for an agent. Query params from/to (optional ISO date or datetime) bound only to dailyActivity; ' +
+      'default window = last 30 days; invalid ISO / empty window / span > 90 days reject with 400 VALIDATION_ERROR.',
+  })
   @ApiParam({ name: 'id', description: 'Agent ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    description:
+      'Window start (ISO date YYYY-MM-DD or datetime YYYY-MM-DDTHH:mm:ss[.sss]Z|±hh:mm), default now-30d; applies only to dailyActivity',
+    type: String,
+  })
+  @ApiQuery({
+    name: 'to',
+    required: false,
+    description:
+      'Window end (ISO date or datetime), default now; date-only to includes that whole day (upper bound = to+1d UTC); applies only to dailyActivity',
+    type: String,
+  })
   @ApiResponse({ status: 200, description: 'Agent stats returned successfully' })
+  @ApiResponse({
+    status: 400,
+    description: 'VALIDATION_ERROR: invalid ISO / empty window / span > 90 days',
+  })
   async stats(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() query: Record<string, unknown>,

@@ -208,6 +208,27 @@ describe('link-health', () => {
       // 外部协议以 .md 结尾也不判定（extractDocLinks 入口已跳过，本函数兜底同口径）
       expect(resolveHrefToDocPath('https://example.com/x.md', 'docs/vision/README.md')).toBeNull();
     });
+
+    it('附件内容 URL 显式跳过 → null（plan §4.2 防御性冗余，防 .md 判定演变误伤）', () => {
+      // 常规附件 contentUrl
+      expect(
+        resolveHrefToDocPath(
+          '/api/v1/attachments/a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11/content',
+          'docs/vision/README.md',
+        ),
+      ).toBeNull();
+      // 变体：带 # 锚点 / 恰好前缀边界的相似路径不误伤
+      expect(
+        resolveHrefToDocPath(
+          '/api/v1/attachments/x/content#frag',
+          'docs/vision/README.md',
+        ),
+      ).toBeNull();
+      // 前缀相似但非附件路径（/api/v1/attachmentsX）不受影响——仍走 .md 判定
+      expect(resolveHrefToDocPath('/api/v1/attachmentsX/y.md', 'docs/vision/README.md')).toBe(
+        'api/v1/attachmentsX/y.md',
+      );
+    });
   });
 
   // ─── computeLinkHealth ─────────────────────────────────────

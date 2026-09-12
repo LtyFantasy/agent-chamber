@@ -25,17 +25,26 @@
 
 'use client';
 
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useMemo } from 'react';
 import { useTranslations } from 'next-intl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { ImagePlus } from 'lucide-react';
+import { ErrorCode } from '@agent-chamber/shared';
 
-import { Api } from '@/lib/api';
+import {
+  Api,
+  ATTACHMENT_ALLOWED_TYPES,
+  ATTACHMENT_MAX_BYTES,
+  escapeAttachmentAlt,
+  type UploadAttachmentResponse,
+} from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { DocPicker, type DocPick } from '@/components/docs/doc-picker';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
-import { confirm } from '@/lib/notify';
+import { createMarkdownComponents } from '@/lib/markdown-components';
+import { confirm, toast } from '@/lib/notify';
 
 /**
  * DocEditor 组件 props 契约（plan §3.1 R5 定稿，逐字遵守）。
@@ -45,6 +54,11 @@ export interface DocEditorProps {
   mode: 'edit' | 'create';
   /** 所属空间 ID（create 模式路径冲突精确校验 listDocs({ path }) 用） */
   spaceId: string;
+  /**
+   * 文档 ID（edit 模式传入；create 模式文档未创建无 id）。
+   * 图片上传绑定 docId（plan §0.3 恰好一值）；缺省 = 图片按钮禁用。
+   */
+  docId?: string;
   /** 初始内容：edit 模式来自 doc-content 缓存，create 传 '' */
   initialContent: string;
   /** 初始路径：edit 模式传入锁定展示；create 不渲染锁 */
@@ -75,6 +89,7 @@ export interface DocEditorProps {
 export function DocEditor({
   mode,
   spaceId,
+  docId,
   initialContent,
   initialPath,
   boardId,
@@ -92,13 +107,19 @@ export function DocEditor({
   const [pathError, setPathError] = useState<string | null>(null);
   /** 精确路径校验请求进行中（保存按钮联动禁用，防校验期间重复提交） */
   const [checkingPath, setCheckingPath] = useState(false);
+  /** 图片上传进行中（按钮禁用防重复提交） */
+  const [uploading, setUploading] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   /** 原始内容（进入编辑态快照，脏状态判断基准） */
   const originalContentRef = useRef(initialContent);
 
   /** 是否脏（内容与进入时不同） */
   const dirty = content !== originalContentRef.current;
+
+  /** 共享 markdown components（plan §5.2）：a 覆盖 + img → AttachmentImage（附件鉴权 blob 加载） */
+  const markdownComponents = useMemo(() => createMarkdownComponents(), []);
 
   /**
    * 尝试退出编辑器（R1 统一脏状态守卫）：
@@ -205,6 +226,68 @@ export function DocEditor({
     [content],
   );
 
+  /**
+   * 插入图片链接回调（handleInsertLink 范式，plan §5.4）：在 textarea 光标处插入
+   * `![alt](contentUrl)`（alt 已转义 `[ ] ( )`，plan §3.6——original_name 含 `](`
+   * 可破 markdown 语法）。插入后恢复 focus 并把光标移到插入文本之后。
+   */
+  const insertImageLink = useCallback(
+    (res: UploadAttachmentResponse) => {
+      const link = `![${escapeAttachmentAlt(res.originalName)}](${res.contentUrl})`;
+      const el = textareaRef.current;
+      if (!el) {
+        setContent((prev) => prev + link);
+        return;
+      }
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      const before = content.slice(0, start);
+      const after = content.slice(end);
+      // 防粘连：插入点后的内容非空且不以换行开头时补换行（同 handleInsertLink）
+      const glue = after && !after.startsWith('\n') ? '\n' : '';
+      const newContent = before + link + glue + after;
+      setContent(newContent);
+      requestAnimationFrame(() => {
+        el.focus();
+        const cursorPos = start + link.length + glue.length;
+        el.setSelectionRange(cursorPos, cursorPos);
+      });
+    },
+    [content],
+  );
+
+  /** 图片文件选择：前端拦截（类型/大小，与后端校验对齐）→ 上传（绑定 docId）→ 插入 */
+  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // 清空 value：允许重复选择同一文件（change 不触发）
+    if (!file) return;
+    if (!ATTACHMENT_ALLOWED_TYPES.includes(file.type)) {
+      toast.error({ title: tGlobal('attachments.typeNotAllowed') });
+      return;
+    }
+    if (file.size > ATTACHMENT_MAX_BYTES) {
+      toast.error({ title: tGlobal('attachments.tooLarge') });
+      return;
+    }
+    if (!docId) return;
+    setUploading(true);
+    try {
+      const res = await Api.attachments.upload(file, { docId });
+      insertImageLink(res);
+    } catch (err) {
+      // 配额超限（12003）单独文案；其余统一上传失败
+      const code = (err as { code?: number }).code;
+      toast.error({
+        title:
+          code === ErrorCode.ATTACHMENT_QUOTA_EXCEEDED
+            ? tGlobal('attachments.quotaExceeded')
+            : tGlobal('attachments.uploadFailed'),
+      });
+    } finally {
+      setUploading(false);
+    }
+  };
+
   // ── Enter 提交（仅路径输入框，防 textarea 误触） ──
   const handlePathKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -233,6 +316,28 @@ export function DocEditor({
           disabled={tab === 'preview'}
           label={t('insertLink')}
           buttonClassName="h-8 text-xs"
+        />
+
+        {/* 插入图片（plan §5.4）：绑定 docId 上传；create 模式文档未创建无 id → 禁用 */}
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-8 text-xs"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={tab === 'preview' || !docId || uploading}
+          title={!docId ? t('imageNeedDoc') : undefined}
+          isLoading={uploading}
+        >
+          <ImagePlus className="mr-1 h-3.5 w-3.5" />
+          {t('insertImage')}
+        </Button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          className="hidden"
+          onChange={(e) => void handleImageChange(e)}
         />
 
         <Button
@@ -270,7 +375,9 @@ export function DocEditor({
             className={`flex-1 overflow-y-auto rounded-md border border-border/40 px-3 py-2 text-sm ${MARKDOWN_CLASSES}`}
           >
             {content.trim() ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {content}
+              </ReactMarkdown>
             ) : (
               <p className="text-muted-foreground">{t('contentPlaceholder')}</p>
             )}

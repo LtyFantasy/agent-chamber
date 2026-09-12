@@ -9,6 +9,14 @@
  *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（sendMessageInternal 是
  *     全仓唯一 messageRepo.create 点，roundtable 经它写系统消息 → service 层插桩决策 2；
  *     幂等 replay 不重复记；newData 白名单 {messageId, topicId, topicTitle}，content 黑名单）
+ *   - 消息附件绑定: plan wiccan-carnage-rocket.md §4.1 + P1 投影（sendMessage 前置校验
+ *     attachmentIds——全部存在(404/12000) + 上传者=发送者 + 绑定本 topic(403/12004)，
+ *     通过则服务端覆盖写 metadata.attachments 索引；无 attachmentIds（含显式 []）
+ *     时堵漏删除客户端自传的该键，索引只有「服务端背书|不存在」两态）。
+ *     P1 起响应层投影恒存在 attachments: MessageAttachment[] 5 字段
+ *     （contentUrl 由 buildContentUrl 派生），不透原始 metadata；与
+ *     seatLabel/seatCoordinator 单键透传并存——attachments 恒存在是机器契约，
+ *     勿按 seatLabel 条件缺省先例改回（见 topic-response.dto.ts JSDoc）
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyTopicIds
@@ -76,7 +84,7 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, In } from 'typeorm';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
 import { Message } from '../../database/entities/message.entity';
@@ -86,6 +94,7 @@ import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Task } from '../../database/entities/task.entity';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
+import { Attachment } from '../../database/entities/attachment.entity';
 import {
   TopicStatus,
   ActorType,
@@ -101,7 +110,8 @@ import {
   TopicKind,
   WakePolicy,
 } from '@agent-chamber/shared';
-import type { TopicDetail } from '@agent-chamber/shared';
+import type { TopicDetail, MessageAttachment } from '@agent-chamber/shared';
+import { buildContentUrl } from '../attachments/dto/attachment-response.dto';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -228,6 +238,10 @@ export class TopicService {
     private readonly ownerProxy: OwnerProxyService,
     private readonly actorProfileService: ActorProfileService,
     private readonly auditService: AuditService,
+    // 消息附件绑定校验（MinIO 媒体附件 P0，plan §4.1）：末尾追加参数——
+    // 两个手工 new TopicService 的真 PG 套件按位传参，末尾追加影响最小
+    @InjectRepository(Attachment)
+    private readonly attachmentRepo: Repository<Attachment>,
   ) {}
 
   /**
@@ -1257,6 +1271,27 @@ export class TopicService {
 
     const { clientRequestId, ...messageDto } = dto;
 
+    // --- 3. 附件绑定校验（MinIO 媒体附件 P0，plan §4.1/§0.4）---
+    // 全部存在 + 上传者=发送者 + 绑定本 topic；通过后服务端覆盖写
+    // metadata.attachments 索引（客户端在 dto.metadata 自传的 attachments 键
+    // 不被信任——索引必须由服务端背书；content 是渲染事实，允许与索引不一致）。
+    // 幂等/非幂等两条写路径共用 messageDto.metadata，此处统一点介入。
+    if (dto.attachmentIds?.length) {
+      const attachmentMeta = await this.validateAttachmentsForMessage(
+        topicId,
+        senderId,
+        dto.attachmentIds,
+      );
+      messageDto.metadata = { ...(messageDto.metadata || {}), attachments: attachmentMeta };
+    } else {
+      // 写路径堵漏（P1）：客户端不带 attachmentIds（含显式传 []——DTO 校验放行
+      // 空数组）却自传 metadata.attachments 键时，索引必须删除——索引只允许两种
+      // 存活态：服务端背书（上方 truthy 分支）或不存在，无第三态。先展开拷贝再
+      // delete，防浅拷贝原地污染调用方 dto（评审 N1）。
+      messageDto.metadata = { ...messageDto.metadata };
+      delete messageDto.metadata.attachments;
+    }
+
     // ── 无幂等键：走原路径（零开销） ──
     if (!clientRequestId) {
       return this.sendMessageInternal(topicId, senderId, actorType, topic, messageDto);
@@ -1360,6 +1395,57 @@ export class TopicService {
   }
 
   /**
+   * 附件绑定前置校验（sendMessage，plan §4.1）。
+   *
+   * 规则（任务书钉死）：
+   * - 任一附件不存在（含已软删——find 默认滤软删）→ 404 ATTACHMENT_NOT_FOUND；
+   * - 上传者≠发送者 → 403 ATTACHMENT_FORBIDDEN（写路径语义：存在但无权操作）；
+   * - 绑定他 topic（topicId 不等，含 doc 绑定/null）→ 403 ATTACHMENT_FORBIDDEN
+   *   （单绑定模型：跨场景复用 = 重新上传，plan §0.3）。
+   *
+   * 返回按输入顺序（含重复，与 ≤9 上限语义一致）映射的 metadata.attachments
+   * 索引条目；sizeBytes 显式 Number()（bigint string → number，批 1 钉死的转换点）。
+   * 返回类型钉为 Omit<MessageAttachment, 'contentUrl'>（缺 contentUrl：索引落库
+   * 不含投影 URL，contentUrl 是响应层投影时经 buildContentUrl 派生的）——
+   * 防索引形状与投影条目漂移（P1）。
+   */
+  private async validateAttachmentsForMessage(
+    topicId: string,
+    senderId: string,
+    attachmentIds: string[],
+  ): Promise<Omit<MessageAttachment, 'contentUrl'>[]> {
+    const rows = await this.attachmentRepo.find({ where: { id: In(attachmentIds) } });
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return attachmentIds.map((id) => {
+      const attachment = byId.get(id);
+      if (!attachment) {
+        throw new NotFoundException({
+          message: `Attachment ${id} not found`,
+          code: ErrorCode.ATTACHMENT_NOT_FOUND,
+        });
+      }
+      if (attachment.uploaderId !== senderId) {
+        throw new ForbiddenException({
+          message: 'Cannot attach an attachment uploaded by another actor',
+          code: ErrorCode.ATTACHMENT_FORBIDDEN,
+        });
+      }
+      if (attachment.topicId !== topicId) {
+        throw new ForbiddenException({
+          message: 'Attachment is not bound to this topic',
+          code: ErrorCode.ATTACHMENT_FORBIDDEN,
+        });
+      }
+      return {
+        id: attachment.id,
+        originalName: attachment.originalName,
+        mimeType: attachment.mimeType,
+        sizeBytes: Number(attachment.sizeBytes),
+      };
+    });
+  }
+
+  /**
    * sendMessage 无幂等键时的原路径（提取为独立方法，避免 sendMessage 过于臃肿）。
    */
   private async sendMessageInternal(
@@ -1427,6 +1513,46 @@ export class TopicService {
   }
 
   /**
+   * 消息附件投影（P1）：把服务端背书的 metadata.attachments 索引投影为响应
+   * 恒存在的 MessageAttachment[]。
+   *
+   * 防御过滤（存量为脏的兜底，plan §1 快照语义）：非数组 → []；条目非对象 /
+   * id/originalName/mimeType 非 string / sizeBytes 无法转有限 number → 丢弃
+   * （NaN 经 JSON.stringify 序列化成 null 会破坏 number 契约——评审 N1）。
+   * 输出恒 5 字段：contentUrl 由 buildContentUrl 单一拼装点派生（相对路径，
+   * 下载需拼 base + 携带凭证），不验证归属——归属/权限由 /content 端点鉴权兜底。
+   *
+   * @param metadata 消息实体的 metadata（jsonb，可能为 undefined/null）
+   * @returns 恒存在数组（无附件 = []）
+   */
+  private projectAttachments(
+    metadata: Record<string, unknown> | undefined | null,
+  ): MessageAttachment[] {
+    const raw = metadata?.attachments;
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter(
+        (entry): entry is Record<string, unknown> =>
+          entry !== null &&
+          typeof entry === 'object' &&
+          typeof (entry as Record<string, unknown>).id === 'string' &&
+          typeof (entry as Record<string, unknown>).originalName === 'string' &&
+          typeof (entry as Record<string, unknown>).mimeType === 'string' &&
+          Number.isFinite(Number((entry as Record<string, unknown>).sizeBytes)),
+      )
+      .map((entry) => {
+        const id = entry.id as string;
+        return {
+          id,
+          originalName: entry.originalName as string,
+          mimeType: entry.mimeType as string,
+          sizeBytes: Number(entry.sizeBytes),
+          contentUrl: buildContentUrl(id),
+        };
+      });
+  }
+
+  /**
    * 构建 sendMessage 一致响应形状：解析 sender 名称/头像 + 统一字段映射。
    * 正常路径与幂等 replay 路径共用，保证响应契约一致。
    * 统一批 A2：sender 解析改走公共 ActorProfileService（withDeleted 查询覆盖软删 actor，
@@ -1461,6 +1587,8 @@ export class TopicService {
       replyTo: msg.replyToId,
       type: msg.type,
       createdAt: msg.createdAt,
+      // 附件投影恒存在（P1，与 mapToMessageDtos 同规）
+      attachments: this.projectAttachments(msg.metadata),
     };
   }
 
@@ -1604,6 +1732,8 @@ export class TopicService {
         replyTo: msg.replyToId,
         type: msg.type,
         createdAt: msg.createdAt,
+        // 附件投影恒存在（P1，与 buildMessageResponse 同规）
+        attachments: this.projectAttachments(msg.metadata),
         // 软删信号透传（统一批契约 docs/spec.md §1）：软删 agent 的消息解析出真名 +
         // senderType='agent'（A1 前被 actors 查询软删过滤误归 'system'，行为变更）；
         // 真孤儿（不进 map）保持 'System' 兜底

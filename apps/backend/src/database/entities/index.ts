@@ -30,3 +30,4 @@ export { DocRoute } from './doc-route.entity';
 export { RoundtableRunner } from './roundtable-runner.entity';
 export { RoundtableSeat } from './roundtable-seat.entity';
 export { RoundtablePermissionRequest } from './roundtable-permission-request.entity';
+export { Attachment } from './attachment.entity';

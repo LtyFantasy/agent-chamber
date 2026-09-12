@@ -11,6 +11,7 @@ import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Task } from '../../database/entities/task.entity';
+import { Attachment } from '../../database/entities/attachment.entity';
 import { EventModule } from '../event/event.module';
 import { AuditModule } from '../audit/audit.module';
 
@@ -26,6 +27,9 @@ import { AuditModule } from '../audit/audit.module';
       Actor,
       Board,
       Task,
+      // Attachment：sendMessage 附件绑定前置校验（plan §4.1）直查，
+      // 不经 AttachmentsModule（依赖方向钉死：AttachmentsModule→TopicModule 单向）
+      Attachment,
     ]),
     EventModule,
     // 活动日志插桩（plan shadowcat-sunspot-catwoman Phase 2）：topic 写操作全量记

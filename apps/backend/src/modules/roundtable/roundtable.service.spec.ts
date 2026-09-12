@@ -364,12 +364,12 @@ describe('RoundtableService', () => {
         batch: { windowMs: number; messages: unknown[] };
       };
     };
-    // 规则头装配（§6：统一装配 + 版本化；v2 = M2 阶段 3 新增 @all 说明）
-    expect(payload.ruleHeader).toContain('规则头（version 2）');
+    // 规则头装配（§6：统一装配 + 版本化；v3 = 精简电报体 + 4 处消歧）
+    expect(payload.ruleHeader).toContain('圆桌规则（v3）');
     expect(payload.ruleHeader).toContain('kimi-1');
     expect(payload.ruleHeader).toContain('{"silent": true}');
     expect(payload.ruleHeader).toContain('证据纪律');
-    expect(payload.ruleHeader).toContain('@all 唤醒全部座位，慎用');
+    expect(payload.ruleHeader).toContain('@all 广播全员（慎用）');
     // r3 冻结消息体
     expect(payload.body).toEqual(
       expect.objectContaining({
@@ -377,7 +377,7 @@ describe('RoundtableService', () => {
         kind: 'roundtable.inject',
         topic: { id: 'topic-1', title: '圆桌测试' },
         seat: { label: 'kimi-1', coordinator: false },
-        ruleHeaderVersion: 2,
+        ruleHeaderVersion: 3,
         batch: { windowMs: 0, messages: [expect.any(Object)] },
       }),
     );
@@ -4150,15 +4150,15 @@ describe('RoundtableService', () => {
 
   // ─────────────────────────── 规则头装配快照 ───────────────────────────
 
-  it('buildRuleHeader：普通座位（身份/沉默协议/@路由含 @all/证据纪律），主脑座位含主脑加成', () => {
+  it('buildRuleHeader：普通座位（身份/@路由含 @all/沉默协议/消息体引用/证据纪律），主脑座位含主脑加成', () => {
     const header = service.buildRuleHeader({ label: 'kimi-1', coordinator: false });
-    expect(header).toContain('规则头（version 2）');
+    expect(header).toContain('圆桌规则（v3）');
     expect(header).toContain('kimi-1');
     expect(header).toContain('{"silent": true}');
     expect(header).toContain('证据纪律');
-    expect(header).toContain('@kimi-1');
-    expect(header).toContain('@all 唤醒全部座位，慎用');
-    expect(header).not.toContain('主脑');
+    expect(header).toContain('你的座位：kimi-1');
+    expect(header).toContain('@all 广播全员（慎用）');
+    expect(header).not.toContain('你是主脑座位');
 
     const bossHeader = service.buildRuleHeader({ label: 'boss', coordinator: true });
     expect(bossHeader).toContain('主脑');

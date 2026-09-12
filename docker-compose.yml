@@ -19,6 +19,34 @@ services:
       timeout: 5s
       retries: 5
 
+  # MinIO 对象存储（MinIO 媒体附件 P0，plan §6.1）
+  # container_name chamber-minio：deploy.sh 自举/卷备份、运维脚本统一按此名寻址。
+  # 端口恒绑 127.0.0.1（console 9001 带 root 凭据，绝不绑 0.0.0.0；DEPLOY.md 写明
+  # 防火墙不开 9000/9001）；MINIO_PORT/MINIO_CONSOLE_PORT 参数化供 9000 被占用机
+  # 用 shell env 覆盖（compose 变量替换只读同目录 .env——无 .env 机须显式 export，
+  # 如本机 MINIO_PORT=19000 MINIO_CONSOLE_PORT=19001）。
+  minio:
+    image: minio/minio
+    container_name: chamber-minio
+    restart: unless-stopped
+    # --console-address 固定 9001：缺省 console 端口动态分配，9001 映射将落空
+    command: server /data --console-address ":9001"
+    environment:
+      # 插值风格对齐 DB_*：与 backend 段 MINIO_ACCESS_KEY/SECRET_KEY 同源，
+      # 无 .env 时默认值 = 开发占位值（生产必须经 .env 覆盖）
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minio_root_user}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-change-me-minio-secret}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: .
@@ -44,10 +72,23 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-in-production-refresh}
+      # MinIO 插值自 .env（镜像 DB_HOST 先例）：容器内 127.0.0.1 指向自身，
+      # endpoint 用服务名 minio；MINIO_PORT 恒 9000（容器间网络直连不经宿主机
+      # 映射——宿主机 MINIO_PORT=19000 之类的覆盖只影响宿主机侧映射端口）
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: ${MINIO_USE_SSL:-false}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio_root_user}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-me-minio-secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-agent-chamber-attachments}
     ports:
       - "8743:8743"
     depends_on:
       postgres:
+        condition: service_healthy
+      # 启动顺序保证 OnModuleInit bucket 自举时 MinIO 已就绪（storage 虽 fail-open
+      # 不崩，但 bucket 不自建会让上传路径 500）
+      minio:
         condition: service_healthy
 
   web:
@@ -85,3 +126,4 @@ services:
 
 volumes:
   postgres_data:
+  minio_data:

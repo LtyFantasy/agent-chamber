@@ -315,6 +315,20 @@ export enum ErrorCode {
   ROUNDTABLE_SEAT_NOT_FOUND = 11001,
   /** 409 — 同一 topic 下该 actor 已有 active 座位（r17 唯一约束：一 agent 一 topic 一 active 座位；removed 软删豁免可重建） */
   ROUNDTABLE_SEAT_BIND_ACTOR_CONFLICT = 11002,
+
+  // Attachments (12000-12099)
+  /** 404 — 附件不存在；对"存在但无权限"的读取/删除访问也返回本码（不泄露存在性） */
+  ATTACHMENT_NOT_FOUND = 12000,
+  /** 413 — 单文件超过 ATTACHMENT_MAX_BYTES（默认 8MiB）；注意配额超限是 12003(403) 不是本码 */
+  ATTACHMENT_TOO_LARGE = 12001,
+  /** 400 — 魔数嗅探不命中图片白名单（png/jpeg/gif/webp），不信任客户端声明的 Content-Type */
+  ATTACHMENT_TYPE_NOT_ALLOWED = 12002,
+  /** 403 — 上传者累计存储配额（ATTACHMENT_QUOTA_BYTES，默认 200MiB）超限；刻意用 403 而非 413（非单请求载荷问题） */
+  ATTACHMENT_QUOTA_EXCEEDED = 12003,
+  /** 403 — 仅上传绑定场景：对目标 topic/doc 无写权限；读取路径一律 12000（404）不泄露存在性 */
+  ATTACHMENT_FORBIDDEN = 12004,
+  /** 400 — 绑定非法：topicId 与 docId 必须恰好传一个（双传/双缺均拒绝） */
+  ATTACHMENT_BIND_CONFLICT = 12005,
 }
 
 /**

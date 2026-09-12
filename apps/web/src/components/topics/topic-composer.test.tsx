@@ -15,10 +15,9 @@
  */
 
 import { useState } from 'react';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TopicComposer } from './topic-composer';
-import { confirm } from '@/lib/notify';
 
 /** topics.message 命名空间的英语文案快照（同 en.json；未命中 key 回退完整路径） */
 const messages: Record<string, string> = {
@@ -26,35 +25,79 @@ const messages: Record<string, string> = {
   'message.mentionNoMatch': 'No matching seat',
   'message.allWakeTitle': 'Wake all seats',
   'message.allWakeConfirm': 'This will wake all {count} seats. Send anyway?',
+  'message.send': 'Send',
+};
+
+/** attachments 命名空间英语文案快照（同 en.json） */
+const attachmentMessages: Record<string, string> = {
+  'attachments.upload': 'Upload image',
+  'attachments.uploading': 'Uploading...',
+  'attachments.uploadFailed': 'Image upload failed, please retry',
+  'attachments.tooLarge': 'Image exceeds the 8MiB size limit',
+  'attachments.typeNotAllowed': 'Only PNG/JPEG/GIF/WebP images are supported',
+  'attachments.quotaExceeded': 'Storage quota exceeded, please clean up attachments first',
+  'attachments.removeChip': 'Remove attachment',
+  'attachments.confirmRemove':
+    'The attachment will be deleted and the image link in the message will be removed. Remove it?',
+  'attachments.removeFailed':
+    'Failed to delete the attachment; you can clean it up later in My Attachments',
 };
 
 // 全局 confirm（lib/notify）mock：window.confirm 替换批次后，@all 闸门改走
 // 异步 Promise 确认——测试用 mockResolvedValue 控制结果 + await act 结算
 jest.mock('@/lib/notify', () => ({
   confirm: jest.fn(),
+  toast: { error: jest.fn(), warning: jest.fn(), success: jest.fn(), info: jest.fn() },
 }));
+import { confirm, toast } from '@/lib/notify';
 const mockConfirm = confirm as jest.Mock;
+const mockToastError = toast.error as jest.Mock;
+const mockToastWarning = toast.warning as jest.Mock;
+
+// Api.attachments mock（附件上传流；既有测试不触达，零影响）。
+// requireActual 保留真实 ATTACHMENT_ALLOWED_TYPES/MAX_BYTES/escapeAttachmentAlt——
+// 前端拦截与 alt 转义测的是真实实现，不是 mock 副本。
+jest.mock('@/lib/api', () => {
+  const actual = jest.requireActual('@/lib/api');
+  return {
+    ...actual,
+    Api: {
+      attachments: {
+        upload: jest.fn(),
+        remove: jest.fn(),
+      },
+    },
+  };
+});
+import { Api } from '@/lib/api';
+const mockUpload = Api.attachments.upload as jest.Mock;
+const mockRemove = Api.attachments.remove as jest.Mock;
 
 beforeEach(() => {
   mockConfirm.mockReset();
+  mockToastError.mockReset();
+  mockToastWarning.mockReset();
+  mockUpload.mockReset();
+  mockRemove.mockReset();
 });
 
 jest.mock('next-intl', () => ({
   // 文案快照 + {count} 插值（@all 闸门确认框断言 N 用；其余 key 无参数不受影响）
   useTranslations: () => (key: string, opts?: { count?: number }) => {
-    const tpl = messages[key] ?? key;
+    const tpl = messages[key] ?? attachmentMessages[key] ?? key;
     return opts && typeof opts.count === 'number'
       ? tpl.replace('{count}', String(opts.count))
       : tpl;
   },
 }));
 
-/** 受控包装：onChange 同步 value，模拟 page 的真实受控流 */
+/** 受控包装：onChange 同步 value，模拟 page 的真实受控流；
+ *  onSend 后清空 value——模拟 page 发送成功（mutation onSuccess）清空输入框 */
 function Harness({
   onSend,
   mentionTargets,
 }: {
-  onSend: () => void;
+  onSend: (attachmentIds: string[]) => void;
   mentionTargets?: string[] | null;
 }) {
   const [value, setValue] = useState('');
@@ -62,7 +105,11 @@ function Harness({
     <TopicComposer
       value={value}
       onChange={setValue}
-      onSend={onSend}
+      onSend={(ids) => {
+        onSend(ids);
+        setValue('');
+      }}
+      topicId="topic-1"
       placeholder="Type a message..."
       mentionTargets={mentionTargets}
     />
@@ -110,8 +157,10 @@ describe('TopicComposer 圆桌 @ 补全', () => {
 
     await user.type(ta, '@');
 
-    // @all 置顶：DOM 顺序上先于第一个座位候选
-    const candidateButtons = Array.from(container.querySelectorAll('button'));
+    // @all 置顶：DOM 顺序上先于第一个座位候选（paperclip/发送按钮无 @ 文本，过滤掉）
+    const candidateButtons = Array.from(container.querySelectorAll('button')).filter((b) =>
+      b.textContent?.includes('@'),
+    );
     expect(candidateButtons[0]?.textContent).toContain('@all');
     expect(candidateButtons[0]?.textContent).toContain('Notify all seats');
     expect(screen.getByText('@kimi-1')).toBeInTheDocument();
@@ -266,11 +315,11 @@ describe('TopicComposer @all 闸门（M3 阶段 3，r13；全局 confirm 替换 
     const user = userEvent.setup();
     mockConfirm.mockResolvedValue(true);
     const onSend = jest.fn();
-    const { container } = render(<Harness onSend={onSend} mentionTargets={SEATS} />);
+    render(<Harness onSend={onSend} mentionTargets={SEATS} />);
 
     await user.type(screen.getByPlaceholderText('Type a message...'), '@all 全体');
-    // 补全框已关闭时组件内唯一 button = 发送按钮（图标无文字，按位置取）
-    await user.click(container.querySelector('button') as HTMLButtonElement);
+    // 发送按钮带 aria-label（图标无文字）；paperclip 按钮同排，必须按可访问名取
+    await user.click(screen.getByRole('button', { name: 'Send' }));
     await act(async () => {});
 
     expect(onSend).toHaveBeenCalledTimes(1);
@@ -281,10 +330,10 @@ describe('TopicComposer @all 闸门（M3 阶段 3，r13；全局 confirm 替换 
     // 第一个 confirm 挂起（pending）：模拟弹窗打开中
     mockConfirm.mockReturnValue(new Promise(() => {}));
     const onSend = jest.fn();
-    const { container } = render(<Harness onSend={onSend} mentionTargets={SEATS} />);
+    render(<Harness onSend={onSend} mentionTargets={SEATS} />);
 
     await user.type(screen.getByPlaceholderText('Type a message...'), '@all 连点');
-    const sendBtn = container.querySelector('button') as HTMLButtonElement;
+    const sendBtn = screen.getByRole('button', { name: 'Send' });
     await user.click(sendBtn);
     await user.click(sendBtn); // 弹窗打开期间连点第二次
 
@@ -342,5 +391,286 @@ describe('TopicComposer @all 闸门（M3 阶段 3，r13；全局 confirm 替换 
 
     expect(mockConfirm).not.toHaveBeenCalled();
     expect(onSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）', () => {
+  /** 构造最小上传响应（字段对齐 UploadAttachmentResponse 契约） */
+  const uploadRes = (id: string, originalName: string) => ({
+    id,
+    contentUrl: `/api/v1/attachments/${id}/content`,
+    originalName,
+    mimeType: 'image/png',
+    sizeBytes: 1024,
+    sha256: 'a'.repeat(64),
+    topicId: 'topic-1',
+    docId: null,
+    createdAt: '2026-09-09T00:00:00.000Z',
+  });
+
+  /** 构造图片 File（jsdom 支持 File/Blob） */
+  const pngFile = (name = 'photo.png', size = 1024) =>
+    new File([new Uint8Array(size)], name, { type: 'image/png' });
+
+  /** 通过隐藏 file input 选择文件（paperclip 触发同一路径） */
+  function pickFile(container: HTMLElement, file: File) {
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      target: { files: [file] },
+    });
+  }
+
+  it('成功上传：插入 `![alt](contentUrl)` 到光标 + chip 回填 + onSend 透传 ids', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-1', 'photo.png'));
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, '看这张图');
+    pickFile(container, pngFile());
+
+    await waitFor(() => {
+      expect(mockUpload).toHaveBeenCalledWith(
+        expect.any(File),
+        expect.objectContaining({ topicId: 'topic-1' }),
+      );
+    });
+    // 成功 → 光标处插入 markdown 图片链接（alt = 原始文件名）
+    await waitFor(() => {
+      expect(ta.value).toBe('看这张图![photo.png](/api/v1/attachments/att-1/content)');
+    });
+    // chip 展示文件名
+    expect(screen.getByText('photo.png')).toBeInTheDocument();
+
+    // 发送 → onSend 携带附件 id
+    await user.type(ta, '{Enter}');
+    expect(onSend).toHaveBeenCalledWith(['att-1']);
+  });
+
+  it('alt 转义：文件名含 `[ ] ( )` 不破 markdown 语法', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-2', 'a[b](c).png'));
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile('a[b](c).png'));
+
+    await waitFor(() => {
+      expect(ta.value).toBe('x![a\\[b\\]\\(c\\).png](/api/v1/attachments/att-2/content)');
+    });
+  });
+
+  it('上传失败 → toast.error + chip 移除（不残留）', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockRejectedValue(new Error('network'));
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile());
+
+    await waitFor(() => {
+      expect(mockToastError).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Image upload failed, please retry' }),
+      );
+    });
+    expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
+    expect(ta.value).toBe('x'); // 未插入链接
+  });
+
+  it('配额超限（12003）→ 单独配额文案', async () => {
+    const user = userEvent.setup();
+    const err = new Error('quota') as Error & { code?: number };
+    err.code = 12003;
+    mockUpload.mockRejectedValue(err);
+    const { container } = render(<Harness onSend={jest.fn()} />);
+
+    await user.type(textareaOf(container), 'x');
+    pickFile(container, pngFile());
+
+    await waitFor(() => {
+      expect(mockToastError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Storage quota exceeded, please clean up attachments first',
+        }),
+      );
+    });
+  });
+
+  it('超限前端拦截：>8MiB 不调 upload，直接 toast', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Harness onSend={jest.fn()} />);
+
+    await user.type(textareaOf(container), 'x');
+    pickFile(container, pngFile('big.png', 8 * 1024 * 1024 + 1));
+
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Image exceeds the 8MiB size limit' }),
+    );
+  });
+
+  it('类型前端拦截：非白名单类型不调 upload，直接 toast', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Harness onSend={jest.fn()} />);
+
+    await user.type(textareaOf(container), 'x');
+    pickFile(container, new File(['svg'], 'evil.svg', { type: 'image/svg+xml' }));
+
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Only PNG/JPEG/GIF/WebP images are supported' }),
+    );
+  });
+
+  it('chip 移除（已上传）：确认后调 DELETE + 同步剥离 textarea 链接', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-3', 'photo.png'));
+    mockConfirm.mockResolvedValue(true);
+    mockRemove.mockResolvedValue({ deleted: true });
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, '看这张图');
+    pickFile(container, pngFile());
+    await waitFor(() => {
+      expect(ta.value).toContain('![photo.png]');
+    });
+
+    // 移除 chip → 确认 → DELETE + 链接剥离
+    await user.click(screen.getByRole('button', { name: 'Remove attachment' }));
+    await act(async () => {});
+
+    expect(mockConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ description: attachmentMessages['attachments.confirmRemove'] }),
+    );
+    expect(mockRemove).toHaveBeenCalledWith('att-3');
+    expect(ta.value).toBe('看这张图'); // 死链已剥离
+    expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
+  });
+
+  it('chip 移除确认取消 → 不删不剥离', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-4', 'photo.png'));
+    mockConfirm.mockResolvedValue(false);
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile());
+    await waitFor(() => {
+      expect(ta.value).toContain('![photo.png]');
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Remove attachment' }));
+    await act(async () => {});
+
+    expect(mockRemove).not.toHaveBeenCalled();
+    expect(ta.value).toContain('![photo.png]');
+  });
+
+  it('上传中移除 chip：不调 DELETE（无 id），成功回调不插入链接', async () => {
+    const user = userEvent.setup();
+    // upload 挂起（pending）：模拟上传中
+    let resolveUpload: (v: unknown) => void = () => {};
+    mockUpload.mockReturnValue(new Promise((r) => (resolveUpload = r)));
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile());
+    await waitFor(() => {
+      expect(screen.getByText('photo.png')).toBeInTheDocument();
+    });
+
+    // 上传中移除（无确认——无 id 可删）
+    await user.click(screen.getByRole('button', { name: 'Remove attachment' }));
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
+
+    // 上传完成：不插入链接（已取消）
+    await act(async () => {
+      resolveUpload(uploadRes('att-5', 'photo.png'));
+    });
+    expect(ta.value).toBe('x');
+  });
+
+  it('onPaste 粘贴图片（全仓首例）：拦截默认粘贴 + 走上传', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-6', 'pasted.png'));
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    // 模拟剪贴板图片粘贴（clipboardData.files）
+    fireEvent.paste(ta, {
+      clipboardData: { files: [pngFile('pasted.png')] },
+    });
+
+    await waitFor(() => {
+      expect(mockUpload).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(ta.value).toBe('x![pasted.png](/api/v1/attachments/att-6/content)');
+    });
+  });
+
+  it('onPaste 非图片（文本/文件）→ 不拦截，不调 upload', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    fireEvent.paste(ta, {
+      clipboardData: { files: [new File(['txt'], 'note.txt', { type: 'text/plain' })] },
+    });
+
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  it('上传中发送被阻塞：发送按钮禁用 + Enter 不触发 onSend', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockReturnValue(new Promise(() => {})); // 挂起
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile());
+    await waitFor(() => {
+      expect(screen.getByText('photo.png')).toBeInTheDocument();
+    });
+
+    // 发送按钮禁用（上传中）
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    await user.keyboard('{Enter}');
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('发送成功后 chips 重置（附件已随消息发送，不删除）', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-7', 'photo.png'));
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile());
+    await waitFor(() => {
+      expect(ta.value).toContain('![photo.png]');
+    });
+
+    // 发送成功 → page 清空 value（受控流）→ chips 重置
+    await user.type(ta, '{Enter}');
+    expect(onSend).toHaveBeenCalledWith(['att-7']);
+    await waitFor(() => {
+      expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
+    });
+    expect(mockRemove).not.toHaveBeenCalled(); // 已发送附件不删除
   });
 });

@@ -38,6 +38,7 @@ import { CommonModule } from './common/common.module';
 
 import databaseConfig from './config/database.config';
 import jwtConfig from './config/jwt.config';
+import minioConfig from './config/minio.config';
 
 import * as entities from './database/entities';
 
@@ -59,6 +60,7 @@ import { WebhookModule } from './modules/webhook/webhook.module';
 import { MonitoringModule } from './modules/monitoring/monitoring.module';
 import { RoundtableModule } from './modules/roundtable/roundtable.module';
 import { DownloadsModule } from './modules/downloads/downloads.module';
+import { AttachmentModule } from './modules/attachments/attachment.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -67,7 +69,7 @@ import { HealthModule } from './health/health.module';
       isGlobal: true,
       // app.config 已删除（review-0831 任务 e013af33：apiPrefix/port 死配置零消费，
       // 端口由 main.ts process.env.PORT 直读，前缀由 shared API_PREFIX 单源）
-      load: [databaseConfig, jwtConfig],
+      load: [databaseConfig, jwtConfig, minioConfig],
     }),
     // 事件总线（M1 圆桌计划决策 2）：@nestjs/event-emitter forRoot() 默认 global: true，
     // 注册一次全模块可注入 EventEmitter2。EventService.create() 末尾 emit('event.created')，
@@ -123,6 +125,9 @@ import { HealthModule } from './health/health.module';
     // 下载分发（M1「最后一公里」P2）：公开提供 install-runner.sh / runner bundle / 对接指南，
     // 供 curl | bash 一键安装链路使用；无 DB 依赖、全 @Public()
     DownloadsModule,
+    // MinIO 媒体附件（P0）：上传代理校验链 + 全鉴权读取 + 配额事务，
+    // 见 modules/attachments/（plan wiccan-carnage-rocket）
+    AttachmentModule,
     HealthModule,
   ],
   providers: [

@@ -9,12 +9,16 @@
 
 /**
  * 规则头版本（chamber 统一装配并写入；演进时全平台一致升级，见 §6/§11 风险对策「规则头漂移」）
+ * v3：精简电报体——17 行四段散文压到 5 行规则（省 ~42% token/inject，CJK≈1.0 口径
+ * 348→202），同步 4 处消歧（@目标座位label / from.coordinator:true 限定路径 /
+ * 有事时…引用回应 / 主脑行（全员可见））；chamber 侧 buildRuleHeader 文本与
+ * body.ruleHeaderVersion 同步升级，runner 仅校验 >=1 整数，向后兼容。
  * v2（M2 阶段 3）：规则头「身份与路由」段新增 @all 显式广播令牌说明（R1 用户拍板，
  * mention 模式下人机皆可用；chamber 侧 buildRuleHeader 文本与 body.ruleHeaderVersion
  * 同步升级，全平台一致——runner 侧不校验具体版本值，仅要求 >=1 整数，向后兼容）。
  * v1：M1 初版（身份 / 沉默协议 / @提及路由 / 攒批语义 / 证据纪律）。
  */
-export const RULE_HEADER_VERSION = 2;
+export const RULE_HEADER_VERSION = 3;
 
 /** 沉默哨兵：整个回复仅为此文本时判定为沉默（结构化哨兵，不用裸字符串；§3/§4 上行回复约定 r3 冻结） */
 export const SILENT_SENTINEL = '{"silent": true}';
@@ -51,7 +55,7 @@ export interface InjectBody {
     /** 是否主脑座位（主脑调度指令必须 topic 明说可观测，§6） */
     coordinator: boolean;
   };
-  /** 规则头版本（当前 2；chamber 装配时写入 RULE_HEADER_VERSION） */
+  /** 规则头版本（当前 3；chamber 装配时写入 RULE_HEADER_VERSION） */
   ruleHeaderVersion: number;
   /** 攒批消息块（batch.messages 按 ts 升序，全量携带消息 id 支持下钻） */
   batch: {

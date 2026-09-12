@@ -25,6 +25,7 @@ import { Actor } from '../../database/entities/actor.entity';
 import { Board } from '../../database/entities/board.entity';
 import { Task } from '../../database/entities/task.entity';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
+import { Attachment } from '../../database/entities/attachment.entity';
 import {
   TopicStatus,
   ActorType,
@@ -184,6 +185,7 @@ describe('TopicService', () => {
   let mockResourceValidator: { exists: jest.Mock; existsMany: jest.Mock };
   let mockDataSource: jest.Mocked<DataSource>;
   let mockIdempotencyRepo: jest.Mocked<Repository<IdempotencyRecord>>;
+  let mockAttachmentRepo: jest.Mocked<Repository<Attachment>>;
   let mockEntityManager: { getRepository: jest.Mock; query: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
   let mockAuditService: { log: jest.Mock };
@@ -198,6 +200,7 @@ describe('TopicService', () => {
     mockBoardRepo = createMockRepo<Board>();
     mockTaskRepo = createMockRepo<Task>();
     mockIdempotencyRepo = createMockRepo<IdempotencyRecord>();
+    mockAttachmentRepo = createMockRepo<Attachment>();
     mockAccessQuery = {
       getAccessibleTopicIds: jest.fn().mockResolvedValue(null),
     } as unknown as jest.Mocked<AccessQueryService>;
@@ -331,6 +334,7 @@ describe('TopicService', () => {
         { provide: DataSource, useValue: mockDataSource },
         { provide: ActorProfileService, useValue: mockActorProfileService },
         { provide: AuditService, useValue: mockAuditService },
+        { provide: getRepositoryToken(Attachment), useValue: mockAttachmentRepo },
       ],
     }).compile();
 
@@ -1605,6 +1609,89 @@ describe('TopicService', () => {
       expect(result.messages[0]).not.toHaveProperty('seatLabel');
     });
 
+    it('attachments 投影恒存在（mapToMessageDtos/P1）：有索引→5 字段+contentUrl；无索引→[]；垃圾键→防御过滤', async () => {
+      // 合法索引：sizeBytes 兼容 number 与 bigint-string 双形态（读库实体 jsonb 保真）
+      const msgValid = createMockMessage({
+        id: 'msg-a',
+        senderId: 'agent-1',
+        senderType: ActorType.AGENT,
+        metadata: {
+          attachments: [
+            { id: 'att-1', originalName: '图.png', mimeType: 'image/png', sizeBytes: 2048 },
+            {
+              id: 'att-2',
+              originalName: 'doc.pdf',
+              mimeType: 'application/pdf',
+              sizeBytes: '5120',
+            },
+          ],
+        },
+      });
+      // 无索引：恒存在 []，不泄露 metadata 键
+      const msgNone = createMockMessage({
+        id: 'msg-b',
+        senderId: 'agent-2',
+        senderType: ActorType.AGENT,
+        metadata: { internalNote: 'must-not-leak' },
+      });
+      // 垃圾键攻击矩阵：非数组 / 缺 id / NaN sizeBytes / 非 string originalName·mimeType
+      const msgGarbage = createMockMessage({
+        id: 'msg-c',
+        senderId: 'agent-3',
+        senderType: ActorType.AGENT,
+        metadata: {
+          attachments: [
+            'not-an-object',
+            { originalName: 'no-id.png', mimeType: 'image/png', sizeBytes: 1 },
+            {
+              id: 'att-nan',
+              originalName: 'nan.bin',
+              mimeType: 'application/octet-stream',
+              sizeBytes: NaN,
+            },
+            { id: 'att-num', originalName: 42, mimeType: 'image/png', sizeBytes: 1 },
+            { id: 'att-mime', originalName: 'x.bin', mimeType: 42, sizeBytes: 1 },
+          ],
+        },
+      });
+      const qbMock = createMockQueryBuilder([msgValid, msgNone, msgGarbage], 3);
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Bot-1', avatarUrl: null } as Agent,
+        { id: 'agent-2', name: 'Bot-2', avatarUrl: null } as Agent,
+        { id: 'agent-3', name: 'Bot-3', avatarUrl: null } as Agent,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+      const byId = new Map(result.messages.map((m) => [m.id, m]));
+
+      // 有索引 → 5 字段全命中，sizeBytes 归一 number，contentUrl 由 buildContentUrl 派生
+      expect(byId.get('msg-a')!.attachments).toEqual([
+        {
+          id: 'att-1',
+          originalName: '图.png',
+          mimeType: 'image/png',
+          sizeBytes: 2048,
+          contentUrl: '/api/v1/attachments/att-1/content',
+        },
+        {
+          id: 'att-2',
+          originalName: 'doc.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: 5120,
+          contentUrl: '/api/v1/attachments/att-2/content',
+        },
+      ]);
+      // 无索引 → 恒存在 []
+      expect(byId.get('msg-b')!.attachments).toEqual([]);
+      // 垃圾键全丢弃 → []
+      expect(byId.get('msg-c')!.attachments).toEqual([]);
+      // 不泄露 metadata（隐私/体积）
+      for (const m of result.messages) expect(m).not.toHaveProperty('metadata');
+    });
+
     it('should handle empty results', async () => {
       const qbMock = createMockQueryBuilder([], 0);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
@@ -2193,6 +2280,8 @@ describe('TopicService', () => {
         replyTo: savedMessage.replyToId,
         type: savedMessage.type,
         createdAt: savedMessage.createdAt,
+        // 附件投影恒存在（P1）：无索引 → []
+        attachments: [],
       });
     });
 
@@ -2645,6 +2734,266 @@ describe('TopicService', () => {
           clientRequestId: 'req-msg-003',
         }),
       ).rejects.toThrow('other unique violation');
+    });
+
+    // ── 附件绑定（MinIO 媒体附件 P0，plan §4.1/§0.4）─────────────────
+    // 校验规则：全部存在(404/12000) + 上传者=发送者(403/12004) + 绑定本
+    // topic(403/12004)；通过后服务端覆盖写 metadata.attachments 索引，
+    // 无 attachmentIds 时堵漏删除自传键；响应恒存在 attachments 投影（P1）。
+    describe('attachmentIds 绑定', () => {
+      /** 合法附件行（uploader=user-1、绑定 topic-1） */
+      function createMockAttachment(overrides: Partial<Attachment> = {}): Attachment {
+        return {
+          id: 'att-1',
+          uploaderId: 'user-1',
+          topicId: 'topic-1',
+          docId: null,
+          originalName: 'photo.png',
+          mimeType: 'image/png',
+          sizeBytes: '2048',
+          ...overrides,
+        } as Attachment;
+      }
+
+      it('绑定成功：metadata.attachments 索引落库（sizeBytes number），且保留 dto.metadata 其他键', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const att = createMockAttachment();
+        mockAttachmentRepo.find.mockResolvedValue([att]);
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'see image',
+          metadata: { customKey: 'keep-me', attachments: 'client-forged' },
+          attachmentIds: ['att-1'],
+        });
+
+        // IN 查询按 ids 全量取（find 默认滤软删——软删附件按不存在 404）
+        expect(mockAttachmentRepo.find).toHaveBeenCalledWith({ where: { id: In(['att-1']) } });
+        // 服务端索引覆盖客户端伪造的 attachments 键；其他键保留
+        expect(mockMessageRepo.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            metadata: {
+              customKey: 'keep-me',
+              attachments: [
+                { id: 'att-1', originalName: 'photo.png', mimeType: 'image/png', sizeBytes: 2048 },
+              ],
+            },
+          }),
+        );
+        // 响应恒存在 attachments 投影（P1 契约：无索引 → []；该 mock 的 savedMessage
+        // metadata 为空，故此处为 []——有索引的响应投影见下方独立用例）
+        expect(result.attachments).toEqual([]);
+      });
+
+      it('任一附件不存在 → 404 ATTACHMENT_NOT_FOUND（12000），且不创建消息', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([]); // att-missing 查无
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'hi',
+            attachmentIds: ['att-missing'],
+          }),
+        ).rejects.toMatchObject({
+          response: { code: ErrorCode.ATTACHMENT_NOT_FOUND },
+        });
+        expect(mockMessageRepo.create).not.toHaveBeenCalled();
+      });
+
+      it('上传者≠发送者 → 403 ATTACHMENT_FORBIDDEN（12004）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({ uploaderId: 'someone-else' }),
+        ]);
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'hi',
+            attachmentIds: ['att-1'],
+          }),
+        ).rejects.toMatchObject({ response: { code: ErrorCode.ATTACHMENT_FORBIDDEN } });
+        expect(mockMessageRepo.create).not.toHaveBeenCalled();
+      });
+
+      it('绑定他 topic → 403 ATTACHMENT_FORBIDDEN（12004）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({ topicId: 'topic-other' }),
+        ]);
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'hi',
+            attachmentIds: ['att-1'],
+          }),
+        ).rejects.toMatchObject({ response: { code: ErrorCode.ATTACHMENT_FORBIDDEN } });
+      });
+
+      it('doc 绑定附件（topicId=null）用于消息 → 403 ATTACHMENT_FORBIDDEN（单绑定模型）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({ topicId: null, docId: 'doc-1' }),
+        ]);
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'hi',
+            attachmentIds: ['att-1'],
+          }),
+        ).rejects.toMatchObject({ response: { code: ErrorCode.ATTACHMENT_FORBIDDEN } });
+      });
+
+      it('空数组 → 不查附件表、不写 attachments 键（语义=未传）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'hi',
+          attachmentIds: [],
+        });
+
+        expect(mockAttachmentRepo.find).not.toHaveBeenCalled();
+        expect(mockMessageRepo.create).toHaveBeenCalledWith(
+          expect.objectContaining({ metadata: {} }),
+        );
+      });
+
+      it('响应投影（正常路径）：sendMessage 返回含服务端索引的消息 → attachments 恒存在且 5 字段 + contentUrl', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({ originalName: '图.png', sizeBytes: '2048' }),
+        ]);
+        // buildMessageResponse 的投影源 = savedMessage.metadata（落库实体），
+        // 服务端索引形状（无 contentUrl——索引不含投影 URL，响应层派生）
+        const savedMessage = createMockMessage({
+          metadata: {
+            customKey: 'keep-me',
+            attachments: [
+              { id: 'att-1', originalName: '图.png', mimeType: 'image/png', sizeBytes: 2048 },
+            ],
+          },
+        });
+        mockMessageRepo.create.mockReturnValue(savedMessage);
+        mockMessageRepo.save.mockResolvedValue(savedMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'see image',
+          attachmentIds: ['att-1'],
+        });
+
+        expect(result.attachments).toEqual([
+          {
+            id: 'att-1',
+            originalName: '图.png',
+            mimeType: 'image/png',
+            sizeBytes: 2048,
+            contentUrl: '/api/v1/attachments/att-1/content',
+          },
+        ]);
+        // 投影只透索引，不透全量 metadata（隐私/体积：customKey 不得外泄）
+        expect(result).not.toHaveProperty('metadata');
+      });
+
+      it('堵漏：attachmentIds 显式传 [] 但 metadata 自传伪造 attachments 键 → 落库 metadata 不含该键（恒存在投影由响应层派生，落库零索引）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const forged = {
+          id: 'att-forged',
+          originalName: 'x.png',
+          mimeType: 'image/png',
+          sizeBytes: 1,
+        };
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+        const dto = {
+          content: 'hi',
+          attachmentIds: [],
+          // DTO 校验放行（metadata 是自由 Record<string, unknown>；attachmentIds 空数组合法）
+          metadata: { attachments: [forged], otherKey: 'keep' },
+        };
+
+        const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, dto);
+
+        // 堵漏分支：不查附件表；落库 metadata 剔除 attachments 键、其余键保留
+        expect(mockAttachmentRepo.find).not.toHaveBeenCalled();
+        expect(mockMessageRepo.create).toHaveBeenCalledWith(
+          expect.objectContaining({ metadata: { otherKey: 'keep' } }),
+        );
+        expect(
+          (mockMessageRepo.create.mock.calls[0][0] as { metadata: Record<string, unknown> })
+            .metadata,
+        ).not.toHaveProperty('attachments');
+        // 调用方 dto 不被原地污染（展开拷贝防浅拷贝串味——评审 N1）
+        expect(dto.metadata).toHaveProperty('attachments', [forged]);
+        // 响应投影恒存在（createdMessage.metadata={} → []）
+        expect(result.attachments).toEqual([]);
+      });
+
+      it('响应投影（replay 路径）：幂等 23505 重放返回与正常路径同形状（含 attachments 5 字段）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        // 事务抛 23505 触发 replay 查找
+        const pgError = Object.assign(new Error('duplicate key'), {
+          code: '23505',
+          constraint: 'uq_idempotency_actor_key',
+        });
+        mockDataSource.transaction.mockRejectedValueOnce(pgError);
+        mockIdempotencyRepo.findOne.mockResolvedValue({
+          id: 'rec-3',
+          actorId: 'user-1',
+          clientRequestId: 'req-msg-003',
+          entityType: 'message',
+          entityId: 'msg-existing-3',
+        } as IdempotencyRecord);
+        // 存量消息带服务端索引（replay 读库实体）
+        mockMessageRepo.findOne.mockResolvedValue(
+          createMockMessage({
+            id: 'msg-existing-3',
+            content: 'Existing',
+            senderId: 'user-1',
+            metadata: {
+              attachments: [
+                { id: 'att-1', originalName: 'photo.png', mimeType: 'image/png', sizeBytes: 2048 },
+              ],
+            },
+          }),
+        );
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'Hello',
+          clientRequestId: 'req-msg-003',
+        });
+
+        expect(result).toHaveProperty('idempotentReplay', true);
+        // 与正常路径同形状：投影由同一 buildMessageResponse 构建
+        expect(result.attachments).toEqual([
+          {
+            id: 'att-1',
+            originalName: 'photo.png',
+            mimeType: 'image/png',
+            sizeBytes: 2048,
+            contentUrl: '/api/v1/attachments/att-1/content',
+          },
+        ]);
+        expect(result).not.toHaveProperty('metadata');
+      });
     });
   });
 

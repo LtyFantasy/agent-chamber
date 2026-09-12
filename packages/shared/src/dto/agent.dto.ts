@@ -53,17 +53,39 @@ export interface UpdateAgentInput {
 }
 
 /**
- * Agent 心跳请求输入
+ * Agent 心跳请求输入（plan plastic-man-wonder-man-raven.md §1，全部字段可选）
+ *
+ * 写入语义 =「全列快照 upsert」：agent_heartbeats 每 agent 恒一行，未提供的遥测列
+ * 被显式清空（省略 = null/0/{}），调用方必须每拍全量自报；status 省略回退 agent
+ * 当前 status，timestamp 省略 = now()，lastError 非空时服务端同步写 lastErrorAt。
  */
 export interface AgentHeartbeatInput {
-  /** 状态 */
-  status?: string;
-  /** 负载 */
+  /** 状态（省略时服务端回退 agent 当前 status，不回退上一拍心跳值） */
+  status?: AgentStatus;
+  /** 负载（折叠进 meta.load 存储） */
   load?: number;
-  /** 版本 */
+  /** 版本（折叠进 meta.version 存储） */
   version?: string;
-  /** 时间戳 */
+  /** 上报时刻（ISO 8601；省略时服务端取 now()） */
   timestamp?: string;
+  /** 延迟毫秒数 */
+  latencyMs?: number;
+  /** 内存占用 MB */
+  memoryMb?: number;
+  /** CPU 百分比（0~100） */
+  cpuPercent?: number;
+  /** 活跃任务数 */
+  activeTasks?: number;
+  /** 队列深度 */
+  queueDepth?: number;
+  /** 已处理事件数（累计） */
+  processedEvents?: number;
+  /** 错误计数（累计） */
+  errorCount?: number;
+  /** 最近错误信息；非空时服务端同步写 lastErrorAt = timestamp */
+  lastError?: string;
+  /** 扩展元数据（load/version 折叠进本字段，与 meta 键共存） */
+  meta?: Record<string, unknown>;
 }
 
 /**

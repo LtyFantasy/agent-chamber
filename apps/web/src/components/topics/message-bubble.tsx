@@ -34,7 +34,7 @@
  * =============================================================================
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -55,6 +55,7 @@ import type { Message } from '@/types';
 import { ActorType, MessageType } from '@/types';
 import { formatRelativeTime } from '@/lib/utils';
 import { MARKDOWN_CHAT_CLASSES } from '@/lib/markdown-classes';
+import { createMarkdownComponents } from '@/lib/markdown-components';
 import { CollapsibleMarkdown } from '@/components/topics/collapsible-markdown';
 import { Badge } from '@/components/ui/badge';
 import { confirm } from '@/lib/notify';
@@ -90,6 +91,10 @@ export function MessageBubble({
 }) {
   const t = useTranslations('topics');
   const locale = useLocale();
+  // 共享 markdown components（plan §5.2）：a 覆盖（外部链接新标签）+ img →
+  // AttachmentImage（附件鉴权 blob 加载）。system 公告条与 thinking 过程记录
+  // 两处 ReactMarkdown 不接本工厂——平台生成内容，无附件场景（plan §5.2 排除项）。
+  const markdownComponents = useMemo(() => createMarkdownComponents(), []);
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
   // 不防则连点排队两个确认框——确认两次 = 重复删除消息）
   const deleteConfirmPendingRef = useRef(false);
@@ -218,7 +223,9 @@ export function MessageBubble({
             } ${MARKDOWN_CHAT_CLASSES}`}
           >
             {/* p 是真正持有文本的块元素：折叠态把 truncate 落在 p 上才出省略号
-                （wrapper 的 truncate 对块级 p 只裁剪不出省略号）；展开态 p 恢复换行 */}
+                （wrapper 的 truncate 对块级 p 只裁剪不出省略号）；展开态 p 恢复换行。
+                不接共享 markdownComponents 工厂（plan §5.2 排除项）：系统公告为
+                平台生成内容，无附件场景，保持轻量 p 覆盖 */}
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
@@ -411,7 +418,9 @@ export function MessageBubble({
             {thinkingExpanded ? t('message.collapse') : t('message.thinkingSummary')}
           </button>
           {/* 展开态渲染完整 markdown（不挂 CollapsibleMarkdown——其 88px 实测阈值
-              会把长过程记录再次截断，违背「展开后完整可见」语义） */}
+              会把长过程记录再次截断，违背「展开后完整可见」语义）。
+              不接共享 markdownComponents 工厂（plan §5.2 排除项）：thinking 为
+              平台生成过程记录，无附件场景 */}
           {thinkingExpanded && (
             <div
               data-testid="thinking-content"
@@ -431,7 +440,9 @@ export function MessageBubble({
               : ''
           }`}
         >
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            {msg.content}
+          </ReactMarkdown>
         </CollapsibleMarkdown>
       )}
     </div>

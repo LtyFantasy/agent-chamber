@@ -139,8 +139,11 @@ check_db() {
   if ! docker ps --format '{{.Names}}' | grep -q "chamber-postgres"; then
     log_warn "Docker PostgreSQL 容器未运行，尝试启动..."
     cd "$PROJECT_ROOT"
-    docker-compose up -d 2>/dev/null || docker compose up -d 2>/dev/null || {
-      log_err "无法启动数据库，请手动执行: docker-compose up -d"
+    # scoped 启动（只拉 postgres）：本函数本意只是要 PG；不带服务名的
+    # `docker-compose up -d` 会无差别拉起 compose 全量服务——minio 进 compose 后
+    # 在 9000 被占用机上必炸，web/backend/mcp 也会被误启（2026-09-09 连带必修）
+    docker-compose up -d postgres 2>/dev/null || docker compose up -d postgres 2>/dev/null || {
+      log_err "无法启动数据库，请手动执行: docker-compose up -d postgres"
       exit 1
     }
     sleep 3

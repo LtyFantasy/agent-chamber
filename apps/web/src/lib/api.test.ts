@@ -173,3 +173,71 @@ describe('Api 拦截器（authHooks 注入，review-0831 任务 04e8d744 拆环�
     // URL 不实际变化；跳转行为由 e2e/手测覆盖，此用例只钉死 onUnauthorized 契约。
   });
 });
+
+describe('Api.attachments（MinIO 媒体附件 P0，plan §5.1）', () => {
+  beforeEach(() => {
+    mockRequest.mockReset();
+  });
+
+  it('upload：FormData + 覆盖默认 Content-Type + 绑定参数透传', async () => {
+    mockRequest.mockResolvedValueOnce({
+      data: {
+        data: {
+          id: 'att-1',
+          contentUrl: '/api/v1/attachments/att-1/content',
+          originalName: 'a.png',
+          mimeType: 'image/png',
+          sizeBytes: 1,
+          sha256: 'a'.repeat(64),
+          topicId: 't1',
+          docId: null,
+          createdAt: '2026-09-09T00:00:00.000Z',
+        },
+      },
+    });
+    const file = new File(['x'], 'a.png', { type: 'image/png' });
+
+    await Api.attachments.upload(file, { topicId: 't1' });
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: '/attachments',
+        params: { topicId: 't1' },
+        // 覆盖实例默认 application/json——axios 自动追加 multipart boundary
+        headers: { 'Content-Type': 'multipart/form-data' },
+      }),
+    );
+    const call = mockRequest.mock.calls[0][0];
+    expect(call.data).toBeInstanceOf(FormData);
+    expect(call.data.get('file')).toBe(file);
+  });
+
+  it('remove：DELETE 到附件 id', async () => {
+    mockRequest.mockResolvedValueOnce({ data: { data: { deleted: true } } });
+
+    await Api.attachments.remove('att-1');
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'DELETE', url: '/attachments/att-1' }),
+    );
+  });
+
+  it('getMine：分页参数透传', async () => {
+    mockRequest.mockResolvedValueOnce({
+      data: {
+        data: { items: [], total: 0, page: 2, pageSize: 50, hasNext: false, hasPrev: false },
+      },
+    });
+
+    await Api.attachments.getMine(2, 50);
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'GET',
+        url: '/attachments/mine',
+        params: { page: 2, pageSize: 50 },
+      }),
+    );
+  });
+});

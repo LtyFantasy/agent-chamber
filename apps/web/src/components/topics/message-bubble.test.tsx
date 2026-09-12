@@ -68,6 +68,8 @@ function makeMessage(overrides: Partial<Message> = {}): Message {
     senderName: 'Agent One',
     content: 'Hello world',
     createdAt: new Date('2024-01-01T00:00:00Z'),
+    // 契约补齐（P1）：附件投影恒存在（无附件 = []）
+    attachments: [],
     ...overrides,
   };
 }

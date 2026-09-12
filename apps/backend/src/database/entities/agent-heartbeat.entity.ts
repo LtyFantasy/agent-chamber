@@ -11,7 +11,10 @@ import { AgentStatus } from '@agent-chamber/shared';
 import { Actor } from './actor.entity';
 
 @Entity('agent_heartbeats')
-@Index(['agentId'])
+// 每 agent 恒一行（全列快照 upsert 的落点）；同名迁移
+// AddAgentHeartbeatUniqueAgentId<ts>：DROP + CREATE UNIQUE 同名重建（无 IF NOT EXISTS），
+// down 恢复非唯一。唯一索引是 upsert ON CONFLICT (agent_id) 的前提
+@Index(['agentId'], { unique: true })
 export class AgentHeartbeat {
   @PrimaryGeneratedColumn('uuid')
   id: string;

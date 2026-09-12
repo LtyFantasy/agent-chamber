@@ -197,3 +197,18 @@ describe('AgentsPage 删除确认弹窗（统一批 B 影响面提示）', () =>
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('a1'));
   });
 });
+
+describe('AgentsPage 详情页入口（遥测 follow-up F1）', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockListAll.mockResolvedValue([AGENT]);
+  });
+
+  it('agent 名字渲染为链接，href 指向 /agents/<id> 遥测详情页', async () => {
+    renderPage();
+
+    // 名字即入口（暗页 → 可达）；next/link 在 jsdom 渲染为普通 <a>
+    const link = await screen.findByRole('link', { name: 'Agent One' });
+    expect(link).toHaveAttribute('href', '/agents/a1');
+  });
+});

@@ -185,7 +185,9 @@ describe('DocSpace 写族 clientRequestId 幂等 — 真实 PG 集成', () => {
     // 专用哨兵 actor，并行安全），覆盖用例内临时 doc 的 audit 行
     await ds.getRepository(AuditLog).delete({ actorId: testActor.id });
     await ds.destroy();
-  });
+    // 尾随参数显式放宽钩子超时：全量 e2e 并行负载下清理排队可能超过 jest 默认
+    // 5000ms（任务 7c2126dd 实测 suite 级 FAIL），与 beforeAll 的 30000 对齐
+  }, 30000);
 
   // ── upsert ─────────────────────────────────────────────────
 

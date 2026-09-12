@@ -194,7 +194,11 @@ export default function AgentDetailPage() {
                       </div>
                       <div className="flex items-center gap-3 text-sm text-muted-foreground">
                         <span>{t('dailyMessages', { count: day.messageCount })}</span>
-                        <span>{t('dailyTokens', { count: day.tokenUsage })}</span>
+                        {/* tokenUsage 键已从 stats 响应移除（optional 类型）；undefined 不渲染
+                            tokens 段，消灭恒 "0 tokens" 假观感（plan plastic-man-wonder-man-raven.md R6） */}
+                        {day.tokenUsage !== undefined && (
+                          <span>{t('dailyTokens', { count: day.tokenUsage })}</span>
+                        )}
                       </div>
                     </div>
                   ))}

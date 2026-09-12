@@ -145,6 +145,9 @@ describe('已删除 Actor 消息/参与者投影语义 — 真实 PG 集成', ()
       {} as never, // ownerProxy（未触达）
       actorProfileService,
       auditService, // 活动日志插桩（Phase 2）——本套件只读路径不触发，真实例防误触
+      // v2 消息附件绑定（plan §4.1）：TopicService 构造末尾追加的 attachmentRepo；
+      // 本套件不触达 sendMessage attachmentIds 路径，空桩即可
+      {} as never,
     );
     agentService = new AgentService(
       ds.getRepository(Agent),

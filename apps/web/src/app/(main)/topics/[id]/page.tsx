@@ -172,7 +172,19 @@ export default function TopicDetailPage() {
   });
 
   const sendMessageMutation = useMutation({
-    mutationFn: (content: string) => Api.topics.sendMessage(id, { content }),
+    mutationFn: (input: { content: string; attachmentIds?: string[] }) =>
+      Api.topics.sendMessage(id, {
+        content: input.content,
+        attachmentIds: input.attachmentIds,
+      }),
+    onError: (err) => {
+      // plan §0.4：发送失败补 onError toast（此前无——失败静默，用户误以为已发送）。
+      // 范式照抄 docs 页 alertMutationError：优先服务端 message，兜底 axios message
+      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
+      toast.error({
+        title: axiosErr?.response?.data?.message || axiosErr?.message || t('message.sendFailed'),
+      });
+    },
     onSuccess: (rawMessage: Message) => {
       // 乐观更新：将新消息添加到第一页（最新消息页），避免丢失已加载的历史分页
       const optimisticMessage: import('@/types').Message = {
@@ -185,6 +197,8 @@ export default function TopicDetailPage() {
         content: rawMessage.content,
         replyTo: (rawMessage as unknown as { replyToId?: string }).replyToId || undefined,
         createdAt: rawMessage.createdAt,
+        // 契约补齐（P1）：附件投影恒存在；乐观消息无附件 → []（UI 不消费该字段）
+        attachments: [],
       };
 
       // 乐观更新：使用与实际 useInfiniteQuery 完全匹配的 queryKey（含 filterSender 参数）
@@ -567,9 +581,9 @@ export default function TopicDetailPage() {
     );
   }, [isRoundtable, topic, seatsData]);
 
-  const handleSend = () => {
+  const handleSend = (attachmentIds: string[]) => {
     if (!messageContent.trim()) return;
-    sendMessageMutation.mutate(messageContent);
+    sendMessageMutation.mutate({ content: messageContent, attachmentIds });
   };
 
   const openConfirm = (type: 'close' | 'archive') => {
@@ -1278,6 +1292,7 @@ export default function TopicDetailPage() {
             value={messageContent}
             onChange={setMessageContent}
             onSend={handleSend}
+            topicId={id}
             disabled={sendMessageMutation.isPending}
             isSending={sendMessageMutation.isPending}
             placeholder={t('message.inputPlaceholder')}

@@ -1,18 +1,56 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
+ * [功能概念]
+ *   - Agent 账户生命周期：findAll/findOne/update/remove/toggle/resetKey/revokeKey
+ *     （docs/architecture.md §3.2.1 Account / Auth / Agent）
+ *   - Agent 遥测（plan plastic-man-wonder-man-raven.md）：stats = 真聚合三计数 +
+ *     dailyActivity UTC 分桶；heartbeat = agent_heartbeats 表全列快照 upsert
+ *     （每 agent 最新一份完整自报）
+ *
+ * [代码职责]
+ *   - 领域逻辑在 service 层，控制器薄（controller 只做权限 + 白名单裁剪）
+ *   - stats/heartbeat **零构造函数变更**：stats 走 this.agentRepo.manager raw SQL
+ *     （对齐 findAll/getDeletionImpact 风格）；heartbeat 用
+ *     manager.getRepository(AgentHeartbeat) + manager.transaction（A3-1 先例）
+ *
+ * [权威文档]
  *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
- *   - 补充: docs/api-definition.md §5. Agents
+ *   - 补充: docs/api-definition.md §5. Agents（§5.8 stats / §5.14 heartbeat）
  *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（revokeKey service 层
  *     插桩 + 可选 operatorActorId，决策 8 同构——key 实体字段 controller 不可得）
  *
- * [踩坑索引] B-46(PATCH清空字段) B-47(topics返回null) D-3(controller预存失败) A3-1(remove事务吊销Key) A3-2(seatCount须jsonb路径)
+ * [关键不变量]
+ *   - 构造函数参数不得增减：三个手工 new AgentService(...) 真 PG e2e 套件
+ *     （test/agent-deletion-impact.e2e-spec.ts / agent-unread.e2e-spec.ts /
+ *     deleted-actor-projection.e2e-spec.ts）依赖 7 参签名
+ *   - heartbeat 是「全列快照」upsert（ON CONFLICT (agent_id) DO UPDATE 全列覆盖）：
+ *     省略字段被有意清空，不做逐字段合并（与 topic.service.ts 自动 join 的合并相反）；
+ *     created_at 未显式给值 → upsert overwrite 列表不含它 → 首次心跳时间保留
+ *   - 快照行构造：status 省略回退 agent 当前 status（NOT NULL 23502 防线）；
+ *     timestamp 省略 = now()；lastError 非空时 lastErrorAt = timestamp；
+ *     load/version 折叠进 meta
+ *   - stats 窗口仅作用于 dailyActivity：UTC 分桶 to_char(AT TIME ZONE 'UTC','YYYY-MM-DD')、
+ *     日期 DESC、[from,to) 半开；date-only 的 to 含当日（< to+1d UTC）；
+ *     非法 ISO / 空窗口(from≥to) / 跨度>90d → 400 VALIDATION_ERROR
+ *   - dailyActivity 行不再返回 tokenUsage 键（shared 类型 optional）；
+ *     前端 page.tsx:197 条件渲染，不显示假 "0 tokens"
  *
- * [铁律关联] #11(代理层透传) #12(文档联动) #23(jsonb查询集成覆盖)
+ * [关联代码]
+ *   - agent.controller.ts stats/heartbeat — 权限（JwtOrApiKeyGuard + ensureCan 'write'）+ @ApiQuery
+ *   - entities/agent-heartbeat.entity.ts — @Index(['agentId'], { unique: true }) 唯一索引
+ *   - dto/agent-heartbeat.dto.ts — 全可选遥测字段 + @IsEnum/@IsISO8601（pipe 层拦格式错）
+ *   - packages/shared/src/dto/agent.dto.ts + agent-response.dto.ts — 契约类型
+ *   - test/agent-telemetry.e2e-spec.ts — 真 PG 集成覆盖（stats 真值 + 快照语义 + 窗口 400）
  *
- * [详细踩坑]（最多 5 条，按严重/最近排序）
+ * [持久踩坑]
+ *   - RT-STATS-1(UTC 分桶)：dailyActivity 必须 to_char(AT TIME ZONE 'UTC') + 日期 DESC，
+ *     时区/格式双钉死；窗口是 [from, to) 半开区间。详情: plan plastic-man-wonder-man-raven.md §1
+ *   - RT-HB-1(快照语义)：heartbeat upsert 全列覆盖，不是 merge——第二次心跳省略的字段
+ *     会被清空，调用方必须每拍全量自报。详情: plan plastic-man-wonder-man-raven.md R1
+ *
+ * [详细踩坑]（既有，按严重/最近排序，最多 5 条）
  *   A3-1: remove() 若先软删后吊销 Key，revoke 失败会留下"agent 已删但 Key 仍活跃"的
  *         半完成态。修复：事务包裹（先批量 revoke 后软删），revoke 失败整体回滚，
  *         agent 未删可恢复。revokedReason='agent deleted' 为本次新增（resetKey 先例未设）。
@@ -30,12 +68,13 @@
  *         状态：待修，不影响实际功能。见 PROJECT.md §5.5 D3
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
+ *   □ 已读 [权威文档] 确认修改符合设计意图
+ *   □ 如果设计文档已过时，同步更新文档（铁律 #12 / 本文件两端 AGENT-DOC-HOOK）
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as crypto from 'crypto';
@@ -43,6 +82,7 @@ import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { ApiKey } from '../../database/entities/api-key.entity';
 import { RoundtableSeat } from '../../database/entities/roundtable-seat.entity';
+import { AgentHeartbeat } from '../../database/entities/agent-heartbeat.entity';
 import {
   AgentStatus,
   ErrorCode,
@@ -56,6 +96,7 @@ import type {
   PaginatedResponse,
   Agent as AgentDto,
   AgentDeletionImpact,
+  AgentStats,
   TopicUnreadCount,
 } from '@agent-chamber/shared';
 import {
@@ -838,25 +879,227 @@ export class AgentService {
     return { id: agent.id, status: agent.status };
   }
 
-  async stats(id: string, query: Record<string, unknown>) {
+  /**
+   * Agent 统计聚合（plan plastic-man-wonder-man-raven.md §1，替代原硬编码全零）
+   *
+   * 三路 all-time 计数走 raw SQL（对齐 getDeletionImpact :775-791 风格；状态字面量
+   * 经 shared 枚举模板插值，受信代码无注入面）：
+   * - messageCount：messages.sender_id = id 且未软删（all-time，不随窗口收窄）
+   * - topicCount：topic_participants.participant_id = id 且 status IN (invited,active)
+   *   **且 JOIN topics 未软删**（R5：与 findAll :192 口径一致，消除列表页/详情页数字不一致）
+   * - taskCount：tasks.assignee_id = id 且未软删（all-time）
+   *
+   * dailyActivity：仅作用于窗口内（[from,to) UTC 半开区间，SQL `>= $2 AND < $3` 实现），
+   * `to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD')` 分桶（时区/格式双钉死，
+   * RT-STATS-1），仅含有消息的日期，日期 DESC；行结构 {date, messageCount}——
+   * **不再返回 tokenUsage 键**（shared 类型改 optional，前端条件渲染不显示假 "0 tokens"）。
+   *
+   * avgResponseTime/tokenUsage 恒 0：无数据源、保留字段（前端 falsy → '-'）。
+   *
+   * @param id    agent id（不存在/已软删 → findOne 抛 404，铁律 #22）
+   * @param query 查询参数（from/to 可选，语义见 resolveStatsWindow；
+   *              非法 ISO / 空窗口 / 跨度>90d → 400 VALIDATION_ERROR）
+   * @returns AgentStats 契约（period 回显有效窗口 [fromEff, toEff)）
+   */
+  async stats(id: string, query: Record<string, unknown>): Promise<AgentStats> {
+    // findOne 对软删 agent 抛 404（前置判空，铁律 #22）
     const agent = await this.findOne(id);
+
+    const [fromEff, toEff] = this.resolveStatsWindow(query);
+
+    // 三路 all-time 计数（软删过滤手写，raw SQL——mock 单测测不出 SQL 生成，
+    // 真实 SQL 语义由 test/agent-telemetry.e2e-spec.ts 打真实 PG 覆盖）
+    const [messageCount, topicCount, taskCount] = await Promise.all([
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(id) as count FROM messages
+         WHERE sender_id = $1 AND deleted_at IS NULL`,
+        [id],
+      ),
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(tp.topic_id) as count FROM topic_participants tp
+         INNER JOIN topics t ON t.id = tp.topic_id
+         WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}', '${ParticipantStatus.ACTIVE}') AND t.deleted_at IS NULL`,
+        [id],
+      ),
+      this.agentRepo.manager.query<Array<{ count: string }>>(
+        `SELECT COUNT(id) as count FROM tasks
+         WHERE assignee_id = $1 AND deleted_at IS NULL`,
+        [id],
+      ),
+    ]);
+
+    // dailyActivity：UTC 分桶 + 日期 DESC，仅窗口内消息（不返回 tokenUsage 键）
+    const dailyRows = (await this.agentRepo.manager.query<
+      Array<{ date: string; messageCount: string }>
+    >(
+      `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date, COUNT(id) AS "messageCount"
+       FROM messages
+       WHERE sender_id = $1 AND deleted_at IS NULL AND created_at >= $2 AND created_at < $3
+       GROUP BY date
+       ORDER BY date DESC`,
+      [id, fromEff, toEff],
+    )) as Array<{ date: string; messageCount: string }>;
+
     return {
       agentId: agent.id,
-      period: query,
-      messageCount: 0,
-      topicCount: 0,
-      taskCount: 0,
+      period: { from: fromEff.toISOString(), to: toEff.toISOString() },
+      messageCount: parseInt(messageCount[0]?.count ?? '0', 10),
+      topicCount: parseInt(topicCount[0]?.count ?? '0', 10),
+      taskCount: parseInt(taskCount[0]?.count ?? '0', 10),
+      // 恒 0：无数据源、保留字段（前端 falsy → '-'，无假观感）
       avgResponseTime: 0,
       tokenUsage: 0,
-      dailyActivity: [],
+      // 行结构 {date, messageCount}——tokenUsage 键不再返回（R6）
+      dailyActivity: dailyRows.map((r) => ({
+        date: r.date,
+        messageCount: parseInt(r.messageCount, 10),
+      })),
     };
   }
 
-  async heartbeat(id: string, _dto: AgentHeartbeatDto) {
+  /**
+   * 心跳落库（plan plastic-man-wonder-man-raven.md §1，替代原"丢弃 DTO 只更新
+   * lastActiveAt"的假写）
+   *
+   * 写入语义 = **全列快照 upsert**（R1）：agent_heartbeats 每 agent 恒一行，
+   * `ON CONFLICT (agent_id) DO UPDATE` 全列覆盖——第二次心跳省略的字段被**有意清空**
+   * （"每 agent 最新一份完整自报"；与 topic.service.ts :126-133 的逐字段合并需求相反，
+   * 故 ORM upsert 全列行即可，无需手写 SQL）。created_at 未在 snapshot 上显式给值，
+   * TypeORM upsert 的 overwrite 列表不含它 → 冲突时不被刷新（首次心跳时间保留）。
+   *
+   * 快照行构造（RT-HB-1）：
+   * - 全部遥测列显式给值：省略 = null（latency/memory/cpu/lastError/lastErrorAt）
+   *   或 0（activeTasks/queueDepth/processedEvents/errorCount）或 {}（meta）
+   * - status 省略回退 **agent 当前 status**（NOT NULL 硬约束，23502 防线；不回退
+   *   上一拍心跳值）
+   * - timestamp 省略 = now()（同上；DTO 侧 @IsISO8601 已拦非法格式）
+   * - lastError 非空时同步 lastErrorAt = timestamp（R8）
+   * - load/version 折叠进 meta（与显式 meta 键共存，显式 meta 在前）
+   *
+   * 事务（R2/A3-1 先例）：upsert + lastActiveAt 双写包 manager.transaction——
+   * 任一失败整体回滚，不留下"心跳已 upsert / lastActiveAt 未推进"的半完成态。
+   *
+   * @param id  agent id（不存在/已软删 → findOne 抛 404）
+   * @param dto 心跳载荷（全可选，见 AgentHeartbeatDto）
+   * @returns agent 实体（响应契约不变；权限 self/owner/admin 限定，评审记录在案）
+   */
+  async heartbeat(id: string, dto: AgentHeartbeatDto) {
+    // findOne 对软删 agent 抛 404（前置判空，铁律 #22）
     const agent = await this.findOne(id);
-    agent.lastActiveAt = new Date();
-    await this.agentRepo.save(agent);
+
+    await this.agentRepo.manager.transaction(async (manager) => {
+      const heartbeatRepo = manager.getRepository(AgentHeartbeat);
+
+      // 快照行构造：全部遥测列显式给值（省略 = null/0/{}）
+      const timestamp = dto.timestamp ? new Date(dto.timestamp) : new Date();
+      const status = dto.status ?? agent.status;
+      const lastError = dto.lastError ?? null;
+      const meta = {
+        ...(dto.meta ?? {}),
+        ...(dto.load !== undefined ? { load: dto.load } : {}),
+        ...(dto.version !== undefined ? { version: dto.version } : {}),
+      };
+      const snapshot = heartbeatRepo.create({
+        agentId: agent.id,
+        status,
+        latencyMs: dto.latencyMs ?? null,
+        memoryMb: dto.memoryMb ?? null,
+        cpuPercent: dto.cpuPercent ?? null,
+        activeTasks: dto.activeTasks ?? 0,
+        queueDepth: dto.queueDepth ?? 0,
+        processedEvents: dto.processedEvents ?? 0,
+        errorCount: dto.errorCount ?? 0,
+        lastError,
+        // lastError 非空时同步写 lastErrorAt = timestamp（R8）
+        lastErrorAt: lastError ? timestamp : null,
+        meta,
+        timestamp,
+      });
+
+      // ON CONFLICT (agent_id) DO UPDATE 全列覆盖（快照语义，R1）
+      await heartbeatRepo.upsert(snapshot, ['agentId']);
+
+      // 双写 lastActiveAt（与心跳同一事务，防半完成态）。
+      // 注意：用服务端到达时间 now()，**不采用自报 timestamp**——与 api-key guard 的
+      // lastActiveAt 推进语义（每次认证请求 = now()）保持一致，防客户端时钟漂移/旧拍
+      // 重放使 lastActiveAt 回退或穿越；自报时刻只落 agent_heartbeats.timestamp 列
+      agent.lastActiveAt = new Date();
+      await manager.save(agent);
+    });
+
     return agent;
+  }
+
+  /**
+   * 解析 stats 窗口参数（plan plastic-man-wonder-man-raven.md §1 窗口语义，逐字）
+   *
+   * - from/to 可选 ISO 日期（YYYY-MM-DD）或带 offset 的 ISO 日期时间
+   *   （YYYY-MM-DDTHH:mm:ss[.sss]Z|±hh:mm）；省略时 from = now-30d、to = now
+   *   （**默认窗口行为变更：旧文档 7d → v2 终稿钉死 30d**，R10）
+   * - date-only 的 to 含当日：解析为当日 UTC 起点后 +1d 作为半开区间上限
+   *   （`< to+1d UTC`，R7）；date-only 的 from = 当日 UTC 起点（含当日）
+   * - 非法 ISO / 空窗口（from ≥ to，含 from==to 退化情形）/ 跨度 > 90 天 →
+   *   400 VALIDATION_ERROR，文案写清约束（MCP 消费者是 LLM，错误文案即下一步指令，R7）
+   * - 返回值 = UTC 半开区间 [fromEff, toEff)，仅用于 dailyActivity（不约束三计数）
+   */
+  private resolveStatsWindow(query: Record<string, unknown>): [Date, Date] {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const DEFAULT_SPAN_MS = 30 * DAY_MS;
+    const MAX_SPAN_MS = 90 * DAY_MS;
+
+    // date-only（YYYY-MM-DD，UTC 午夜语义）；完整 ISO 必须带 T 与 offset（Z 或 ±hh:mm），
+    // 杜绝无 offset 字符串被 JS 按本地时区解析的歧义（RT-STATS-1）
+    const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+    const ISO_DATETIME_RE =
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+    const parseParam = (name: 'from' | 'to', raw: unknown): Date | null => {
+      if (raw === undefined || raw === null) return null;
+      if (typeof raw !== 'string') {
+        throw new BadRequestException({
+          message: `${name} 必须是字符串：YYYY-MM-DD（date-only）或带 offset 的 ISO 日期时间（YYYY-MM-DDTHH:mm:ss[.sss]Z|±hh:mm），如 ${name}=2026-09-01`,
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
+      const v = raw.trim();
+      if (DATE_ONLY_RE.test(v)) return new Date(`${v}T00:00:00.000Z`);
+      if (ISO_DATETIME_RE.test(v)) {
+        const d = new Date(v);
+        if (!Number.isNaN(d.getTime())) return d;
+      }
+      throw new BadRequestException({
+        message: `${name} 非法 ISO：${v}。接受 YYYY-MM-DD 或 YYYY-MM-DDTHH:mm:ss[.sss]Z|±hh:mm；修正参数后重试`,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    };
+
+    const now = new Date();
+    const fromRaw = parseParam('from', query.from);
+    const toRaw = parseParam('to', query.to);
+    const fromEff = fromRaw ?? new Date(now.getTime() - DEFAULT_SPAN_MS);
+    // date-only 的 to 含当日：上限 = to+1d（半开）；非 date-only 直接用解析出的时刻
+    const toEff = toRaw
+      ? typeof query.to === 'string' && DATE_ONLY_RE.test(query.to.trim())
+        ? new Date(toRaw.getTime() + DAY_MS)
+        : toRaw
+      : now;
+
+    if (fromEff.getTime() >= toEff.getTime()) {
+      throw new BadRequestException({
+        message: `from 必须早于 to（空窗口无意义）：from=${query.from ?? fromEff.toISOString()}, to=${query.to ?? toEff.toISOString()}；修正后重试`,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+    if (toEff.getTime() - fromEff.getTime() > MAX_SPAN_MS) {
+      throw new BadRequestException({
+        message: `窗口跨度最大 90 天：from=${fromEff.toISOString()}, to=${toEff.toISOString()}（跨度 ${Math.round(
+          (toEff.getTime() - fromEff.getTime()) / DAY_MS,
+        )} 天）；收窄窗口后重试`,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+    }
+
+    return [fromEff, toEff];
   }
 
   async findKeys(agentId: string) {

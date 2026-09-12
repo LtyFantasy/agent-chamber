@@ -57,6 +57,7 @@ import { ApiKey } from '../src/database/entities/api-key.entity';
 import { Topic } from '../src/database/entities/topic.entity';
 import { TopicParticipant } from '../src/database/entities/topic-participant.entity';
 import { Message } from '../src/database/entities/message.entity';
+import { Attachment } from '../src/database/entities/attachment.entity';
 import { User } from '../src/database/entities/user.entity';
 import { Board } from '../src/database/entities/board.entity';
 import { Task } from '../src/database/entities/task.entity';
@@ -139,6 +140,8 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
         ds.getRepository(User),
       ),
       { log: async () => undefined } as unknown as AuditService,
+      // v2 消息附件绑定（plan §4.1）：TopicService 构造末尾追加的 attachmentRepo
+      ds.getRepository(Attachment),
     );
   }, 30000);
 

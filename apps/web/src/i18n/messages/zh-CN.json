@@ -269,7 +269,9 @@
       "allWakeConfirm": "将唤醒全部 {count} 个座位，确认发送？",
       "coordinatorBadge": "主脑",
       "coordinatorTitle": "主脑座位：调度指令以 topic 正文明说可观测",
-      "deletedSenderTitle": "该成员已删除"
+      "deletedSenderTitle": "该成员已删除",
+      "send": "发送",
+      "sendFailed": "消息发送失败，请重试"
     },
     "permissionRequest": {
       "title": "{count} 项待审批",
@@ -689,7 +691,10 @@
       "docMatches": "文档匹配",
       "docLinkNotFound": "文档不存在或已删除",
       "loadMore": "加载更多",
-      "loadMoreFolders": "加载更多目录"
+      "loadMoreFolders": "加载更多目录",
+      "copyMarkdown": "复制 Markdown",
+      "copied": "已复制",
+      "copyMarkdownError": "复制失败，请重试"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",
@@ -798,7 +803,9 @@
       "overwriteConfirm": "该路径已有文档，保存将覆盖已有内容。确定继续？",
       "contentLoadError": "文档原文加载失败",
       "contentLoadErrorDesc": "请检查网络后重试，或退出编辑",
-      "exitEdit": "退出编辑"
+      "exitEdit": "退出编辑",
+      "insertImage": "插入图片",
+      "imageNeedDoc": "新建文档需先保存才能插入图片"
     },
     "upload": {
       "button": "批量上传",
@@ -1206,5 +1213,21 @@
     "countSummary": "{count} 位成员",
     "countSummaryWithInvited": "{count} 位成员 · {invited} 位已邀请",
     "noSearchResults": "未找到匹配的成员"
+  },
+  "attachments": {
+    "upload": "上传图片",
+    "uploading": "上传中...",
+    "uploadFailed": "图片上传失败，请重试",
+    "tooLarge": "图片超过 8MiB 大小上限",
+    "typeNotAllowed": "仅支持 PNG/JPEG/GIF/WebP 图片",
+    "quotaExceeded": "存储配额已满，请先清理附件",
+    "brokenImage": "图片加载失败",
+    "removeChip": "移除附件",
+    "confirmRemove": "移除后附件将被删除，消息中的图片链接也会同步移除。确定移除？",
+    "removeFailed": "附件删除失败，可稍后在「我的附件」中清理",
+    "preview": "图片预览",
+    "zoomActual": "原始尺寸",
+    "zoomFit": "适应窗口",
+    "closePreview": "关闭预览"
   }
 }

@@ -242,6 +242,28 @@ describe('AgentController (e2e)', () => {
       });
   });
 
+  it('POST /agents/:id/heartbeat - 非法 status → 400（@IsEnum 走全局 ValidationPipe）', async () => {
+    // pipe 层断言（plan plastic-man-wonder-man-raven.md §4）：AgentHeartbeatDto.status 的
+    // @IsEnum(AgentStatus) 在进入 Controller 前由全局 ValidationPipe 拦截——
+    // service 直连 harness 无 pipe 不可达，必须走真实 HTTP 管线验证；
+    // 'bogus' 值域外 → 400（不落数据库 22P02，R8）
+    return request(app.getHttpServer())
+      .post('/agents/00000000-0000-4000-8000-000000000002/heartbeat')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ status: 'bogus' })
+      .expect(400);
+  });
+
+  it('POST /agents/:id/heartbeat - 非法 timestamp → 400（@IsISO8601 走全局 ValidationPipe）', async () => {
+    // pipe 层断言（QA 补漏）：AgentHeartbeatDto.timestamp 的 @IsISO8601 拦垃圾日期串，
+    // 防穿透到 PG 抛 22007 → 500（R8 的第二条腿）
+    return request(app.getHttpServer())
+      .post('/agents/00000000-0000-4000-8000-000000000002/heartbeat')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ timestamp: 'not-a-date' })
+      .expect(400);
+  });
+
   it('GET /agents/me/unread - success (route smoke, plan WS-B)', async () => {
     // 路由注册 + guard + controller → service 链路 smoke：manager.query 返回
     // 未读计数行，断言响应透传（SQL 语义由 agent-unread.e2e-spec.ts 真 PG 覆盖）。
