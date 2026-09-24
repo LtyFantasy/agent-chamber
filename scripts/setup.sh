@@ -64,6 +64,11 @@ if grep -q '^JWT_REFRESH_SECRET=change-me' .env; then
   set_env JWT_REFRESH_SECRET "$(rand_hex)"
   info "已生成随机 JWT_REFRESH_SECRET"
 fi
+# 附件签名 URL 密钥（v1.75 起后端 fail-fast 必填，且须异于 JWT_SECRET）：占位值同样替换为随机值
+if grep -q '^ATTACHMENT_URL_SECRET=change-me' .env; then
+  set_env ATTACHMENT_URL_SECRET "$(rand_hex)"
+  info "已生成随机 ATTACHMENT_URL_SECRET"
+fi
 
 # ---------- 3. admin 初始账号 ----------
 # 优先级：shell 环境变量 > .env 中已被用户修改的值 > 交互询问/自动生成
