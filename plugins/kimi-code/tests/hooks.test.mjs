@@ -20,12 +20,12 @@ const TEST_KEY = 'ask_testkey1234567890';
 
 // —— golden string 快照（与 lib/format.mjs 逐字一致）——
 const GOLDEN_A = [
-  '[agent-chamber] 未检测到接入配置：项目无 .kimi-code/agent-chamber.json（或 mcp.json 未配 chamber server）。',
+  '[agent-chamber] 未检测到接入配置：项目无 .agent-chamber/agent-chamber.json（或 mcp.json 未配 chamber server）。',
   '接入三步：① 登录 chamber（无账号找管理员申请，注册是 admin-only）→ Agents 页创建 agent 复制 API key；② 按插件 README「接入 playbook」初始化（MCP 模式/ REST-only 任一）；③ 重启会话生效。',
 ].join('\n');
 const GOLDEN_B = [
   '[agent-chamber] 已认证 chamber（agent: test-agent）· 活跃任务 3 · 未读 2',
-  '本项目未绑定 board：在 .kimi-code/agent-chamber.json 填入 boardId / docSpaceId / topicId 后重启会话，即可注入项目 digest。没有 board 就先去 web 建一个。',
+  '本项目未绑定 board：在 .agent-chamber/agent-chamber.json 填入 boardId / docSpaceId / topicId 后重启会话，即可注入项目 digest。没有 board 就先去 web 建一个。',
 ].join('\n');
 const GOLDEN_C = [
   '[agent-chamber] test-agent · 项目「Test Board」· 活跃任务 3 · 未读 2',
@@ -120,14 +120,15 @@ function runHook(script, stdin, env = {}) {
   });
 }
 
-/** 构造临时项目目录：files 的 { 文件名: 内容 } 写入 <tmp>/.kimi-code/；返回目录路径 */
+/** 构造临时项目目录；返回目录路径。绑定文件落 <tmp>/.agent-chamber/，其余（mcp.json）落 <tmp>/.kimi-code/
+ * ——2026-09-18 起绑定文件迁至跨 harness 中立目录，mcp.json 仍是 kimi-code 私有的 harness 文件 */
 function makeProject(files) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ac-hook-'));
-  if (Object.keys(files).length > 0) {
-    mkdirSync(path.join(dir, '.kimi-code'), { recursive: true });
-    for (const [name, content] of Object.entries(files)) {
-      writeFileSync(path.join(dir, '.kimi-code', name), typeof content === 'string' ? content : JSON.stringify(content));
-    }
+  for (const [name, content] of Object.entries(files)) {
+    // 按文件名分派归属目录：两者向上查找的起点不同，混在一个目录会掩盖查找路径的回归
+    const dirName = name === 'agent-chamber.json' ? '.agent-chamber' : '.kimi-code';
+    mkdirSync(path.join(dir, dirName), { recursive: true });
+    writeFileSync(path.join(dir, dirName, name), typeof content === 'string' ? content : JSON.stringify(content));
   }
   return dir;
 }
@@ -219,7 +220,7 @@ test('分支④：REST 401 → 模板 D（配置异常，不静默但 exit 0）'
   try {
     const { code, stdout } = await runHook(SESSION_START, sessionPayload(dir), { KIMI_CODE_HOME: path.join(dir, 'home') });
     assert.equal(code, 0);
-    assert.equal(stdout, wrapSession('[agent-chamber] chamber 连接异常（HTTP 401）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'));
+    assert.equal(stdout, wrapSession('[agent-chamber] chamber 连接异常（HTTP 401）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
     await new Promise((r) => auth.server.close(r));
@@ -236,7 +237,7 @@ test('分支④：mcpServer 指针错配 → 模板 D（A4：与分支①完全�
     assert.equal(code, 0);
     assert.equal(
       stdout,
-      wrapSession('[agent-chamber] chamber 连接异常（mcpServer 指针 "nonexistent-server" 未命中（server 不存在/非 HTTP/被禁用））：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'),
+      wrapSession('[agent-chamber] chamber 连接异常（mcpServer 指针 "nonexistent-server" 未命中（server 不存在/非 HTTP/被禁用））：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'),
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -288,7 +289,7 @@ test('fail-open：网络错误 → exit 0（分支④ 模板 D；端口 1 必连
   try {
     const { code, stdout } = await runHook(SESSION_START, sessionPayload(dir), { KIMI_CODE_HOME: path.join(dir, 'home') });
     assert.equal(code, 0);
-    assert.equal(stdout, wrapSession('[agent-chamber] chamber 连接异常（network-error）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'));
+    assert.equal(stdout, wrapSession('[agent-chamber] chamber 连接异常（network-error）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

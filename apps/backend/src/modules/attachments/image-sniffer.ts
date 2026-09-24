@@ -94,7 +94,8 @@ function readJpegDimensions(buf: Buffer): ImageDimensions | null {
     if (offset + 4 > buf.length) return null;
     const segmentLength = buf.readUInt16BE(offset + 2);
     if (segmentLength < 2) return null;
-    const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    const isSof =
+      marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
     if (isSof) {
       if (offset + 9 > buf.length) return null;
       const height = buf.readUInt16BE(offset + 5);
@@ -140,7 +141,10 @@ function readWebpDimensions(buf: Buffer): ImageDimensions | null {
  * 按已嗅探的 mime 解析头部尺寸；头部损坏/截断/不认识的结构返回 null。
  * 调用方语义：null = 不可信文件（魔数可能系伪造头），拒绝入库。
  */
-export function readImageDimensions(buf: Buffer, mime: ImageSniffResult['mime']): ImageDimensions | null {
+export function readImageDimensions(
+  buf: Buffer,
+  mime: ImageSniffResult['mime'],
+): ImageDimensions | null {
   switch (mime) {
     case 'image/png':
       return readPngDimensions(buf);

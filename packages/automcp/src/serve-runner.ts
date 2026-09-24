@@ -1,25 +1,48 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: .kimi/plans/miss-martian-polaris-superboy.md §Step 6
- *   - 补充: .kimi/plan-mcp-phase2.md §2 (custom tools 扩展点)
- *   - 补充: .kimi/plans/miss-martian-polaris-superboy.md §运行模式
+ * [功能概念]
+ *   - serve 命令启动管线：spec → profile 过滤 → tools 映射 → Express + HttpProxy + McpServer
+ *   - 接口调用频率统计的暴露面（surface）解析点：MCP 实例身份 `mcp` / `mcp-full` / `unknown`
  *
- * [踩坑索引] MCP-BODY-1(express.json 默认 100kb 卡死大文档 upsert, 须显式 limit)
+ * [代码职责]
+ *   - 解析启动参数（spec / 认证 / profile）→ 组装依赖 → 注册 tools → 启动
+ *   - `resolveSurface()`：按 `MCP_SURFACE` env > `--surface` > profile 名映射 > `'unknown'`
+ *     决定本实例的 surface，并交给 McpServer（进入 ALS 上下文 + 上报载荷）
  *
- * [铁律关联] #7(编译优先) #11(注释强制)
+ * [权威文档]
+ *   - 主文档: docs/api-definition.md §Usage Stats — surface 词表与合法取名源
+ *   - 补充: docs/architecture.md §automcp — 双实例（8745 worker / 8746 full）
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   MCP-BODY-1: 2026-08-15 实锤（backlog f4fe0a59）——裸 express.json() 默认 100kb，
- *   113KB 文档 upsert_doc 经 MCP 通道 413；backend main.ts 是 5mb，两侧必须对齐语义。
- *   修复 = 显式 { limit: '10mb' }（本文件 serve 入口唯一 json body 解析点）。
+ * [关键不变量]
+ *   - **surface 的取名源禁用 profile JSON 的 `name` 字段**：那是人类可读标签
+ *     （实值如 "Platform Agent (Worker)"），不是实例标识——用它会让全部流量落
+ *     `unknown`，而聚合表没有明细可回填。合法源只有：MCP_SURFACE / --surface /
+ *     文件名（`--profile <name>` 的字面值，或 `--profile-path` 的 basename 剥 `.json`）
+ *   - surface 必须是后端封闭词表内的值（不含 `''`——空串语义是"非 MCP 流量"）。
+ *     非法显式输入终局归 `'unknown'`（不回落下一个源）：后端 DTO 是严格制，
+ *     发出非法值 = 该行 400 → 计数永久丢失
+ *   - profile 文件名按**字面值**映射，不读文件内容（解析因此不依赖 IO）
  *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [关联代码]
+ *   - cli.ts — `--profile` / `--profile-path` / `--surface` 参数入口（env 由进程提供）
+ *   - server/mcp-server.ts — surface 的消费方（ALS 上下文 + 上报载荷）
+ *
+ * [持久踩坑]
+ *   MCP-BODY-1(express.json 默认 100kb 卡死大文档 upsert, 须显式 limit):
+ *     2026-08-15 实锤（backlog f4fe0a59）——裸 express.json() 默认 100kb，
+ *     113KB 文档 upsert_doc 经 MCP 通道 413；backend main.ts 是 5mb，两侧必须对齐语义。
+ *     修复 = 显式 { limit: '10mb' }（本文件 serve 入口唯一 json body 解析点）。
+ *   MCP-SURFACE-1(profile name 误用): 拿 profile JSON 的 `name` 当实例标识会全落
+ *     unknown，事后不可回填。安全方向: 只用文件名/字面值，单测用仓库真实 profile
+ *     文件断言"name 字段与解析结果无关"。
+ *
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面（取名源是否仍不含 profile name）
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -51,6 +74,102 @@ export interface ServeResult {
   app: Application;
   /** 停止服务器的回调 */
   stop: () => Promise<void>;
+}
+
+/**
+ * profile 名字面值 → surface 词表映射（D4c）
+ *
+ * 键 = 部署时实际使用的 profile 文件名（`--profile agent` 或
+ * `--profile-path …/agent.json`）；值 = 后端封闭词表内的 surface。
+ * 新增 MCP 实例时在此补一行，并同步 systemd 的启动参数。
+ */
+const PROFILE_SURFACE_MAP = new Map<string, string>([
+  ['agent', 'mcp'],
+  ['full', 'mcp-full'],
+]);
+
+/** automcp 可发出的 surface（后端词表去掉 `''`——空串语义是"非 MCP 流量"） */
+const EMITTABLE_SURFACE_VALUES: readonly string[] = ['mcp', 'mcp-full', 'unknown'];
+
+/** 无法判定时的终局 surface（词表内合法值：MCP 但暴露面不明） */
+const SURFACE_UNKNOWN = 'unknown';
+
+/**
+ * 解析本实例的 MCP 暴露面（D4c）
+ *
+ * 优先级：`MCP_SURFACE` env > `--surface` > profile 名映射 > `'unknown'`。
+ * 前两级是操作者的显式声明；profile 名是兜底推断——取**文件名**而不是 profile JSON
+ * 里的 `name` 字段（后者是人类可读标签，实值如 "Platform Agent (Worker)"，
+ * 拿它当实例标识会让全量流量落 unknown）。
+ *
+ * @param options - serve 选项（只读 `surface` / `profile` / `profilePath`）
+ * @param env - 环境变量来源（默认 process.env；可注入以便单测）
+ * @returns 后端词表内的 surface 值
+ */
+export function resolveSurface(
+  options: Pick<ServeOptions, 'surface' | 'profile' | 'profilePath'>,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const fromEnv = normalizeExplicitSurface(env.MCP_SURFACE);
+  if (fromEnv !== undefined) {
+    return fromEnv;
+  }
+
+  const fromCli = normalizeExplicitSurface(options.surface);
+  if (fromCli !== undefined) {
+    return fromCli;
+  }
+
+  const profileName = resolveProfileName(options);
+  const mapped = profileName === undefined ? undefined : PROFILE_SURFACE_MAP.get(profileName);
+
+  return mapped ?? SURFACE_UNKNOWN;
+}
+
+/**
+ * 归一化显式声明的 surface（`MCP_SURFACE` env / `--surface`）
+ *
+ * 非法值（不在词表内）终局归 `'unknown'` 而非回落下一个源：操作者明明写了值，
+ * 却被静默替换成另一个源的推断结果，比"归为 unknown"更难排查；且后端 DTO 是严格制，
+ * 非法值一旦发出，该行计数直接 400 丢失。
+ *
+ * @param raw - 原始字符串（可能 undefined / 空白 / 大小写不一）
+ * @returns 词表内的值；未提供时返回 undefined（表示"继续看下一个源"）
+ */
+function normalizeExplicitSurface(raw: string | undefined): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed === '') {
+    return undefined;
+  }
+
+  return EMITTABLE_SURFACE_VALUES.includes(trimmed) ? trimmed : SURFACE_UNKNOWN;
+}
+
+/**
+ * 提取 profile 名字面值（surface 推断用）
+ *
+ * 优先级与 `loadProfileForServe` 一致：`--profile-path` 的 basename（剥 `.json`）
+ * 优先于 `--profile` 的字面值。**不读文件内容**——surface 解析因此不依赖 IO。
+ *
+ * @param options - serve 选项（只读 profile 相关两个字段）
+ * @returns 归一化（小写）后的 profile 名；两者都未提供时 undefined
+ */
+function resolveProfileName(
+  options: Pick<ServeOptions, 'profile' | 'profilePath'>,
+): string | undefined {
+  if (options.profilePath !== undefined && options.profilePath !== '') {
+    return path.basename(options.profilePath, '.json').toLowerCase();
+  }
+
+  if (options.profile !== undefined && options.profile !== '') {
+    return options.profile.toLowerCase();
+  }
+
+  return undefined;
 }
 
 /**
@@ -87,7 +206,19 @@ export async function runServe(options: ServeOptions): Promise<ServeResult> {
 
   const auth = buildAuthConfig(options);
   const proxy = new HttpProxy(options.baseUrl, auth);
-  const server = new McpServer(app, options.port, proxy, options.basePath, options.baseUrl);
+  // surface 解析一次后全程不变（D4c）：进 ALS 上下文 → 两头与上报载荷都取自它。
+  // 认证显式注入 server：`/mcp` 实例没有 custom tools（不走 registerCustomTools），
+  // 不注入则 fallbackAuth 恒 undefined → invocation 上报因无凭据被整片跳过。
+  const surface = resolveSurface(options);
+  const server = new McpServer(
+    app,
+    options.port,
+    proxy,
+    options.basePath,
+    options.baseUrl,
+    surface,
+  );
+  server.setFallbackAuth(auth);
 
   // ─── 5. 注册并启动 ───
   server.registerTools(mappings);

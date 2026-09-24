@@ -371,7 +371,11 @@ export function DocEditor({
             className="flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 font-mono text-sm leading-relaxed placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-primary/50 focus-visible:ring-2 focus-visible:ring-ring/70"
           />
         ) : (
+          // 预览面板：data-scroll-container = 附件图片视口门控的 IntersectionObserver
+          // root 锚点（见 attachment-image.tsx；编辑态此面板自身滚动，root 必须指它
+          // 而非外层 main，否则预取会被裁切 neuter）
           <div
+            data-scroll-container
             className={`flex-1 overflow-y-auto rounded-md border border-border/40 px-3 py-2 text-sm ${MARKDOWN_CLASSES}`}
           >
             {content.trim() ? (

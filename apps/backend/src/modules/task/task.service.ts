@@ -1690,7 +1690,7 @@ export class TaskService {
    *   无 key 调用方：状态步骤失败且本次已发评论时，错误响应 data 槽带
    *   commentPosted:true（MCP 层归一为 details.commentPosted），盲重试可先自查评论。
    * - 并发同 key：靠 uq_idempotency_actor_key 23505 catch 重读胜者快照继续（照
-   *   doc-idempotency.helper 范式）；并发窗口内双方都可能已发评论（无共享事务，
+   *   common/services/idempotency.helper.ts 范式）；并发窗口内双方都可能已发评论（无共享事务，
    *   幂等保证的是「重试」而非「并发首击」）。
    *
    * @param id   任务 ID
@@ -1852,7 +1852,7 @@ export class TaskService {
   }
 
   /**
-   * 幂等记录 hash/entityType 校验（对齐 doc-idempotency.helper 语义）：
+   * 幂等记录 hash/entityType 校验（对齐 common/services/idempotency.helper.ts 语义）：
    * entityType 非预期值、request_hash 缺失或与当前 payload 不符 → 409，
    * 防「同 key 不同 payload 第二次写被静默吞掉」。
    *

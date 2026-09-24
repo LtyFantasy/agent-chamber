@@ -59,6 +59,16 @@ import { ChevronDown, ChevronLeft, ChevronRight, RotateCcw, ShieldCheck, User } 
  * 需同步补充，否则过滤器缺项。取值证据：task/topic/agent/user/board/…
  * 各模块 audit 插桩点（grep `entityType: '` 于 apps/backend/src）。
  */
+/**
+ * 审计实体名下拉（`audit_logs.entityType`）。
+ *
+ * ⚠️ 与后端写入侧清单 `apps/backend/src/modules/audit/audit-constants.ts` 的
+ * `AUDIT_ENTITY_TYPES`（25 值）对齐——缺项会让"按实体筛选"漏掉该类审计。
+ * 2026-09-22 经验库第二期补债：`experience`、`experience_space_member`（批 1/2 新增）、
+ * `attachment`（P2 媒体附件批的既有债，核对后确为真实 entityType，后端两处写入）。
+ * 注：本列表仍含历史字面量 `task_description`/`task_report`（后端已改常量路径，
+ * 存量审计行仍在，保留以支持回查），故本表与后端清单**允许双向差集**。
+ */
 const ENTITY_TYPES = [
   'user',
   'agent',
@@ -84,6 +94,10 @@ const ENTITY_TYPES = [
   'roundtable_seat',
   'roundtable_request',
   'webhook_delivery',
+  // 第二期经验库 + 附件补债
+  'experience',
+  'experience_space_member',
+  'attachment',
 ] as const;
 
 /** 时间预设档（毫秒跨度）；custom = 自定义 datetime-local 起止 */

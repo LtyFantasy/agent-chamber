@@ -8,7 +8,7 @@
  * 文案断言用 en.json 快照（monitoring/page.test.tsx 同构）。
  */
 
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import LogsPage from './page';
 import { buildLogsQuery } from '@/lib/logs-query';
@@ -234,6 +234,26 @@ describe('LogsPage — 过滤器 → 查询参数', () => {
       entityType: 'task',
       action: 'create',
     });
+  });
+
+  it('实体名下拉包含经验库与附件（第二期补债）：experience / experience_space_member / attachment 可选中', async () => {
+    mockLogsList.mockResolvedValue(makeResponse([], null));
+    renderPage();
+    await waitFor(() => expect(mockLogsList).toHaveBeenCalledTimes(1));
+
+    const entitySelect = screen.getAllByRole('combobox')[0];
+    // 三个补债项必须在下拉里（缺项 = 这两类审计无法按实体筛选）
+    for (const entityType of ['experience', 'experience_space_member', 'attachment']) {
+      expect(within(entitySelect).getByRole('option', { name: entityType })).toBeInTheDocument();
+    }
+
+    // 且能真的作为过滤值发出（下拉选项 → 查询参数闭环）
+    fireEvent.change(entitySelect, { target: { value: 'experience_space_member' } });
+    await waitFor(() =>
+      expect(mockLogsList).toHaveBeenLastCalledWith(
+        expect.objectContaining({ entityType: 'experience_space_member' }),
+      ),
+    );
   });
 
   it('自定义时间档：datetime-local 起止 → ISO 8601（UTC）', async () => {

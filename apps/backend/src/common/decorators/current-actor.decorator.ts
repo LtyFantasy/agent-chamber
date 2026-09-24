@@ -34,6 +34,16 @@ import { ActorType } from '@agent-chamber/shared';
  *   @CurrentActor() actor: UnifiedActor
  *   @CurrentActor('id') actorId: string
  *   @CurrentActor('role') role: UserRole
+ *
+ * ⚠️ 两个字段的填充纪律（2026-09-22 经验库第二期，见 actor.types.ts 踩坑 O1/P1）：
+ * - `ownerId` **只在 agent 分支填充**（`agents.owner_id`，来自 ApiKeyAuthService）
+ *   ——human 分支刻意留空（人即 owner 自身，不是"某个 agent 的 owner"）。
+ *   漏填 = 经验库禁自审四态的"agent 审自己 owner""同 owner 兄弟互审"两态**静默放行**。
+ * - `permissions` 形状 = `{ scopes: [...] }`（Record），与 AgentPayload 同形。
+ *
+ * `getRequest()` 返回 `any`（NestJS 签名默认），故此处**没有**编译期形状校验——
+ * 上游 guard 漏塞字段只会表现为运行期 undefined，改本文件时必须对照
+ * `api-key-auth.service.ts` 的 AgentPayload 与 `types/express.d.ts` 的 request.agent。
  */
 export const CurrentActor = createParamDecorator(
   (
@@ -59,6 +69,8 @@ export const CurrentActor = createParamDecorator(
         permissions: request.agent.permissions,
         // 决策 9：透传本次认证所用 key 前缀（审计插桩 keyPrefix 缓解，非明文）
         keyPrefix: request.agent.keyPrefix,
+        // 第二期：agent 的人类 owner（禁自审四态后两态的判定输入；human 分支刻意不填）
+        ownerId: request.agent.ownerId,
       };
     }
 

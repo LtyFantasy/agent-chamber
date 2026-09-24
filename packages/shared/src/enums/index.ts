@@ -150,6 +150,15 @@ export enum AuditAction {
   RESUME_TOPIC = 'resume_topic',
   /** v1.60.0-dev：文档原子移动（verb_noun 风格对齐 reset_api_key/pause_topic 先例） */
   MOVE_DOC = 'move_doc',
+  /**
+   * v1.75.0-dev：附件短时签名 URL 铸造（P2 批 2，verb_noun 同款）——
+   * audit_logs.action 是 PG 原生枚举，补值需 migration
+   * `AddAuditMintAttachmentUrlAction1789205400000`（缺值写入报
+   * `invalid input value for enum audit_action` 500）。
+   * newData 只记 {variant, ttlSeconds, expiresAt}，**禁含 token**（能力凭证不进审计）。
+   * 铸造可安全重试（每次新 token，无副作用），审计行随之逐次留痕。
+   */
+  MINT_ATTACHMENT_URL = 'mint_attachment_url',
 }
 
 export enum WebhookStatus {
@@ -329,6 +338,107 @@ export enum ErrorCode {
   ATTACHMENT_FORBIDDEN = 12004,
   /** 400 — 绑定非法：topicId 与 docId 必须恰好传一个（双传/双缺均拒绝） */
   ATTACHMENT_BIND_CONFLICT = 12005,
+  /**
+   * 401 — 短时签名 URL 凭证无效：验签失败 / scope 非 `attachment:content` /
+   * token 载荷 `aid` 与路径 `:id` 不符（三断言任一不成立）。
+   *
+   * 归类**刻意粗粒度**：不回显 token 原文与 claims 明细（防 oracle 与信息泄露），
+   * 消费方只需知道"这张凭证不可用"。消息必须指导下一步——重新铸造
+   * （`POST /attachments/:id/signed-url`），并说明该公开端点自身不需要 API Key
+   * （避免消费方误以为要去配凭证）。
+   */
+  ATTACHMENT_SIGNATURE_INVALID = 12006,
+  /**
+   * 401 — 短时签名 URL 已过期（JWT `exp` 到期）。
+   *
+   * 与 12006 刻意分码：消费方可区分"凭证被篡改/张冠李戴"与"单纯超时"，
+   * 消息同样指导下一步（重新铸造，而不是猜测原因或重试同一 URL）。
+   */
+  ATTACHMENT_SIGNATURE_EXPIRED = 12007,
+  /**
+   * 404 — 缩略图不可用：附件本身存在且有权读取，但该附件没有缩略图
+   * （存量行未回溯生成 / 上传时缩略图 fail-open 失败）。
+   *
+   * 与 12000（不存在或无权）**刻意分码**：消费方能区分"资源不可达"与
+   * "资源可达但无该变体"，消息必须指导下一步（改用 /attachments/:id/content 取原图）。
+   * 三表面同码同语义（P2）：① GET /attachments/:id/thumbnail（批 1）；
+   * ② POST /attachments/:id/signed-url variant=thumbnail（批 2）；
+   * ③ 公开端点 GET /public/attachments/:id/content?token=<签名 token>
+   *    （变体取自 token 载荷 `var`，var=thumbnail 时该路径适用，批 2）。
+   */
+  ATTACHMENT_THUMBNAIL_UNAVAILABLE = 12008,
+
+  // Experience (13000-13099)
+  /**
+   * 404 — 经验条目不存在（含已软删行；软删对读写一律表现为 404，不泄露存在性）。
+   *
+   * message 必须指导下一步：**勿重试同 id，回 search**（`GET /experiences` /
+   * MCP `search_experiences`）——id 可能来自过期缓存或他人转述，重试同 id 恒失败。
+   */
+  EXPERIENCE_NOT_FOUND = 13000,
+  /**
+   * 403 — 经验条目**写操作**越权：调用者既非作者（creator / owner 代理）也非 admin。
+   *
+   * ⚠️ **仅写路径（PATCH / DELETE / 反馈等条目写通道）使用本码**（作者判定）。
+   * 终审（`PATCH /experiences/:id/quality`）/ includeSuspect / 判断日志读取
+   * （`GET /experiences/judgments`）三处**必须用 13004**（13004 = 需要 admin 或本空间
+   * owner/reviewer 角色，是"角色/授权"判定的统一码）——两码分工见 13004 注释：
+   * 13001 = 端点对你开放但**这一条**不属于你；13004 = 你**缺角色**。
+   * message 必须给出唯一可行动线：**勿重试，走作者或 admin 代管通道**
+   * （agent 无自助改他人条目路径）。
+   *
+   * 与 1009（PERMISSION_DENIED）的分工（2026-09-22 第二期收口）：1009 = 你的身份**类别**
+   * 本就不该调这个端点（RolesGuard 对「agent 误调人类 admin 端点」的既有码）；
+   * 经验模块的终审/includeSuspect 两处**已下线 1009**，人类身份不再天然被拒——
+   * 改由空间成员角色承担（13004）。1009 保留给全平台其它"身份类别不对"场景。
+   */
+  EXPERIENCE_FORBIDDEN = 13001,
+  /**
+   * 403 — 经验终审**禁自审**（四态矩阵：作者本人 / 人类审自己 agent 的条目 / agent 审自己
+   * owner 的条目 / 同一人类 owner 名下兄弟 agent 互审）。
+   *
+   * ⚠️ **已退役（2026-09-24 用户拍板，v1.81.0）——号不复用**：单租户 + 同模型 agent +
+   * 新会话无上下文包袱的现实下，兄弟 agent 审与自审独立性同构，四态只制造死锁
+   * （2026-09-24 生产实证：17 条待审、`viewerCanReview` 全 false ⇒ 无人可 verdict）。
+   * 退役后：**任何 admin 或空间 owner/reviewer 可终审任意条目（含本人所录）**，终审资格
+   * 退化为**纯角色判定**，唯一的终审拒绝码是 13004（缺角色）。双向权力同时放开：持角色者
+   * 也可对自己/兄弟的条目打 `suspect`，靠审计 old→new+reason 留痕 + admin 翻案权兜底。
+   * 决策记录与多租户捡回条件见线上 `docs/experience-base.md` §11。
+   *
+   * 保留本枚举条目只为"号不复用"这条纪律有唯一的落点（**禁止改号、禁止复用**）；
+   * 全仓已无任何抛出处。旧详情字段 `viewerReviewBlockReason` 一并停发。
+   */
+  EXPERIENCE_SELF_REVIEW = 13002,
+  /**
+   * 404 — 目标 actor 不是经验库空间成员（PATCH/DELETE `/experiences/members/:actorId`
+   * 的成员行缺失；「不存在」与「已软删的 actor」同码，不泄露存在性）。
+   *
+   * message 必须指导下一步：**先核对成员清单**（`GET /experiences/members`，含 actorId
+   * 与当前角色），再决定是新增成员还是改用别的 actorId——勿对同 id 反复 PATCH/DELETE。
+   */
+  EXPERIENCE_MEMBER_NOT_FOUND = 13003,
+  /**
+   * 403 — 需要「人类 admin 或**本空间** owner/reviewer 角色」的操作被拒。
+   *
+   * 三处端点共用本码（**message 按端点各自给下一步**）：① 终审
+   * `PATCH /experiences/:id/quality`；② `includeSuspect` 放宽（suspect 复核出口）；
+   * ③ 判断日志 `GET /experiences/judgments`。缺角色时的动作 = 走
+   * `GET /experiences/members` 确认自己是否在册，不在册则请 admin/空间 owner 授权
+   * （成员管理端点 `POST /experiences/members`）。
+   *
+   * 本码是**终审的唯一拒绝码**（v1.81.0）：旧 13002（禁自审）已退役——13004 = 你**缺角色**
+   * （可经授权解除）；已不存在"你有资格但这一条不能审"的状态（持角色者可审任意条目）。
+   */
+  EXPERIENCE_REVIEW_FORBIDDEN = 13004,
+  /**
+   * 409 — 目标 actor **已是成员**，但请求的角色与现有角色不同（`POST /experiences/members`
+   * 的幂等/冲突分工：同角色 → 200 幂等返回成员行；异角色 → 本码）。
+   *
+   * message 必须指导下一步：**改角色走 PATCH**
+   * （`PATCH /experiences/members/:actorId`）——勿删了重加（DELETE + POST 会丢失
+   * invited_by 授权留痕，且中途存在"无成员行"窗口）。
+   */
+  EXPERIENCE_MEMBER_EXISTS = 13005,
 }
 
 /**
@@ -362,7 +472,13 @@ export enum WakePolicy {
  * - removed：软删（M3 阶段 3 座位移除，行保留供溯源）
  * ⚠️ 与协议包 SEAT_RUNTIME_STATUSES（online/busy/offline，SeatEvent 运行态）是两套词汇，勿混
  */
-export const SEAT_LIFECYCLE_STATUSES = ['active', 'paused', 'parked', 'offline', 'removed'] as const;
+export const SEAT_LIFECYCLE_STATUSES = [
+  'active',
+  'paused',
+  'parked',
+  'offline',
+  'removed',
+] as const;
 
 /** 圆桌座位生命周期状态类型 */
 export type SeatLifecycleStatus = (typeof SEAT_LIFECYCLE_STATUSES)[number];
@@ -399,4 +515,187 @@ export const PRESENCE_PHASE = {
   REPLYING: PRESENCE_PHASES[2],
   IDLE: PRESENCE_PHASES[3],
   OFFLINE: PRESENCE_PHASES[4],
+} as const;
+
+// =============================================================================
+// 经验库（Experience Base）值域
+//
+// 统一模式：`<DOMAIN>S` 值域数组（as const）→ 派生 type union → 命名访问视图
+// `<DOMAIN>`（与 SEAT_LIFECYCLE_STATUS / PRESENCE_PHASE 同款「值域数组 + 命名化派生」）。
+// 三处消费者共用单源：DTO @IsIn 校验 / entity 默认值 / MCP 工具 schema enum。
+// =============================================================================
+
+/**
+ * 经验条目类型值域（experience_entries.intent，plan v1.3 §1.1；列是裸 varchar(32)，
+ * 新增值无需 migration）。
+ *
+ * 分类学：**按问题性质分，不按行业分**（EvoMap 全球网络同款决策）——行业分类树应对
+ * 不了开放领域，检索主入口是 signals 症状匹配而非分类下钻。
+ * - pitfall：价值是**警告错误做法**（"别这么干，我踩过"）
+ * - repair：价值是**读者手上有报错、要解法**（症状 → 根因 → 修复）
+ * - howto：价值是**正确做法的操作序列**（无前置故障）
+ * - optimize：价值是**已能跑但想更快/更省**的改进
+ * - decision：价值是**取舍记录**（选 A 不选 B 的理由与代价）
+ *
+ * repair 与 pitfall 重叠时的判别规则（写进 MCP schema description，plan §4）：
+ * 标题描述**症状**选 repair，描述**错误做法**选 pitfall。
+ */
+export const EXPERIENCE_INTENTS = ['pitfall', 'repair', 'howto', 'optimize', 'decision'] as const;
+
+/** 经验条目类型 */
+export type ExperienceIntent = (typeof EXPERIENCE_INTENTS)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_INTENTS，供 entity 默认值 / DTO 枚举 / MCP schema 命名引用） */
+export const EXPERIENCE_INTENT = {
+  PITFALL: EXPERIENCE_INTENTS[0],
+  REPAIR: EXPERIENCE_INTENTS[1],
+  HOWTO: EXPERIENCE_INTENTS[2],
+  OPTIMIZE: EXPERIENCE_INTENTS[3],
+  DECISION: EXPERIENCE_INTENTS[4],
+} as const;
+
+/**
+ * 经验条质量值域（experience_entries.quality，plan v1.3 §6；裸 varchar(32)，新增值无需 migration）。
+ *
+ * 生命周期（单向为主、双向门见下）：
+ * - unverified：缺省（全认证可写，立即可搜、无需审批）；**内容改写自动回落本态**
+ * - verified：**人类 admin 或空间 owner/reviewer 终审**通过（写 verified_by/verified_at）；
+ *   排序加权层
+ * - suspect：终审判定可疑（检索默认排除，详情仍可见可改回——PM R1 复核/申诉动线）
+ *
+ * 双向门：verified ↔ suspect 可由 admin 互改（终审不是单向判决，plan §3 quality 端点）。
+ */
+export const EXPERIENCE_QUALITIES = ['unverified', 'verified', 'suspect'] as const;
+
+/** 经验条质量 */
+export type ExperienceQuality = (typeof EXPERIENCE_QUALITIES)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_QUALITIES，供 entity 缺省值 / DTO / 查询命名引用） */
+export const EXPERIENCE_QUALITY = {
+  UNVERIFIED: EXPERIENCE_QUALITIES[0],
+  VERIFIED: EXPERIENCE_QUALITIES[1],
+  SUSPECT: EXPERIENCE_QUALITIES[2],
+} as const;
+
+/**
+ * 经验反馈结果值域（experience_feedback.outcome，plan v1.3 §1.2；裸 varchar(16)）。
+ *
+ * ⚠️ 语义是「**应用后**是否有效」，**不是**「搜索结果是否命中」——写进 MCP schema
+ * description 与文档，防消费方把"搜到了"当成"帮到了"（plan §4 report_experience_feedback）。
+ */
+export const EXPERIENCE_FEEDBACK_OUTCOMES = ['helped', 'not_helpful'] as const;
+
+/** 经验反馈结果 */
+export type ExperienceFeedbackOutcome = (typeof EXPERIENCE_FEEDBACK_OUTCOMES)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_FEEDBACK_OUTCOMES） */
+export const EXPERIENCE_FEEDBACK_OUTCOME = {
+  HELPED: EXPERIENCE_FEEDBACK_OUTCOMES[0],
+  NOT_HELPFUL: EXPERIENCE_FEEDBACK_OUTCOMES[1],
+} as const;
+
+/**
+ * 经验空间成员角色值域（`experience_space_members.role`，第二期 plan §0/§1.1；
+ * 列是裸 varchar(20)，新增值无需 migration）。
+ *
+ * - `owner`（中文标签 = **空间管理员**）：终审权 + 管理 reviewer（增删/改角色，
+ *   且**仅对 reviewer 行、仅可授 reviewer 值**——PATCH 双约束，防 owner 自造 owner）
+ * - `reviewer`（中文标签 = **终审人**）：终审权（写 verified/suspect 徽章）
+ *
+ * ⚠️ **术语撞车警示**：平台既有 "owner" 指 agent 的人类主人（`OwnerProxyService`），
+ * 本枚举的 "owner" 是**空间角色**——两者语义无关，勿混用命名空间。中文标签已钉死
+ * （web/i18n 只许用「空间管理员」/「终审人」），代码标识符保持 owner/reviewer。
+ * 人类 admin 是全局兜底（无需入表即可行使全部成员操作）——**零成员 = 无任何条目可终审**
+ * 是明文接受的退化态（admin 自录条目保持 unverified）。
+ *
+ * role 列**刻意无 DB 默认值**：两值皆是特权，默认值 = 默认授权（违反最小权限），
+ * service 层显式必填 + `@IsIn` 快速失败。
+ */
+export const EXPERIENCE_MEMBER_ROLES = ['owner', 'reviewer'] as const;
+
+/** 经验空间成员角色 */
+export type ExperienceMemberRole = (typeof EXPERIENCE_MEMBER_ROLES)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_MEMBER_ROLES，供 entity / DTO 枚举 / 服务判定命名引用） */
+export const EXPERIENCE_MEMBER_ROLE = {
+  OWNER: EXPERIENCE_MEMBER_ROLES[0],
+  REVIEWER: EXPERIENCE_MEMBER_ROLES[1],
+} as const;
+
+/**
+ * 经验判断操作值域（`experience_judgments.operation`，第二期 plan §1.2；裸 varchar(32)）。
+ *
+ * 本批**唯一产出值** = `record_check`（录入/内容变更后的七维 rubric 软判定）；
+ * `rerank` / `autotag` 是**预留值**（搜索重排与自动打标在 plan §13 明列不做，
+ * 等 observe 期数据攒够再评估）——预留而非新增，避免将来新增值时历史日志出现
+ * "未知操作"的解析分支。
+ *
+ * ⚠️ 消费面纪律：`operation` 是**过滤参数白名单**（`@IsIn`）——拼错的取值必须 400，
+ * 不许静默返回空页（否则"查不到语料"与"参数打错"无法区分）。
+ */
+export const EXPERIENCE_JUDGMENT_OPERATIONS = ['record_check', 'rerank', 'autotag'] as const;
+
+/** 经验判断操作 */
+export type ExperienceJudgmentOperation = (typeof EXPERIENCE_JUDGMENT_OPERATIONS)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_JUDGMENT_OPERATIONS） */
+export const EXPERIENCE_JUDGMENT_OPERATION = {
+  RECORD_CHECK: EXPERIENCE_JUDGMENT_OPERATIONS[0],
+  RERANK: EXPERIENCE_JUDGMENT_OPERATIONS[1],
+  AUTOTAG: EXPERIENCE_JUDGMENT_OPERATIONS[2],
+} as const;
+
+/**
+ * 经验判断结果状态值域（`experience_judgments.status`，第二期 plan §1.2/§3.2；裸 varchar(16)）。
+ *
+ * - `ok`：判断成功且归一化结果通过逐字段白名单校验（快照列同步写入）
+ * - `error`：provider 异常 / HTTP 非 200 / 响应解析失败 / 白名单校验失败。固定失败标签按
+ *   provider 分列，口径以线上 `docs/experience-base.md` §12 为准；历史行里的 JSON-RPC error
+ *   标签来自已退役的 `jev` MCP 传输（v1.83.0 起不再产生）
+ * - `timeout`：超过 `JUDGMENT_TIMEOUT_MS`（默认 8s）硬顶
+ * - `skipped`：**限流跳过**（未调用 provider）——`request` 写占位
+ *   `{skipped:true, reason:'judgment_rate_limited'}`，`response` 为 null，
+ *   **同样计入 actor 判断额度**（行写入有界，防日志表被刷爆）
+ *
+ * ⚠️ **失败与跳过都落库**：observe 期的失败率/覆盖率全靠本表；**"未判"与"判失败"的区分
+ * = 查本表 status**（条目快照列 `judgment=null` 无法区分，也不自动重判——明文决策）。
+ * 失败率分母口径 = `ok + error + timeout`（**排除 skipped**）。
+ */
+export const EXPERIENCE_JUDGMENT_STATUSES = ['ok', 'error', 'timeout', 'skipped'] as const;
+
+/** 经验判断结果状态 */
+export type ExperienceJudgmentStatus = (typeof EXPERIENCE_JUDGMENT_STATUSES)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_JUDGMENT_STATUSES） */
+export const EXPERIENCE_JUDGMENT_STATUS = {
+  OK: EXPERIENCE_JUDGMENT_STATUSES[0],
+  ERROR: EXPERIENCE_JUDGMENT_STATUSES[1],
+  TIMEOUT: EXPERIENCE_JUDGMENT_STATUSES[2],
+  SKIPPED: EXPERIENCE_JUDGMENT_STATUSES[3],
+} as const;
+
+/**
+ * 经验终审可写入的质量值域（第二期 plan §2.1：从后端 DTO **提升到 shared**，裸 varchar(32)）。
+ *
+ * 与 `EXPERIENCE_QUALITIES`（三值，entity 缺省与查询过滤用）的区别：本值域是**终审写路径**
+ * 的可选值——`unverified` 刻意不在其中（终审是"给结论"，撤回结论走内容改写回落，
+ * 不提供"手动改回未审"的入口）。
+ *
+ * 提升 rationale：MCP 侧（platform-mcp）需要本地枚举快速失败，而它**不可达后端模块**
+ * （`@agent-chamber/backend` 的 DTO 不在其依赖面内）——shared 是唯一双方都可达的单源。
+ * 后端 DTO 改为引用本值域（**禁止在 DTO 里再抄一份字面量数组**，两处漂移 = 工具侧
+ * 放行后端拒绝的值）。
+ */
+export const EXPERIENCE_REVIEW_QUALITIES = [
+  EXPERIENCE_QUALITY.VERIFIED,
+  EXPERIENCE_QUALITY.SUSPECT,
+] as const;
+
+/** 经验终审可写入的质量值 */
+export type ExperienceReviewQuality = (typeof EXPERIENCE_REVIEW_QUALITIES)[number];
+
+/** 命名访问视图（单源派生自 EXPERIENCE_REVIEW_QUALITIES） */
+export const EXPERIENCE_REVIEW_QUALITY = {
+  VERIFIED: EXPERIENCE_REVIEW_QUALITIES[0],
+  SUSPECT: EXPERIENCE_REVIEW_QUALITIES[1],
 } as const;

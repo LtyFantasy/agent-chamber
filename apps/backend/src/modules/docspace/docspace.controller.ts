@@ -595,17 +595,24 @@ export class DocSpaceController {
   @UseGuards(JwtOrApiKeyGuard)
   @Get(':id/export')
   @ApiOperation({
-    summary: 'Export a DocSpace as a full bundle (formatVersion 1)',
+    summary: 'Export a DocSpace as a full bundle (formatVersion 2)',
     description:
       'Space-level full export: single JSON bundle containing curated metadata AND full doc ' +
       'content — space meta (name/description/visibility/settings), categories, intent routes ' +
       '(docs referenced by path, incl. codeEntryType), and every doc with its verbatim markdown ' +
-      'content plus summary/docType/tags/category. Purpose: version-alignment snapshots + ' +
-      'offline backup (pull into git, diff across releases). ' +
+      'content plus summary/docType/tags/category. ' +
+      'formatVersion 2 adds a media segment: attachment bytes (original + thumbnail) for ' +
+      'attachments bound to docs in this space, so re-imported docs keep their images. ' +
+      'Media is packed under a joint request-body budget (10MiB − docs section − 64KiB margin); ' +
+      'items beyond the per-item limit (6MiB) or the remaining budget appear as ' +
+      '`{skipped: "too_large"|"budget_exceeded"}` markers in the same segment (fetch those ' +
+      'separately), and attachments referenced by doc content but bound to a topic are listed ' +
+      'in the informational `mediaOmitted` array (their links stay broken after import). ' +
+      'Purpose: version-alignment snapshots + offline backup (pull into git, diff across releases). ' +
       'Permission: same as overview (space read). ' +
       'NOTE: large spaces produce large responses (docs carry full content, no pagination) — ' +
       'this is by design; snapshot integrity is the priority. The output is directly consumable ' +
-      'by POST /doc-spaces/:id/import-bundle (roundtrip).',
+      'by POST /doc-spaces/:id/import-bundle (roundtrip; formatVersion 1 bundles are still accepted).',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Export bundle returned successfully' })
@@ -620,16 +627,25 @@ export class DocSpaceController {
   // 回导是"把 bundle 应用到既有空间"的更新语义（非新建资源），200 而非 POST 默认 201
   @HttpCode(200)
   @ApiOperation({
-    summary: 'Import a DocSpace export bundle (formatVersion 1)',
+    summary: 'Import a DocSpace export bundle (formatVersion 1 or 2)',
     description:
-      'Restore a bundle produced by GET /doc-spaces/:id/export. Four ordered phases: ' +
-      '① categories (idempotent by name) → ② docs (per-doc independent transaction via the ' +
-      'batch-upsert pipeline; a single failing doc does not abort the batch) → ' +
-      '③ routes (idempotent by intent + primaryDocPath, write-time validation reused) → ' +
-      '④ space meta, which is SKIPPED unless overwriteSpaceMeta=true (explicit opt-in to avoid ' +
+      'Restore a bundle produced by GET /doc-spaces/:id/export. Six ordered phases: ' +
+      '① categories (idempotent by name) → ② media stage-1 (byte-evidence check of every ' +
+      'base64 payload against its declared mimeType, then insert-or-reuse keyed on ' +
+      '(importer, sha256, binding state) so re-imports create no duplicate rows or objects) → ' +
+      '③ docs (per-doc independent transaction via the batch-upsert pipeline; body attachment ' +
+      'URLs are rewritten inline to the new attachment ids — URLs without a mapping keep their ' +
+      'old value) → ④ media stage-2 (rebind rows to the new doc ids) → ' +
+      '⑤ routes (idempotent by intent + primaryDocPath, write-time validation reused) → ' +
+      '⑥ space meta, which is SKIPPED unless overwriteSpaceMeta=true (explicit opt-in to avoid ' +
       'clobbering the target space curation). ' +
-      'formatVersion mismatch → 400 VALIDATION_ERROR. Re-importing the same bundle is fully ' +
-      'idempotent (no duplicate rows). Requires space write permission.',
+      'Returns a `media` section with {created, reused, skipped, failed[{docPath, originalName, ' +
+      'reason}]}; failed items are visible as broken links (no rewrite) and a re-import can ' +
+      'complete their binding. formatVersion 1 bundles skip media entirely (the media section ' +
+      'comes back all-zero); unsupported versions → 400 VALIDATION_ERROR. Re-importing the same ' +
+      'bundle is fully idempotent (no duplicate rows, no duplicate objects, docs unchanged). ' +
+      'Requires space write permission. NOTE: bundles with media can approach the 10MiB request ' +
+      'limit — for very large spaces prefer transferring the bundle as a file.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiQuery({

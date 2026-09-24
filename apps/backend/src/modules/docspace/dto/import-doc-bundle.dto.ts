@@ -5,26 +5,34 @@
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: docs/api-definition.md §16 (DocSpace 模块, doc_routes 段) —— 任务 T6（空间级全量导出/回导）
+ *   - 补充: docs/api-definition.md §16 (bundle formatVersion 2, P2 批 5) —— media/mediaOmitted 段
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [踩坑索引]
+ *   - BUNDLE-MEDIA-UNION: media[] 是**联合形状**（完整媒体项 | skipped 标记），
+ *     而 class-validator 的装饰器只能表达"字段可选"——union 的必填性由 Service 层
+ *     按 `skipped` 是否存在分支校验，非法项落 per-item failed（手改包不该整包 400）。
+ *     改本文件时必须保持"DTO 只管格式、union 语义归 Service"的分工（铁律 #21）。
  *
  * [铁律关联] #21(双层校验) #11(注释强制) #17(测试契约) #25(类型前置)
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ contentBase64 @MaxLength / media @ArrayMaxSize / mimeType @IsIn 三处上限
+ *     必须取自 doc-bundle.constants.ts（与导出预算、导入复检同源）
+ *   □ 新增导出字段必须在此显式声明（forbidNonWhitelisted：未声明字段会让 roundtrip 400）
  * =============================================================================
  */
 import {
   ArrayMaxSize,
   IsArray,
+  IsBase64,
   IsIn,
   IsInt,
   IsNotEmpty,
   IsObject,
   IsOptional,
   IsString,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -39,15 +47,22 @@ import {
   DOC_TITLE_MAX_LENGTH,
   DOC_SUMMARY_MAX_LENGTH,
 } from '@agent-chamber/shared';
+import {
+  DOC_BUNDLE_MEDIA_BASE64_MAX_LENGTH,
+  DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES,
+  DOC_BUNDLE_MEDIA_MAX_ITEMS,
+  DOC_BUNDLE_MEDIA_MIME_TYPES,
+  DOC_BUNDLE_MEDIA_SKIP_REASONS,
+} from '../doc-bundle.constants';
 
 /**
- * 空间导出 bundle 顶层格式版本（任务 T6）。
+ * 空间导出 bundle 顶层格式版本（任务 T6；P2 批 5 升 2）。
  *
- * formatVersion 是 bundle 形状的稳定契约：导出端点写入、回导端点校验。
- * 只支持当前版本（=1）；不匹配 → 400 VALIDATION_ERROR（Service 层业务校验，
- * DTO 层只保证它是整数——铁律 #21 双层校验的分工）。
+ * formatVersion 是 bundle 形状的稳定契约：导出端点**恒写 2**，回导端点接受
+ * `DOC_BUNDLE_ACCEPTED_FORMAT_VERSIONS`（{1,2}）。不匹配 → 400 VALIDATION_ERROR
+ * （Service 层业务校验，DTO 层只保证它是整数——铁律 #21 双层校验的分工）。
  */
-export const DOC_BUNDLE_FORMAT_VERSION = 1;
+export const DOC_BUNDLE_FORMAT_VERSION = 2;
 
 /** 回导 bundle 的排序权重上限（对齐 CreateDocRouteDto/CreateDocCategoryDto 惯例） */
 const BUNDLE_SORT_ORDER_MAX = 10000;
@@ -236,8 +251,8 @@ export class BundleDocItemDto {
 
   /**
    * 原始写入 payload 的 SHA-256（export 侧附加，v1.62.0；nullable 列可达 null）。
-   * **纯 informational，import 时忽略不参与写**——新增了该字段的新版 bundle 回导
-   * 旧/新服务端皆不报错（formatVersion 保持 1；roundtrip 兼容）。
+   * **纯 informational，import 时忽略不参与写**——新增了该字段后的 bundle 回导
+   * 旧/新服务端皆不报错（formatVersion 1/2 都声明该字段；roundtrip 兼容）。
    */
   @ApiPropertyOptional({
     description: 'Original payload SHA-256 (informational, ignored on import; nullable)',
@@ -292,13 +307,154 @@ export class BundleDocItemDto {
 }
 
 /**
- * POST /doc-spaces/:id/import-bundle 请求体 = 导出端点的完整输出（formatVersion 1）。
+ * bundle.media[] 的 thumbnail 载荷（formatVersion 2，plan §⑤.2）。
+ *
+ * 只有附件行有缩略图（thumb_key 非空）时才出现；导入侧按**字节证据**校验：
+ * 解码字节必须嗅探为 webp，且与声明的 sizeBytes/sha256 自洽——任一不符该项
+ * per-item failed（不落行）。
+ */
+export class BundleMediaThumbnailDto {
+  @ApiProperty({ description: 'Thumbnail width in px', minimum: 1, maximum: 16384 })
+  @IsInt()
+  @Min(1)
+  @Max(16384)
+  width: number;
+
+  @ApiProperty({ description: 'Thumbnail height in px', minimum: 1, maximum: 16384 })
+  @IsInt()
+  @Min(1)
+  @Max(16384)
+  height: number;
+
+  @ApiProperty({ description: 'Decoded thumbnail byte length', minimum: 1 })
+  @IsInt()
+  @Min(1)
+  @Max(DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES)
+  sizeBytes: number;
+
+  @ApiProperty({ description: 'SHA-256 of the decoded thumbnail bytes (lowercase hex)' })
+  @IsString()
+  @Matches(/^[0-9a-f]{64}$/)
+  sha256: string;
+
+  @ApiProperty({ description: 'Thumbnail bytes, standard padded base64' })
+  @IsString()
+  @IsBase64()
+  @MaxLength(DOC_BUNDLE_MEDIA_BASE64_MAX_LENGTH)
+  contentBase64: string;
+}
+
+/**
+ * bundle.media[] 条目（formatVersion 2，plan §⑤.2）——**联合形状**：
+ *
+ * - 完整媒体项：sourceAttachmentId + docPath + originalName/mimeType/sizeBytes/sha256/
+ *   contentBase64（+ 可选 thumbnail）；
+ * - 导出侧因超出单项上限或联合预算未打包时落 `{ skipped, ...meta }` 标记，
+ *   导入侧计入 skipped（不落行、不报错）。
+ *
+ * 必填性为什么不在 DTO 表达：union 语义 class-validator 表达不了；DTO 只做格式校验
+ * （mimeType 值域 / sha256 形状 / base64 / 长度上限），"该有的字段没给"由 Service 层
+ * 落 per-item failed（手改包不该让整包 400）。
+ *
+ * sourceAttachmentId 是**URL 重写配对键**：导出侧恒等于正文 URL 里的旧附件 id；
+ * 自建 bundle 时也必须保持一致，否则正文里的旧 URL 找不到映射（无映射不重写）。
+ */
+export class BundleMediaItemDto {
+  @ApiPropertyOptional({
+    description:
+      'Source attachment id (URL-rewrite pairing key; must match the id in the body URL)',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  sourceAttachmentId?: string;
+
+  @ApiProperty({ description: 'Doc path this media item belongs to', maxLength: 512 })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(512)
+  docPath: string;
+
+  @ApiPropertyOptional({ description: 'Original file name (sanitized on import)', maxLength: 255 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  originalName?: string;
+
+  @ApiPropertyOptional({
+    description: 'MIME type (must match the byte evidence of contentBase64)',
+    enum: [...DOC_BUNDLE_MEDIA_MIME_TYPES],
+  })
+  @IsOptional()
+  @IsIn([...DOC_BUNDLE_MEDIA_MIME_TYPES])
+  mimeType?: string;
+
+  @ApiPropertyOptional({ description: 'Decoded byte length', minimum: 0 })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES)
+  sizeBytes?: number;
+
+  @ApiPropertyOptional({ description: 'SHA-256 of the decoded bytes (lowercase hex)' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[0-9a-f]{64}$/)
+  sha256?: string;
+
+  @ApiPropertyOptional({ description: 'Original image bytes, standard padded base64' })
+  @IsOptional()
+  @IsString()
+  @IsBase64()
+  @MaxLength(DOC_BUNDLE_MEDIA_BASE64_MAX_LENGTH)
+  contentBase64?: string;
+
+  @ApiPropertyOptional({ description: 'Thumbnail payload (only when the row has one)' })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => BundleMediaThumbnailDto)
+  thumbnail?: BundleMediaThumbnailDto;
+
+  @ApiPropertyOptional({
+    description: 'Exporter-side skip marker (no payload); skipped items are not imported',
+    enum: [...DOC_BUNDLE_MEDIA_SKIP_REASONS],
+  })
+  @IsOptional()
+  @IsIn([...DOC_BUNDLE_MEDIA_SKIP_REASONS])
+  skipped?: string;
+}
+
+/**
+ * bundle.mediaOmitted[] 条目（formatVersion 2，plan §⑤.1 / PM Q4/m4）——
+ * **informational 清单**：正文引用了该附件，但它绑定的是 topic（跨环境主题 id 不通用，
+ * 且 topic 绑定附件不在空间读权限面内）→ 刻意不打包，让"回导后这段断链"可被发现。
+ */
+export class BundleMediaOmittedItemDto {
+  @ApiProperty({ description: 'Doc path whose body references the attachment', maxLength: 512 })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(512)
+  docPath: string;
+
+  @ApiProperty({ description: 'Referenced attachment id' })
+  @IsString()
+  @MaxLength(64)
+  attachmentId: string;
+
+  @ApiProperty({ description: 'Why it was not packed', enum: ['topic_bound'] })
+  @IsIn(['topic_bound'])
+  reason: string;
+}
+
+/**
+ * POST /doc-spaces/:id/import-bundle 请求体 = 导出端点的完整输出（formatVersion 1 或 2）。
  *
  * 顶层即 bundle 本身（不套 envelope），导出文件可直接作为请求体回灌。
- * categories/routes/docs 可选（空数组合法）；space 必填。
+ * categories/routes/docs/media/mediaOmitted 可选（空数组合法）；space 必填。
+ * formatVersion=1 时 media 段整体跳过（结果信封 media 段为全零值形状）。
  */
 export class ImportDocBundleDto {
-  @ApiProperty({ description: 'Bundle format version (must equal 1)', example: 1 })
+  @ApiProperty({ description: 'Bundle format version (1 = no media, 2 = with media)', example: 2 })
   @IsInt()
   formatVersion: number;
 
@@ -341,4 +497,29 @@ export class ImportDocBundleDto {
   @ValidateNested({ each: true })
   @Type(() => BundleDocItemDto)
   docs?: BundleDocItemDto[];
+
+  @ApiPropertyOptional({
+    description:
+      'Media payloads (formatVersion 2): attachment bytes referenced by doc content, ' +
+      'packed under a joint request-body budget; skipped markers carry no payload',
+    type: [BundleMediaItemDto],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(DOC_BUNDLE_MEDIA_MAX_ITEMS)
+  @ValidateNested({ each: true })
+  @Type(() => BundleMediaItemDto)
+  media?: BundleMediaItemDto[];
+
+  @ApiPropertyOptional({
+    description:
+      'Informational list of body-referenced attachments that were deliberately not packed ' +
+      '(reason: topic_bound) — the corresponding links stay broken after import',
+    type: [BundleMediaOmittedItemDto],
+  })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => BundleMediaOmittedItemDto)
+  mediaOmitted?: BundleMediaOmittedItemDto[];
 }

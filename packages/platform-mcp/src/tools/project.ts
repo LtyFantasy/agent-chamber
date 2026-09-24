@@ -46,11 +46,7 @@ export const SNIPPET_MAX_CHARS = 300;
  * @param field    - 要截断的字段名
  * @param maxChars - 截断上限（字符）；0 = 不截断返全文
  */
-export function truncateField(
-  obj: Record<string, unknown>,
-  field: string,
-  maxChars: number,
-): void {
+export function truncateField(obj: Record<string, unknown>, field: string, maxChars: number): void {
   if (
     maxChars !== 0 &&
     typeof obj[field] === 'string' &&

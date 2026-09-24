@@ -126,11 +126,12 @@ test('合并语义：项目级同名 server 覆盖用户级（惯例名命中取
 });
 
 // —— 向上查找 ——
-test('向上查找：cwd=子目录 → 找到项目级 .kimi-code 文件（openviking 同款模式）', () => {
+test('向上查找：cwd=子目录 → 找到项目级绑定与 mcp 文件（openviking 同款模式）', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ac-up-'));
   try {
+    mkdirSync(path.join(dir, '.agent-chamber'), { recursive: true });
+    writeFileSync(path.join(dir, '.agent-chamber', 'agent-chamber.json'), JSON.stringify({ boardId: 'b1' }));
     mkdirSync(path.join(dir, '.kimi-code'), { recursive: true });
-    writeFileSync(path.join(dir, '.kimi-code', 'agent-chamber.json'), JSON.stringify({ boardId: 'b1' }));
     writeFileSync(
       path.join(dir, '.kimi-code', 'mcp.json'),
       JSON.stringify(mcp({ chamber: httpServer('https://x/mcp', { 'X-API-Key': 'ask_up1234567890' }) })),
@@ -148,7 +149,7 @@ test('向上查找：cwd=子目录 → 找到项目级 .kimi-code 文件（openv
 });
 
 test('向上查找：到 fs 根停止，不抛异常', () => {
-  assert.equal(findUpward('/nonexistent-dir-xyz', '.kimi-code/agent-chamber.json'), null);
+  assert.equal(findUpward('/nonexistent-dir-xyz', '.agent-chamber/agent-chamber.json'), null);
 });
 
 // —— A4 边界：enabled:false ——

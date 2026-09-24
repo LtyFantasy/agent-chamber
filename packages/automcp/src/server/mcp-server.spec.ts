@@ -24,11 +24,17 @@ import express from 'express';
 import request from 'supertest';
 import { McpServer } from './mcp-server';
 import { HttpProxy } from '../proxy/http-proxy';
+import { getToolContext } from './tool-context';
+import { reportToolInvocation } from './usage-reporter';
 import type { ToolMapping, ToolCallResult, CustomTool, CustomToolContext } from '../types';
 
 // Mock HttpProxy
 jest.mock('../proxy/http-proxy');
 const MockedHttpProxy = HttpProxy as jest.MockedClass<typeof HttpProxy>;
+
+// 上报是 fire-and-forget 的副作用：mock 掉发送层才能在 tools/call 路径上断言载荷形状
+jest.mock('./usage-reporter');
+const mockedReport = reportToolInvocation as jest.MockedFunction<typeof reportToolInvocation>;
 
 describe('McpServer', () => {
   let app: express.Application;
@@ -352,7 +358,9 @@ describe('McpServer', () => {
     });
 
     it('should serve JSON-RPC on configured basePath', async () => {
-      server = new McpServer(app, 9877, proxy, '/mcp-full');
+      // 端口 9879（原 9877）：9877 被 Windows 宿主进程占用（WSL2 localhost 转发镜像
+      // Windows 端口，WSL 内 ss/lsof 不可见、bind 必 EADDRINUSE——同族坑见 9876/Blender）
+      server = new McpServer(app, 9879, proxy, '/mcp-full');
       server.registerTools([makeMapping('custom_path_tool')]);
       await server.start();
 
@@ -738,6 +746,174 @@ describe('McpServer', () => {
         { type: 'text', text: 'second block' },
       ]);
       expect(res.body.result.structuredContent).toBeUndefined();
+    });
+  });
+
+  describe('usage stats（D4b：ALS 上下文 + invocation 上报）', () => {
+    const usageBaseUrl = 'http://localhost:8743/api/v1';
+    const fallbackAuth = { type: 'apiKey' as const, apiKey: 'shared-key' };
+
+    // 外层的 beforeEach 只清 HttpProxy 构造 mock，上报 mock 需在本组内清（否则计数累积）
+    beforeEach(() => {
+      mockedReport.mockClear();
+    });
+
+    /** 构造带 surface 与服务端默认认证的 server（上报的两个前提） */
+    function makeReportingServer(surface = 'mcp'): McpServer {
+      const instance = new McpServer(app, 9876, proxy, '/mcp', usageBaseUrl, surface);
+      instance.setFallbackAuth(fallbackAuth);
+      return instance;
+    }
+
+    /** 取出最近一次上报载荷 */
+    function lastReport(): Parameters<typeof reportToolInvocation>[0] {
+      const calls = mockedReport.mock.calls;
+      return calls[calls.length - 1][0];
+    }
+
+    /** 发起一次 tools/call（可带 client 认证头） */
+    function callToolRequest(
+      params: Record<string, unknown> | undefined,
+      apiKeyHeader?: string,
+    ): request.Test {
+      const httpRequest = request(app).post('/mcp');
+      if (apiKeyHeader !== undefined) {
+        httpRequest.set('X-API-Key', apiKeyHeader);
+      }
+      return httpRequest.send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        ...(params === undefined ? {} : { params }),
+      });
+    }
+
+    it('自动映射工具成功调用 → 恰好上报一次，载荷含 baseUrl/toolName/surface/ok/latencyMs', async () => {
+      proxy.execute.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+      server = makeReportingServer('mcp');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'list_topics', arguments: {} });
+
+      expect(mockedReport).toHaveBeenCalledTimes(1);
+      expect(lastReport()).toMatchObject({
+        baseUrl: usageBaseUrl,
+        toolName: 'list_topics',
+        surface: 'mcp',
+        ok: true,
+        // 无 client 认证头 → 走服务端默认认证（后端据此落 actor_type='system'）
+        viaFallbackAuth: true,
+      });
+      expect(lastReport().latencyMs as number).toBeGreaterThanOrEqual(0);
+      expect(Number.isInteger(lastReport().latencyMs)).toBe(true);
+    });
+
+    it('proxy 返回 isError:true → ok:false', async () => {
+      proxy.execute.mockResolvedValue({
+        content: [{ type: 'text', text: 'HTTP 404: Not Found' }],
+        isError: true,
+      });
+      server = makeReportingServer('mcp');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'list_topics', arguments: {} });
+
+      expect(mockedReport).toHaveBeenCalledTimes(1);
+      expect(lastReport()).toMatchObject({ toolName: 'list_topics', ok: false });
+    });
+
+    it('出口 ④ tool-not-found → 用真名 + ok:false（"想用但入口没有"的晋升信号）', async () => {
+      server = makeReportingServer('mcp');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'non_existent_tool', arguments: {} });
+
+      expect(mockedReport).toHaveBeenCalledTimes(1);
+      expect(lastReport()).toMatchObject({ toolName: 'non_existent_tool', ok: false });
+    });
+
+    it('pre-name 出口（params 缺失）→ toolName=__invalid__ + ok:false', async () => {
+      server = makeReportingServer('mcp');
+      await server.start();
+
+      await callToolRequest(undefined);
+
+      expect(mockedReport).toHaveBeenCalledTimes(1);
+      expect(lastReport()).toMatchObject({ toolName: '__invalid__', ok: false });
+    });
+
+    it('pre-name 出口（name 非字符串）→ toolName=__invalid__ + ok:false', async () => {
+      server = makeReportingServer('mcp');
+      await server.start();
+
+      await callToolRequest({ name: 123, arguments: {} });
+
+      expect(mockedReport).toHaveBeenCalledTimes(1);
+      expect(lastReport()).toMatchObject({ toolName: '__invalid__', ok: false });
+    });
+
+    it('client 自带认证头 → viaFallbackAuth:false（身份可信）', async () => {
+      proxy.execute.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+      server = makeReportingServer('mcp');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'list_topics', arguments: {} }, 'client-own-key');
+
+      expect(lastReport()).toMatchObject({ viaFallbackAuth: false });
+    });
+
+    it('无任何凭据（无 client 头 + 无 fallbackAuth）→ 不上报（两通道均不可见，D1 口径代价）', async () => {
+      proxy.execute.mockResolvedValue({ content: [{ type: 'text', text: '{"ok":true}' }] });
+      server = new McpServer(app, 9876, proxy, '/mcp', usageBaseUrl, 'mcp');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'list_topics', arguments: {} });
+
+      expect(mockedReport).not.toHaveBeenCalled();
+    });
+
+    it('代理调用点可见 ALS 上下文（两头注入的前提，V4）', async () => {
+      let seen: unknown;
+      proxy.execute.mockImplementation(async () => {
+        seen = getToolContext();
+        return { content: [{ type: 'text', text: '{"ok":true}' }] };
+      });
+      server = makeReportingServer('mcp-full');
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      await callToolRequest({ name: 'list_topics', arguments: {} });
+
+      expect(seen).toEqual({ toolName: 'list_topics', surface: 'mcp-full' });
+    });
+
+    it('custom tool handler 内可见 ALS 上下文（platform-mcp 语义工具路径）', async () => {
+      let seen: unknown;
+      server = makeReportingServer('mcp');
+      server.registerCustomTools([
+        {
+          tool: {
+            name: 'read_doc',
+            description: 'Read a doc',
+            inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+          },
+          handler: async () => {
+            seen = getToolContext();
+            return { content: [{ type: 'text', text: 'ok' }] };
+          },
+        },
+      ]);
+      await server.start();
+
+      await callToolRequest({ name: 'read_doc', arguments: {} });
+
+      expect(seen).toEqual({ toolName: 'read_doc', surface: 'mcp' });
+      expect(mockedReport).toHaveBeenCalledTimes(1);
     });
   });
 });

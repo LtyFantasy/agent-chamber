@@ -23,8 +23,10 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import http from 'http';
 import axios from 'axios';
-import { runServe } from './serve-runner';
+import { resolveSurface, runServe } from './serve-runner';
+import { loadProfile } from './profile/profile-loader';
 import type { ServeOptions } from './types';
 
 const fixturesDir = path.join(__dirname, 'parser', '__fixtures__');
@@ -399,5 +401,195 @@ describe('runServe', () => {
 
       await result.stop();
     });
+  });
+});
+
+/**
+ * 仓库内**真实** profile 文件（生产部署实际使用的那两份）
+ *
+ * surface 解析单测刻意用真实文件而非临时 fixture：`name` 字段的实值是自然语言标签
+ * （"Platform Agent (Worker)"），只有真实文件才能钉住"解析不看 name"这一事实。
+ */
+const realProfilesDir = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'apps',
+  'backend',
+  'config',
+  'mcp-profiles',
+);
+const agentProfilePath = path.join(realProfilesDir, 'agent.json');
+const fullProfilePath = path.join(realProfilesDir, 'full.json');
+
+/** 轮询等待条件成立（invocation 上报是 fire-and-forget，测试必须自己等它到达） */
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('waitFor: condition not met within timeout');
+}
+
+describe('resolveSurface（usage stats D4c：surface 取名源与优先级）', () => {
+  it('真实 profile 文件存在（前提断言——路径漂移后本组会立刻红，而不是假绿）', () => {
+    expect(fs.existsSync(agentProfilePath)).toBe(true);
+    expect(fs.existsSync(fullProfilePath)).toBe(true);
+  });
+
+  it('--profile-path：basename 剥 .json → agent.json=mcp / full.json=mcp-full', () => {
+    expect(resolveSurface({ profilePath: agentProfilePath }, {})).toBe('mcp');
+    expect(resolveSurface({ profilePath: fullProfilePath }, {})).toBe('mcp-full');
+  });
+
+  it('禁用 profile JSON 的 name 字段（实值是人类标签，用它必落 unknown）', async () => {
+    const agentProfile = await loadProfile(agentProfilePath);
+    const fullProfile = await loadProfile(fullProfilePath);
+
+    // 实值证据：name 是自然语言标签，不是实例标识
+    expect(agentProfile.name).toBe('Platform Agent (Worker)');
+    expect(fullProfile.name).toBe('Platform Full');
+
+    // 解析结果只由文件名决定——若实现改成读 name，这两条立刻红
+    expect(resolveSurface({ profilePath: agentProfilePath }, {})).toBe('mcp');
+    expect(resolveSurface({ profilePath: fullProfilePath }, {})).toBe('mcp-full');
+  });
+
+  it('--profile 字面值：agent → mcp，full → mcp-full', () => {
+    expect(resolveSurface({ profile: 'agent' }, {})).toBe('mcp');
+    expect(resolveSurface({ profile: 'full' }, {})).toBe('mcp-full');
+  });
+
+  it('profilePath 优先于 profile（与 loadProfileForServe 的优先级一致）', () => {
+    expect(resolveSurface({ profile: 'full', profilePath: agentProfilePath }, {})).toBe('mcp');
+  });
+
+  it('MCP_SURFACE env 优先于 --surface 与 profile 推断', () => {
+    expect(
+      resolveSurface(
+        { profilePath: agentProfilePath, surface: 'mcp' },
+        { MCP_SURFACE: 'mcp-full' },
+      ),
+    ).toBe('mcp-full');
+  });
+
+  it('--surface 优先于 profile 推断', () => {
+    expect(resolveSurface({ profilePath: agentProfilePath, surface: 'mcp-full' }, {})).toBe(
+      'mcp-full',
+    );
+  });
+
+  it('显式值大小写/空白容错（词表是小写）', () => {
+    expect(resolveSurface({}, { MCP_SURFACE: ' MCP-FULL ' })).toBe('mcp-full');
+    expect(resolveSurface({ surface: 'MCP' }, {})).toBe('mcp');
+  });
+
+  it('显式值非法 → 终局 unknown（不回落 profile 推断）', () => {
+    expect(resolveSurface({ profile: 'agent', surface: 'worker' }, {})).toBe('unknown');
+    expect(resolveSurface({ profile: 'agent' }, { MCP_SURFACE: 'platform' })).toBe('unknown');
+  });
+
+  it('空/空白的显式值视为未提供（回落下一个源）', () => {
+    expect(resolveSurface({ profile: 'agent', surface: '' }, { MCP_SURFACE: '   ' })).toBe('mcp');
+  });
+
+  it('无任何来源 / 未知 profile 名 → unknown', () => {
+    expect(resolveSurface({}, {})).toBe('unknown');
+    expect(resolveSurface({ profile: 'unknown-profile' }, {})).toBe('unknown');
+    expect(resolveSurface({ profilePath: path.join(realProfilesDir, 'other.json') }, {})).toBe(
+      'unknown',
+    );
+  });
+});
+
+describe('usage stats 端到端（两头注入 + invocation 上报，V4/D4b）', () => {
+  let fakeBackend: http.Server;
+  let backendPort: number;
+  const received: Array<{ url: string; headers: http.IncomingHttpHeaders; body: unknown }> = [];
+
+  beforeEach(async () => {
+    received.length = 0;
+    fakeBackend = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (chunk) => {
+        raw += String(chunk);
+      });
+      req.on('end', () => {
+        const isUsageReport = req.url === '/api/v1/system/usage-events';
+        received.push({
+          url: req.url ?? '',
+          headers: req.headers,
+          body: raw === '' ? undefined : (JSON.parse(raw) as unknown),
+        });
+        res.writeHead(isUsageReport ? 202 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(isUsageReport ? { accepted: true } : { id: 'u1', name: 'me' }));
+      });
+    });
+
+    await new Promise<void>((resolve) => {
+      fakeBackend.listen(0, '127.0.0.1', resolve);
+    });
+
+    const address = fakeBackend.address();
+    backendPort = typeof address === 'object' && address !== null ? address.port : 0;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => {
+      fakeBackend.close(() => resolve());
+    });
+  });
+
+  it('tools/call → REST 扇出带两头，且后端收到一条 invocation 上报', async () => {
+    const result = await runServe(
+      makeOptions(path.join(fixturesDir, 'openapi3-minimal.json'), {
+        baseUrl: `http://127.0.0.1:${backendPort}/api/v1`,
+        apiKey: 'shared-api-key',
+        // full.json 的 include 是 `.*`（不会过滤掉 fixture 的工具），其 surface = mcp-full
+        profilePath: fullProfilePath,
+      }),
+    );
+
+    const callRes = await axios.post(
+      `${result.url}/mcp`,
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'get_current_user', arguments: {} },
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 5_000 },
+    );
+
+    expect(callRes.status).toBe(200);
+    expect(callRes.data.result.isError).toBeUndefined();
+
+    // 上报是 fire-and-forget：响应不等它，所以必须轮询等待
+    await waitFor(() => received.some((item) => item.url === '/api/v1/system/usage-events'));
+
+    // ① 代理路径扇出的 REST 请求带两头（注入点 ①）
+    const fanOut = received.find((item) => item.url === '/api/v1/users/me');
+    expect(fanOut).toBeDefined();
+    expect(fanOut?.headers['x-mcp-tool']).toBe('get_current_user');
+    expect(fanOut?.headers['x-mcp-surface']).toBe('mcp-full');
+    // 无 client 认证头 → 用服务端默认认证（--api-key）
+    expect(fanOut?.headers['x-api-key']).toBe('shared-api-key');
+
+    // ② invocation 上报（D4b 通道）——精确计数来源
+    const report = received.find((item) => item.url === '/api/v1/system/usage-events');
+    expect(report?.headers['x-api-key']).toBe('shared-api-key');
+    expect(report?.body).toMatchObject({
+      toolName: 'get_current_user',
+      surface: 'mcp-full',
+      ok: true,
+      viaFallbackAuth: true,
+    });
+    expect(Number.isInteger((report?.body as { latencyMs: number }).latencyMs)).toBe(true);
+
+    await result.stop();
   });
 });

@@ -39,6 +39,8 @@ import { CommonModule } from './common/common.module';
 import databaseConfig from './config/database.config';
 import jwtConfig from './config/jwt.config';
 import minioConfig from './config/minio.config';
+import attachmentUrlConfig from './config/attachment-url.config';
+import judgmentConfig from './config/judgment.config';
 
 import * as entities from './database/entities';
 
@@ -62,6 +64,8 @@ import { RoundtableModule } from './modules/roundtable/roundtable.module';
 import { DownloadsModule } from './modules/downloads/downloads.module';
 import { AttachmentModule } from './modules/attachments/attachment.module';
 import { HealthModule } from './health/health.module';
+import { UsageStatsModule } from './modules/usage-stats/usage-stats.module';
+import { ExperienceModule } from './modules/experience/experience.module';
 
 @Module({
   imports: [
@@ -69,7 +73,7 @@ import { HealthModule } from './health/health.module';
       isGlobal: true,
       // app.config 已删除（review-0831 任务 e013af33：apiPrefix/port 死配置零消费，
       // 端口由 main.ts process.env.PORT 直读，前缀由 shared API_PREFIX 单源）
-      load: [databaseConfig, jwtConfig, minioConfig],
+      load: [databaseConfig, jwtConfig, minioConfig, attachmentUrlConfig, judgmentConfig],
     }),
     // 事件总线（M1 圆桌计划决策 2）：@nestjs/event-emitter forRoot() 默认 global: true，
     // 注册一次全模块可注入 EventEmitter2。EventService.create() 末尾 emit('event.created')，
@@ -129,6 +133,13 @@ import { HealthModule } from './health/health.module';
     // 见 modules/attachments/（plan wiccan-carnage-rocket）
     AttachmentModule,
     HealthModule,
+    // 接口/MCP 调用频率统计（批 1 采集核心）：全局拦截器采集 REST 调用 →
+    // 内存按 UTC 小时桶聚合 → 定期 flush 进 api_usage_stats_hourly
+    // （plan rocket-batwoman-booster-gold；批 2 追加查询面与上报端点）
+    UsageStatsModule,
+    // 经验库（平台第四资源，批 2 后端）：8 端点 + 检索三路融合 + 反馈计数联动 +
+    // 零命中埋点轻表；本批**不进**全局 /search、不发 events/SSE（plan §3 末段决策）
+    ExperienceModule,
   ],
   providers: [
     {

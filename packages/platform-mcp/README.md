@@ -1,8 +1,8 @@
 # @agent-chamber/platform-mcp
 
-Agent Chamber 平台业务语义层 —— 在 automcp 通用 OpenAPI→MCP 映射之上提供 5 个高层编排工具。
+Agent Chamber 平台业务语义层 —— 在 automcp 通用 OpenAPI→MCP 映射之上提供高层编排 MCP tools（customTools 数组，见 `src/index.ts`；数量与全清单以根仓 `pnpm skill:gen` 生成的 SKILL §6.1a/§6.4 机器装配总览为准，此处不维护手抄计数）。
 
-## 5 个语义工具速查
+## 首批 5 个语义工具（示例；全清单见 SKILL §6.4）
 
 | Tool | 场景 | 编排步骤 |
 |------|------|---------|
@@ -11,6 +11,8 @@ Agent Chamber 平台业务语义层 —— 在 automcp 通用 OpenAPI→MCP 映�
 | `get_topic_digest` | 话题速览 | 并行查 topic + messages |
 | `create_topic_with_board` | 一站式立项 | create_topic → create_board（board 失败时返回 topic id 供补救） |
 | `report_task_result` | 任务结果汇报 | 发评论（含 commit SHA）→ 改状态 |
+
+经验库五件（`record_experience` / `search_experiences` / `read_experience` / `update_experience` / `report_experience_feedback`）等后续批次的工具契约，统一见线上 `docs/api-definition.md` 与 SKILL §6.4。
 
 ## 认证透传
 

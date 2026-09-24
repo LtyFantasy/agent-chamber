@@ -1,0 +1,19 @@
+# dsh-agent-chamber bundle patch（plan「交付物 A」逐字规格；阶段二由 reconcilePlugins 自动挂入 profile bundles）。
+# baseUrl = profile 目录；!!js 仅在 config/disabled 生效（已实证硬事实 8）——两个 customSkillDirs 表达式
+# 经 createRequire 定位本包再取兄弟目录 kimi-code/skills（sibling 假设成立前提 = 仓内布局；
+# 插件 apply 内有 checkSkillDirs 自检兜底日志）。注意：--dump-config 不求值 !!js，
+# 表达式正确性由 boot 后 skills 可见性兜住（v1.2.1 §6）。
+- insert:
+    - id: agent-chamber
+      name: dsh-agent-chamber
+    - id: agent-chamber-skills
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: agent-chamber
+        includeDefaultRoots: false
+        watch: false
+        customSkillDirs:
+          # 根目录形态：扫描直接子目录束（agent-chamber/、session-start/）
+          - !!js process.getBuiltinModule('node:module').createRequire(new URL('package.json', baseUrl)).resolve('dsh-agent-chamber/package.json').replace(/\/plugins\/dsh\/package\.json$/, '/plugins/kimi-code/skills')
+          # 束目录形态：agent-chamber 的子目录（diagrams/docs/roundtable/taskboard/topics）各含 SKILL.md
+          - !!js process.getBuiltinModule('node:module').createRequire(new URL('package.json', baseUrl)).resolve('dsh-agent-chamber/package.json').replace(/\/plugins\/dsh\/package\.json$/, '/plugins/kimi-code/skills/agent-chamber')

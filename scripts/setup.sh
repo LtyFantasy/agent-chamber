@@ -11,6 +11,11 @@
 #
 # 非交互用法（CI / 自动化）：
 #   ADMIN_EMAIL=you@example.com ADMIN_PASSWORD=your-password ./scripts/setup.sh
+#   TYPESAFE_API_KEY=<TypeSafe 官方 key> ./scripts/setup.sh   # 顺带启用经验库判别（可选；见下）
+#
+# 经验库判别（可选增强，缺省关闭）：给经验库条目加机器初评标注。不配也能正常使用录入/
+# 检索/评审；启用后条目文本会上传至 TypeSafe 云端并按量计费——详见 .env.example 判别块。
+# 非交互环境下不传 TYPESAFE_API_KEY 即保持关闭（不会追问、不会失败）。
 #
 # 重复执行是安全的：.env 已存在则沿用，admin 仅在系统无管理员时创建。
 # =============================================================================
@@ -93,6 +98,69 @@ fi
 set_env ADMIN_EMAIL "$ADMIN_EMAIL"
 set_env ADMIN_PASSWORD "$ADMIN_PASSWORD"
 
+# ---------- 3.2 经验库判别（可选；缺省关闭） ----------
+# 判别服务是**可选增强**：不配也能用完整体验（录入/检索/评审），故这里绝不强制。
+# 优先级与 admin 一致：shell 环境变量（`TYPESAFE_API_KEY=… ./scripts/setup.sh`）> .env 已有
+# 非空值（重复执行不覆盖）> 交互询问（仅 tty；curl|bash 的 stdin 非 tty ⇒ 自然跳过）。
+# ⚠️ 三个触点共用一条前置守卫：**trim 后为空 ⇒ 一律视为"跳过"**（既不写 key 也不写 typesafe）
+#    ——空白 key 直写 .env 会让 production 走 fail-fast ⇒ 容器 on-failure 重启循环 ⇒ setup 白等 300s。
+# ⚠️ **绝不把用户已显式关闭的判别静默改回启用**：`.env` 里的 `JUDGMENT_PROVIDER` 是用户的显式决定，
+#    "key 留在原处 + provider 改回 none" 是文档支持的关闭方式。改写它**只在两种情况**：
+#    ① 用户**本次**显式提供 key（shell env 或交互输入）；② `.env` 本就是 `typesafe`（幂等回写）。
+#    其余情况（key 只是 .env 里既有的、而 provider 非 typesafe）⇒ 只保留 key，provider 原样不动。
+trim_ws() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+existing_env_value() { # existing_env_value KEY —— .env 中该键的首个值（无则空串；单进程无管道）
+  awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' .env
+}
+
+# key 来源（shell / env-file / prompt）——决定是否允许改写 provider（见上守则）
+KEY_SOURCE=""
+TYPESAFE_KEY="$(trim_ws "${TYPESAFE_API_KEY:-}")"
+if [[ -n "$TYPESAFE_KEY" ]]; then
+  KEY_SOURCE="shell"
+  info "检测到 shell 环境变量 TYPESAFE_API_KEY——将启用经验库判别"
+else
+  # 重复执行幂等：.env 里已有非空 key 就沿用，绝不覆盖用户填好的值
+  TYPESAFE_KEY="$(trim_ws "$(existing_env_value TYPESAFE_API_KEY)")"
+  if [[ -n "$TYPESAFE_KEY" ]]; then
+    KEY_SOURCE="env-file"
+    info "沿用以 .env 中已有的 TYPESAFE_API_KEY（不覆盖）"
+  fi
+fi
+
+if [[ -z "$TYPESAFE_KEY" && -t 0 ]]; then
+  echo -e "${YELLOW}[setup]${NC} 可选：启用经验库判别（录入/改写后给条目加机器初评标注）"
+  echo -e "        需要 TypeSafe 官方 key，申请入口 ${YELLOW}https://console.typesafe.ai/keys${NC}"
+  echo -e "        ⚠️ 启用 = 条目文本出境：标题/摘要/正文节选/信号/领域/环境指纹，以及"
+  echo -e "           疑似重复候选的标题与质量都会上传到 TypeSafe 云端。"
+  echo -e "        💰 按输入 token 计费，账单记在**你自己的 TypeSafe 账号**；"
+  echo -e "           JUDGMENT_RATE_LIMIT 即账单上限（缺省 60/actor/小时）。留空 = 跳过（推荐先跳过）。"
+  read -rsp "[setup] TYPESAFE_API_KEY（留空跳过）: " TYPESAFE_KEY || TYPESAFE_KEY=""
+  echo ""
+  TYPESAFE_KEY="$(trim_ws "$TYPESAFE_KEY")"
+  if [[ -n "$TYPESAFE_KEY" ]]; then
+    KEY_SOURCE="prompt"
+  fi
+fi
+
+if [[ -n "$TYPESAFE_KEY" ]]; then
+  set_env TYPESAFE_API_KEY "$TYPESAFE_KEY"
+
+  # 用户显式关闭时不得改写 provider（B1）：只有"本次显式给 key"或"本来就是 typesafe"才写
+  PROVIDER_IN_ENV="$(trim_ws "$(existing_env_value JUDGMENT_PROVIDER)")"
+  if [[ "$KEY_SOURCE" == "shell" || "$KEY_SOURCE" == "prompt" || "$PROVIDER_IN_ENV" == "typesafe" ]]; then
+    set_env JUDGMENT_PROVIDER "typesafe"
+    info "已启用经验库判别（.env 写入 TYPESAFE_API_KEY + JUDGMENT_PROVIDER=typesafe）"
+  else
+    info "已保留 TYPESAFE_API_KEY；JUDGMENT_PROVIDER=${PROVIDER_IN_ENV:-<空>} 未改动 ⇒ 判别保持关闭"
+    info "  （要启用：把 .env 的 JUDGMENT_PROVIDER 改成 typesafe，再 docker compose up -d backend）"
+  fi
+else
+  info "经验库判别保持关闭（JUDGMENT_PROVIDER=none）——录入/检索/评审不受影响"
+fi
+unset TYPESAFE_KEY KEY_SOURCE PROVIDER_IN_ENV
+
 # ---------- 3.5 构建镜像源自动回落 ----------
 # 官方源（alpine CDN / npmjs）不通或过慢时自动把国内镜像写入 .env（compose 构建经
 # ${APK_MIRROR:-}/${NPM_REGISTRY:-} 插值拾取）。用户显式设置（shell env 或 .env
@@ -156,3 +224,14 @@ fi
 echo ""
 echo -e "  停止服务    : docker compose down"
 echo -e "  查看日志    : docker compose logs -f backend"
+echo ""
+# 判别提示行**按写入后的 .env 状态条件化**（非 tty 安装的唯一可见落点：curl|bash 的 stdin
+# 非 tty ⇒ 上面的交互询问不可达，用户必须在这里被告知"还有这个可选增强"）。
+# 打印 .env 的**绝对路径**：curl|bash 用户的 CWD 在 $HOME，相对路径会指错地方。
+if grep -q '^JUDGMENT_PROVIDER=typesafe' .env; then
+  echo -e "  经验库判别  : ${GREEN}已启用（typesafe）${NC}"
+else
+  echo -e "  经验库判别  : ${YELLOW}可选${NC}（当前关闭，录入/检索/评审不受影响）"
+  echo -e "                启用 → 见 ${YELLOW}${ROOT}/.env${NC} 判别块：把 JUDGMENT_PROVIDER=none"
+  echo -e "                改成 typesafe 并填 TYPESAFE_API_KEY，再 docker compose up -d backend"
+fi

@@ -10,6 +10,7 @@ import remarkGfm from 'remark-gfm';
 import Link from 'next/link';
 import {
   AlertTriangle,
+  ArchiveRestore,
   ArrowLeft,
   BookOpen,
   Check,
@@ -57,6 +58,16 @@ import { createMarkdownComponents } from '@/lib/markdown-components';
 import { DocEditor } from '@/components/docs/doc-editor';
 import { DiagramViewer } from '@/components/docs/diagram-viewer';
 import { BatchUploadDialog } from '@/components/docs/batch-upload-dialog';
+import { ImportBundleDialog } from '@/components/docs/import-bundle-dialog';
+import { BUNDLE_BODY_MAX_BYTES, bundleDownloadName, serializedBodySize } from '@/lib/doc-bundle';
+import {
+  buildHumanExportEntries,
+  humanExportDownloadName,
+  type HumanExportFiles,
+  type HumanExportReadmeTexts,
+} from '@/lib/doc-human-export';
+import { zip } from 'fflate';
+import { ExportMenu } from '@/components/docs/export-menu';
 import { confirm, toast } from '@/lib/notify';
 import { MembersSheet } from '@/components/members/members-sheet';
 import type { MemberItem, MembersSheetLabels } from '@/components/members/types';
@@ -93,6 +104,25 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * fflate 异步 `zip` 的 Promise 包装。
+ *
+ * 用异步版（而非 `zipSync`）的理由：附件字节可达数 MB，同步压缩会长时间占用主线程。
+ * fflate 在有 Worker 时走 worker，无 Worker（含 jsdom）自动同进程完成——行为一致，仅调度不同。
+ *
+ * 返回类型为 `BlobPart`（而非 Uint8Array）：fflate 回调声明的是
+ * `Uint8Array<ArrayBufferLike>`，而 TS 5.7 起 `BlobPart` 只接受 ArrayBuffer 背书的视图；
+ * 运行时 fflate 恒返回普通 ArrayBuffer 视图，故在此**唯一一处**收窄，避免调用方各写各的断言。
+ */
+function zipAsync(files: HumanExportFiles): Promise<BlobPart> {
+  return new Promise((resolve, reject) => {
+    zip(files, (err, data) => {
+      if (err) reject(err);
+      else resolve(data as unknown as BlobPart);
+    });
+  });
 }
 
 /** 滚动到正文内指定标题（目录传 outline DTO heading——后端 heading_text 列直读，
@@ -144,6 +174,10 @@ export default function DocSpaceDetailPage() {
   const [editing, setEditing] = useState<{ mode: 'edit' | 'create' } | null>(null);
   const [spaceSettingsOpen, setSpaceSettingsOpen] = useState(false);
   const [batchUploadOpen, setBatchUploadOpen] = useState(false);
+  /** 空间级 bundle 导入对话框开关（canManage 可见） */
+  const [importBundleOpen, setImportBundleOpen] = useState(false);
+  /** 空间级 bundle 导出进行中（大空间导出可达数十秒，防连点） */
+  const [exporting, setExporting] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState('');
   /** 断链条目复制反馈（1.5s 后复位） */
   const [copiedHref, setCopiedHref] = useState<string | null>(null);
@@ -268,6 +302,24 @@ export default function DocSpaceDetailPage() {
   });
 
   /**
+   * 分类模式选中同步（D8）：命中文档所属分类若处于折叠态 → 展开（分类内换文档同理）。
+   * deps = selectedDocId + doc?.categoryId：同分类内换文档时 categoryId 不变，
+   * 只靠 categoryId 不会重跑（复核新-3）；而 selectedDocId 变化瞬间 doc 查询已换 key
+   * （data 短暂为 undefined），只靠 selectedDocId 则新 doc 落地时不会重跑——两个都要。
+   * 未命中集合时同引用早退，零写入零重渲染；categoryId 为空（未分类）零动作。
+   */
+  useEffect(() => {
+    const categoryId = doc?.categoryId;
+    if (!categoryId) return;
+    setCollapsedCats((prev) => {
+      if (!prev.has(categoryId)) return prev;
+      const next = new Set(prev);
+      next.delete(categoryId);
+      return next;
+    });
+  }, [selectedDocId, doc?.categoryId]);
+
+  /**
    * Web 全文通道（中栏渲染）。enabled 追加 doc 就绪 + 非 diagram 双条件：
    * ① doc 就绪才能知道 docType——diagram doc 的正文是 IR JSON，中栏走
    *   DiagramViewer（iframe 快照），绝不能发 /content 拉 IR 文本（acceptance:
@@ -350,6 +402,15 @@ export default function DocSpaceDetailPage() {
   const visibleCategories = useMemo(
     () => categories.filter((cat) => (categoryCounts.get(cat.slug) ?? 0) > 0),
     [categories, categoryCounts],
+  );
+
+  /**
+   * 当前文档所属分类 slug（分类模式选中同步的 gate 依据，D8）：
+   * doc 未就绪 / 未分类 / 分类不在空间分类表中 → null → 分类模式零动作（B5）。
+   */
+  const activeCategorySlug = useMemo(
+    () => categories.find((c) => c.id === doc?.categoryId)?.slug ?? null,
+    [categories, doc?.categoryId],
   );
 
   /** 过滤态扁平列表（P3：type/tag 过滤激活 → 扁平分页列表态） */
@@ -455,6 +516,112 @@ export default function DocSpaceDetailPage() {
     void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
+  };
+
+  /**
+   * 空间级内容批量变更（bundle 回导）后的刷新：空间/树/聚合 + 正文类查询整类前缀失效。
+   *
+   * 回导按 path 覆盖任意篇文档，逐篇精确失效不可行；前缀匹配（['docs','doc-content'] 覆盖
+   * 全部 docId）一次消灭整类，保证中栏正文立即反映新内容（D5）。
+   */
+  const invalidateSpaceContent = () => {
+    invalidateSpace();
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'doc'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content-full'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'filtered'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'search-docs'] });
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'search'] });
+  };
+
+  /**
+   * 人类可读 ZIP 的 README 文案（跟随 UI locale）。
+   *
+   * lib 不依赖 next-intl（纯函数、可在 node 侧复用），故文案在此注入；
+   * README 的 markdown 结构由 lib 拥有，这里只提供纯文本行。
+   */
+  const humanExportReadmeTexts = useMemo<HumanExportReadmeTexts>(
+    () => ({
+      title: t('bundle.export.readme.title'),
+      exportedAt: t('bundle.export.readme.exportedAt'),
+      docs: t('bundle.export.readme.docs'),
+      attachments: t('bundle.export.readme.attachments'),
+      unpacked: t('bundle.export.readme.unpacked'),
+      linksRewritten: t('bundle.export.readme.linksRewritten'),
+      invalidTitle: t('bundle.export.readme.invalidTitle'),
+      invalidHint: t('bundle.export.readme.invalidHint'),
+      invalidItem: t('bundle.export.readme.invalidItem'),
+      restoreHint: t('bundle.export.readme.restoreHint'),
+    }),
+    [t],
+  );
+
+  /**
+   * 导出整空间 bundle 并触发浏览器下载。
+   *
+   * - **pretty 打印**：后端文档化用途是快照 / 离线备份 / 落 git diff（体积代价 <1%）；
+   * - Blob 带 `{type:'application/json'}`；`revokeObjectURL` **延时 1s**（数 MB 下载防中断）；
+   * - 文件名 slug 由 `bundleDownloadName` 生成（纯中文名退化为空 → 回退 spaceId 前 8 位）；
+   * - 导出后自检：紧凑 JSON 超 10MiB 的包任何 HTTP/MCP 通道都导不回 → 警告 toast（对称闭环）。
+   */
+  const handleExportBundle = async () => {
+    setExporting(true);
+    try {
+      const bundle = await Api.docs.exportSpaceBundle(spaceId);
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = bundleDownloadName(bundle.space?.name ?? space?.name ?? '', spaceId);
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (serializedBodySize(bundle) > BUNDLE_BODY_MAX_BYTES) {
+        toast.warning({ title: t('bundle.export.tooLarge') });
+      }
+    } catch (err) {
+      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
+      toast.error({
+        title: axiosErr?.response?.data?.message || axiosErr?.message || t('bundle.export.failed'),
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  /**
+   * 导出人类可读 ZIP（docs 目录树 + 附件原文件 + README）。
+   *
+   * 与 JSON 导出共用同一 endpoint 与 `exporting` 防连点；转换**纯前端**完成（零 API 变更）：
+   * bundle → `buildHumanExportEntries`（消毒 / 配对 / 正文 URL 相对化 / README）→
+   * fflate 异步 zip → Blob `application/zip` 下载。
+   * `revokeObjectURL` 延时 1s 同 JSON 侧（数 MB 下载防中断）；
+   * 失败原因优先透传服务端 message，兜底 ZIP 专属文案（与 JSON 失败文案区分，便于定位）。
+   */
+  const handleExportHumanZip = async () => {
+    setExporting(true);
+    try {
+      const bundle = await Api.docs.exportSpaceBundle(spaceId);
+      const { files } = buildHumanExportEntries(bundle, {
+        texts: humanExportReadmeTexts,
+        spaceId,
+      });
+      const zipped = await zipAsync(files);
+      const blob = new Blob([zipped], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = humanExportDownloadName(bundle.space?.name ?? space?.name ?? '', spaceId);
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
+      toast.error({
+        title:
+          axiosErr?.response?.data?.message || axiosErr?.message || t('bundle.export.zipFailed'),
+      });
+    } finally {
+      setExporting(false);
+    }
   };
 
   /** 邀请 Agent 加入空间（R2 Promise 契约：页面层 allSettled 循环调用；
@@ -894,10 +1061,14 @@ export default function DocSpaceDetailPage() {
             </div>
           )
         ) : viewMode === 'tree' ? (
-          /* 目录模式（默认）：懒加载目录树（展开态 localStorage 持久化在 SidebarTree 内部管理） */
+          /* 目录模式（默认）：懒加载目录树（展开态 localStorage 持久化在 SidebarTree 内部管理）。
+             key={spaceId}：跨空间软导航不重挂载组件，换空间需重置内存态（展开态按空间分片，D3a）；
+             activeDocPath 供祖先链自动展开 + 层内有界自动翻页（选中态随内链跳转同步） */
           <SidebarTree
+            key={spaceId}
             spaceId={spaceId}
             activeDocId={selectedDocId}
+            activeDocPath={doc?.path ?? null}
             onSelectDoc={(docId) => handleDocSelect(docId)}
           />
         ) : /* 分类模式：分类 = getSpace categories ⋈ facets 计数（count=0 隐藏），展开拉 ?category=slug 分页 */
@@ -924,6 +1095,7 @@ export default function DocSpaceDetailPage() {
                   })
                 }
                 activeDocId={selectedDocId}
+                activeCategorySlug={activeCategorySlug}
                 onSelectDoc={(docId) => handleDocSelect(docId)}
               />
             ))}
@@ -1175,7 +1347,7 @@ export default function DocSpaceDetailPage() {
             )}
           </h1>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* 左栏折叠入口（v1.47.0-dev 移动端优化）：xl 以下左栏收进抽屉，正文不再被挤压 */}
           {!editing && (
             <Button
@@ -1267,16 +1439,51 @@ export default function DocSpaceDetailPage() {
               {t('upload.button')}
             </Button>
           )}
+          {/* 数据搬运（D1）：导出对齐后端 read 语义（全读者可见），导入走 canManage 门（write）。
+              导出菜单双格式：JSON = 机器可读全量快照（可回导），ZIP = 人类可读目录树（仅供阅读/搬运） */}
+          <ExportMenu
+            labels={{
+              trigger: t('bundle.export.menu.trigger'),
+              jsonLabel: t('bundle.export.menu.jsonLabel'),
+              jsonDesc: t('bundle.export.menu.jsonDesc'),
+              zipLabel: t('bundle.export.menu.zipLabel'),
+              zipDesc: t('bundle.export.menu.zipDesc'),
+            }}
+            exporting={exporting}
+            title={editing ? t('bundle.export.editingTitle') : t('bundle.export.title')}
+            onExportJson={() => {
+              void handleExportBundle();
+            }}
+            onExportZip={() => {
+              void handleExportHumanZip();
+            }}
+          />
+          {canManage && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!!editing}
+              title={editing ? t('bundle.import.disabledEditing') : t('bundle.import.title')}
+              onClick={() => setImportBundleOpen(true)}
+            >
+              <ArchiveRestore className="mr-1 h-4 w-4" />
+              {t('bundle.import.button')}
+            </Button>
+          )}
         </div>
       </div>
-      {/* 三栏主体 */}
-      <div className="flex gap-4" style={{ height: 'calc(100vh - 9rem)' }}>
+      {/* 三栏主体（xl 限定定高：<xl 按钮换行会顶出视口，改为自然流式滚动，UX R1） */}
+      <div className="flex gap-4 xl:h-[calc(100vh-9rem)]">
         {/* 左栏：搜索 + 过滤 + 分类树/搜索命中（xl 常驻；xl 以下收进折叠 Sheet，v1.47.0-dev 移动端优化） */}
         <aside className="hidden w-64 shrink-0 flex-col gap-2 overflow-hidden xl:flex">
           {sidebarContent}
         </aside>
-        {/* 中栏：文档正文或编辑器 */}
-        <main className="min-w-0 flex-1 overflow-y-auto rounded-lg border border-border/40 p-4">
+        {/* 中栏：文档正文或编辑器（data-scroll-container = 附件图片视口门控的
+            IntersectionObserver root 锚点，见 attachment-image.tsx） */}
+        <main
+          data-scroll-container
+          className="min-w-0 flex-1 overflow-y-auto rounded-lg border border-border/40 p-4"
+        >
           {editing ? (
             // 编辑模式必须等 full 原文就绪——去重版 docContent 回写会丢首标题行（P0 数据损坏）
             editing.mode === 'edit' && fullContentIsError ? (
@@ -1754,12 +1961,19 @@ export default function DocSpaceDetailPage() {
         spaceId={spaceId}
         open={batchUploadOpen}
         onOpenChange={setBatchUploadOpen}
-        onUploaded={() => {
-          // 懒加载目录树/聚合计数（A4 防脏目录计数）：前缀通配失效覆盖全部 prefix 层
-          void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
-          void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
-          void queryClient.invalidateQueries({ queryKey: ['docs', 'space', spaceId] });
-        }}
+        // 收口到既有 helper（行为仅新增 ['docs','spaces'] 失效，B6）
+        onUploaded={invalidateSpace}
+      />
+
+      {/* 空间级 bundle 导入 Dialog（回导成功 → 空间 + 正文类查询整类失效，D5） */}
+      <ImportBundleDialog
+        spaceId={spaceId}
+        spaceName={space.name ?? ''}
+        spaceVisibility={space.visibility ?? Visibility.OPEN}
+        spaceDocCount={space.docCount ?? 0}
+        open={importBundleOpen}
+        onOpenChange={setImportBundleOpen}
+        onImported={invalidateSpaceContent}
       />
     </div>
   );

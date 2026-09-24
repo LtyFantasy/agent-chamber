@@ -2,7 +2,7 @@
   "name": "@agent-chamber/platform-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Agent Chamber 平台业务语义层 —— 15 个高层编排 MCP tools",
+  "description": "Agent Chamber 平台业务语义层 —— 高层编排 MCP tools（数量以 pnpm skill:gen 机器装配为准）",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

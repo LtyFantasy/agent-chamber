@@ -9,7 +9,7 @@ import { create } from 'zustand';
  *
  * [代码职责]
  *   - 命令式触发点（attachment-image.tsx 的 img onClick）↔ 声明式宿主
- *     （image-preview-host.tsx）之间的契约层：open(src, alt) / close()
+ *     （image-preview-host.tsx）之间的契约层：open(displaySrc, alt, pinKey) / close()
  *
  * [权威文档]
  *   - 主文档: docs/frontend-architecture.md §3.2.3（消息渲染）— 图片预览宿主挂载
@@ -17,12 +17,16 @@ import { create } from 'zustand';
  *
  * [关键不变量]
  *   - 不 persist（瞬态 UI 状态，会话刷新即消失——与 notification.store 同范式）
- *   - src 为「当前显示 URL」：attachment 分支传 blob URL（blob 生命周期由
- *     AttachmentImage 的引用计数缓存管理，宿主只消费不持有）
+ *   - **显示源与 pin 键分离**（plan §③ 键空间契约）：src = 「当前显示 URL」（attachment
+ *     分支为 blob URL，外部图为原始 URL）；pinKey = 「附件内容 URL」，与
+ *     attachment-image 的 blobCache 同键空间，宿主据此 acquireRef/releaseRef 持有 blob
+ *     （附件 blob 由引用计数缓存管理，宿主按 pinKey 持有、不按 blobUrl——blobUrl 必 miss）
+ *   - pinKey 仅内部流转：不得渲染进 DOM/URL（blob URL 与附件 URL 都属会话资源）
  *
  * [关联代码]
  *   - src/components/attachments/attachment-image.tsx — 唯一触发点（open）
- *   - src/components/attachments/image-preview-host.tsx — 唯一消费点（渲染/close）
+ *     + acquireRef/releaseRef 模块 API（pin 计数）
+ *   - src/components/attachments/image-preview-host.tsx — 唯一消费点（渲染/close/pin）
  *
  * [持久踩坑]
  *   - 无
@@ -36,12 +40,19 @@ import { create } from 'zustand';
  */
 
 interface ImagePreviewState {
-  /** 预览图片 src（null = 关闭；attachment 分支为 blob URL，外部图为原始 URL） */
+  /** 预览图片当前显示 URL（null = 关闭；attachment 分支为 blob URL，外部图为原始 URL） */
   src: string | null;
   /** 图片 alt（读屏/对话框 aria-label，可选） */
   alt?: string;
-  /** 打开预览（AttachmentImage 渲染态 img 点击触发） */
-  open: (src: string, alt?: string) => void;
+  /**
+   * 预览图的附件内容 URL（pin 键，plan §③ 键空间契约）：
+   * 与 attachment-image 的模块级 blobCache 同键空间，宿主据此引用计数持有 blob，
+   * 保证预览期间组件滚出视口/卸载不会 revoke 掉正在显示的 blob；
+   * 外部图无 blob → undefined（宿主不做引用计数）。
+   */
+  pinKey?: string;
+  /** 打开预览（AttachmentImage 渲染态 img 点击触发；pinKey 见上） */
+  open: (displaySrc: string, alt?: string, pinKey?: string) => void;
   /** 关闭预览（ESC / 背板点击 / 关闭按钮共用） */
   close: () => void;
 }
@@ -53,8 +64,9 @@ interface ImagePreviewState {
 export const useImagePreviewStore = create<ImagePreviewState>()((set) => ({
   src: null,
   alt: undefined,
+  pinKey: undefined,
 
-  open: (src, alt) => set({ src, alt }),
+  open: (displaySrc, alt, pinKey) => set({ src: displaySrc, alt, pinKey }),
 
-  close: () => set({ src: null, alt: undefined }),
+  close: () => set({ src: null, alt: undefined, pinKey: undefined }),
 }));

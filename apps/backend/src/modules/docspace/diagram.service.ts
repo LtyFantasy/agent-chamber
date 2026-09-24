@@ -66,11 +66,13 @@ import { IdempotencyRecord } from '../../database/entities/idempotency-record.en
 import { DocService } from './doc.service';
 import { DiagramRendererService } from './diagram-renderer.service';
 import { applyDiagramPatch, DiagramPatchError } from './diagram-patch';
+import { DOC_IDEMPOTENCY_ENTITY_TYPE } from './doc-constants';
+// v1.63.0 Diagram 写族幂等：通用实现已上移 common/services/idempotency.helper.ts
 import {
   buildIdempotencyContext,
   tryIdempotentReplay,
   persistIdempotencyStandalone,
-} from './doc-idempotency.helper';
+} from '../../common/services/idempotency.helper';
 import type { UnifiedActor } from '../../common/types/actor.types';
 import type { UpsertDiagramDto, PatchDiagramDto, ValidateDiagramDto } from './dto';
 
@@ -246,7 +248,7 @@ export class DiagramService {
     }
 
     // 入口级幂等 ctx（最外层写入口，照 patchSection/patchByMatch 先例）
-    const ctx = buildIdempotencyContext(actor, dto.clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, dto.clientRequestId, {
       docId,
       patches: dto.patches,
       expectedContentHash: dto.expectedContentHash,

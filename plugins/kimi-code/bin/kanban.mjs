@@ -41,10 +41,10 @@ function parseStatus(raw) {
  */
 function formatInferError(board) {
   if (board.error === 'none') {
-    return '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个 board。请先创建或加入一个 board（或在 .kimi-code/agent-chamber.json 显式填写 boardId）后重试 /agent-chamber:kanban。';
+    return '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个 board。请先创建或加入一个 board（或在 .agent-chamber/agent-chamber.json 显式填写 boardId）后重试 /agent-chamber:kanban。';
   }
   if (board.error === 'invalid-config') {
-    return '[agent-chamber] 配置错误：.kimi-code/agent-chamber.json 的 boardId 必须是字符串（当前值类型非法）。请修正后重试 /agent-chamber:kanban。';
+    return '[agent-chamber] 配置错误：.agent-chamber/agent-chamber.json 的 boardId 必须是字符串（当前值类型非法）。请修正后重试 /agent-chamber:kanban。';
   }
   if (board.error === 'ambiguous') {
     const lines = board.candidates.map((c) => `- ${c.id} ${c.name}`);
@@ -52,20 +52,20 @@ function formatInferError(board) {
     return [
       `[agent-chamber] 绑定未配置且存在多个候选 board${total}，无法自动推断。候选：`,
       ...lines,
-      '请在 .kimi-code/agent-chamber.json 显式填写 boardId 指向其中一个，再重试 /agent-chamber:kanban。',
+      '请在 .agent-chamber/agent-chamber.json 显式填写 boardId 指向其中一个，再重试 /agent-chamber:kanban。',
     ].join('\n');
   }
   // mine-unsupported（A2）：旧后端收到未声明的 mine 参数 → 400；禁止回退非 mine 列表（open 污染推断）
-  return '[agent-chamber] 当前 chamber 后端版本不支持绑定推断（列表接口缺少 mine 参数）。请在 .kimi-code/agent-chamber.json 显式填写 boardId，或升级 chamber 后端后再试。';
+  return '[agent-chamber] 当前 chamber 后端版本不支持绑定推断（列表接口缺少 mine 参数）。请在 .agent-chamber/agent-chamber.json 显式填写 boardId，或升级 chamber 后端后再试。';
 }
 
 /** 绑定失效文案（P3）：显式 id 路径下实体不存在/被删；与「未接入/歧义」文案不混用 */
 const BINDING_INVALID_TEXT =
-  '[agent-chamber] 绑定的 board 不存在或已被删除，请检查 .kimi-code/agent-chamber.json 的 boardId。';
+  '[agent-chamber] 绑定的 board 不存在或已被删除，请检查 .agent-chamber/agent-chamber.json 的 boardId。';
 
 /** 连接异常文案（对齐 hooks 模板 D）：所有 ChamberRequestError 的兜底引导 */
 function formatConnectError(err) {
-  return `[agent-chamber] chamber 连接异常（${err.reason}）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。`;
+  return `[agent-chamber] chamber 连接异常（${err.reason}）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。`;
 }
 
 /**

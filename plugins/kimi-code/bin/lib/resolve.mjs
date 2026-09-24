@@ -43,7 +43,7 @@ export class ChamberRequestError extends Error {
 /**
  * 配置解析三步（projectDir → binding → key → apiBase）。
  * cwd 语义：bin 脚本被 agent 经 Bash 调用时 cwd=项目目录（无 hooks 的 cwd 陷阱），
- * 直接 resolveConfig(projectDir) 逐层向上找 .kimi-code/ 即可。
+ * 直接 resolveConfig(projectDir) 逐层向上找即可（绑定在 .agent-chamber/，mcp.json 在 .kimi-code/）。
  * @param {string} projectDir 会话项目目录（process.cwd()）
  * @param {object} [opts] { env, homeDir } 可注入便于测试（透传 resolveConfig）
  * @returns {{baseUrl: string, key: string, binding: object|null} | {error: string}}
@@ -70,21 +70,21 @@ export function resolveContext(projectDir, opts = {}) {
 function keyErrorText(keyResult) {
   if (keyResult.status === 'not-configured') {
     return (
-      '[agent-chamber] 未检测到接入配置：项目无 .kimi-code/agent-chamber.json（或 mcp.json 未配 chamber server）。\n' +
+      '[agent-chamber] 未检测到接入配置：项目无 .agent-chamber/agent-chamber.json（或 mcp.json 未配 chamber server）。\n' +
       '接入三步：① 登录 chamber（无账号找管理员申请，注册是 admin-only）→ Agents 页创建 agent 复制 API key；② 按插件 README「接入 playbook」初始化（MCP 模式/ REST-only 任一）；③ 重启会话生效。'
     );
   }
   // pointer-mismatch / no-key-in-server：指针命中但 server 不可用或无 X-API-Key
-  return `[agent-chamber] mcp.json 中找不到 mcpServer 指针「${keyResult.serverName ?? ''}」对应的可用 HTTP server（或其 headers 无 X-API-Key），请检查 .kimi-code/agent-chamber.json 的 mcpServer 与 mcp.json 配置。`;
+  return `[agent-chamber] mcp.json 中找不到 mcpServer 指针「${keyResult.serverName ?? ''}」对应的可用 HTTP server（或其 headers 无 X-API-Key），请检查 .agent-chamber/agent-chamber.json 的 mcpServer 与 mcp.json 配置。`;
 }
 
 /** resolveApiBase 非 ok 状态的文案（scheme 违例 / 配置不完整 → 引导显式写 apiBaseUrl） */
 function baseErrorText(baseResult) {
   if (baseResult.status === 'invalid-mcp-url' || baseResult.status === 'invalid-scheme') {
-    return '[agent-chamber] apiBaseUrl 无效（仅允许 https；localhost/127.0.0.1 例外允许 http）。请在 .kimi-code/agent-chamber.json 显式填写 apiBaseUrl。';
+    return '[agent-chamber] apiBaseUrl 无效（仅允许 https；localhost/127.0.0.1 例外允许 http）。请在 .agent-chamber/agent-chamber.json 显式填写 apiBaseUrl。';
   }
   // incomplete：有 key 但无 mcp server url / apiBaseUrl，推导无从谈起
-  return '[agent-chamber] 配置不完整：无法推导 API 地址（无 mcp server url 且未显式写 apiBaseUrl）。请在 .kimi-code/agent-chamber.json 显式填写 apiBaseUrl。';
+  return '[agent-chamber] 配置不完整：无法推导 API 地址（无 mcp server url 且未显式写 apiBaseUrl）。请在 .agent-chamber/agent-chamber.json 显式填写 apiBaseUrl。';
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * DocBundleService 单元测试（任务 T6：空间级全量导出/回导）
+ * DocBundleService 单元测试（任务 T6：空间级全量导出/回导；P2 批 5：媒体段）
  *
  * 覆盖：导出 bundle 形状（space meta/categories/docs 全文/routes 含 codeEntryType）、
  * 孤儿路由 primaryDocPath=null、formatVersion 校验（400 VALIDATION_ERROR）、
@@ -7,21 +7,32 @@
  * 幂等（存在更新/解析失败 per-item failed 不中止）、space meta 默认不回写 +
  * overwriteSpaceMeta=true 显式覆盖（保留空间身份字段）。
  *
+ * P2 批 5（媒体段）覆盖：media 打包与确定性排序 + 缩略图、联合预算（docs 段参与扣减）、
+ * skipped 双形态（too_large / budget_exceeded）、mediaOmitted（topic 绑定断链）、
+ * 对象读失败/自洽不符不入包、六阶段顺序、正文 URL 重写两形态 + 无映射不重写、
+ * v1 兼容（跳 media、信封全零值）、media 段三源失败合并。
+ *
+ * 媒体门面（AttachmentService）在本套件是**桩**：字节证据/复用键/配额等实现细节
+ * 由 attachment-bundle.spec.ts 单测 + docspace-bundle.e2e-spec.ts 真 PG/真 MinIO 覆盖。
  * 真实 PG 的 roundtrip 无损/幂等再导入/导入冲突覆盖在 docspace-bundle.e2e-spec.ts
  * （铁律 #23：ORM SQL 生成与 chunk 往返 mock 测不出）。
  */
 import { BadRequestException } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { ActorType, ErrorCode, Visibility } from '@agent-chamber/shared';
 import { DocSpaceService } from './docspace.service';
 import { AuditService } from '../audit/audit.service';
 import { DocService } from './doc.service';
 import { DocRouteService } from './doc-route.service';
 import { DocBundleService } from './doc-bundle.service';
+import { AttachmentService } from '../attachments/attachment.service';
 import { DOC_BUNDLE_FORMAT_VERSION } from './dto';
+import { DOC_BUNDLE_MAX_BYTES, DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES } from './doc-bundle.constants';
 import { DocSpace } from '../../database/entities/doc-space.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
+import { Attachment } from '../../database/entities/attachment.entity';
 
 const mockActor = { id: 'actor-0001', type: ActorType.HUMAN };
 const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
@@ -89,6 +100,32 @@ function makeRoute(overrides: Partial<DocRoute> = {}): DocRoute {
   } as DocRoute;
 }
 
+/** 造一行 doc 绑定附件（导出侧候选 / mediaOmitted 判定用） */
+function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
+  return {
+    id: 'att-1',
+    uploaderId: 'user-1',
+    bucket: 'agent-chamber-attachments',
+    objectKey: 'obj-1.png',
+    originalName: 'img.png',
+    mimeType: 'image/png',
+    sizeBytes: '4',
+    sha256: 'a'.repeat(64),
+    status: 'ready',
+    topicId: null,
+    docId: 'doc-1',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    deletedAt: null,
+    thumbKey: null,
+    thumbWidth: null,
+    thumbHeight: null,
+    thumbSizeBytes: null,
+    thumbSha256: null,
+    ...overrides,
+  } as Attachment;
+}
+
 /**
  * 简易内存 find（按 where 等值匹配；IsNull 操作符特判为 null/undefined 匹配）。
  * 单测不依赖真实 ORM SQL 生成（那是 e2e 的职责，铁律 #23）。
@@ -120,6 +157,13 @@ describe('DocBundleService', () => {
   >;
   let docService: jest.Mocked<Pick<DocService, 'getContent' | 'batchUpsert'>>;
   let docRouteService: jest.Mocked<Pick<DocRouteService, 'create' | 'update'>>;
+  let attachmentService: {
+    listByDocIds: jest.Mock;
+    listByIds: jest.Mock;
+    readObjectBytes: jest.Mock;
+    importFromBundle: jest.Mock;
+    bindBundleMedia: jest.Mock;
+  };
   let spaceRepo: { save: jest.Mock };
   let categoryRepo: { find: jest.Mock };
   let docRepo: { find: jest.Mock };
@@ -131,6 +175,7 @@ describe('DocBundleService', () => {
       docspaceService as unknown as DocSpaceService,
       docService as unknown as DocService,
       docRouteService as unknown as DocRouteService,
+      attachmentService as unknown as AttachmentService,
       spaceRepo as unknown as never,
       categoryRepo as unknown as never,
       docRepo as unknown as never,
@@ -240,6 +285,20 @@ describe('DocBundleService', () => {
     categoryRepo = { find: findFrom<DocCategory>([]) };
     docRepo = { find: findFrom<Doc>([]) };
     routeRepo = { find: findFrom<DocRoute>([]) };
+    // 媒体门面桩（默认：无候选、无引用、空结果）
+    attachmentService = {
+      listByDocIds: jest.fn(async () => []),
+      listByIds: jest.fn(async () => []),
+      readObjectBytes: jest.fn(async () => Buffer.from([0x89, 0x50, 0x4e, 0x47])),
+      importFromBundle: jest.fn(async () => ({
+        created: 0,
+        reused: 0,
+        skipped: 0,
+        failed: [],
+        bindings: [],
+      })),
+      bindBundleMedia: jest.fn(async () => ({ bound: 0, failures: [] })),
+    };
     buildService();
   });
 
@@ -334,6 +393,476 @@ describe('DocBundleService', () => {
       const bundle = await service.exportBundle('space-1');
 
       expect(bundle.docs[0].category).toBeNull();
+    });
+  });
+
+  // ─── export：media 段（P2 批 5）─────────────────────────────
+
+  describe('exportBundle 媒体段', () => {
+    /** 按对象键返回字节（导出侧读对象用） */
+    function bytesByKey(entries: Record<string, Buffer>): jest.Mock {
+      return jest.fn(async (key: string) => {
+        const buf = entries[key];
+        if (!buf) throw new Error(`object not found: ${key}`);
+        return buf;
+      });
+    }
+
+    const sha256 = (buf: Buffer): string => createHash('sha256').update(buf).digest('hex');
+
+    it('doc 绑定附件打包：base64/sha/缩略图齐备，排序 docPath→originalName→attachmentId', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = findFrom<Doc>([
+        makeDoc({ id: 'doc-1', path: 'docs/a.md' }),
+        makeDoc({ id: 'doc-2', path: 'docs/b.md' }),
+      ]);
+      routeRepo.find = findFrom<DocRoute>([]);
+
+      const bodyA = Buffer.from('PNG-BYTES-A');
+      const bodyZ = Buffer.from('PNG-BYTES-Z');
+      const thumb = Buffer.from('WEBP-THUMB');
+      // 库内候选顺序刻意打乱：导出必须自行排序（不能信 DB 返回序）
+      attachmentService.listByDocIds.mockResolvedValue([
+        makeAttachment({
+          id: 'att-z',
+          docId: 'doc-2',
+          originalName: 'z.png',
+          objectKey: 'obj-z',
+          sizeBytes: String(bodyZ.length),
+          sha256: sha256(bodyZ),
+        }),
+        makeAttachment({
+          id: 'att-b',
+          docId: 'doc-1',
+          originalName: 'b.png',
+          objectKey: 'obj-b',
+          sizeBytes: String(bodyA.length),
+          sha256: sha256(bodyA),
+        }),
+        makeAttachment({
+          id: 'att-a',
+          docId: 'doc-1',
+          originalName: 'a.png',
+          objectKey: 'obj-a',
+          sizeBytes: String(bodyA.length),
+          sha256: sha256(bodyA),
+          thumbKey: 'thumb-a',
+          thumbWidth: 64,
+          thumbHeight: 32,
+          thumbSizeBytes: String(thumb.length),
+          thumbSha256: sha256(thumb),
+        }),
+      ]);
+      attachmentService.readObjectBytes.mockImplementation(
+        bytesByKey({ 'obj-a': bodyA, 'obj-b': bodyA, 'obj-z': bodyZ, 'thumb-a': thumb }),
+      );
+
+      const bundle = await service.exportBundle('space-1');
+
+      expect(bundle.formatVersion).toBe(2);
+      expect(bundle.media.map((m) => ('skipped' in m ? m.skipped : m.sourceAttachmentId))).toEqual([
+        'att-a',
+        'att-b',
+        'att-z',
+      ]);
+      const first = bundle.media[0];
+      expect('skipped' in first).toBe(false);
+      if ('skipped' in first) throw new Error('unreachable');
+      expect(first).toMatchObject({
+        sourceAttachmentId: 'att-a',
+        docPath: 'docs/a.md',
+        originalName: 'a.png',
+        mimeType: 'image/png',
+        sizeBytes: bodyA.length,
+        sha256: sha256(bodyA),
+        contentBase64: bodyA.toString('base64'),
+      });
+      expect(first.thumbnail).toEqual({
+        width: 64,
+        height: 32,
+        sizeBytes: thumb.length,
+        sha256: sha256(thumb),
+        contentBase64: thumb.toString('base64'),
+      });
+      // 无缩略图的行不带 thumbnail 键（增强项，缺席即无）
+      const second = bundle.media[1];
+      if ('skipped' in second) throw new Error('unreachable');
+      expect(Object.hasOwn(second, 'thumbnail')).toBe(false);
+      expect(bundle.mediaOmitted).toEqual([]);
+    });
+
+    it('联合预算：docs 段字节参与扣减（超剩余额度 → budget_exceeded，小项仍可打包）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      // docs 段 ≥3MB：额度被压缩到 10MiB − 3MiB − 64KiB
+      const bigContent = `# 大文档\n\n${'x'.repeat(3 * 1024 * 1024)}`;
+      docRepo.find = findFrom<Doc>([makeDoc({ id: 'doc-1', path: 'docs/big.md' })]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      (docService.getContent as jest.Mock).mockImplementation(async () => ({
+        docId: 'doc-1',
+        docPath: 'docs/big.md',
+        title: '大文档',
+        content: bigContent,
+      }));
+
+      // 5.75MiB（≤ 单项上限 6MiB）：base64 后 8.03MB > 剩余额度（10MiB − 3MiB − 64KiB ≈ 7.1MB）
+      const hugeBytes = Buffer.alloc(5.75 * 1024 * 1024, 0x41);
+      const tinyBytes = Buffer.from('TINY');
+      attachmentService.listByDocIds.mockResolvedValue([
+        makeAttachment({
+          id: 'att-huge',
+          docId: 'doc-1',
+          originalName: 'a-huge.png',
+          objectKey: 'obj-huge',
+          sizeBytes: String(hugeBytes.length),
+          sha256: sha256(hugeBytes),
+        }),
+        makeAttachment({
+          id: 'att-tiny',
+          docId: 'doc-1',
+          originalName: 'b-tiny.png',
+          objectKey: 'obj-tiny',
+          sizeBytes: String(tinyBytes.length),
+          sha256: sha256(tinyBytes),
+        }),
+      ]);
+      attachmentService.readObjectBytes.mockImplementation(
+        bytesByKey({ 'obj-huge': hugeBytes, 'obj-tiny': tinyBytes }),
+      );
+
+      const bundle = await service.exportBundle('space-1');
+
+      // 预判阶段即拒绝（未读对象）：docs 段已占 3MB，5MiB 图 base64 后 ≈6.99MB > 剩余额度
+      expect(bundle.media[0]).toMatchObject({
+        skipped: 'budget_exceeded',
+        sourceAttachmentId: 'att-huge',
+        docPath: 'docs/big.md',
+      });
+      expect(attachmentService.readObjectBytes).not.toHaveBeenCalledWith('obj-huge');
+      // 小项仍按剩余额度打包
+      expect(bundle.media[1]).toMatchObject({ sourceAttachmentId: 'att-tiny' });
+    });
+
+    it('单项超 6MiB → skipped too_large（不读对象）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = findFrom<Doc>([makeDoc()]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      attachmentService.listByDocIds.mockResolvedValue([
+        makeAttachment({
+          id: 'att-big',
+          docId: 'doc-1',
+          sizeBytes: String(DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES + 1),
+        }),
+      ]);
+
+      const bundle = await service.exportBundle('space-1');
+
+      expect(bundle.media).toEqual([
+        {
+          skipped: 'too_large',
+          sourceAttachmentId: 'att-big',
+          docPath: 'docs/a.md',
+          originalName: 'img.png',
+          sizeBytes: DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES + 1,
+        },
+      ]);
+      expect(attachmentService.readObjectBytes).not.toHaveBeenCalled();
+    });
+
+    it('mediaOmitted：正文引用的 topic 绑定附件报出；doc 绑定项不进清单', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = findFrom<Doc>([makeDoc({ id: 'doc-1', path: 'docs/a.md' })]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      const topicAttId = '11111111-1111-4111-8111-111111111111';
+      const docAttId = '22222222-2222-4222-8222-222222222222';
+      (docService.getContent as jest.Mock).mockImplementation(async () => ({
+        docId: 'doc-1',
+        docPath: 'docs/a.md',
+        title: 'Doc A',
+        content:
+          `# Doc A\n\n![t](/api/v1/attachments/${topicAttId}/content)\n\n` +
+          `![d](/api/v1/attachments/${docAttId}/content)\n`,
+      }));
+      attachmentService.listByIds.mockResolvedValue([
+        makeAttachment({ id: topicAttId, docId: null, topicId: 'topic-1' }),
+        makeAttachment({ id: docAttId, docId: 'doc-1' }),
+      ]);
+      attachmentService.listByDocIds.mockResolvedValue([]);
+
+      const bundle = await service.exportBundle('space-1');
+
+      expect(bundle.mediaOmitted).toEqual([
+        { docPath: 'docs/a.md', attachmentId: topicAttId, reason: 'topic_bound' },
+      ]);
+      expect(attachmentService.listByIds).toHaveBeenCalledWith([topicAttId, docAttId]);
+    });
+
+    it('对象读失败 / 字节与行元数据不符 → 该项不入 media（bundle 自洽优先）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = findFrom<Doc>([makeDoc()]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      const good = Buffer.from('GOOD');
+      attachmentService.listByDocIds.mockResolvedValue([
+        makeAttachment({
+          id: 'att-read-fail',
+          docId: 'doc-1',
+          originalName: 'a.png',
+          objectKey: 'obj-missing',
+          sizeBytes: '4',
+          sha256: sha256(Buffer.from('GOOD')),
+        }),
+        makeAttachment({
+          id: 'att-tampered',
+          docId: 'doc-1',
+          originalName: 'b.png',
+          objectKey: 'obj-tampered',
+          sizeBytes: '4',
+          sha256: sha256(Buffer.from('REAL')),
+        }),
+        makeAttachment({
+          id: 'att-ok',
+          docId: 'doc-1',
+          originalName: 'c.png',
+          objectKey: 'obj-ok',
+          sizeBytes: String(good.length),
+          sha256: sha256(good),
+        }),
+      ]);
+      attachmentService.readObjectBytes.mockImplementation(
+        bytesByKey({ 'obj-tampered': good, 'obj-ok': good }),
+      );
+
+      const bundle = await service.exportBundle('space-1');
+
+      expect(bundle.media.map((m) => ('skipped' in m ? m.skipped : m.sourceAttachmentId))).toEqual([
+        'att-ok',
+      ]);
+    });
+  });
+
+  // ─── import：媒体段（P2 批 5）─────────────────────────────
+
+  describe('importBundle 媒体段', () => {
+    const oldId = '11111111-1111-4111-8111-111111111111';
+    const newId = '99999999-9999-4999-8999-999999999999';
+
+    /** 带媒体项的 v2 bundle（docs[] 正文引用旧附件 URL） */
+    function makeMediaBundle(overrides: Partial<Record<string, unknown>> = {}) {
+      return makeBundle({
+        docs: [
+          {
+            path: 'docs/a.md',
+            title: 'Doc A',
+            content: `# Doc A\n\n![img](/api/v1/attachments/${oldId}/content)\n`,
+          },
+        ],
+        media: [
+          {
+            sourceAttachmentId: oldId,
+            docPath: 'docs/a.md',
+            originalName: 'img.png',
+            mimeType: 'image/png',
+            sizeBytes: 4,
+            sha256: 'a'.repeat(64),
+            contentBase64: 'AAAA',
+          },
+        ],
+        ...overrides,
+      });
+    }
+
+    beforeEach(() => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      // routes 阶段按 path 解析 doc（阶段 ③ 的产物等价物）：空表会让 routes.create 不被调用
+      docRepo.find = findFrom<Doc>([makeDoc({ id: 'doc-new-1', path: 'docs/a.md' })]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      attachmentService.importFromBundle.mockResolvedValue({
+        created: 1,
+        reused: 0,
+        skipped: 0,
+        failed: [],
+        bindings: [
+          {
+            sourceAttachmentId: oldId,
+            attachmentId: newId,
+            docPath: 'docs/a.md',
+            originalName: 'img.png',
+          },
+        ],
+      });
+      attachmentService.bindBundleMedia.mockResolvedValue({ bound: 1, failures: [] });
+      // docs 阶段的落库产物：docPath → 新 docId（回绑需要）
+      (docService.batchUpsert as jest.Mock).mockImplementation(
+        async (_spaceId: string, docs: Array<{ path: string }>) => ({
+          results: docs.map((d) => ({ path: d.path, status: 'created' as const, id: 'doc-new-1' })),
+          summary: {
+            total: docs.length,
+            created: docs.length,
+            updated: 0,
+            unchanged: 0,
+            failed: 0,
+          },
+        }),
+      );
+    });
+
+    it('六阶段顺序 + 正文 URL 重写（相对与同源绝对两形态都换成新 id）', async () => {
+      const bundle = makeBundle({
+        docs: [
+          {
+            path: 'docs/a.md',
+            title: 'Doc A',
+            content:
+              `# Doc A\n\n![rel](/api/v1/attachments/${oldId}/content)\n\n` +
+              `![abs](https://platform.example.com/api/v1/attachments/${oldId}/content)\n\n` +
+              `![other](/api/v1/attachments/22222222-2222-4222-8222-222222222222/content)\n`,
+          },
+        ],
+        media: [
+          {
+            sourceAttachmentId: oldId,
+            docPath: 'docs/a.md',
+            originalName: 'img.png',
+            mimeType: 'image/png',
+            sizeBytes: 4,
+            sha256: 'a'.repeat(64),
+            contentBase64: 'AAAA',
+          },
+        ],
+      });
+
+      const result = await service.importBundle('space-1', bundle as never, mockActor);
+
+      // 阶段顺序：media stage-1 → docs → media stage-2 → routes
+      const order = [
+        attachmentService.importFromBundle.mock.invocationCallOrder[0],
+        (docService.batchUpsert as jest.Mock).mock.invocationCallOrder[0],
+        attachmentService.bindBundleMedia.mock.invocationCallOrder[0],
+        (docRouteService.create as jest.Mock).mock.invocationCallOrder[0],
+      ];
+      expect(order[0]).toBeLessThan(order[1]);
+      expect(order[1]).toBeLessThan(order[2]);
+      expect(order[2]).toBeLessThan(order[3]);
+
+      // 重写：两种形态都换 id；无映射的旧 URL 原样保留（无映射不重写）
+      const sentDocs = (docService.batchUpsert as jest.Mock).mock.calls[0][1] as Array<{
+        content: string;
+      }>;
+      expect(sentDocs[0].content).toContain(`/api/v1/attachments/${newId}/content`);
+      expect(sentDocs[0].content).toContain(
+        `https://platform.example.com/api/v1/attachments/${newId}/content`,
+      );
+      expect(sentDocs[0].content).toContain(
+        '/api/v1/attachments/22222222-2222-4222-8222-222222222222/content',
+      );
+      expect(sentDocs[0].content).not.toContain(oldId);
+
+      // 回绑：新行 id + docs 阶段产出的 docId
+      expect(attachmentService.bindBundleMedia).toHaveBeenCalledWith([
+        {
+          attachmentId: newId,
+          docId: 'doc-new-1',
+          sourceAttachmentId: oldId,
+          docPath: 'docs/a.md',
+          originalName: 'img.png',
+        },
+      ]);
+      expect(result.media).toEqual({ created: 1, reused: 0, skipped: 0, failed: [] });
+      expect(result.formatVersion).toBe(2);
+    });
+
+    it('formatVersion 1：整段跳过 media（不调门面），信封 media 全零值形状', async () => {
+      // v1 包即便被手改塞了 media 字段也不处理（版本语义优先）
+      const v1 = makeMediaBundle({
+        formatVersion: 1,
+        media: [{ skipped: 'too_large', docPath: 'docs/a.md' }],
+      });
+
+      const result = await service.importBundle('space-1', v1 as never, mockActor);
+
+      expect(result.formatVersion).toBe(1);
+      expect(result.media).toEqual({ created: 0, reused: 0, skipped: 0, failed: [] });
+      expect(attachmentService.importFromBundle).not.toHaveBeenCalled();
+      expect(attachmentService.bindBundleMedia).not.toHaveBeenCalled();
+      // 正文零重写（映射为空）
+      const sentDocs = (docService.batchUpsert as jest.Mock).mock.calls[0][1] as Array<{
+        content: string;
+      }>;
+      expect(sentDocs[0].content).toContain(oldId);
+    });
+
+    it('media 信封：stage-1 失败 + doc upsert 失败（回绑不了）+ stage-2 失败 三源合并', async () => {
+      const otherId = '33333333-3333-4333-8333-333333333333';
+      attachmentService.importFromBundle.mockResolvedValue({
+        created: 1,
+        reused: 0,
+        skipped: 1,
+        failed: [{ docPath: 'docs/a.md', originalName: 'bad.png', reason: 'sha mismatch' }],
+        bindings: [
+          {
+            sourceAttachmentId: oldId,
+            attachmentId: newId,
+            docPath: 'docs/a.md',
+            originalName: 'img.png',
+          },
+          {
+            sourceAttachmentId: otherId,
+            attachmentId: 'att-unbindable',
+            docPath: 'docs/b.md',
+            originalName: 'other.png',
+          },
+        ],
+      });
+      attachmentService.bindBundleMedia.mockResolvedValue({
+        bound: 1,
+        failures: [
+          { docPath: 'docs/a.md', originalName: 'img.png', reason: 'attachment row disappeared' },
+        ],
+      });
+      // docs 阶段：docs/a.md 失败（无 id）→ 该项回绑不了；docs/b.md 成功
+      (docService.batchUpsert as jest.Mock).mockImplementation(async () => ({
+        results: [
+          { path: 'docs/a.md', status: 'failed' as const, error: { message: 'boom', code: 1 } },
+          { path: 'docs/b.md', status: 'created' as const, id: 'doc-b' },
+        ],
+        summary: { total: 2, created: 1, updated: 0, unchanged: 0, failed: 1 },
+      }));
+
+      const result = await service.importBundle('space-1', makeMediaBundle() as never, mockActor);
+
+      expect(result.media.skipped).toBe(1);
+      expect(result.media.created).toBe(1);
+      // 三源失败都在（顺序：stage-1 → 回绑不了（doc 失败）→ stage-2）
+      expect(result.media.failed.map((f) => f.reason.split(/[;:]/)[0])).toEqual([
+        'sha mismatch',
+        'doc upsert failed for this docPath',
+        'attachment row disappeared',
+      ]);
+      // 只有能解析出 docId 的绑定才进入 stage-2（docs/a.md 失败 → 该项不进）
+      expect(attachmentService.bindBundleMedia).toHaveBeenCalledWith([
+        {
+          attachmentId: 'att-unbindable',
+          docId: 'doc-b',
+          sourceAttachmentId: otherId,
+          docPath: 'docs/b.md',
+          originalName: 'other.png',
+        },
+      ]);
+    });
+
+    it('不支持版本 → 400 + 逐字消息（指导重新导出）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      await expect(
+        service.importBundle('space-1', makeBundle({ formatVersion: 3 }) as never, mockActor),
+      ).rejects.toThrow(
+        'Unsupported bundle formatVersion 3; this server accepts 1 (no media) and 2 (with media). ' +
+          'Re-export from a compatible server version.',
+      );
     });
   });
 

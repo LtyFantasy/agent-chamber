@@ -84,24 +84,37 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
 /**
  * import_doc_bundle — DocSpace 回导（吃 export_doc_space 产出的 bundle）
  *
- * 包装 POST /doc-spaces/:id/import-bundle：四阶段有序回导（categories → docs → routes →
- * space meta），per-item 独立事务（单篇失败不中止），重复导入幂等。
+ * 包装 POST /doc-spaces/:id/import-bundle：六阶段有序回导（categories → media stage-1 →
+ * docs（正文附件 URL 内联重写）→ media stage-2 回绑 → routes → space meta），
+ * per-item 独立事务（单篇失败不中止），重复导入幂等（不重复插行/不重复落对象）。
  * space meta 默认不回写；overwriteSpaceMeta=true 显式开启。
  */
 export const importDocBundleTool: CustomTool = {
   tool: {
     name: 'import_doc_bundle',
     description:
-      'Restore a DocSpace from an export bundle (the output of export_doc_space, formatVersion 1). ' +
+      'Restore a DocSpace from an export bundle (the output of export_doc_space; ' +
+      'formatVersion 2 with media, or 1 for older snapshots). ' +
       'Resolves spaceName via three-layer match (exact → prefix → substring, case-insensitive); ' +
       '0 or >1 candidates returns isError:true + structured candidate info — never silently picks one. ' +
-      'Four ordered phases: ① categories (idempotent by name) → ② docs (per-doc independent ' +
-      'transaction — a single failing doc does not abort the batch) → ③ routes (idempotent by ' +
-      'intent + primaryDocPath) → ④ space meta, SKIPPED unless overwriteSpaceMeta=true (explicit ' +
-      'opt-in to avoid clobbering the target space curation). formatVersion mismatch → 400 ' +
-      'VALIDATION_ERROR. Re-importing the same bundle is fully idempotent (no duplicate rows). ' +
-      'Returns per-item statuses (created/updated/unchanged/failed) plus summary counts. ' +
-      'Requires write access to the space.',
+      'Six ordered phases: ① categories (idempotent by name) → ② media stage-1 (every base64 ' +
+      'payload is checked against its declared mimeType by byte evidence, then rows are inserted ' +
+      'or reused by (importer, sha256, binding state) with an advisory-locked quota check) → ' +
+      '③ docs (per-doc independent transaction — a single failing doc does not abort the batch; ' +
+      'body attachment URLs are rewritten inline to the new attachment ids, and URLs without a ' +
+      'mapping keep their old value) → ④ media stage-2 (rebind to the new doc ids) → ' +
+      '⑤ routes (idempotent by intent + primaryDocPath) → ⑥ space meta, SKIPPED unless ' +
+      'overwriteSpaceMeta=true (explicit opt-in to avoid clobbering the target space curation). ' +
+      'Unsupported formatVersion → 400 VALIDATION_ERROR; formatVersion 1 skips media entirely ' +
+      '(the returned media section is all zeros). Re-importing the same bundle is fully ' +
+      'idempotent: no duplicate rows, no duplicate stored objects, and docs come back unchanged. ' +
+      'Returns per-item statuses (created/updated/unchanged/failed) plus summary counts and a ' +
+      'media section {created, reused, skipped, failed[{docPath, originalName, reason}]} — ' +
+      'failed media items leave the corresponding links broken (visible, never silently ' +
+      'rewritten) and a re-import can complete their binding. ' +
+      'Requires write access to the space. CAUTION: bundles with media can approach the 10MiB ' +
+      'request limit — for very large bundles prefer transferring the bundle as a file (the ' +
+      'HTTP endpoint) instead of through this tool.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -112,8 +125,10 @@ export const importDocBundleTool: CustomTool = {
         bundle: {
           type: 'object',
           description:
-            'The export bundle object (formatVersion 1) — pass the result of export_doc_space ' +
-            'verbatim, or a previously saved snapshot read back from git/storage.',
+            'The export bundle object (formatVersion 2 with a media array, or 1 for older ' +
+            'snapshots) — pass the result of export_doc_space verbatim, or a previously saved ' +
+            'snapshot read back from git/storage. Multi-MB bundles risk client-side truncation ' +
+            'in the tool result; prefer the HTTP endpoint as a file for very large bundles.',
         },
         overwriteSpaceMeta: {
           type: 'boolean',

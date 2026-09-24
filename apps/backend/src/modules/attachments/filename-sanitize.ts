@@ -1,5 +1,6 @@
 /**
- * original_name sanitize 与 RFC 6266 filename* 编码（plan wiccan-carnage-rocket §3.6 钉死）
+ * original_name sanitize 与 RFC 6266 filename* 编码（plan wiccan-carnage-rocket §3.6 钉死）；
+ * P2 批 1 追加缩略图下载文件名拼装（buildThumbnailFilename）。
  *
  * 威胁模型：
  * 1. 原始文件名进 Content-Disposition 响应头——含 \r\n 可直接响应头注入
@@ -85,4 +86,17 @@ export function encodeFilenameStar(name: string): string {
     out += ATTR_CHAR.test(ch) ? ch : '%' + b.toString(16).toUpperCase().padStart(2, '0');
   }
   return out;
+}
+
+/**
+ * 缩略图下载文件名（P2 批 1 规格钉死）：`<原文件名 stem>_thumb.webp`。
+ *
+ * stem = 去掉最后一个扩展名（`photo.png` → `photo_thumb.webp`；多段扩展名
+ * 只剥最后一段：`archive.tar.gz` → `archive.tar_thumb.webp`）；无扩展名
+ * 原样加后缀；纯扩展名/空 stem 回退 FALLBACK_NAME（`attachment_thumb.webp`）。
+ * 输入是**已 sanitize** 的 originalName（无控制字符/路径分隔符），故此处不再清洗。
+ */
+export function buildThumbnailFilename(originalName: string): string {
+  const stem = originalName.replace(/\.[^./\\]*$/, '');
+  return `${stem === '' ? FALLBACK_NAME : stem}_thumb.webp`;
 }

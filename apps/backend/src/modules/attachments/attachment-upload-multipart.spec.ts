@@ -18,6 +18,7 @@ import request = require('supertest');
 import { ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
 import { AttachmentController } from './attachment.controller';
 import { AttachmentService } from './attachment.service';
+import { AttachmentSignedUrlService } from './attachment-signed-url.service';
 import { MulterLimitErrorInterceptor } from './multer-error.interceptor';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ATTACHMENT_MAX_BYTES } from './attachment.constants';
@@ -55,7 +56,12 @@ describe('AttachmentController multipart 解析实测（复刻 main.ts bodyParse
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AttachmentController],
-      providers: [{ provide: AttachmentService, useValue: service }, MulterLimitErrorInterceptor],
+      providers: [
+        { provide: AttachmentService, useValue: service },
+        // P2 批 2：controller 新增铸造端点依赖（本套件不触达该端点，空桩即可）
+        { provide: AttachmentSignedUrlService, useValue: { mint: jest.fn() } },
+        MulterLimitErrorInterceptor,
+      ],
     })
       // guard mock：认证通过并把 human 身份塞进 request.user（@CurrentActor 的读取源）
       .overrideGuard(JwtOrApiKeyGuard)

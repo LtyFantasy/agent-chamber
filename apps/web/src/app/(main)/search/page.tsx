@@ -13,7 +13,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { EmptyState } from '@/components/ui/empty-state';
 import { taskStatusMap, taskPriorityMap } from '@/lib/status-visuals';
 import { formatRelativeTime } from '@/lib/utils';
-import { Search, MessageSquare, ClipboardList, FileText, User } from 'lucide-react';
+import { Search, MessageSquare, ClipboardList, FileText, User, Lightbulb } from 'lucide-react';
 import Link from 'next/link';
 import type {
   MessageSearchResult,
@@ -62,6 +62,8 @@ export default function SearchPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const t = useTranslations('search');
+  /** 经验库入口文案（跨命名空间：/search 页不持有 experiences 文案，避免两处维护） */
+  const tExperiences = useTranslations('experiences');
   const locale = useLocale();
   const tGlobal = useTranslations();
 
@@ -400,6 +402,23 @@ export default function SearchPage() {
         </div>
       ) : (
         <Tabs value={activeTab} onValueChange={handleTabChange}>
+          {/*
+            经验库固定入口（plan §5 / PM M7）：空结果与有结果**两种状态都在**。
+            经验是独立检索面（症状信号匹配 + 带伤疤的实战笔记），不与 messages/tasks/docs
+            混排；带当前查询词直达，用户不必重新输入。
+          */}
+          <Link
+            href={`/experiences?q=${encodeURIComponent(query.trim())}`}
+            data-testid="search-experiences-entry"
+            className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-primary/5 px-3 py-2 transition-colors hover:border-primary/40"
+          >
+            <Lightbulb className="h-4 w-4 shrink-0 text-primary" />
+            <span className="text-sm font-medium">{tExperiences('searchEntry.label')}</span>
+            <span className="text-xs text-muted-foreground">
+              {tExperiences('searchEntry.hint')}
+            </span>
+          </Link>
+
           <TabsList className="mb-4">
             <TabsTrigger value="all">
               {t('tab.all')} {totalCount > 0 && `(${totalCount})`}

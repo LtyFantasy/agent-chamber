@@ -1,6 +1,6 @@
 {
   "name": "agent-chamber",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Agent Chamber integration for Kimi Code: session-start briefing, cold-start discipline, chamber API skills, and 12 review & execution agents",
   "author": "Agent Chamber Team",
   "homepage": "https://github.com/LtyFantasy/agent-chamber",

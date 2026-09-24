@@ -44,6 +44,8 @@ import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer
 import { DocSearchService } from '../src/modules/docspace/doc-search.service';
 import { DocRouteService } from '../src/modules/docspace/doc-route.service';
 import { DocBundleService } from '../src/modules/docspace/doc-bundle.service';
+// 媒体门面类型（P2 批 5：DocBundleService 构造新增第 4 参）
+import type { AttachmentService } from '../src/modules/attachments/attachment.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
 import { DocVersion } from '../src/database/entities/doc-version.entity';
@@ -219,6 +221,20 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
       docspaceService,
       docService,
       docRouteService,
+      // 媒体门面桩（P2 批 5）：本套件只测 diagram 的 bundle 往返，媒体段不触达
+      {
+        listByDocIds: async () => [],
+        listByIds: async () => [],
+        readObjectBytes: async () => Buffer.alloc(0),
+        importFromBundle: async () => ({
+          created: 0,
+          reused: 0,
+          skipped: 0,
+          failed: [],
+          bindings: [],
+        }),
+        bindBundleMedia: async () => ({ bound: 0, failures: [] }),
+      } as unknown as AttachmentService,
       ds.getRepository(DocSpace),
       ds.getRepository(DocCategory),
       ds.getRepository(Doc),

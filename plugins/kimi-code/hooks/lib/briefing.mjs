@@ -23,6 +23,8 @@ export class BriefingError extends Error {
 
 /**
  * 拉取我的简报：GET {base}/agents/me/briefing（瘦身参数对齐 SKILL §2.0a）。
+ * statuses 参数刻意省略 = 走服务端默认活跃口径（DEFAULT_ACTIVE_STATUSES，agent.service.ts）——
+ * 口径单源在服务端，hook 不再自备一份会漂移的副本（任务 43138c5f：statuses=todo,in_progress 曾致活跃任务恒 0）。
  * taskLimit=20：分组化简报需要按 board 分组的任务明细（前 3 标题/组），5 条不够铺满 3 个 board 行；
  * 响应体增量 ≈ items 12 字段投影 ×20 ≈ 几 KB，8s 超时内无压力（plan §7）。
  * @param {string} base apiBaseUrl（resolveApiBase 结果，已过 scheme 白名单）
@@ -35,7 +37,7 @@ export class BriefingError extends Error {
  *   数组字段防御性默认空数组（服务端缺字段不炸 format 层）。
  */
 export async function fetchBriefing(base, key, { fetchImpl = globalThis.fetch, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
-  const url = `${stripTrailingSlash(base)}/agents/me/briefing?statuses=todo,in_progress&taskLimit=20&activityLimit=3&maxContentLength=160`;
+  const url = `${stripTrailingSlash(base)}/agents/me/briefing?taskLimit=20&activityLimit=3&maxContentLength=160`;
   const data = await requestJson(url, key, fetchImpl, timeoutMs);
   return {
     name: data?.me?.name ?? 'unknown',

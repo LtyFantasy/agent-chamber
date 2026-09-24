@@ -1196,8 +1196,12 @@ export default function TopicDetailPage() {
       {/* Messages */}
       <Card className="flex-1 overflow-hidden">
         <CardContent className="flex h-full flex-col p-2 md:p-4">
+          {/* 消息滚动容器：data-scroll-container = 附件图片视口门控的
+              IntersectionObserver root 锚点（见 attachment-image.tsx；嵌套滚动容器
+              下 root:null 会让 rootMargin 预取被裁切 neuter） */}
           <div
             ref={scrollContainerRef}
+            data-scroll-container
             onScroll={handleScroll}
             className="flex-1 overflow-y-auto space-y-3 md:space-y-4 pr-1 md:pr-2"
           >

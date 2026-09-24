@@ -4,8 +4,9 @@
 
 /**
  * 单文件大小上限：4.5MB。
- * rationale：后端 body limit 为 5mb 且作用于整个请求体（JSON 封装 + 批量元数据有开销），
- * 单文件阈值预留 ~0.5MB 余量，避免单文件顶格时整片请求被 413 拒绝（B4）。
+ * rationale：后端 body limit 为 10mb（`main.ts` json({limit:'10mb'})，nginx 同值）且作用于整个
+ * 请求体（JSON 封装 + 批量元数据有开销），单文件阈值预留余量，避免单文件顶格时整片请求被 413
+ * 拒绝（B4）。本常量只约束批量上传；空间级 bundle 的 10MiB 口径见 `lib/doc-bundle.ts`。
  */
 export const FILE_MAX_BYTES = 4.5 * 1024 * 1024;
 

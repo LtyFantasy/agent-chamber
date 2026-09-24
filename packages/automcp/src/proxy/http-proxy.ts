@@ -1,28 +1,42 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: .kimi/plans/miss-martian-polaris-superboy.md §Step 4
- *   - 补充: .kimi/plans/miss-martian-polaris-superboy.md §核心映射规则
- *   - 补充: plan forge-jubilee-robin（WS-C2' C5：成功+错误路径紧凑序列化，去 pretty-print）
+ * [功能概念]
+ *   - MCP tool call → REST 请求的代理转换（URL / query / body / header / 响应格式化）
+ *   - 接口调用频率统计的 MCP 流量标识：本层是**原子映射工具**的头注入点 ①
  *
- * [踩坑索引] -
+ * [代码职责]
+ *   - `buildHeaders`：Content-Type + 认证头 + 由 ALS 上下文注入的
+ *     `X-MCP-Tool` / `X-MCP-Surface`（后端据两端区分 MCP 流量与直连 REST）
  *
- * [铁律关联] #7(编译优先) #11(注释强制) #17(测试契约)
+ * [权威文档]
+ *   - 主文档: docs/api-definition.md §Usage Stats — 两个头契约 + 统计口径专章
+ *   - 补充: docs/architecture.md §automcp — 代理层在链路中的位置
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
+ * [关键不变量]
+ *   - **两头注入必须在 `auth === undefined` early return 之前**：未认证调用同样是
+ *     MCP 流量，漏注会让"按工具看调用"的视角整片缺失（后端只看到裸 REST 请求）
+ *   - **无 ALS 上下文不注头**：CLI 直连、非 MCP 场景没有工具语义，注一个
+ *     'unknown' 是伪造事实（与"头缺失"的语义不同）
+ *   - 注入发生在 axios 调用之前同步完成，不在 I/O 之后补头（V4：上下文不断链）
  *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [关联代码]
+ *   - server/tool-context.ts — 上下文与头名常量的单一定义点
+ *   - server/mcp-server.ts — 上下文建立点（handleToolsCall）
+ *   - packages/platform-mcp/src/platform-client.ts — 注入点 ②（语义工具走它）
+ *
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面（early return 之前注入是否仍在）
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
 import axios from 'axios';
 import type { AuthConfig, ToolMapping, ToolCallResult, ParamLocation } from '../types';
+import { MCP_SURFACE_HEADER, MCP_TOOL_HEADER, getToolContext } from '../server/tool-context';
 
 /**
  * HTTP 请求代理器
@@ -294,9 +308,12 @@ export class HttpProxy {
   /**
    * 构建请求头
    *
-   * 包含 Content-Type（当有 body 时）和认证头。
+   * 由内到外三层：Content-Type（有 body 时）→ MCP 流量标识（有 ALS 上下文时）
+   * → 认证头。标识头刻意放在认证头与 early return **之前**——未认证的 MCP 调用
+   * 同样是 MCP 流量，漏掉会让统计里整片工具调用消失。
    *
    * @param hasBody - 是否包含请求体
+   * @param auth - 生效认证（client 透传优先，否则 server 默认）
    * @returns HTTP 请求头对象
    */
   private buildHeaders(hasBody: boolean, auth?: AuthConfig): Record<string, string> {
@@ -304,6 +321,15 @@ export class HttpProxy {
 
     if (hasBody) {
       headers['Content-Type'] = 'application/json';
+    }
+
+    // MCP 流量标识（usage stats D4）：仅当本次调用处于 tools/call 的 ALS 上下文内。
+    // 无上下文 = 非 MCP 场景（CLI 直连 HttpProxy），此时不注头——注 'unknown'
+    // 会把"没有工具语义的调用"伪造成"暴露面不明"，两者在后端口径里不可互换。
+    const toolContext = getToolContext();
+    if (toolContext !== undefined) {
+      headers[MCP_TOOL_HEADER] = toolContext.toolName;
+      headers[MCP_SURFACE_HEADER] = toolContext.surface;
     }
 
     if (auth === undefined) {

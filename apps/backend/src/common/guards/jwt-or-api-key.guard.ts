@@ -26,6 +26,7 @@ import { Repository } from 'typeorm';
 import { User } from '../../database/entities/user.entity';
 import { AgentStatus, ErrorCode } from '@agent-chamber/shared';
 import { ApiKeyAuthService } from '../services/api-key-auth.service';
+import { hasSessionSubject } from '../utils/session-token-shape';
 
 /**
  * JWT 优先、API Key 兜底的认证 guard（Bearer / X-API-Key 双通道）。
@@ -37,6 +38,10 @@ import { ApiKeyAuthService } from '../services/api-key-auth.service';
  * 注意：ApiKeyAuthService 会同步写 lastUsedAt + 异步写 lastActiveAt（抽取前
  * JwtOrApiKeyGuard 只写 lastUsedAt，此为抽取统一带来的唯一差异，语义为「活跃时间
  * 更准确」，无客户端可见行为变化）。
+ *
+ * P2 批 2（security B1-A）：Bearer 分支在 DB 查询前加 session 形状断言
+ * （`hasSessionSubject`）——无 sub 的 token 直接视为"JWT 未通过"，不查库，避免
+ * `findOne({id: undefined})` 静默丢条件命中首条用户（认证绕过）。
  */
 @Injectable()
 export class JwtOrApiKeyGuard implements CanActivate {
@@ -59,23 +64,30 @@ export class JwtOrApiKeyGuard implements CanActivate {
         const payload = this.jwtService.verify(token, {
           secret: this.configService.get('jwt.secret'),
         });
-        const user = await this.userRepo.findOne({
-          where: { id: payload.sub },
-          relations: { actor: true },
-        });
-        if (
-          user &&
-          user.actor?.status === AgentStatus.ACTIVE &&
-          !user.actor?.deletedAt &&
-          !user.deletedAt
-        ) {
-          request.user = {
-            userId: user.id,
-            email: user.email,
-            role: user.role,
-            name: user.displayName || user.username,
-          };
-          return true;
+        // ── session 形状断言（P2 批 2 / security B1-A，**必须在 DB 查询前**）──────
+        // 无 sub / 空 sub / 非字符串 sub 的 token（附件签名 token、refresh token、
+        // 任意第三方 JWT）会让 `where: { id: undefined }` 被 TypeORM 静默丢条件，
+        // 命中 users 表首条用户 = 认证绕过（评审实证）。断言不成立时**不查库**，
+        // 本分支视为"JWT 未通过"，落入下方 API Key 兜底 → 最终 401（宽松语义不变）。
+        if (hasSessionSubject(payload)) {
+          const user = await this.userRepo.findOne({
+            where: { id: payload.sub },
+            relations: { actor: true },
+          });
+          if (
+            user &&
+            user.actor?.status === AgentStatus.ACTIVE &&
+            !user.actor?.deletedAt &&
+            !user.deletedAt
+          ) {
+            request.user = {
+              userId: user.id,
+              email: user.email,
+              role: user.role,
+              name: user.displayName || user.username,
+            };
+            return true;
+          }
         }
       } catch {
         // JWT failed, try API key

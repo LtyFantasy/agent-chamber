@@ -5,7 +5,7 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §16（DocSpace 写端点 clientRequestId 幂等契约）
  *   - 补充: plan fire-jericho-she-hulk.md（v1.63.0 Board 任务 7d918c7b）
- *   - 补充: apps/backend/src/modules/docspace/doc-idempotency.helper.ts（幂等 helper）
+ *   - 补充: apps/backend/src/common/services/idempotency.helper.ts（幂等 helper 通用实现）
  *
  * [踩坑索引]
  *   - 58k 字符写丢响应事故（游戏方 Pilot 3，topic msg dd5b90c4）：transport error

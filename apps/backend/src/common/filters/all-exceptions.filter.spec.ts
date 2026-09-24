@@ -350,4 +350,49 @@ describe('AllExceptionsFilter', () => {
       expect(warnSpy).not.toHaveBeenCalled();
     });
   });
+
+  // ─── URL 脱敏（P2 批 2 / plan §②.7）────────────────────────
+  describe('query redaction', () => {
+    let warnSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => jest.restoreAllMocks());
+
+    it('4xx 日志行：?token= 的值被脱敏（能力凭证不进日志）', () => {
+      mockRequest.url = '/api/v1/public/attachments/abc/content?token=eyJhbGciOi.abc.def';
+      const exception = new UnauthorizedException({
+        message: 'Signed URL token is invalid',
+        code: ErrorCode.ATTACHMENT_SIGNATURE_INVALID,
+      });
+
+      filter.catch(exception, mockHost as unknown as ArgumentsHost);
+
+      const line = warnSpy.mock.calls[0][0] as string;
+      expect(line).toContain('GET /api/v1/public/attachments/abc/content?token=[redacted] 401');
+      expect(line).not.toContain('eyJhbGciOi');
+    });
+
+    it('数组形态 ?token=a&token=b 与其它敏感键同样被脱敏', () => {
+      mockRequest.url = '/x?token=a&token=b&api_key=secret&page=1';
+      filter.catch(new BadRequestException('bad'), mockHost as unknown as ArgumentsHost);
+
+      const line = warnSpy.mock.calls[0][0] as string;
+      expect(line).toContain('/x?token=[redacted]&token=[redacted]&api_key=[redacted]&page=1 400');
+      expect(line).not.toContain('token=a');
+      expect(line).not.toContain('secret');
+    });
+
+    it('非敏感 query 原样保留（脱敏不破坏常规日志可读性）', () => {
+      mockRequest.url = '/api/v1/attachments/mine?page=2&pageSize=20';
+      filter.catch(new NotFoundException('nope'), mockHost as unknown as ArgumentsHost);
+
+      expect(warnSpy.mock.calls[0][0]).toContain(
+        'GET /api/v1/attachments/mine?page=2&pageSize=20 404',
+      );
+    });
+  });
 });

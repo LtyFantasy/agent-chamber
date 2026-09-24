@@ -19,6 +19,7 @@
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
  *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
+ *   □ 打 URL 必须经 redactUrl()（签名 URL 的 ?token= 是能力凭证，P2 批 2）
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
  * =============================================================================
  */
@@ -33,6 +34,7 @@ import {
 import { Request, Response } from 'express';
 import { ErrorCode } from '@agent-chamber/shared';
 import { QueryFailedError, EntityNotFoundError } from 'typeorm';
+import { redactUrl } from '../utils/redact-url';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -140,7 +142,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
     // 日志降噪：5xx 为服务端错误，error 级 + stack 便于排查；
     // 4xx 为客户端错误（含 QueryFailedError 映射的 4xx），warn 级且不带 stack，
     // 避免 driverError.detail 回显用户输入污染生产日志。
-    const logMessage = `${request.method} ${request.url} ${status} - ${message}`;
+    // URL 经 redactUrl 脱敏（P2 批 2）：签名 URL 的 ?token= 是能力凭证，明文进日志 = 凭证落盘。
+    const logMessage = `${request.method} ${redactUrl(request.url)} ${status} - ${message}`;
     if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
       this.logger.error(logMessage, exception instanceof Error ? exception.stack : undefined);
     } else {

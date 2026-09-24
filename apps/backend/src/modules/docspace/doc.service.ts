@@ -16,7 +16,7 @@
  *     SHA-256 **不可互算**——expectedContentHash 一律用响应返回的同源 token
  *   - 补充: plan fire-jericho-she-hulk.md（v1.63.0 Board 任务 7d918c7b）：写入口
  *     clientRequestId 幂等——upsert/patchSection/patchByMatch/patchMetadata 四入口，
- *     helper 见 doc-idempotency.helper.ts；重放返回 response_snapshot 首次快照，
+ *     helper 见 common/services/idempotency.helper.ts；重放返回 response_snapshot 首次快照，
  *     同 key 不同 payload → 409 IDEMPOTENCY_KEY_CONFLICT；patch 借道 upsertCore
  *     事务登记（快照形状 = patch 入口响应），禁止把幂等包裹放进 upsert 内层
  *   - 补充: plan docspace-lazy-tree-v1.md（v1.70.0-dev：findTree/findFacets 只读端点）。
@@ -132,7 +132,7 @@ import type {
 } from '@agent-chamber/shared';
 import { chunkMarkdown, estimateTokens } from './markdown-chunker';
 import type { ChunkResult } from './markdown-chunker';
-import { DOC_SOURCE_NATIVE } from './doc-constants';
+import { DOC_IDEMPOTENCY_ENTITY_TYPE, DOC_SOURCE_NATIVE } from './doc-constants';
 // review-0831 任务 bbd175dc 子项 1：slugify 唯一实现（本文件复制品已删，行为统一为
 // 带兜底版——中文分类名 slug 从 '' 变为 's-xxxxxxxx'，属预期修复：按 slug 匹配的
 // 分类查询对中文名不再必然不命中）
@@ -149,14 +149,15 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { AuditLog } from '../../database/entities/audit-log.entity';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { EventService } from '../event/event.service';
-// v1.63.0 DocSpace 写族幂等（Board 任务 7d918c7b）：helper 与 DocMoveService 共用
+// v1.63.0 DocSpace 写族幂等（Board 任务 7d918c7b）：通用实现已上移 common/services
+// （幂等 helper 全平台一份；本模块只留身份标记 DOC_IDEMPOTENCY_ENTITY_TYPE）
 import {
   buildIdempotencyContext,
   tryIdempotentReplay,
   persistIdempotencyStandalone,
   insertIdempotencyInTx,
-  type DocWriteIdempotencyContext,
-} from './doc-idempotency.helper';
+  type WriteIdempotencyContext,
+} from '../../common/services/idempotency.helper';
 
 /**
  * 小文档全文内联的缺省 token 阈值（?maxFullTokens= 可覆盖，0 = 强制 outline）。
@@ -223,7 +224,7 @@ export class DocService {
     private readonly routeHealthService: RouteHealthService,
     // 幂等记录 repo（v1.63.0 DocSpace 写族幂等）：与业务写同事务插入（主路径）或
     // 独立单插（unchanged 早退 / 23505 winner 分支），重放返回 response_snapshot。
-    // helper 实现见 doc-idempotency.helper.ts（DocMoveService 共用同一套）
+    // helper 实现见 common/services/idempotency.helper.ts（DocMoveService 共用同一套）
     @InjectRepository(IdempotencyRecord)
     private readonly idempotencyRepo: Repository<IdempotencyRecord>,
     // Diagram IR v1 渲染门（plan diagram-ir-v1-plan.md §3.2-3.3）：upsertCore diagram
@@ -466,7 +467,7 @@ export class DocService {
     // 幂等包裹（最外层写入口）：无键零开销旁路；有键先查重放——命中直接返回首次
     // 快照（跳过 unchanged 短路等一切后续逻辑，保证重放响应与首次逐字段一致）。
     // requestHash 只含入口业务字段（versionSource 是内部传参不参与指纹）。
-    const ctx = buildIdempotencyContext(actor, clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, clientRequestId, {
       path: dto.path,
       content: dto.content,
       title: dto.title,
@@ -515,7 +516,7 @@ export class DocService {
       forceRechunk?: boolean;
     },
     actor?: UnifiedActor,
-    ctx?: DocWriteIdempotencyContext | null,
+    ctx?: WriteIdempotencyContext | null,
   ): Promise<UpsertDocResult> {
     const source = dto.source || DOC_SOURCE_NATIVE;
 
@@ -2194,7 +2195,7 @@ export class DocService {
     // 幂等包裹（最外层写入口）：requestHash = 本入口 payload 指纹（position/content/
     // source/expectedSectionHash），非内层 upsert 的 fullContent 指纹——同 key 不同
     // position 的两次 patch 必须判冲突而非静默复用首次结果
-    const ctx = buildIdempotencyContext(actor, clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, clientRequestId, {
       docId,
       position,
       content,
@@ -2328,7 +2329,7 @@ export class DocService {
   ): Promise<UpsertDocResult> {
     // 幂等包裹（最外层写入口）：requestHash = 本入口 payload 指纹（oldString/newString/
     // source），非内层 upsert 的 fullContent 指纹
-    const ctx = buildIdempotencyContext(actor, clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, clientRequestId, {
       docId,
       oldString,
       newString,
@@ -2455,7 +2456,7 @@ export class DocService {
   ): Promise<UpsertDocResult> {
     // 幂等包裹（最外层写入口）：requestHash = 本入口 payload 指纹（position 缺省值
     // 归一化进指纹——'end' 显式传与缺省视为同一请求），非内层 upsert 的 fullContent 指纹
-    const ctx = buildIdempotencyContext(actor, clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, clientRequestId, {
       docId,
       content: dto.content,
       position: dto.position ?? 'end',
@@ -2496,7 +2497,7 @@ export class DocService {
     dto: AppendDocInput,
     source: string,
     actor: UnifiedActor | undefined,
-    ctx: DocWriteIdempotencyContext | null,
+    ctx: WriteIdempotencyContext | null,
   ): Promise<UpsertDocResult> {
     const doc = await this.findById(docId);
 
@@ -2700,7 +2701,7 @@ export class DocService {
   ): Promise<PatchDocMetadataResult> {
     // 幂等包裹（最外层写入口）：无键零开销旁路；有键先查重放——命中直接返回首次快照，
     // 跳过 source/hash/category 校验链（首次已验证过，重放零副作用）
-    const ctx = buildIdempotencyContext(actor, clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, clientRequestId, {
       docId,
       title: dto.title,
       summary: dto.summary,

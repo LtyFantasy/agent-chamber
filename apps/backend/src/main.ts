@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { WsAdapter } from '@nestjs/platform-ws';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { json, urlencoded } from 'express';
@@ -12,9 +13,18 @@ async function bootstrap() {
   // 单文件 >100kb）会触发 PayloadTooLargeError。放宽到 10mb：覆盖文档同步 +
   // v1.55 import-bundle 空间回导（export bundle 随空间增长，agent-core 147 篇已 3.4MB）；
   // 生产 nginx 侧 client_max_body_size 需同步放宽（scripts/nginx/agent-chamber.conf）。
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
   app.use(json({ limit: '10mb' }));
   app.use(urlencoded({ extended: true, limit: '10mb' }));
+
+  // 限流 tracker 修复（P2 批 2 / security major）：生产经 nginx 反代，不加 trust proxy 时
+  // Express 的 req.ip 恒为 127.0.0.1（socket 对端 = nginx），throttler 按 IP 计数退化为
+  // **全局合桶**——任何单一客户端都能把全站配额打满（现有上传 30/min 在生产就是如此）。
+  // hop=1 与 nginx `$proxy_add_x_forwarded_for` 的附加语义配合是防伪的：Express 从 XFF
+  // 右端取第 1 跳（= nginx 亲见的真实客户端地址），客户端自己伪造的左侧段被跳过；
+  // 直连 8743（本地开发/无代理）无 XFF 头时回退 socket IP，行为不变。
+  // ⚠️ 仅在"恰好一层可信反代"的前提下成立；多跳代理链需改为具体 IP/CIDR 白名单。
+  app.set('trust proxy', 1);
 
   // CORS：默认 origin:true（全放行，行为不变）；生产可设 CORS_ORIGINS 逗号分隔白名单收紧。
   // 当前 Bearer header 鉴权风险本就可控，此项为前置收紧（见 .env.example 模板）。
@@ -55,6 +65,10 @@ async function bootstrap() {
   SwaggerModule.setup('api/docs', app, document);
 
   const port = parseInt(process.env.PORT || '8743', 10);
+  // 关停钩子（usage stats 批 1，D9/V6）：kill -TERM 时触发 onApplicationShutdown，
+  // 让统计 buffer 把最后一窗口计数 flush 落库（终局 flush 自带 10s 超时护栏）。
+  // 必须在 listen 之前注册——收到信号后才注册会漏掉关停事件。
+  app.enableShutdownHooks();
   await app.listen(port);
   Logger.log(`Application is running on: http://localhost:${port}`);
   Logger.log(`Swagger docs: http://localhost:${port}/api/docs`);

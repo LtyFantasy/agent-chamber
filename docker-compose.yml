@@ -81,6 +81,14 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio_root_user}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-me-minio-secret}
       MINIO_BUCKET: ${MINIO_BUCKET:-agent-chamber-attachments}
+      # 经验库判别服务（6 键；插值风格对齐 DB_*）。可选键在无 .env / 未设时注空串，
+      # 空串由代码回落缺省（model 键尤其依赖 `?.trim() ||`：空串当请求 model 会 422）。
+      JUDGMENT_PROVIDER: ${JUDGMENT_PROVIDER:-}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      TYPESAFE_BASE_URL: ${TYPESAFE_BASE_URL:-}
+      TYPESAFE_DEFAULT_MODEL: ${TYPESAFE_DEFAULT_MODEL:-}
+      JUDGMENT_TIMEOUT_MS: ${JUDGMENT_TIMEOUT_MS:-}
+      JUDGMENT_RATE_LIMIT: ${JUDGMENT_RATE_LIMIT:-}
     ports:
       - "8743:8743"
     depends_on:

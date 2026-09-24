@@ -22,6 +22,7 @@
 
 import axios from 'axios';
 import { HttpProxy } from './http-proxy';
+import { runWithToolContext } from '../server/tool-context';
 import type { ToolMapping, AuthConfig } from '../types';
 
 jest.mock('axios');
@@ -674,6 +675,69 @@ describe('HttpProxy', () => {
       const result = await proxy.execute(makeMapping(), {});
 
       expect(result.content[0].text).toBe('null');
+    });
+  });
+
+  describe('MCP 流量标识头注入（usage stats D4 注入点 ①）', () => {
+    /** 取出最近一次 axios 调用收到的 headers */
+    function lastHeaders(): Record<string, string> {
+      return (mockedAxios.mock.calls[0][0] as { headers: Record<string, string> }).headers;
+    }
+
+    it('ALS 上下文内 → 注入 X-MCP-Tool / X-MCP-Surface', async () => {
+      mockedAxios.mockResolvedValueOnce({ status: 200, statusText: 'OK', data: { id: '1' } });
+
+      await runWithToolContext({ toolName: 'list_topics', surface: 'mcp' }, () =>
+        proxy.execute(makeMapping(), {}),
+      );
+
+      expect(lastHeaders()).toMatchObject({
+        'X-MCP-Tool': 'list_topics',
+        'X-MCP-Surface': 'mcp',
+      });
+    });
+
+    it('无 ALS 上下文 → 不注头（非 MCP 场景不得伪造 unknown）', async () => {
+      mockedAxios.mockResolvedValueOnce({ status: 200, statusText: 'OK', data: { id: '1' } });
+
+      await proxy.execute(makeMapping(), {});
+
+      expect(lastHeaders()['X-MCP-Tool']).toBeUndefined();
+      expect(lastHeaders()['X-MCP-Surface']).toBeUndefined();
+    });
+
+    it('无认证（auth===undefined early return 路径）时两头仍注入', async () => {
+      mockedAxios.mockResolvedValueOnce({ status: 200, statusText: 'OK', data: { id: '1' } });
+
+      // proxy 构造时无 auth、调用时也不传 authOverride → 必然走 early return 分支
+      await runWithToolContext({ toolName: 'get_me', surface: 'mcp-full' }, () =>
+        proxy.execute(makeMapping(), {}),
+      );
+
+      const headers = lastHeaders();
+      expect(headers['X-MCP-Tool']).toBe('get_me');
+      expect(headers['X-MCP-Surface']).toBe('mcp-full');
+      // 认证头确实不存在，证明两头来自 early return 之前的注入点
+      expect(headers['X-API-Key']).toBeUndefined();
+      expect(headers['Authorization']).toBeUndefined();
+    });
+
+    it('有认证时两头与认证头共存', async () => {
+      mockedAxios.mockResolvedValueOnce({ status: 200, statusText: 'OK', data: { id: '1' } });
+      const authedProxy = new HttpProxy('https://api.example.com', {
+        type: 'apiKey',
+        apiKey: 'secret-key-123',
+      });
+
+      await runWithToolContext({ toolName: 'list_topics', surface: 'mcp' }, () =>
+        authedProxy.execute(makeMapping(), {}),
+      );
+
+      expect(lastHeaders()).toMatchObject({
+        'X-API-Key': 'secret-key-123',
+        'X-MCP-Tool': 'list_topics',
+        'X-MCP-Surface': 'mcp',
+      });
     });
   });
 });

@@ -68,7 +68,29 @@ import type {
   UpsertDocResult,
   ActivityLogListResponse,
   ActivityLogQuery,
+  // 空间级导出 / 回导 bundle（形状来源指针见 types/index.ts 对应注释）
+  DocSpaceExportBundle,
+  DocSpaceImportBundleResult,
+  // 经验库响应投影 + 值域类型（批 1 shared 单源，经 @/types barrel 引用）
+  ExperienceDetail,
+  ExperienceListResponse,
+  ExperienceFacetsResponse,
+  RecordExperienceResponse,
+  ExperienceFeedbackResponse,
+  ExperienceQualityReviewResponse,
+  ExperienceMemberDto,
+  ExperienceMembersResponse,
+  ExperienceMemberRole,
+  ExperienceEnv,
+  ExperienceIntent,
+  ExperienceFeedbackOutcome,
 } from '@/types';
+// 经验库 web 侧契约翻译层（数组重复键序列化 / 过滤态 → query 参数）
+import {
+  buildExperienceQueryParams,
+  serializeRepeatedParams,
+  type ExperienceListFilters,
+} from '@/lib/experience';
 // 圆桌座位契约类型（review-0831 任务 04e8d744 收窄：vendor 换协议包 SeatVendor）
 import type { SeatVendor } from '@agent-chamber/roundtable-protocol';
 // 懒加载目录树响应类型（v1.70.0-dev）：shared 已就绪，web 直接引用（铁律 #25 类型前置）
@@ -953,6 +975,178 @@ const docs = {
         failed: number;
       };
     }>('PUT', `/doc-spaces/${spaceId}/docs/batch`, { docs }),
+
+  // ── 空间级导出 / 回导（v1.55 起后端已存在，web UI 补入口）──
+  /**
+   * 导出整空间 bundle（read 权限即够——OPEN 空间任何登录 actor 可读）。
+   *
+   * 显式 `timeout: 120000`：大空间 docs 携带 full content（无分页，快照完整性优先）
+   * + media base64 字节，30s 全局默认不够（D11）。
+   */
+  exportSpaceBundle: (spaceId: string) =>
+    apiRequest<DocSpaceExportBundle>('GET', `/doc-spaces/${spaceId}/export`, undefined, {
+      timeout: 120000,
+    }),
+  /**
+   * 回导 bundle（write 权限；六阶段非整体事务，**同 bundle 重导幂等**）。
+   *
+   * - `bundle` 原样作为请求体（服务端 DTO 直接吃导出输出）；
+   * - `overwriteSpaceMeta` 仅 true 时传 params（false 由后端缺省处理，不显式传 false）；
+   * - 显式 `timeout: 120000` 同上（D11）。
+   */
+  importSpaceBundle: (
+    spaceId: string,
+    bundle: DocSpaceExportBundle,
+    overwriteSpaceMeta?: boolean,
+  ) =>
+    apiRequest<DocSpaceImportBundleResult>('POST', `/doc-spaces/${spaceId}/import-bundle`, bundle, {
+      timeout: 120000,
+      params: overwriteSpaceMeta ? { overwriteSpaceMeta: true } : undefined,
+    }),
+};
+
+// ──────────────────────────────────────────────
+// Experiences（经验库：列表检索 / 分面 / 详情 / 录入 / 反馈 / 编辑 / 终审 / 软删）
+// ──────────────────────────────────────────────
+/**
+ * 经验库 API 命名空间（plan v1.3 §3 八端点）。
+ *
+ * **数组参数红线**（本命名空间最易踩的坑）：`signals`/`domains` 走 **重复 query 键**
+ * （`?signals=a&signals=b`）。axios 默认序列化成方括号形态 `signals[]=`，后端
+ * `assertNoBracketedArrayQuery` 会明确 400（不是静默忽略）——故 list/facets 两个
+ * GET 必须显式传 `paramsSerializer: serializeRepeatedParams`。
+ */
+const experiences = {
+  /**
+   * 列表 + 检索合一（GET /experiences）。
+   *
+   * q 存在时既是过滤也是排序信号（后端忽略 sort）；零命中是**成功信封**
+   * （`items: []` + `total: 0` + `hint`），不抛 404——调用方按空态渲染即可。
+   */
+  list: (filters: ExperienceListFilters = {}) =>
+    apiRequest<ExperienceListResponse>('GET', '/experiences', undefined, {
+      params: buildExperienceQueryParams(filters),
+      paramsSerializer: serializeRepeatedParams,
+    }),
+  /** 条目详情（含 content 全文；suspect/过期条目照常返回并带标记——复核动线） */
+  get: (id: string) => apiRequest<ExperienceDetail>('GET', `/experiences/${id}`),
+  /**
+   * 分面聚合（GET /experiences/facets）。
+   *
+   * 返回 byIntent/byQuality **键全量**（未命中 = 0，前端无需自造默认值）+
+   * availableDomains 开放词表回显 + admin 专属 suspectCount。
+   */
+  facets: (filters: ExperienceListFilters = {}) =>
+    apiRequest<ExperienceFacetsResponse>('GET', '/experiences/facets', undefined, {
+      params: buildExperienceQueryParams(filters),
+      paramsSerializer: serializeRepeatedParams,
+    }),
+  /**
+   * 录入（POST /experiences）：恒为 unverified，立即可搜。
+   *
+   * 响应可能带 `possibleDuplicates`（疑似重复，软提示不阻断）与 `warnings`
+   * （如缺「验证方式」节）——两者都必须展示给用户，但都不阻止成功。
+   */
+  create: (data: {
+    title: string;
+    summary: string;
+    content: string;
+    intent: ExperienceIntent;
+    signals: string[];
+    domains?: string[];
+    env?: ExperienceEnv;
+    sourceProject?: string;
+    expiresAt?: string;
+    clientRequestId: string;
+  }) => apiRequest<RecordExperienceResponse>('POST', '/experiences', data),
+  /**
+   * 编辑（PATCH /experiences/:id）：`expectedUpdatedAt` 必填（乐观锁）。
+   *
+   * 409 = 期间他人改过——正确动作是**重读条目后用新 updatedAt 重试**，禁止用同一
+   * token 盲重试。改 title/summary/content/signals 任一 → 后端把 quality 回落
+   * unverified 并清终审留痕（徽章洗白防线）。
+   */
+  update: (
+    id: string,
+    data: {
+      title?: string;
+      summary?: string;
+      content?: string;
+      intent?: ExperienceIntent;
+      signals?: string[];
+      domains?: string[];
+      env?: ExperienceEnv;
+      sourceProject?: string | null;
+      expiresAt?: string | null;
+      expectedUpdatedAt: string;
+    },
+  ) => apiRequest<ExperienceDetail>('PATCH', `/experiences/${id}`, data),
+  /**
+   * 质量终审（PATCH /experiences/:id/quality）——**仅人类 admin**。
+   *
+   * 双向门：verified ↔ suspect 可互改；reason 必填并入审计（old→new+reason）。
+   * agent 身份调用会得到 403/1009（"不是你的身份类别"，非"稍后重试"）。
+   */
+  updateQuality: (id: string, data: { quality: 'verified' | 'suspect'; reason: string }) =>
+    apiRequest<ExperienceQualityReviewResponse>('PATCH', `/experiences/${id}/quality`, data),
+  /**
+   * 使用反馈（POST /experiences/:id/feedback）——语义是「**应用后**是否有效」，
+   * 不是「搜索是否命中」。
+   *
+   * `clientRequestId` 必填：同 key 同 outcome 重放（不动计数）；同 key 不同 payload
+   * 是 409/9002。改判是**新的 outcome**（不是幂等重试）——故 UI 每次点击都生成新的
+   * `crypto.randomUUID()`，避免把"改变主意"误判成重放。过期条目反馈 409。
+   */
+  feedback: (id: string, data: { outcome: ExperienceFeedbackOutcome; clientRequestId: string }) =>
+    apiRequest<ExperienceFeedbackResponse>('POST', `/experiences/${id}/feedback`, data),
+  /**
+   * 软删（DELETE /experiences/:id）：作者/admin/owner 代理可删。
+   *
+   * 软删后读写一律 404（与"从未存在"不可区分，刻意不泄露存在性）；无恢复端点
+   * （admin 走 DB 人工窗口）。
+   */
+  remove: (id: string) =>
+    apiRequest<{ deleted: boolean; id: string }>('DELETE', `/experiences/${id}`),
+
+  // ── 空间成员（第二期：终审权委托面）────────────────────────────────────
+  /**
+   * 成员清单（GET /experiences/members）——**任何认证身份可读**。
+   *
+   * 透明性取舍（plan §0）：成员清单全认证可见（"该找谁终审"比藏住名单更重要）；
+   * 唯一收窄项是 `invitedBy`（仅 admin/owner 非空，服务端判定，web 只渲染）。
+   */
+  members: () => apiRequest<ExperienceMembersResponse>('GET', '/experiences/members'),
+  /**
+   * 授权成员（POST /experiences/members）。
+   *
+   * 闸门在服务端：admin 全权；owner 仅可授 `reviewer`；目标 actor 不存在 → 404/5000。
+   * **同角色重发是幂等 200**（返回同一成员行），异角色 → 409/13005（改角色走 PATCH，
+   * 勿删了重加——会丢 invitedBy 授权留痕）。
+   */
+  addMember: (data: { actorId: string; role: ExperienceMemberRole }) =>
+    apiRequest<ExperienceMemberDto>('POST', '/experiences/members', data),
+  /**
+   * 原子改角色（PATCH /experiences/members/:actorId）。
+   *
+   * owner 有双约束（目标行与请求值都须 reviewer）；同角色 PATCH 是幂等 200 no-op；
+   * 非成员 → 404/13003。
+   */
+  updateMemberRole: (actorId: string, data: { role: ExperienceMemberRole }) =>
+    apiRequest<ExperienceMemberDto>(
+      'PATCH',
+      `/experiences/members/${encodeURIComponent(actorId)}`,
+      data,
+    ),
+  /**
+   * 夺权（DELETE /experiences/members/:actorId）——**物理删，即时生效**。
+   *
+   * owner 仅可删 reviewer 行；非成员 → 404/13003。
+   */
+  removeMember: (actorId: string) =>
+    apiRequest<{ deleted: boolean; actorId: string }>(
+      'DELETE',
+      `/experiences/members/${encodeURIComponent(actorId)}`,
+    ),
 };
 
 // ──────────────────────────────────────────────
@@ -1169,6 +1363,7 @@ export const Api = {
   boards,
   tasks,
   docs,
+  experiences,
   dashboard,
   avatars,
   search,

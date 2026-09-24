@@ -9,10 +9,12 @@ import os from 'node:os';
 export const CONVENTIONAL_NAMES = ['chamber', 'platform', 'agent-chamber'];
 
 /**
- * 从 projectDir 逐层向上查找 .kimi-code/ 下的文件（openviking find_project_config 同款模式）。
+ * 从 projectDir 逐层向上查找文件（openviking find_project_config 同款模式）。
  * 为什么向上查找：项目可能嵌套在 monorepo 子目录/子模块中，绑定与身份文件在项目根。
+ * 注意调用方传入的 relPath 可能指向不同目录：绑定文件在跨 harness 中立的 `.agent-chamber/`，
+ * mcp.json 仍在 kimi-code 私有的 `.kimi-code/`（本函数只做通用向上查找，不假设目录归属）。
  * @param {string} projectDir 会话项目目录（payload.cwd；绝不用进程 cwd——插件 hooks 运行时 cwd=插件根，官方-plugins）
- * @param {string} relPath 相对 .kimi-code/ 的文件名，如 'agent-chamber.json'
+ * @param {string} relPath 相对项目根的文件路径，如 '.agent-chamber/agent-chamber.json'
  * @returns {string|null} 找到的绝对路径；未找到返回 null
  */
 export function findUpward(projectDir, relPath) {
@@ -49,7 +51,7 @@ export function loadJsonFile(filePath) {
  * @returns {{binding: object|null, bindingPath: string|null, projectMcp: object|null, projectMcpPath: string|null, userMcp: object|null, userMcpPath: string|null}}
  */
 export function resolveConfig(projectDir, env = process.env, homeDir = os.homedir()) {
-  const bindingPath = findUpward(projectDir, '.kimi-code/agent-chamber.json');
+  const bindingPath = findUpward(projectDir, '.agent-chamber/agent-chamber.json');
   const projectMcpPath = findUpward(projectDir, '.kimi-code/mcp.json');
   const userMcpPath = resolveUserMcpPath(env, homeDir);
   return {

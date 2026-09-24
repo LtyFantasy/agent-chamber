@@ -583,12 +583,14 @@ describe('DocSpaceController', () => {
     it('ensures read permission（与 overview 一致）then returns bundle', async () => {
       const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
       const bundle = {
-        formatVersion: 1,
+        formatVersion: 2,
         exportedAt: '2026-08-16T00:00:00.000Z',
         space: { name: 'Test', description: null, visibility: Visibility.OPEN, settings: {} },
         categories: [],
         routes: [],
         docs: [],
+        media: [],
+        mediaOmitted: [],
       };
       service.findById.mockResolvedValue(space);
       bundleService.exportBundle.mockResolvedValue(bundle);
@@ -601,18 +603,20 @@ describe('DocSpaceController', () => {
 
   describe('importBundle', () => {
     const bundle = {
-      formatVersion: 1,
+      formatVersion: 2,
       exportedAt: '2026-08-16T00:00:00.000Z',
       space: { name: 'Test', description: null, visibility: Visibility.OPEN, settings: {} },
       categories: [],
       routes: [],
       docs: [],
+      media: [],
+      mediaOmitted: [],
     };
 
     it('ensures write permission then imports bundle（overwriteSpaceMeta 缺省 false）', async () => {
       const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
       const result = {
-        formatVersion: 1,
+        formatVersion: 2,
         importedAt: '2026-08-16T00:00:00.000Z',
         docs: {
           results: [],
@@ -620,6 +624,7 @@ describe('DocSpaceController', () => {
         },
         categories: { results: [], summary: { total: 0, created: 0, updated: 0, failed: 0 } },
         routes: { results: [], summary: { total: 0, created: 0, updated: 0, failed: 0 } },
+        media: { created: 0, reused: 0, skipped: 0, failed: [] },
         spaceMeta: { applied: false, status: 'skipped' },
       };
       service.findById.mockResolvedValue(space);

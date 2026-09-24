@@ -116,6 +116,14 @@ export interface MessageAttachment {
   sizeBytes: number;
   /** 下载/引用直达 URL（相对路径，buildContentUrl 单一拼装点派生） */
   contentUrl: string;
+  /**
+   * 缩略图 URL（相对路径，buildThumbnailUrl 单一拼装点派生）。
+   *
+   * 缺席语义（P2 批 1 逐字钉死，防漂移）：Present ⇔ 该附件发送时已有缩略图；
+   * absent = 无缩略图，回退 contentUrl；永不为 null/空串
+   * （服务端仅在索引 hasThumbnail === true 时条件展开该键）。
+   */
+  thumbnailContentUrl?: string;
 }
 
 /**

@@ -2,23 +2,35 @@
 
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: .kimi/plans/miss-martian-polaris-superboy.md §Step 6
- *   - 补充: .kimi/plans/miss-martian-polaris-superboy.md §运行模式
+ * [功能概念]
+ *   - automcp CLI 入口（`serve` / `generate` 子命令的参数解析层）
  *
- * [踩坑索引] -
+ * [代码职责]
+ *   - commander 选项定义 + 格式校验（互斥项、端口范围）→ 组装 ServeOptions → runServe
+ *   - 暴露面（surface）的 CLI 声明入口 `--surface`（env `MCP_SURFACE` 优先级高于它）
  *
- * [铁律关联] #7(编译优先) #11(注释强制)
+ * [权威文档]
+ *   - 主文档: docs/api-definition.md §Usage Stats — surface 词表与合法取名源
+ *   - 补充: docs/architecture.md §automcp — 双实例启动方式（8745 worker / 8746 full）
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
+ * [关键不变量]
+ *   - 参数层只做**格式校验**；业务语义（surface 词表收敛、profile 名映射）在
+ *     serve-runner 侧，本文件不重复实现——两处规则必然漂移
+ *   - `--profile` / `--profile-path` 互斥（同 `--api-key` / `--bearer-token`）：
+ *     两者同给会让"surface 取名源"与"profile 加载源"指向不同实例
+ *   - 新增参数必须同步进 `ServeOptions`（类型缺失 = 解析结果静默丢弃，无报错）
  *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [关联代码]
+ *   - serve-runner.ts — 参数消费方；`resolveSurface()` 的实现点
+ *   - server/mcp-server.ts — surface 与认证的最终消费方（ALS 上下文 + invocation 上报）
+ *
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面（新参数是否同步进 ServeOptions）
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -64,6 +76,10 @@ program
   .option('--exclude <patterns>', '排除匹配 operationId 的 pattern（逗号分隔）')
   .option('--profile <name>', '使用预设 profile（如 agent）')
   .option('--profile-path <path>', '直接指定 profile JSON 文件路径')
+  .option(
+    '--surface <name>',
+    'MCP 暴露面（mcp / mcp-full / unknown）；优先级低于 MCP_SURFACE env，高于 profile 名推断',
+  )
   .option('--base-path <path>', 'MCP JSON-RPC endpoint 的 base path（默认 /mcp）', '/mcp')
   .option('--custom-tools <path>', '自定义 tools 模块路径（须导出 customTools 数组）')
   .action(
@@ -78,6 +94,7 @@ program
       exclude?: string;
       profile?: string;
       profilePath?: string;
+      surface?: string;
       basePath?: string;
       customTools?: string;
     }) => {
@@ -114,6 +131,7 @@ program
         exclude: splitCommaList(rawOptions.exclude),
         profile: rawOptions.profile,
         profilePath: rawOptions.profilePath,
+        surface: rawOptions.surface,
         basePath: rawOptions.basePath,
         customTools: rawOptions.customTools,
       };

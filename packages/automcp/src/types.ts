@@ -80,6 +80,26 @@ export interface JSONSchema {
   format?: string;
   /** 是否允许额外属性 */
   additionalProperties?: boolean;
+  /**
+   * 字符串长度下界（Draft-07 校验关键字）。
+   *
+   * 扩展来由（经验库批 3）：本类型原先只有结构关键字，手写 custom tool 无法表达
+   * 「signals 至少 1 个元素」「title ≤200 字符」这类约束，只能写进 description 文字——
+   * 而 MCP 客户端是**按 inputSchema 校验/引导模型**的，文字约束对模型是弱提示。
+   * mcp-server 的 `handleToolsList` 把 tool 对象**原样**作为 JSON-RPC 响应透传
+   * （经手写 server，不过任何 SDK/Zod 校验），故新增关键字会真实到达客户端。
+   * 纯注解扩展：OpenAPI 映射路径不产出这些键（openapi-parser 只解析结构关键字），
+   * 既有工具零影响。
+   */
+  minLength?: number;
+  /** 字符串长度上界（Draft-07；见 minLength 的扩展来由） */
+  maxLength?: number;
+  /** 数组元素数下界（Draft-07；见 minLength 的扩展来由） */
+  minItems?: number;
+  /** 数组元素数上界（Draft-07；见 minLength 的扩展来由） */
+  maxItems?: number;
+  /** 缺省值（Draft-07 注解关键字：不改变校验结果，只向模型/客户端说明省缺语义） */
+  default?: unknown;
   /** 组合 schema：多选一（透传自 OpenAPI，分支已递归转换） */
   oneOf?: JSONSchema[];
   /** 组合 schema：任一匹配（透传自 OpenAPI，分支已递归转换） */
@@ -137,6 +157,13 @@ export interface ServeOptions {
   profile?: string;
   /** 直接指定 profile JSON 文件路径 */
   profilePath?: string;
+  /**
+   * MCP 暴露面（后端封闭词表 `mcp` / `mcp-full` / `unknown`）
+   *
+   * 显式声明本实例身份，优先级低于 `MCP_SURFACE` env、高于 profile 名推断；
+   * 非法值终局归 `'unknown'`。解析实现见 `serve-runner.resolveSurface`。
+   */
+  surface?: string;
   /** MCP JSON-RPC endpoint 的 base path（默认 /mcp） */
   basePath?: string;
   /** 自定义 tools 模块路径（文件绝对/相对路径或包名），模块须导出 customTools: CustomTool[] */

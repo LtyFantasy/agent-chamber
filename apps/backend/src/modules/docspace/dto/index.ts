@@ -35,5 +35,8 @@ export {
   BundleCategoryItemDto,
   BundleRouteItemDto,
   BundleDocItemDto,
+  BundleMediaItemDto,
+  BundleMediaThumbnailDto,
+  BundleMediaOmittedItemDto,
   DOC_BUNDLE_FORMAT_VERSION,
 } from './import-doc-bundle.dto';

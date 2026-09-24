@@ -4,9 +4,16 @@
  * 覆盖：信封剥壳、4xx 归一化、网络错误、三种 auth header 构造、默认 timeout。
  */
 
+import path from 'path';
 import { PlatformApiClient, PlatformApiError } from './platform-client';
 import axios from 'axios';
-import type { AuthConfig } from '@agent-chamber/automcp';
+import {
+  MCP_SURFACE_HEADER,
+  MCP_TOOL_HEADER,
+  getToolContext,
+  runWithToolContext,
+  type AuthConfig,
+} from '@agent-chamber/automcp';
 
 // Mock axios
 jest.mock('axios');
@@ -294,5 +301,112 @@ describe('PlatformApiClient', () => {
         expect.objectContaining({ validateStatus: expect.any(Function) }),
       );
     });
+  });
+});
+
+/** 取最近一次 axios instance 请求的 headers（头注入断言用） */
+function lastRequestHeaders(inst: ReturnType<typeof mockInstance>): Record<string, string> {
+  return (inst.request.mock.calls[0][0] as { headers: Record<string, string> }).headers;
+}
+
+/** 成功响应（信封剥壳路径） */
+function okEnvelopeResponse() {
+  return {
+    status: 200,
+    statusText: 'OK',
+    data: { code: 200, message: 'ok', data: {} },
+    headers: {},
+    config: {} as any,
+  };
+}
+
+describe('PlatformApiClient — MCP 流量标识头（usage stats D4 注入点 ②）', () => {
+  it('无 ALS 上下文 → 不注头（非 MCP 场景不得伪造 unknown）', async () => {
+    const inst = mockInstance();
+    inst.request.mockResolvedValue(okEnvelopeResponse());
+    const client = new PlatformApiClient('http://localhost:8743/api/v1');
+
+    await client.request('GET', '/agents/me');
+
+    const headers = lastRequestHeaders(inst);
+    expect(headers[MCP_TOOL_HEADER]).toBeUndefined();
+    expect(headers[MCP_SURFACE_HEADER]).toBeUndefined();
+  });
+
+  it('ALS 上下文内 → 注入两头，且与认证头共存（语义工具的 REST 出口同样带标识）', async () => {
+    const inst = mockInstance();
+    inst.request.mockResolvedValue(okEnvelopeResponse());
+    const auth: AuthConfig = { type: 'apiKey', apiKey: 'k' };
+    const client = new PlatformApiClient('http://localhost:8743/api/v1', auth);
+
+    await runWithToolContext({ toolName: 'read_doc', surface: 'mcp' }, () =>
+      client.request('GET', '/agents/me'),
+    );
+
+    expect(lastRequestHeaders(inst)).toMatchObject({
+      'X-API-Key': 'k',
+      [MCP_TOOL_HEADER]: 'read_doc',
+      [MCP_SURFACE_HEADER]: 'mcp',
+    });
+  });
+
+  it('无认证（auth===undefined early return 路径）时两头仍注入', async () => {
+    const inst = mockInstance();
+    inst.request.mockResolvedValue(okEnvelopeResponse());
+    const client = new PlatformApiClient('http://localhost:8743/api/v1');
+
+    await runWithToolContext({ toolName: 'get_my_briefing', surface: 'mcp-full' }, () =>
+      client.request('GET', '/agents/me'),
+    );
+
+    const headers = lastRequestHeaders(inst);
+    expect(headers[MCP_TOOL_HEADER]).toBe('get_my_briefing');
+    expect(headers[MCP_SURFACE_HEADER]).toBe('mcp-full');
+    expect(headers['X-API-Key']).toBeUndefined();
+  });
+
+  it('await 之后才发起请求，两头仍在（异步续体不断链，V4）', async () => {
+    const inst = mockInstance();
+    inst.request.mockResolvedValue(okEnvelopeResponse());
+    const client = new PlatformApiClient('http://localhost:8743/api/v1');
+
+    await runWithToolContext({ toolName: 'list_docs', surface: 'mcp' }, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return client.request('GET', '/doc-spaces');
+    });
+
+    expect(lastRequestHeaders(inst)[MCP_TOOL_HEADER]).toBe('list_docs');
+  });
+});
+
+describe('V8：automcp ALS 实例同一性（跨包）', () => {
+  it('包入口导出 ALS helper —— 缺 re-export 时本组必红', () => {
+    expect(typeof runWithToolContext).toBe('function');
+    expect(typeof getToolContext).toBe('function');
+    expect(typeof MCP_TOOL_HEADER).toBe('string');
+    expect(typeof MCP_SURFACE_HEADER).toBe('string');
+  });
+
+  it('运行时依赖解析到 automcp 包本体（而非第二份副本）', () => {
+    // 生产中 automcp 与 platform-mcp 由 node_modules 同一 realpath 加载同一模块实例，
+    // ALS 才成立；解析到别的路径（如另装的副本）就等于第二份 ALS
+    expect(require.resolve('@agent-chamber/automcp')).toContain(
+      path.join('packages', 'automcp', 'dist', 'index.js'),
+    );
+  });
+
+  it('包入口建立的上下文，platform-client 能读到（同一实例的行为证据）', async () => {
+    const inst = mockInstance();
+    inst.request.mockResolvedValue(okEnvelopeResponse());
+    const client = new PlatformApiClient('http://localhost:8743/api/v1');
+
+    let seenInside: unknown;
+    await runWithToolContext({ toolName: 'search_docs', surface: 'mcp' }, async () => {
+      seenInside = getToolContext();
+      return client.request('GET', '/search');
+    });
+
+    expect(seenInside).toEqual({ toolName: 'search_docs', surface: 'mcp' });
+    expect(lastRequestHeaders(inst)[MCP_TOOL_HEADER]).toBe('search_docs');
   });
 });

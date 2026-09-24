@@ -1,8 +1,8 @@
 ---
 name: docs
 description: 平台 DocSpace（知识库）子 skill。覆盖三层消费模型（overview → search → read）、文档 upsert/delete、source 写入隔离（native vs git ingest）、任务-文档关联与 ingest 同步约定。Agent 阅读或产出平台文档时使用。
-version: 1.3.3
-updatedAt: 2026-09-02
+version: 1.3.5
+updatedAt: 2026-09-16
 ---
 
 # 文档知识库（DocSpace）— Agent 知识库
@@ -134,9 +134,10 @@ upsert_doc {
 
 ### 3.1b 跨文档引用约定（写文档时遵守）
 
-**文档正文里引用另一篇文档，一律用对方的 path 写标准 Markdown 链接**：`[系统架构](docs/architecture.md)`。
+**文档正文里引用另一篇文档，一律用**空间根绝对 path**写标准 Markdown 链接**：`[系统架构](/docs/architecture.md)`。
 
 - **为什么用 path**：Agent 可读可写（看到 path 直接 `read_doc(spaceName+path)` 一跳直达）；git 仓库渲染原生可跳转；web 前端点击时由链接渲染器实时解析 path → docId 做 SPA 跳转（归一化规则与 linkHealth 同款：剥 `#` 锚点、去 `./` `../`、补 `docs/` 前缀兜底）；断链会被 linkHealth 巡检报警。
+- **为什么要空间根绝对形式（`/docs/x.md`，2026-09-16 实证）**：v1.61 起 linkHealth 按**源目录严格 POSIX 解析**——文档自身就在 `docs/` 目录内时，写相对形 `docs/x.md` 会被解析成 `docs/docs/x.md` 而判 broken（usage stats 文档批实测复现）；写 `/docs/x.md` 则稳定命中。写 `x.md` 裸名虽有"补 docs/ 前缀兜底"，但跨目录文档（如 memory/ 引 docs/）不适用——一律 `/docs/x.md` 最稳。
 - **不要手写** `/docs/<spaceId>?doc=<docId>` 规范链接进正文——那是 web「复制链接」的产物，供消息/评论/书签等无巡检兜底的分享场景用；docId 对 Agent 不可读、需额外查询才能写出。
 - 标准 `[text](href)` 语法才会进入 linkHealth 体检；反引号行内代码（`` `path` ``）不算链接、不被检查也不可点击。
 - 改某篇文档的 path 前，先全仓检索谁引用了旧 path 一并修改；漏改的会在下次同步后出现在该文档右栏断链警告里。
@@ -204,15 +205,16 @@ patch_doc { "spaceName": "...", "path": "docs/api-definition.md", "oldString": "
 list_docs { "spaceName": "...", "pathPrefix": "memory/", "slim": true }   # 平铺清单（分页拉全）
 list_doc_tree { "spaceName": "...", "prefix": "memory/" }                 # 分层目录（v1.70.0-dev，逐层下钻）
 list_doc_routes { "spaceName": "...", "q": "架构" }                        # 意图路由清单（不传分页=全量数组）
-export_doc_space { "spaceName": "..." }                                    # 空间全量 bundle（formatVersion 1）
-import_doc_bundle { "spaceName": "...", "bundle": <export_doc_space 输出> } # 回导（默认不动 space meta）
+export_doc_space { "spaceName": "..." }                                    # 空间全量 bundle（formatVersion 2，v1.75.0-dev 起含媒体）
+import_doc_bundle { "spaceName": "...", "bundle": <export_doc_space 输出> } # 回导（吃 v1/v2；默认不动 space meta）
 ```
 
 - `list_docs`：与 overview 分工——overview 是分类树地图，本工具是可翻页的平铺清单；`slim=true` 只回 `{path,title,updatedAt}`。
 - `list_doc_tree`（v1.70.0-dev）：**大空间目录发现**——一次调用只返「当前层」直接子目录（递归 `docCount`/`latestDocAt` 聚合）+ 直挂文档 slim 分页；用返回的 `folder.path` 作下一次 `prefix` 逐层下钻（目录不递归展开，免全量拉取）；`sort=recent`（缺省）\|`name`；`docsLimit` 缺省 50 上限 200 / `foldersLimit` 缺省 200 上限 500，folders/docs 独立分页，`total` 不受 limit/offset 影响。**采集空间钻取链路**：`list_doc_tree` 根层看 `folders[].docCount` 找大目录 → 用其 `path` 下钻 → 目标层 `list_docs` 拉全量 → `read_doc` 精读。
 - `list_doc_routes`：不传 `page`/`pageSize` = 全量数组（上限 1000 条兜底）；传 = 分页信封。
-- `export_doc_space`：空间元数据 + categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇全文与策展元数据；read 权限即可；快照可落 git 做版本对齐 diff / 离线灾备。
-- `import_doc_bundle`：四阶段有序回导（categories 按名幂等 → docs 每篇独立事务 → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；formatVersion 不匹配 400；重复回导完全幂等；需 space write。
+- `export_doc_space`：空间元数据 + categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇全文与策展元数据；**v1.75.0-dev 起 `formatVersion 2` 另含 `media[]`（doc 绑定附件的原始字节 + 缩略图，base64）与 informational `mediaOmitted[]`（正文引用但刻意未打包的 topic 绑定附件）**——媒体受**联合请求体预算**约束（`10MiB − docs 段实际字节 − 64KiB 余量`），未打包项同段落 `{skipped:'too_large'|'budget_exceeded', ...meta}`（可发现优于静默截断）；read 权限即可；快照可落 git 做版本对齐 diff / 离线灾备。
+- `import_doc_bundle`：**六阶段有序回导**（categories 按名幂等 → media stage-1（字节证据校验 + 插入或复用）→ docs 每篇独立事务 + 正文附件 URL 按配对映射重写（**无映射不重写**）→ media stage-2 回绑 docId → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；`formatVersion` 接受 **{1, 2}**（1 = 存量快照格式，整段跳过 media，结果信封 media 段全零值），其余值 400；**同 bundle 重复回导幂等**（附件行数/对象数不变、docs unchanged——复用键 + tie-break 保证收敛）；返回 per-item `created/updated/unchanged/failed` + `media:{created,reused,skipped,failed[]}` 计数；需 space write。
+- **媒体打包边界**（v1.75.0-dev 起，详见 [`../SKILL.md` §3a.3/§3a.4](../SKILL.md)）：只打包 **doc 绑定**附件；**topic 绑定附件仍不打包**（跨环境 topic id 不通用）——它们在 `mediaOmitted[]`（`reason:'topic_bound'`）里可见，回导后该处断链；导出侧 `media[].skipped` 项需另行取件。
 
 ---
 
@@ -257,7 +259,7 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 
 | 分组 | 端点 |
 |------|------|
-| 空间 | `POST/GET /doc-spaces`、`GET/PATCH/DELETE /doc-spaces/:id`、`GET /doc-spaces/:id/overview`（v1.55 起 routes 段截断 + `routesTruncated`/`routesTotal`）、`GET /doc-spaces/:id/export`（v1.55 全量导出 bundle）、`POST /doc-spaces/:id/import-bundle`（v1.55 回导，`?overwriteSpaceMeta=`） |
+| 空间 | `POST/GET /doc-spaces`、`GET/PATCH/DELETE /doc-spaces/:id`、`GET /doc-spaces/:id/overview`（v1.55 起 routes 段截断 + `routesTruncated`/`routesTotal`）、`GET /doc-spaces/:id/export`（v1.55 全量导出 bundle；**v1.75.0-dev 起 `formatVersion 2` 含媒体字节**）、`POST /doc-spaces/:id/import-bundle`（v1.55 回导，吃 v1/v2，`?overwriteSpaceMeta=`） |
 | 成员（creator-only） | `POST /doc-spaces/:id/{invite-agent,uninvite-agent,add-editor,remove-editor}` |
 | 分类 | `POST /doc-spaces/:id/categories`、`PATCH/DELETE /doc-categories/:id` |
 | 意图路由（v1.43 起） | `GET/POST /doc-spaces/:id/routes`（v1.55 起 GET 双模式：无分页参数=全量数组+1000 兜底，传 page/pageSize=分页信封，q/category 过滤）、`PATCH/DELETE /doc-routes/:id`、`POST /doc-spaces/:id/routes/recheck`（手动重检 health，space write）、`PUT /doc-spaces/:id/repo-manifest`（仓库清单上报，space write） |

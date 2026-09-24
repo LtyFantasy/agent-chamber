@@ -18,7 +18,7 @@ const TEST_KEY = 'ask_testkey1234567890';
 
 // —— golden string 快照（与 lib/format.mjs 逐字一致；纯文本，无 JSON 包装）——
 const GOLDEN_A = [
-  '[agent-chamber] 未检测到接入配置：项目无 .kimi-code/agent-chamber.json（或 mcp.json 未配 chamber server）。',
+  '[agent-chamber] 未检测到接入配置：项目无 .agent-chamber/agent-chamber.json（或 mcp.json 未配 chamber server）。',
   '接入三步：① 登录 chamber（无账号找管理员申请，注册是 admin-only）→ Agents 页创建 agent 复制 API key；② 按插件 README「接入 playbook」初始化（MCP 模式/ REST-only 任一）；③ 重启会话生效。',
 ].join('\n');
 const GOLDEN_C = [
@@ -31,9 +31,9 @@ const GOLDEN_C = [
   '深拉通道：get_topic_digest(topicId) / get_board_digest / get_docs_overview（或 REST 等价，见 skill）。',
 ].join('\n');
 const GOLDEN_D_NETWORK =
-  '[agent-chamber] chamber 连接异常（network-error）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。';
+  '[agent-chamber] chamber 连接异常（network-error）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。';
 const GOLDEN_D_401 =
-  '[agent-chamber] chamber 连接异常（HTTP 401）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。';
+  '[agent-chamber] chamber 连接异常（HTTP 401）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。';
 
 // —— 本地 mock server（bound / 401 场景的 REST 响应源）——
 let server;
@@ -116,14 +116,15 @@ function runHook(script, stdin, env = {}) {
   });
 }
 
-/** 构造临时项目目录：files 的 { 文件名: 内容 } 写入 <tmp>/.kimi-code/；返回目录路径 */
+/** 构造临时项目目录；返回目录路径。绑定文件落 <tmp>/.agent-chamber/，其余（mcp.json）落 <tmp>/.kimi-code/
+ * ——2026-09-18 起绑定文件迁至跨 harness 中立目录，mcp.json 仍是 kimi-code 私有的 harness 文件 */
 function makeProject(files) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ac-pb-'));
-  if (Object.keys(files).length > 0) {
-    mkdirSync(path.join(dir, '.kimi-code'), { recursive: true });
-    for (const [name, content] of Object.entries(files)) {
-      writeFileSync(path.join(dir, '.kimi-code', name), typeof content === 'string' ? content : JSON.stringify(content));
-    }
+  for (const [name, content] of Object.entries(files)) {
+    // 按文件名分派归属目录：两者向上查找的起点不同，混在一个目录会掩盖查找路径的回归
+    const dirName = name === 'agent-chamber.json' ? '.agent-chamber' : '.kimi-code';
+    mkdirSync(path.join(dir, dirName), { recursive: true });
+    writeFileSync(path.join(dir, dirName, name), typeof content === 'string' ? content : JSON.stringify(content));
   }
   return dir;
 }

@@ -17,6 +17,7 @@ import {
 } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Test, TestingModule } from '@nestjs/testing';
+import { Logger } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { ActorType, AuditAction, ErrorCode, UserRole } from '@agent-chamber/shared';
 import { AttachmentService, UploadedMemoryFile } from './attachment.service';
@@ -33,7 +34,7 @@ import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { AuditService } from '../audit/audit.service';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { ATTACHMENT_MAX_BYTES, ATTACHMENT_QUOTA_BYTES } from './attachment.constants';
-import { makePngBuffer } from './test-image-fixtures';
+import { makePngBuffer, makeRealPngBuffer } from './test-image-fixtures';
 
 const FIXED_DATE = new Date('2026-09-09T01:02:03.000Z');
 const ACTOR = { id: 'uploader-1', type: ActorType.HUMAN, role: UserRole.EDITOR } as const;
@@ -48,6 +49,25 @@ const PRIVATE_TOPIC = {
 /** 合法上传载荷（2x2 PNG，魔数+IHDR 真实） */
 function makeFile(overrides: Partial<UploadedMemoryFile> = {}): UploadedMemoryFile {
   const buffer = makePngBuffer(2, 2);
+  return {
+    fieldname: 'file',
+    originalname: 'photo.png',
+    encoding: '7bit',
+    mimetype: 'image/png',
+    size: buffer.length,
+    buffer,
+    ...overrides,
+  };
+}
+
+/**
+ * 真实可解码上传载荷（P2 批 1）：走**成功生成缩略图**路径的用例专用。
+ * 伪图（makeFile）在 sharp 里解不了码，只能覆盖 fail-open 分支。
+ */
+async function makeRealFile(
+  overrides: Partial<UploadedMemoryFile> = {},
+): Promise<UploadedMemoryFile> {
+  const buffer = await makeRealPngBuffer(1024, 768);
   return {
     fieldname: 'file',
     originalname: 'photo.png',
@@ -424,6 +444,87 @@ describe('AttachmentService', () => {
     });
   });
 
+  describe('缩略图变体（P2 批 1）：生成 / fail-open / 双删', () => {
+    it('成功生成：thumb 5 列写完（≤512 webp、sha256/size 自洽）+ 独立 uuid 对象键', async () => {
+      const file = await makeRealFile();
+      const res = await service.upload(ACTOR, { topicId: 'topic-1' }, file);
+
+      // putObject 两次：原图（嗅探 mime）→ 缩略图（image/webp，独立 uuid 键）
+      expect(storage.putObject).toHaveBeenCalledTimes(2);
+      const [origKey, origBuf, origMime] = storage.putObject.mock.calls[0];
+      expect(origKey).toMatch(/^[0-9a-f-]{36}\.png$/);
+      expect(origBuf).toBe(file.buffer);
+      expect(origMime).toBe('image/png');
+      const [thumbKey, thumbBuf, thumbMime] = storage.putObject.mock.calls[1];
+      expect(thumbKey).toMatch(/^[0-9a-f-]{36}\.thumb\.webp$/);
+      expect(thumbKey).not.toBe(origKey); // 独立键，不共享原图键
+      expect(thumbMime).toBe('image/webp');
+
+      // 插行 5 列（thumb 组同生共死）
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.thumbKey).toBe(thumbKey);
+      expect(created.thumbWidth).toBe(512);
+      expect(created.thumbHeight).toBe(384);
+      expect(created.thumbSizeBytes).toBe(String((thumbBuf as Buffer).length));
+      expect(created.thumbSha256).toBe(
+        createHash('sha256')
+          .update(thumbBuf as Buffer)
+          .digest('hex'),
+      );
+
+      // 上传响应（四表面之一）带条件第 6 键
+      expect(res.thumbnailContentUrl).toBe('/api/v1/attachments/att-1/thumbnail');
+    });
+
+    it('fail-open：解码失败（伪图）→ thumb 5 列全 null + 结构化 warn + 上传照常 + 不删原图', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const res = await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+
+      // 只落了原图对象；原图保留（fail-open 不触发双删）
+      expect(storage.putObject).toHaveBeenCalledTimes(1);
+      expect(storage.removeObject).not.toHaveBeenCalled();
+
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.thumbKey).toBeNull();
+      expect(created.thumbWidth).toBeNull();
+      expect(created.thumbHeight).toBeNull();
+      expect(created.thumbSizeBytes).toBeNull();
+      expect(created.thumbSha256).toBeNull();
+
+      // 结构化 warn（attachmentId/uploaderId/sniffed mime/error 类 + 累计失败计数）
+      const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(logged).toContain('Thumbnail generation failed');
+      expect(logged).toContain('uploaderId=uploader-1');
+      expect(logged).toContain('mime=image/png');
+      expect(logged).toContain('failuresSinceStartup=1');
+
+      // 响应缺席语义：无缩略图 = 字面缺键（绝不 null/''）
+      expect(Object.hasOwn(res, 'thumbnailContentUrl')).toBe(false);
+      warn.mockRestore();
+    });
+
+    it('插行失败双删：原图 + 缩略图（幂等删，两个键都清）', async () => {
+      const file = await makeRealFile();
+      queryRunner.manager.save.mockRejectedValue(new Error('db write failed'));
+
+      await expect(service.upload(ACTOR, { topicId: 'topic-1' }, file)).rejects.toThrow(
+        'db write failed',
+      );
+
+      const keys = storage.removeObject.mock.calls.map((c) => c[0] as string);
+      expect(keys).toHaveLength(2);
+      expect(keys[0]).toMatch(/^[0-9a-f-]{36}\.png$/);
+      expect(keys[1]).toMatch(/^[0-9a-f-]{36}\.thumb\.webp$/);
+      expect(queryRunner.rollbackTransaction).toHaveBeenCalled();
+    });
+
+    it('插行失败且缩略图未生成（fail-open）：只删原图', async () => {
+      queryRunner.manager.save.mockRejectedValue(new Error('db write failed'));
+      await expect(service.upload(ACTOR, { topicId: 'topic-1' }, makeFile())).rejects.toThrow();
+      expect(storage.removeObject).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('getMetadata / getContent（读取路径 404 一致性）', () => {
     const row = {
       id: 'att-1',
@@ -487,6 +588,109 @@ describe('AttachmentService', () => {
       const res = await service.getContent('att-1', ACTOR);
       expect(storage.getObject).toHaveBeenCalledWith('k.png');
       expect(res).toEqual({ attachment: row, stream });
+    });
+  });
+
+  describe('getThumbnail（P2 批 1 缩略图读取）', () => {
+    /** 有缩略图的行（thumb 5 列齐全——同生共死不变量） */
+    const thumbRow = {
+      id: 'att-1',
+      uploaderId: 'uploader-1',
+      objectKey: 'k.png',
+      thumbKey: 'k.thumb.webp',
+      thumbWidth: 512,
+      thumbHeight: 384,
+      thumbSizeBytes: '4096',
+      thumbSha256: 'cd'.repeat(32),
+      originalName: 'a.png',
+      mimeType: 'image/png',
+    } as unknown as Attachment;
+
+    it('无缩略图（thumb_key NULL）→ 404 + 12008，消息指导改用 /content', async () => {
+      attachmentRepo.findOne.mockResolvedValue({ ...thumbRow, thumbKey: null } as Attachment);
+      await expectError(
+        service.getThumbnail('att-1', ACTOR),
+        NotFoundException,
+        ErrorCode.ATTACHMENT_THUMBNAIL_UNAVAILABLE,
+      );
+      await expect(service.getThumbnail('att-1', ACTOR)).rejects.toMatchObject({
+        response: {
+          message:
+            'No thumbnail available for this attachment; use /attachments/:id/content for the original',
+        },
+      });
+      expect(storage.getObject).not.toHaveBeenCalled();
+    });
+
+    it('有缩略图 → 按 thumbKey 取流（不是原图 objectKey）', async () => {
+      attachmentRepo.findOne.mockResolvedValue(thumbRow);
+      const stream = { pipe: jest.fn() };
+      storage.getObject.mockResolvedValue(stream);
+      const res = await service.getThumbnail('att-1', ACTOR);
+      expect(storage.getObject).toHaveBeenCalledWith('k.thumb.webp');
+      expect(res).toEqual({ attachment: thumbRow, stream });
+    });
+
+    it('无权限 → access 的 404·12000 透传（先于无缩略图判定，不因变体分码泄露存在性）', async () => {
+      attachmentRepo.findOne.mockResolvedValue({ ...thumbRow, thumbKey: null } as Attachment);
+      access.assertCanRead.mockRejectedValue(
+        new NotFoundException({
+          message: 'Attachment not found',
+          code: ErrorCode.ATTACHMENT_NOT_FOUND,
+        }),
+      );
+      await expectError(
+        service.getThumbnail('att-1', ACTOR),
+        NotFoundException,
+        ErrorCode.ATTACHMENT_NOT_FOUND,
+      );
+    });
+  });
+
+  describe('四表面口径（P2 批 1）：thumbnailContentUrl 有则出现、无则字面缺键', () => {
+    const withoutThumb = {
+      id: 'att-1',
+      uploaderId: 'uploader-1',
+      objectKey: 'k.png',
+      thumbKey: null,
+      originalName: 'a.png',
+      mimeType: 'image/png',
+      sizeBytes: '33',
+      sha256: 'ab'.repeat(32),
+      topicId: 'topic-1',
+      docId: null,
+      createdAt: FIXED_DATE,
+    } as unknown as Attachment;
+    const withThumb = { ...withoutThumb, thumbKey: 'k.thumb.webp' } as unknown as Attachment;
+
+    it('无缩略图：upload / GET :id / mine 三面均无该键（Object.hasOwn === false，绝不为 null）', async () => {
+      // upload：伪图 → fail-open（无缩略图）
+      const uploaded = await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+      expect(Object.hasOwn(uploaded, 'thumbnailContentUrl')).toBe(false);
+
+      // GET :id
+      attachmentRepo.findOne.mockResolvedValue(withoutThumb);
+      const meta = await service.getMetadata('att-1', ACTOR);
+      expect(Object.hasOwn(meta, 'thumbnailContentUrl')).toBe(false);
+
+      // mine
+      attachmentRepo.findAndCount.mockResolvedValue([[withoutThumb], 1]);
+      const mine = await service.findMine(ACTOR, {});
+      expect(Object.hasOwn(mine.items[0], 'thumbnailContentUrl')).toBe(false);
+    });
+
+    it('有缩略图：三面 URL 形状一致（/api/v1/attachments/<id>/thumbnail）', async () => {
+      const file = await makeRealFile();
+      const uploaded = await service.upload(ACTOR, { topicId: 'topic-1' }, file);
+      expect(uploaded.thumbnailContentUrl).toBe('/api/v1/attachments/att-1/thumbnail');
+
+      attachmentRepo.findOne.mockResolvedValue(withThumb);
+      const meta = await service.getMetadata('att-1', ACTOR);
+      expect(meta.thumbnailContentUrl).toBe('/api/v1/attachments/att-1/thumbnail');
+
+      attachmentRepo.findAndCount.mockResolvedValue([[withThumb], 1]);
+      const mine = await service.findMine(ACTOR, {});
+      expect(mine.items[0].thumbnailContentUrl).toBe('/api/v1/attachments/att-1/thumbnail');
     });
   });
 
@@ -588,6 +792,36 @@ describe('AttachmentService', () => {
       attachmentRepo.findOne.mockResolvedValue(row);
       storage.removeObject.mockRejectedValue(new Error('minio down'));
       await expect(service.remove('att-1', ACTOR)).resolves.toBeUndefined();
+      expect(auditService.log).toHaveBeenCalled();
+    });
+
+    it('有缩略图的行：软删后原图 + 缩略图双删（thumb 键在软删之后）', async () => {
+      const withThumb = { ...row, thumbKey: 'k.thumb.webp' } as unknown as Attachment;
+      attachmentRepo.findOne.mockResolvedValue(withThumb);
+      const em = { softDelete: jest.fn(async () => undefined) };
+      dataSource.transaction.mockImplementation(async (cb: (e: unknown) => Promise<unknown>) =>
+        cb(em),
+      );
+
+      await service.remove('att-1', ACTOR);
+
+      expect(storage.removeObject).toHaveBeenCalledTimes(2);
+      expect(storage.removeObject).toHaveBeenNthCalledWith(1, 'k.png');
+      expect(storage.removeObject).toHaveBeenNthCalledWith(2, 'k.thumb.webp');
+      expect(em.softDelete.mock.invocationCallOrder[0]).toBeLessThan(
+        storage.removeObject.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('缩略图删失败不牵连原图：两键各自容错（行已软删，GC 兜底）', async () => {
+      const withThumb = { ...row, thumbKey: 'k.thumb.webp' } as unknown as Attachment;
+      attachmentRepo.findOne.mockResolvedValue(withThumb);
+      storage.removeObject.mockImplementation(async (key: string) => {
+        if (key === 'k.thumb.webp') throw new Error('minio down');
+      });
+
+      await expect(service.remove('att-1', ACTOR)).resolves.toBeUndefined();
+      expect(storage.removeObject).toHaveBeenCalledTimes(2); // 原图删照常执行（互不阻塞）
       expect(auditService.log).toHaveBeenCalled();
     });
   });

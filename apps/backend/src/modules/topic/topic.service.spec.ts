@@ -1692,6 +1692,53 @@ describe('TopicService', () => {
       for (const m of result.messages) expect(m).not.toHaveProperty('metadata');
     });
 
+    it('attachments 投影：hasThumbnail 严格 === true 才带第 6 键，其余（false/缺键/非布尔）字面缺键且绝不 null/空串', async () => {
+      const mkMsg = (id: string, entry: Record<string, unknown>) =>
+        createMockMessage({
+          id,
+          senderId: 'agent-1',
+          senderType: ActorType.AGENT,
+          metadata: { attachments: [entry] },
+        });
+      const base = { originalName: '图.png', mimeType: 'image/png', sizeBytes: 2048 };
+      const qbMock = createMockQueryBuilder(
+        [
+          mkMsg('msg-thumb-true', { id: 'att-true', ...base, hasThumbnail: true }),
+          mkMsg('msg-thumb-false', { id: 'att-false', ...base, hasThumbnail: false }),
+          mkMsg('msg-thumb-missing', { id: 'att-missing', ...base }), // P1 存量索引（无该键）
+          mkMsg('msg-thumb-junk', { id: 'att-junk', ...base, hasThumbnail: 'true' }), // 脏值
+        ],
+        4,
+      );
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Bot-1', avatarUrl: null } as Agent,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+      const byId = new Map(result.messages.map((m) => [m.id, m]));
+      const entryOf = (id: string): Record<string, unknown> =>
+        (byId.get(id)!.attachments as unknown as Array<Record<string, unknown>>)[0];
+
+      // 唯一出现条件：hasThumbnail === true → 条件第 6 键
+      const withThumb = entryOf('msg-thumb-true');
+      expect(withThumb.thumbnailContentUrl).toBe('/api/v1/attachments/att-true/thumbnail');
+      // 同一条目仍是 5 字段 + 条件键（hasThumbnail 自身 strip，不透传——存储态不外泄）
+      expect(Object.keys(withThumb).sort()).toEqual(
+        ['contentUrl', 'id', 'mimeType', 'originalName', 'sizeBytes', 'thumbnailContentUrl'].sort(),
+      );
+
+      for (const id of ['msg-thumb-false', 'msg-thumb-missing', 'msg-thumb-junk']) {
+        const entry = entryOf(id);
+        // 缺席语义：字面缺键（Object.hasOwn === false），且绝不为 null/空串
+        expect(Object.hasOwn(entry, 'thumbnailContentUrl')).toBe(false);
+        expect(entry.thumbnailContentUrl).toBeUndefined();
+        expect(Object.hasOwn(entry, 'hasThumbnail')).toBe(false); // strip
+      }
+    });
+
     it('should handle empty results', async () => {
       const qbMock = createMockQueryBuilder([], 0);
       mockMessageRepo.createQueryBuilder.mockReturnValue(
@@ -2755,7 +2802,7 @@ describe('TopicService', () => {
         } as Attachment;
       }
 
-      it('绑定成功：metadata.attachments 索引落库（sizeBytes number），且保留 dto.metadata 其他键', async () => {
+      it('绑定成功：metadata.attachments 索引落库（sizeBytes number + required hasThumbnail），且保留 dto.metadata 其他键', async () => {
         const topic = createMockTopic();
         mockTopicRepo.findOne.mockResolvedValue(topic);
         const att = createMockAttachment();
@@ -2773,13 +2820,20 @@ describe('TopicService', () => {
 
         // IN 查询按 ids 全量取（find 默认滤软删——软删附件按不存在 404）
         expect(mockAttachmentRepo.find).toHaveBeenCalledWith({ where: { id: In(['att-1']) } });
-        // 服务端索引覆盖客户端伪造的 attachments 键；其他键保留
+        // 服务端索引覆盖客户端伪造的 attachments 键；其他键保留；
+        // hasThumbnail 是 required 布尔（无 thumbKey 的行 → false，P2 批 1）
         expect(mockMessageRepo.create).toHaveBeenCalledWith(
           expect.objectContaining({
             metadata: {
               customKey: 'keep-me',
               attachments: [
-                { id: 'att-1', originalName: 'photo.png', mimeType: 'image/png', sizeBytes: 2048 },
+                {
+                  id: 'att-1',
+                  originalName: 'photo.png',
+                  mimeType: 'image/png',
+                  sizeBytes: 2048,
+                  hasThumbnail: false,
+                },
               ],
             },
           }),
@@ -2787,6 +2841,31 @@ describe('TopicService', () => {
         // 响应恒存在 attachments 投影（P1 契约：无索引 → []；该 mock 的 savedMessage
         // metadata 为空，故此处为 []——有索引的响应投影见下方独立用例）
         expect(result.attachments).toEqual([]);
+      });
+
+      it('绑定成功：有缩略图的附件 → 索引 hasThumbnail: true（缩略图有无快照）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({ thumbKey: 'k.thumb.webp' } as Partial<Attachment>),
+        ]);
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'see image',
+          attachmentIds: ['att-1'],
+        });
+
+        const written = mockMessageRepo.create.mock.calls[0][0] as {
+          metadata: { attachments: Array<Record<string, unknown>> };
+        };
+        expect(written.metadata.attachments[0].hasThumbnail).toBe(true);
+        // 索引不含投影 URL（URL 是响应层派生物，落库零 URL——防漂移 pin）
+        expect(Object.hasOwn(written.metadata.attachments[0], 'contentUrl')).toBe(false);
+        expect(Object.hasOwn(written.metadata.attachments[0], 'thumbnailContentUrl')).toBe(false);
       });
 
       it('任一附件不存在 → 404 ATTACHMENT_NOT_FOUND（12000），且不创建消息', async () => {
@@ -2870,7 +2949,7 @@ describe('TopicService', () => {
         );
       });
 
-      it('响应投影（正常路径）：sendMessage 返回含服务端索引的消息 → attachments 恒存在且 5 字段 + contentUrl', async () => {
+      it('响应投影（正常路径）：sendMessage 返回含服务端索引的消息 → attachments 恒存在且 5 字段 + contentUrl（索引无 hasThumbnail → 无第 6 键）', async () => {
         const topic = createMockTopic();
         mockTopicRepo.findOne.mockResolvedValue(topic);
         mockAttachmentRepo.find.mockResolvedValue([
@@ -2945,7 +3024,7 @@ describe('TopicService', () => {
         expect(result.attachments).toEqual([]);
       });
 
-      it('响应投影（replay 路径）：幂等 23505 重放返回与正常路径同形状（含 attachments 5 字段）', async () => {
+      it('响应投影（replay 路径）：幂等 23505 重放返回与正常路径同形状（5 字段 + hasThumbnail 命中的第 6 键）', async () => {
         const topic = createMockTopic();
         mockTopicRepo.findOne.mockResolvedValue(topic);
         // 事务抛 23505 触发 replay 查找
@@ -2961,7 +3040,7 @@ describe('TopicService', () => {
           entityType: 'message',
           entityId: 'msg-existing-3',
         } as IdempotencyRecord);
-        // 存量消息带服务端索引（replay 读库实体）
+        // 存量消息带服务端索引（replay 读库实体；hasThumbnail: true → 条件第 6 键）
         mockMessageRepo.findOne.mockResolvedValue(
           createMockMessage({
             id: 'msg-existing-3',
@@ -2969,7 +3048,13 @@ describe('TopicService', () => {
             senderId: 'user-1',
             metadata: {
               attachments: [
-                { id: 'att-1', originalName: 'photo.png', mimeType: 'image/png', sizeBytes: 2048 },
+                {
+                  id: 'att-1',
+                  originalName: 'photo.png',
+                  mimeType: 'image/png',
+                  sizeBytes: 2048,
+                  hasThumbnail: true,
+                },
               ],
             },
           }),
@@ -2990,6 +3075,7 @@ describe('TopicService', () => {
             mimeType: 'image/png',
             sizeBytes: 2048,
             contentUrl: '/api/v1/attachments/att-1/content',
+            thumbnailContentUrl: '/api/v1/attachments/att-1/thumbnail',
           },
         ]);
         expect(result).not.toHaveProperty('metadata');

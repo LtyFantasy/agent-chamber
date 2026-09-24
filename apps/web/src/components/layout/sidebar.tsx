@@ -23,6 +23,7 @@ import {
   X,
   BookOpen,
   ExternalLink,
+  Lightbulb,
   LogOut,
   ChevronUp,
 } from 'lucide-react';
@@ -39,6 +40,9 @@ const allNavItems = [
   { href: '/topics', labelKey: 'topics', icon: MessageSquare },
   { href: '/boards', labelKey: 'boards', icon: KanbanSquare },
   { href: '/docs', labelKey: 'docs', icon: FileText },
+  // 经验库：平台第四资源（Topic 管人 / Board 管事 / DocSpace 管知识 / Experience 管实战笔记），
+  // 插在 docs 之后 search 之前——知识 → 经验 → 检索的动线顺序
+  { href: '/experiences', labelKey: 'experiences', icon: Lightbulb },
   { href: '/search', labelKey: 'search', icon: Search },
   { href: '/settings', labelKey: 'settings', icon: Settings },
   { href: '/monitoring', labelKey: 'monitoring', icon: Activity },
@@ -75,6 +79,34 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
     refetchInterval: 30_000,
   });
   const pendingCount = pendingCountData?.count ?? 0;
+
+  /**
+   * 经验库「待终审」角标（第二期：**全体登录用户都拉，按角色决定渲染**）。
+   *
+   * 数据源 = facets 端点的 `byQuality.unverified`（**全局**未终审积压量）+ 角色级总览门
+   * `viewerIsReviewer`（服务端判定：人类 admin 或空间 owner/reviewer 任一）。
+   *
+   * 两处取舍写在明处：
+   * - **query 对全体登录用户发起**（原为 `!!user && isAdmin`）：第二期起"能不能终审"不再
+   *   等于 admin（空间成员也能），web 无法从 user.role 推出角色——角色只有服务端知道，
+   *   故由服务端透出的 `viewerIsReviewer` 当渲染门；代价是给非终审人多发一次低成本的
+   *   facets 查询（与圆桌角标同节奏 30s 轮询）。
+   * - **角标语义 = 全局积压**（含"我不可审"的那些条目）：web 无 per-item 判定投影，
+   *   逐条算成本不值（plan §13 已登记"列表页不提示哪条我能审"）；文案措辞与 4 周度量
+   *   口径一致（见 docs/experience-base.md 的积压量口径）。
+   */
+  const { data: experienceFacets } = useQuery({
+    queryKey: ['experiences', 'facets'],
+    queryFn: () => Api.experiences.facets(),
+    enabled: !!user,
+    refetchInterval: 30_000,
+  });
+  const pendingReviewCount = experienceFacets?.byQuality?.unverified ?? 0;
+  /**
+   * 渲染门：服务端角色级门（admin 也置 true）+ 有积压才显示。
+   * 缺省 false 是**有意 fail-closed**：字段缺失（旧后端/迁移窗口）不渲染角标。
+   */
+  const canReviewExperiences = experienceFacets?.viewerIsReviewer === true;
 
   /**
    * 平台版本角标（logo 正下方）：后端 /health 实时读取
@@ -167,6 +199,27 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
                   </span>
                 ) : null;
 
+              /**
+               * 经验库「待终审」角标：unverified 计数 > 0 才显示（仅 admin 有数据）。
+               * 有积压时把导航项 href 直达 `?quality=unverified`（列表页支持该 searchParams
+               * 初始化过滤态，评审 minor 7）——点角标即落到待终审面，而不是先看全量再手选。
+               * 注意：`isActive` 判定仍用 `item.href`（原值 /experiences），不受此影响。
+               */
+              const hasPendingReview =
+                item.href === '/experiences' && canReviewExperiences && pendingReviewCount > 0;
+              const experienceReviewBadge = hasPendingReview ? (
+                <span
+                  data-testid="nav-experiences-pending-count"
+                  title={t('pendingExperienceReviews', { count: pendingReviewCount })}
+                  aria-label={t('pendingExperienceReviews', { count: pendingReviewCount })}
+                  className="absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground"
+                >
+                  {pendingReviewCount > 99 ? '99+' : pendingReviewCount}
+                </span>
+              ) : null;
+              /** 导航项实际 href（仅经验库在有待终审时带过滤参数） */
+              const linkHref = hasPendingReview ? '/experiences?quality=unverified' : item.href;
+
               /** 外部链接渲染为 <a target="_blank">，新标签打开 */
               if (isExternal) {
                 return (
@@ -188,13 +241,14 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
               return (
                 <Link
                   key={item.href}
-                  href={item.href}
+                  href={linkHref}
                   onClick={onMobileClose}
                   className={linkClasses}
                 >
                   <item.icon className="h-5 w-5" />
                   {t(item.labelKey)}
                   {approvalBadge}
+                  {experienceReviewBadge}
                 </Link>
               );
             })}

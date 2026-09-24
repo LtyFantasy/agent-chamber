@@ -46,7 +46,7 @@ test('fetch 200：信封 unwrap → name/activeTasksTotal/activeItems/unreadTota
   const fetchImpl = async (url, init) => {
     assert.match(
       url,
-      /\/agents\/me\/briefing\?statuses=todo,in_progress&taskLimit=20&activityLimit=3&maxContentLength=160$/,
+      /\/agents\/me\/briefing\?taskLimit=20&activityLimit=3&maxContentLength=160$/,
     );
     assert.equal(init.headers['X-API-Key'], 'ask_test1234567890');
     return okResponse({

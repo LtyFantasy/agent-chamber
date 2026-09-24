@@ -4,7 +4,7 @@
  * 威胁回归点：CRLF 响应头注入 / 路径分隔符 / UTF-8 字节截断不砍多字节中间 /
  * filename* percent-encoding 补编码 '()*（encodeURIComponent 漏网四字符）。
  */
-import { encodeFilenameStar, sanitizeOriginalName } from './filename-sanitize';
+import { buildThumbnailFilename, encodeFilenameStar, sanitizeOriginalName } from './filename-sanitize';
 
 describe('sanitizeOriginalName', () => {
   it('剥离控制字符（\\r \\n \\0 \\x07 \\x7F）——CRLF 注入回归', () => {
@@ -71,5 +71,19 @@ describe('encodeFilenameStar（RFC 6266 ext-value）', () => {
     expect(encodeFilenameStar('a!b#c$d&e+f-g.h^i_j`k|l~m.png')).toBe(
       'a!b#c$d&e+f-g.h^i_j`k|l~m.png',
     );
+  });
+});
+
+describe('buildThumbnailFilename（P2 批 1 缩略图下载名）', () => {
+  it('剥最后一个扩展名 + _thumb.webp 后缀', () => {
+    expect(buildThumbnailFilename('photo.png')).toBe('photo_thumb.webp');
+    expect(buildThumbnailFilename('截图 2026-09-09.png')).toBe('截图 2026-09-09_thumb.webp');
+    expect(buildThumbnailFilename('archive.tar.gz')).toBe('archive.tar_thumb.webp');
+  });
+
+  it('无扩展名原样加后缀；纯扩展名/空名回退 attachment', () => {
+    expect(buildThumbnailFilename('photo')).toBe('photo_thumb.webp');
+    expect(buildThumbnailFilename('.gitignore')).toBe('attachment_thumb.webp');
+    expect(buildThumbnailFilename('')).toBe('attachment_thumb.webp');
   });
 });

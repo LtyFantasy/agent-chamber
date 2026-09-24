@@ -12,6 +12,13 @@
  * 取值集合收齐依据：全仓 grep `entityType: '…'` 产品代码写入点（auditService.log
  * 与 auditRepo.create 调用块，93 处）实测 22 个值，2026-08-31 快照。
  * 2026-09-09 新增 'attachment'（MinIO 媒体附件 P0 DELETE 审计，第 23 值）。
+ * 2026-09-21 新增 'experience'（经验库质量终审 / 软删 / 越权尝试插桩，第 24 值）。
+ * 2026-09-22 新增 'experience_space_member'（经验库第二期空间成员授权/改角色/夺权 +
+ *            越权尝试 denied 审计，第 25 值——授权动作必须可复盘"谁在什么时候给谁什么角色"）。
+ *
+ * ⚠️ **追加纪律**：`AUDIT_ENTITY_TYPES` 是**位置索引**（下方 `AUDIT_ENTITY_TYPE` 命名视图
+ * 用 `AUDIT_ENTITY_TYPES[n]` 取值），中间插入会让其后全部命名视图**静默错位**（编译通过、
+ * 落库的 entityType 却是另一个模块的）——新增值一律**末尾追加**并补最后一位命名视图。
  */
 export const AUDIT_ENTITY_TYPES = [
   'agent',
@@ -37,6 +44,8 @@ export const AUDIT_ENTITY_TYPES = [
   'topic_participant',
   'user',
   'webhook_delivery',
+  'experience',
+  'experience_space_member',
 ] as const;
 
 /** audit.entityType 取值联合（写入侧已知值；查询侧仍接受任意字符串） */
@@ -71,4 +80,6 @@ export const AUDIT_ENTITY_TYPE = {
   TOPIC_PARTICIPANT: AUDIT_ENTITY_TYPES[20],
   USER: AUDIT_ENTITY_TYPES[21],
   WEBHOOK_DELIVERY: AUDIT_ENTITY_TYPES[22],
+  EXPERIENCE: AUDIT_ENTITY_TYPES[23],
+  EXPERIENCE_SPACE_MEMBER: AUDIT_ENTITY_TYPES[24],
 } as const;

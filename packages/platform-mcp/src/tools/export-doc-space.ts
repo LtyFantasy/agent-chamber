@@ -7,7 +7,9 @@
  *   - 补充: docs/platform-mcp.md §2（语义化高层工具契约）
  *   - 补充: v1.62.0（contentHash 读路径透传）——bundle docs[] item 增 docId + contentHash
  *     （原始写入 payload 的 SHA-256 = 权威 revision 标识；content 是重建产物，勿对 content
- *     自算 hash）；formatVersion 保持 1，import DTO 显式忽略新字段防 roundtrip 400
+ *     自算 hash）；import DTO 显式声明该字段防 roundtrip 400
+ *   - 补充: v1.75.0（bundle formatVersion 2，P2 批 5）——media 段（附件字节，联合预算 +
+ *     skipped 双形态）+ mediaOmitted（topic 绑定断链说明）；描述必须与后端契约同步
  *
  * [踩坑索引] -
  *
@@ -85,30 +87,41 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 /**
- * export_doc_space — DocSpace 空间级全量导出（formatVersion 1 bundle）
+ * export_doc_space — DocSpace 空间级全量导出（formatVersion 2 bundle）
  *
  * 包装 GET /doc-spaces/:id/export：单 JSON bundle = 空间元数据（图例/settings）+
  * categories + doc_routes（含 codeEntryType，文档以 path 引用）+ 每篇完整原文与
- * 策展元数据（summary/docType/tags/category）。快照可直接落 git 做版本对齐 diff，
- * 也是离线灾备；回导走 import_doc_bundle。
+ * 策展元数据（summary/docType/tags/category）+ media（doc 绑定附件字节）+ mediaOmitted。
+ * 快照可直接落 git 做版本对齐 diff，也是离线灾备；回导走 import_doc_bundle。
  */
 export const exportDocSpaceTool: CustomTool = {
   tool: {
     name: 'export_doc_space',
     description:
-      'Export an entire DocSpace as a single JSON bundle (formatVersion 1): space legend + ' +
+      'Export an entire DocSpace as a single JSON bundle (formatVersion 2): space legend + ' +
       'settings, categories, intent routes (docs referenced by path, incl. codeEntryType), ' +
-      'and every doc with its full reconstructed markdown content plus curated metadata ' +
+      'every doc with its full reconstructed markdown content plus curated metadata ' +
       '(summary/docType/tags/category) and revision fields: each docs[] item carries docId ' +
       '(informational, not the import business key) and contentHash (SHA-256 of the original ' +
       'upsert payload — the authoritative revision identifier for export/import diffing; ' +
       'content is a reconstruction whose own SHA-256 does NOT equal contentHash, never ' +
-      'self-compute). Resolves spaceName via three-layer match ' +
+      'self-compute), and a `media` array with the bytes of attachments bound to docs in this ' +
+      'space (original base64 + optional thumbnail) so re-imported docs keep their images. ' +
+      'Media is packed under a joint request-body budget (10MiB − docs section − 64KiB margin); ' +
+      'items too large (>6MiB) or beyond the remaining budget come back as ' +
+      '`{skipped: "too_large"|"budget_exceeded"}` markers in the same array (fetch those ' +
+      'separately), and body-referenced attachments bound to a topic are listed in the ' +
+      'informational `mediaOmitted` array (their links stay broken after import — no bytes are ' +
+      'included). Resolves spaceName via three-layer match ' +
       '(exact → prefix → substring, case-insensitive); 0 or >1 candidates returns ' +
       'isError:true + structured candidate info — never silently picks one. ' +
       'Purpose: version-alignment snapshots (pull into git, diff across releases) and offline ' +
-      'backup. CAUTION: large spaces produce large responses (full doc contents, no pagination). ' +
-      'The bundle is directly consumable by import_doc_bundle (roundtrip). ' +
+      'backup. CAUTION: large spaces produce large responses (full doc contents, no pagination); ' +
+      'bundles with media can approach the 10MiB request/response limit and a multi-MB tool ' +
+      'result risks client-side truncation — for very large spaces prefer transferring the ' +
+      'bundle as a file (the HTTP endpoint) instead of through this tool. ' +
+      'The bundle is directly consumable by import_doc_bundle (roundtrip; formatVersion 1 ' +
+      'bundles remain importable). ' +
       'Requires read access to the space.',
     inputSchema: {
       type: 'object',

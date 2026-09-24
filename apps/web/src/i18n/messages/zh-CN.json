@@ -28,6 +28,7 @@
     "topics": "话题",
     "boards": "看板",
     "docs": "文档",
+    "experiences": "经验库",
     "search": "搜索",
     "settings": "设置",
     "monitoring": "监控",
@@ -37,7 +38,8 @@
     "closeMenu": "关闭菜单",
     "logout": "退出登录",
     "language": "语言",
-    "pendingApprovals": "{count} 项圆桌审批待处理"
+    "pendingApprovals": "{count} 项圆桌审批待处理",
+    "pendingExperienceReviews": "{count} 条经验待终审"
   },
   "settings": {
     "language": {
@@ -831,6 +833,115 @@
       "disabledEditing": "编辑中，请先保存或取消当前编辑",
       "fileTooLarge": "以下文件超过 {max} 的单文件大小限制，已跳过：",
       "networkError": "网络错误"
+    },
+    "bundle": {
+      "export": {
+        "title": "导出当前空间快照（JSON）",
+        "editingTitle": "导出为服务器当前版本，不含未保存的编辑",
+        "failed": "导出失败，请重试",
+        "tooLarge": "该包超出 10MiB 请求体上限，无法经网页/API 回导，需拆分空间或走文件通道",
+        "zipFailed": "生成人类可读版失败，请重试",
+        "menu": {
+          "trigger": "导出",
+          "jsonLabel": "导出 bundle（JSON）",
+          "jsonDesc": "完整快照：全部文档 + 附件字节，可回导平台",
+          "zipLabel": "导出人类可读版（ZIP）",
+          "zipDesc": "docs 目录树 + 附件原文件，直接浏览"
+        },
+        "readme": {
+          "title": "%space%（人类可读导出）",
+          "exportedAt": "导出时间：%time%",
+          "docs": "文档：%count% 篇",
+          "attachments": "附件原文件：%count% 个",
+          "unpacked": "正文引用但未打包的附件：%count% 个（正文保留原引用，联网仍可访问）",
+          "linksRewritten": "正文中的附件链接已改写为相对路径，本地 Markdown 预览可直接显示图片",
+          "invalidTitle": "路径异常的文档",
+          "invalidHint": "以下文档原路径含 `..`、空段或反斜杠，已改名放入 `__invalid-path__/`：",
+          "invalidItem": "`%from%` → `%to%`",
+          "restoreHint": "本 ZIP 仅供阅读与搬运，**不可回导平台**；回导请使用「导出 bundle（JSON）」。"
+        }
+      },
+      "import": {
+        "button": "导入 bundle",
+        "title": "从导出文件恢复文档",
+        "disabledEditing": "编辑中，请先保存或取消当前编辑"
+      },
+      "cancel": "取消",
+      "done": "完成",
+      "backToSelect": "返回重选",
+      "retry": "重试",
+      "dialog": {
+        "title": "导入空间 bundle",
+        "description": "bundle 是平台导出的整包 JSON（文档 + 分类 + 路由 + 媒体）；逐篇上传 md 请用「批量上传」",
+        "selectFile": "选择 bundle 文件",
+        "noFileHint": "尚未选择文件（.json）",
+        "importing": "导入中...大空间可能需要 1-2 分钟",
+        "importingHint": "导入中请勿关闭；即使中断，重新导入同一文件是安全的",
+        "importingProgress": "导入中..."
+      },
+      "errors": {
+        "fileTooLargeToRead": "该文件超过 32 MB 读取上限，已拒绝读取",
+        "tooLarge": "该 bundle 超出服务端 10MiB 请求体上限，任何 HTTP/MCP 通道均无法回导，需拆分空间或联系运维走文件通道",
+        "invalidJson": "该文件不是合法的 JSON，无法解析",
+        "missingSpace": "该文件缺少空间信息，不是合法 bundle",
+        "unsupportedVersion": "不支持的 bundle 版本（仅支持 formatVersion 1 或 2）",
+        "docsNotArray": "该文件不是平台导出的 bundle"
+      },
+      "visibility": {
+        "open": "公开",
+        "private": "私有"
+      },
+      "preview": {
+        "sourceMismatch": "来源空间「{source}」与当前空间「{target}」不同名，请确认这是要恢复的那份包",
+        "notDeleting": "导入只新增/覆盖包内文档，不会删除包外已有文档",
+        "mediaBroken": "{count} 个媒体文件未打包，这些图片回导后将是断链，本页面不提供补取",
+        "emptyBundle": "该 bundle 不含文档",
+        "coverageLoading": "正在核对覆盖范围...",
+        "coverageUnknown": "无法核对覆盖范围；请「返回重选」后再选一次，或稍后重试",
+        "coverageExact": "将写入 {total} 篇，其中 {overwrite} 篇覆盖已有内容",
+        "coverageAtLeast": "将写入 {total} 篇，至少覆盖 {overwrite} 篇已有内容（空间共 {spaceTotal} 篇，仅核对前 {checked} 篇）",
+        "counts": "分类 {categories} · 路由 {routes} · 文档 {docs} · 媒体 {media}（跳过 {mediaSkipped}） · 未打包附件 {mediaOmitted}",
+        "source": "来源空间：{name}",
+        "exportedAt": "导出时间：{time}",
+        "formatVersion": "格式版本：v{version}",
+        "concurrency": "若他人正在编辑同篇文档，其保存会覆盖本次导入的该篇正文，重新导入可复原"
+      },
+      "overwrite": {
+        "label": "同时覆盖空间元信息（名称 / 图例 / settings / 可见性）",
+        "scopeTitle": "勾选后的真实写范围：",
+        "scopeName": "名称、图例（整字段替换）",
+        "scopeSettings": "settings 整对象替换（原有键全部丢失）",
+        "scopeVisibility": "可见性可能被改为包内值",
+        "visibilityChange": "可见性：当前 {from} → 导入后 {to}",
+        "visibilityConfirmTitle": "将修改空间可见性",
+        "visibilityConfirmDesc": "当前 {from} → 导入后 {to}。确认继续吗？",
+        "confirm": "确认导入",
+        "confirmDanger": "确认导入（覆盖 {overwrite} 篇）",
+        "confirmDangerAtLeast": "确认导入（覆盖 ≥{overwrite} 篇）"
+      },
+      "result": {
+        "title": "导入结果",
+        "emptyDocs": "该 bundle 不含文档",
+        "docsSection": "文档",
+        "categoriesSection": "分类",
+        "routesSection": "路由",
+        "mediaSection": "媒体",
+        "spaceMetaSection": "空间元信息",
+        "created": "新建",
+        "updated": "更新",
+        "unchanged": "未变化",
+        "failed": "失败",
+        "reused": "复用",
+        "skipped": "跳过",
+        "spaceMetaUpdated": "已覆盖",
+        "spaceMetaSkipped": "未改动",
+        "failuresTitle": "未导入项（{count}）",
+        "failuresHint": "未导入项在正文中将显示为断链/缺失；重新导入同一文件即可修复，不会产生重复"
+      },
+      "error": {
+        "partialWarning": "失败可能发生在部分内容已写入之后；重新导入同一文件是安全的（幂等）",
+        "fallback": "导入请求失败"
+      }
     }
   },
   "monitoring": {
@@ -1229,5 +1340,222 @@
     "zoomActual": "原始尺寸",
     "zoomFit": "适应窗口",
     "closePreview": "关闭预览"
+  },
+  "experiences": {
+    "title": "经验库",
+    "description": "跨项目共享的实战笔记：症状、根因与解法。所有认证主体可读，任何认证主体可录。",
+    "record": "录入经验",
+    "searchPlaceholder": "搜索经验...",
+    "filter": {
+      "intent": "类型",
+      "quality": "质量",
+      "domain": "领域",
+      "creator": "录入者",
+      "sort": "排序",
+      "all": "全部",
+      "countUnknown": "—",
+      "creatorUnavailable": "录入者列表未就绪（加载中或加载失败）——暂不能按录入者筛选。",
+      "creatorTruncated": "仅列出条数最多的前 {count} 位录入者——更多录入者请用搜索，或从条目详情查看录入者。"
+    },
+    "sort": {
+      "recent": "最近更新",
+      "most_used": "最多使用",
+      "mostUsedNotice": "使用计数为自报数据、可被操纵——只当参考，别当结论。"
+    },
+    "intent": {
+      "pitfall": "避坑",
+      "repair": "排障",
+      "howto": "操作指南",
+      "optimize": "优化",
+      "decision": "决策"
+    },
+    "quality": {
+      "unverified": "未终审",
+      "verified": "已验证",
+      "suspect": "可疑"
+    },
+    "qualityHint": {
+      "unverified": "尚未经终审——按同伴笔记看待，不要当作已核实的事实。",
+      "verified": "已由一位终审人确认（可能是录入者本人）。",
+      "suspect": "已被终审人判定可疑——默认检索排除，此处仍可读。"
+    },
+    "expired": "已过期",
+    "neverExpires": "永不过期",
+    "expiresAt": "过期时间 {date}",
+    "trustSignal": "{count} 位使用者反馈有效",
+    "signals": "症状信号",
+    "domains": "领域",
+    "card": {
+      "createdAt": "录入于 {time}"
+    },
+    "creator": {
+      "deletedHint": "该录入者的账号已被删除——名字保留自其档案快照。",
+      "orphanHint": "该录入者的档案已无法解析（可能已硬删）——显示 ID 前 8 位。",
+      "type": {
+        "human": "人类",
+        "agent": "Agent",
+        "system": "系统"
+      }
+    },
+    "empty": "暂无匹配的经验",
+    "emptyDesc": "没有条目符合当前过滤条件。",
+    "emptyHint": "当前阶段零命中是常态——如果你自己把问题解决了，把它录进来，下一个人就能搜到。",
+    "listError": "经验列表加载失败",
+    "retry": "重试",
+    "pagination": "第 {page} / {totalPages} 页 · 每页 {pageSize} 条 · 共 {total} 条",
+    "paginationPrev": "上一页",
+    "paginationNext": "下一页",
+    "detail": {
+      "back": "返回经验库",
+      "notFound": "经验条目不存在",
+      "notFoundDesc": "它可能已被删除。返回列表重新搜索。",
+      "notFoundBack": "返回列表",
+      "content": "正文",
+      "signals": "症状信号",
+      "domains": "领域",
+      "env": "环境指纹",
+      "sourceProject": "来源项目",
+      "createdBy": "录入者",
+      "createdAt": "创建时间",
+      "updatedAt": "更新时间",
+      "verifiedBy": "终审人",
+      "verifiedAt": "终审时间",
+      "none": "—",
+      "edit": "编辑",
+      "delete": "删除",
+      "deleteConfirmTitle": "确认删除这条经验？",
+      "deleteConfirmDesc": "删除后将从列表与检索中消失，界面不提供恢复入口。",
+      "deleteFailed": "删除失败",
+      "deleted": "经验已删除"
+    },
+    "feedback": {
+      "title": "这条经验帮到你了吗？",
+      "hint": "请在你**实际应用之后**再反馈——这不是「搜索是否命中」。",
+      "helped": "帮到了",
+      "notHelpful": "没帮到",
+      "helpedCount": "{count} 人反馈有效",
+      "notHelpfulCount": "{count} 人反馈无效",
+      "distinctCount": "{count} 位去重使用者确认有效",
+      "expiredNotice": "该条目已过期，反馈通道关闭。",
+      "failed": "反馈提交失败",
+      "thanks": "感谢反馈"
+    },
+    "review": {
+      "title": "终审",
+      "onlyAdmin": "仅 admin 或经验库终审人（空间管理员 / 终审人）可终审。",
+      "current": "当前质量：{quality}",
+      "verify": "标记已验证",
+      "suspect": "标记可疑",
+      "reasonPlaceholder": "判定理由（必填，写入审计留痕）",
+      "reasonRequired": "必须填写理由",
+      "verified": "已标记为已验证",
+      "suspected": "已标记为可疑",
+      "failed": "终审提交失败"
+    },
+    "members": {
+      "title": "经验库成员",
+      "owner": "空间管理员",
+      "reviewer": "终审人",
+      "human": "人类",
+      "agent": "Agent",
+      "setOwner": "设为空间管理员",
+      "setReviewer": "设为终审人",
+      "inviteFailed": "成功 {succeeded} 位，失败 {failed} 位"
+    },
+    "judgment": {
+      "title": "机器初评（观察期）· 仅供参考",
+      "suppressed": "已隐藏：终审后可对照",
+      "resultHint": "已录入成功。下面的机器初评仅供参考——它不会改变质量取值，也不会阻断录入。",
+      "dimension": {
+        "completeness": "完整度",
+        "reusability": "可复用性",
+        "signalQuality": "信号质量",
+        "duplicate": "重复度",
+        "intentSuggestion": "类型建议",
+        "domainSuggestion": "领域建议",
+        "admissionSuggestion": "准入建议（跨项目）"
+      },
+      "admission": {
+        "admit": "可准入——跨项目成立",
+        "needs_human": "边界情况——交终审人判断",
+        "reject": "建议拒收——对跨项目库价值低"
+      },
+      "rubricVersion": "评分规则 {version}",
+      "level": {
+        "missing": "缺失",
+        "thin": "单薄",
+        "partial": "基本可用",
+        "complete": "完整",
+        "one_off": "一次性",
+        "narrow": "窄场景",
+        "broad": "广泛适用",
+        "noise": "噪声",
+        "weak": "弱信号",
+        "distinctive": "高辨识"
+      },
+      "verdict": {
+        "distinct": "新条目",
+        "possible_duplicate": "可能重复",
+        "likely_duplicate": "很可能重复",
+        "keep": "当前取值合适",
+        "none_fits": "既有词表无合适项",
+        "suggested": "建议：{value}"
+      }
+    },
+    "form": {
+      "createTitle": "录入经验",
+      "editTitle": "编辑经验",
+      "editIntro": "修改标题、摘要、正文或症状信号会把质量回落为「未终审」。",
+      "title": "标题",
+      "titlePlaceholder": "一句话点明症状或结论",
+      "summary": "摘要",
+      "summaryPlaceholder": "为什么值得记 / 什么时候该读（列表页展示的就是它）",
+      "content": "正文",
+      "contentPlaceholder": "Markdown——四节骨架已预填",
+      "sectionSymptom": "症状",
+      "sectionRootCause": "根因",
+      "sectionFix": "解决方式",
+      "sectionHowVerified": "验证方式",
+      "intent": "类型",
+      "signals": "症状信号",
+      "signalsPlaceholder": "输入一个关键词后回车，例如 ECONNREFUSED",
+      "signalsHint": "检索的主入口：一个 chip 一个区分性关键词（最多 20 个，每个 ≤50 字符，不能含逗号）。命中语义是「至少共享一个信号」。",
+      "domains": "领域",
+      "domainsPlaceholder": "例如 devops——回车添加",
+      "domainsHint": "开放词表（最多 20 个）。复用已有标签才容易被搜到。",
+      "env": "环境指纹",
+      "envHint": "键固定（os / tool / version / runtime），值自由填写、按精确相等匹配。",
+      "envOs": "操作系统",
+      "envTool": "工具",
+      "envVersion": "版本",
+      "envRuntime": "运行时",
+      "expiresAt": "过期时间",
+      "expiresAtHint": "留空 = 永不过期（填过去的时间会被拒绝）。",
+      "sourceProject": "来源项目",
+      "sourceProjectPlaceholder": "仓库标识，例如 agent-chamber",
+      "secretWarning": "禁止录入密钥、API Key 或个人隐私数据——经验库对所有认证主体可读。",
+      "requiredHint": "标题、摘要、正文、类型与至少一个症状信号为必填。",
+      "submitCreate": "录入",
+      "submitEdit": "保存",
+      "submitting": "提交中...",
+      "createSuccess": "经验已录入——立即可搜（admin 终审前为「未终审」）。",
+      "updateSuccess": "经验已更新",
+      "createFailed": "经验录入失败",
+      "updateFailed": "经验更新失败",
+      "chipEmpty": "请先输入关键词",
+      "chipTooLong": "每个关键词不超过 50 字符",
+      "chipComma": "一个 chip 一个关键词，不能含逗号",
+      "chipTooMany": "最多 {max} 个",
+      "removeChip": "移除",
+      "conflict": "编辑期间该条目已被修改，已为你重新加载最新版本——请确认后重新提交。",
+      "possibleDuplicates": "已存在相似条目——先读过再决定是否重复录入：",
+      "warnings": "提示："
+    },
+    "searchEntry": {
+      "label": "去经验库搜",
+      "hint": "跨项目的症状与解法笔记，零命中是常态。"
+    },
+    "clearFilters": "清除全部筛选",
+    "backToFirstPage": "回到第 1 页"
   }
 }

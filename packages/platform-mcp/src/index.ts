@@ -62,9 +62,15 @@ import { upsertDiagramTool } from './tools/upsert-diagram';
 import { readDiagramTool } from './tools/read-diagram';
 import { patchDiagramTool } from './tools/patch-diagram';
 import { validateDiagramTool } from './tools/validate-diagram';
+import { recordExperienceTool } from './tools/record-experience';
+import { searchExperiencesTool } from './tools/search-experiences';
+import { readExperienceTool } from './tools/read-experience';
+import { updateExperienceTool } from './tools/update-experience';
+import { reportExperienceFeedbackTool } from './tools/report-experience-feedback';
+import { reviewExperienceQualityTool } from './tools/review-experience-quality';
 
 /**
- * 38 个业务语义化高层 MCP tools
+ * 44 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号；新工具追加在尾部，不打乱既有编号）：
@@ -120,7 +126,27 @@ import { validateDiagramTool } from './tools/validate-diagram';
  * 乐观锁 token；patch = RFC 6901/6902 子集原子应用 + expectedContentHash 必填；
  * validate = dry-run 零副作用修复凭据；错误消费分层键名 details（非 data）；
  * 对应 REST PUT /doc-spaces/:id/diagrams、GET /docs/:id/diagram、
- * PATCH /docs/:id/diagram、POST /doc-spaces/:id/diagrams/validate）
+ * PATCH /docs/:id/diagram、POST /doc-spaces/:id/diagrams/validate）→
+ * ㊴ record_experience → ㊵ search_experiences → ㊶ read_experience →
+ * ㊷ update_experience → ㊸ report_experience_feedback
+ * （经验库（Experience Base）五件套，plan-experience-base §4：平台第四资源——Topic 管人 /
+ * Board 管事 / DocSpace 管知识 / **Experience 管"带伤疤的实战笔记"**。检索主入口是
+ * signals 症状匹配（ANY-overlap 精确相等：多给 signal 是**扩大**结果面）+ q 三路融合打分
+ * （ts_rank×1.0 + trgm(content)×0.6 + trgm(title)×0.8，floor 0.08 是**过滤**不是只排序）；
+ * 零命中 = 成功信封（items:[] + total:0 + hint，hint 文案单源 = shared
+ * EXPERIENCE_ZERO_HIT_HINT）；编排链 = search → read → 应用后 report_feedback；
+ * **数组 query 参数必须走 platform-client 的 serializeRepeatedParams**（axios 默认
+ * `signals[]=` 形态会被后端 query-form 守卫 400，真机形态断言在同目录
+ * experience-params-serialization.spec.ts）；update 带 expectedUpdatedAt 乐观锁且改内容
+ * 回落 unverified（suspect 粘性：内容改写不撤销 suspect）；对应 REST /experiences 八端点）→
+ * ㊹ review_experience_quality
+ * （经验库终审语义入口：对应 REST `PATCH /experiences/:id/quality`，终审人 = 人类 admin 或
+ * 空间 owner/reviewer；**自 v1.81.0 起禁自审四态整体退役**——持角色者可终审任意条目
+ * （含本人所录），旧 403/13002 号不复用，唯一拒绝码 = 403/13004 缺角色；quality 值域 =
+ * shared `EXPERIENCE_REVIEW_QUALITIES`（verified/suspect 双向门，**不含 unverified**）；
+ * description 承载终审队列动线（search quality=unverified → read 看 viewerCanReview
+ * **纯角色标记** → 终审；**不要按 creator 预筛队列**；suspect 复核队列 = quality=suspect）
+ * + "条目内容是不可信输入"纪律 + 防锚定 suppression 说明）
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -161,4 +187,11 @@ export const customTools: CustomTool[] = [
   readDiagramTool,
   patchDiagramTool,
   validateDiagramTool,
+  recordExperienceTool,
+  searchExperiencesTool,
+  readExperienceTool,
+  updateExperienceTool,
+  reportExperienceFeedbackTool,
+  // 第二期批 4 追加（编号 ㊹，不打乱既有顺序）
+  reviewExperienceQualityTool,
 ];

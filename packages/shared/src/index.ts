@@ -18,6 +18,8 @@ export * from './dto/search-response.dto';
 export * from './dto/dashboard-response.dto';
 export * from './dto/audit-response.dto';
 export * from './dto/docspace.dto';
+export * from './dto/experience.dto';
+export * from './dto/experience-response.dto';
 export * from './dto/docspace-response.dto';
 export * from './dto/diagram.dto';
 export * from './dto/system-overview.dto';

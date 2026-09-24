@@ -1,0 +1,43 @@
+{
+  "name": "dsh-agent-chamber",
+  "version": "0.2.0",
+  "description": "Agent Chamber bundle for DeepSeek Harness: startup briefing (two-stage pre-step injection), compaction reminder, collaboration system-prompt section, chamber skills.",
+  "type": "module",
+  "private": true,
+  "main": "./lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-api-gateway"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "watch": "tsdown --watch",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.4.0"
+  }
+}

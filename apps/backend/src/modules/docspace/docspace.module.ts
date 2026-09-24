@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
@@ -36,7 +36,18 @@ import { DocRoute } from '../../database/entities/doc-route.entity';
 import { DiagramService } from './diagram.service';
 import { DiagramRendererService } from './diagram-renderer.service';
 import { DiagramController } from './diagram.controller';
+import { AttachmentModule } from '../attachments/attachment.module';
 
+/**
+ * DocSpace 模块。
+ *
+ * ⚠️ **双向 forwardRef（P2 批 5，plan §0 arch M1）**：本模块 `imports: [forwardRef(() => AttachmentModule)]`
+ * 只为 bundle 的媒体段（DocBundleService 注入 AttachmentService 门面），而
+ * AttachmentModule 早已 forwardRef 引用本模块（doc 绑定写校验）。
+ * 代价 = 模块图不再是单向 DAG，Nest 需靠 forwardRef 解环——收益 = bundle 归属不动
+ * （导出/导入编排留在 docspace，媒体实现留在 attachments，不为了"无环"把 bundle 挪走）。
+ * gitnexus 复核：除本对外无其他环；构造器侧无 provider 互依，故无需 @Inject(forwardRef)。
+ */
 @Module({
   imports: [
     TypeOrmModule.forFeature([
@@ -62,6 +73,9 @@ import { DiagramController } from './diagram.controller';
     BoardModule,
     EventModule,
     AuditModule,
+    // bundle formatVersion 2 媒体段（P2 批 5）：媒体读写全在 attachments 模块内聚，
+    // 本模块只消费门面——双向 forwardRef 的代价说明见类注释
+    forwardRef(() => AttachmentModule),
   ],
   providers: [
     DocSpaceService,

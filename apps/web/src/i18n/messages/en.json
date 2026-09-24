@@ -28,6 +28,7 @@
     "topics": "Topics",
     "boards": "Boards",
     "docs": "Docs",
+    "experiences": "Experiences",
     "search": "Search",
     "settings": "Settings",
     "monitoring": "Monitoring",
@@ -37,7 +38,8 @@
     "closeMenu": "Close menu",
     "logout": "Logout",
     "language": "Language",
-    "pendingApprovals": "{count} roundtable approvals pending"
+    "pendingApprovals": "{count} roundtable approvals pending",
+    "pendingExperienceReviews": "{count} experiences awaiting final review"
   },
   "settings": {
     "language": {
@@ -831,6 +833,115 @@
       "disabledEditing": "Finish or cancel editing before batch upload",
       "fileTooLarge": "The following files exceed the {max} single-file limit and were skipped:",
       "networkError": "Network error"
+    },
+    "bundle": {
+      "export": {
+        "title": "Export the current space snapshot (JSON)",
+        "editingTitle": "Exports the server-side version, excluding unsaved edits",
+        "failed": "Export failed, please retry",
+        "tooLarge": "This bundle exceeds the 10MiB request-body limit and cannot be re-imported through web or API — split the space or use a file channel",
+        "zipFailed": "Failed to build the human-readable export, please retry",
+        "menu": {
+          "trigger": "Export",
+          "jsonLabel": "Export bundle (JSON)",
+          "jsonDesc": "Full snapshot: all documents + attachment bytes, restorable into the platform",
+          "zipLabel": "Export human-readable (ZIP)",
+          "zipDesc": "docs directory tree + original attachment files, open directly"
+        },
+        "readme": {
+          "title": "%space% (human-readable export)",
+          "exportedAt": "Exported at: %time%",
+          "docs": "Documents: %count%",
+          "attachments": "Original attachment files: %count%",
+          "unpacked": "Attachments referenced but not packed: %count% (references kept as-is, still reachable online)",
+          "linksRewritten": "Attachment links in document bodies were rewritten to relative paths, so local Markdown preview shows images directly",
+          "invalidTitle": "Documents with invalid paths",
+          "invalidHint": "These documents had illegal paths (containing `..`, empty segments or backslashes) and were renamed into `__invalid-path__/`:",
+          "invalidItem": "`%from%` → `%to%`",
+          "restoreHint": "This ZIP is for reading and moving files only and **cannot be imported back**; to restore, use “Export bundle (JSON)”."
+        }
+      },
+      "import": {
+        "button": "Import bundle",
+        "title": "Restore documents from an export file",
+        "disabledEditing": "Finish or cancel editing before import"
+      },
+      "cancel": "Cancel",
+      "done": "Done",
+      "backToSelect": "Select another file",
+      "retry": "Retry",
+      "dialog": {
+        "title": "Import a space bundle",
+        "description": "A bundle is the platform's full JSON export (docs + categories + routes + media); use Batch upload for per-file markdown",
+        "selectFile": "Choose bundle file",
+        "noFileHint": "No file selected (.json)",
+        "importing": "Importing... large spaces can take 1-2 minutes",
+        "importingHint": "Do not close while importing; even if interrupted, re-importing the same file is safe",
+        "importingProgress": "Importing..."
+      },
+      "errors": {
+        "fileTooLargeToRead": "This file exceeds the 32 MB read limit and was not read",
+        "tooLarge": "This bundle exceeds the server's 10MiB request-body limit — no HTTP/MCP channel can import it; split the space or contact ops for a file channel",
+        "invalidJson": "This file is not valid JSON and could not be parsed",
+        "missingSpace": "This file has no space information — not a valid bundle",
+        "unsupportedVersion": "Unsupported bundle version (only formatVersion 1 or 2)",
+        "docsNotArray": "This file is not a platform export bundle"
+      },
+      "visibility": {
+        "open": "Public",
+        "private": "Private"
+      },
+      "preview": {
+        "sourceMismatch": "Source space \"{source}\" differs from the current space \"{target}\" — make sure this is the bundle you want to restore",
+        "notDeleting": "Import only adds or overwrites documents inside the bundle; it never deletes existing documents",
+        "mediaBroken": "{count} media files were not packed — those images will be broken links after import, and this page cannot fetch them",
+        "emptyBundle": "This bundle contains no documents",
+        "coverageLoading": "Checking what will be overwritten...",
+        "coverageUnknown": "Could not verify the overwrite scope — use \"Select another file\" to try again",
+        "coverageExact": "{total} documents will be written, {overwrite} of them overwriting existing content",
+        "coverageAtLeast": "{total} documents will be written, overwriting at least {overwrite} (space has {spaceTotal} documents; only the first {checked} were checked)",
+        "counts": "Categories {categories} · Routes {routes} · Docs {docs} · Media {media} (skipped {mediaSkipped}) · Unpacked attachments {mediaOmitted}",
+        "source": "Source space: {name}",
+        "exportedAt": "Exported at: {time}",
+        "formatVersion": "Format version: v{version}",
+        "concurrency": "If someone is editing the same document, their save will overwrite this import's body text — re-importing restores it"
+      },
+      "overwrite": {
+        "label": "Also overwrite space metadata (name / legend / settings / visibility)",
+        "scopeTitle": "What will actually be written:",
+        "scopeName": "Name and legend (replaced wholesale)",
+        "scopeSettings": "settings replaced as a whole object (all existing keys lost)",
+        "scopeVisibility": "Visibility may be changed to the bundle's value",
+        "visibilityChange": "Visibility: currently {from} → after import {to}",
+        "visibilityConfirmTitle": "Space visibility will change",
+        "visibilityConfirmDesc": "Currently {from} → after import {to}. Continue?",
+        "confirm": "Confirm import",
+        "confirmDanger": "Confirm import (overwrite {overwrite})",
+        "confirmDangerAtLeast": "Confirm import (overwrite ≥{overwrite})"
+      },
+      "result": {
+        "title": "Import result",
+        "emptyDocs": "This bundle contains no documents",
+        "docsSection": "Documents",
+        "categoriesSection": "Categories",
+        "routesSection": "Routes",
+        "mediaSection": "Media",
+        "spaceMetaSection": "Space metadata",
+        "created": "Created",
+        "updated": "Updated",
+        "unchanged": "Unchanged",
+        "failed": "Failed",
+        "reused": "Reused",
+        "skipped": "Skipped",
+        "spaceMetaUpdated": "Overwritten",
+        "spaceMetaSkipped": "Not modified",
+        "failuresTitle": "Failed items ({count})",
+        "failuresHint": "Failed items appear as broken links or missing content; re-importing the same file fixes them without creating duplicates"
+      },
+      "error": {
+        "partialWarning": "The failure may have happened after some content was already written; re-importing the same file is safe (idempotent)",
+        "fallback": "Import request failed"
+      }
     }
   },
   "monitoring": {
@@ -1229,5 +1340,222 @@
     "zoomActual": "Actual size",
     "zoomFit": "Fit to window",
     "closePreview": "Close preview"
+  },
+  "experiences": {
+    "title": "Experience Base",
+    "description": "Battle-scarred notes shared across projects: symptoms, root causes and fixes. Every authenticated actor can read; anyone can record.",
+    "record": "Record experience",
+    "searchPlaceholder": "Search experiences...",
+    "filter": {
+      "intent": "Type",
+      "quality": "Quality",
+      "domain": "Domain",
+      "creator": "Recorded by",
+      "sort": "Sort",
+      "all": "All",
+      "countUnknown": "—",
+      "creatorUnavailable": "Creator list is still loading (or failed to load) — filtering by creator is unavailable right now.",
+      "creatorTruncated": "Showing the top {count} creators by entry count — search for the rest, or open an entry to see who recorded it."
+    },
+    "sort": {
+      "recent": "Recently updated",
+      "most_used": "Most used",
+      "mostUsedNotice": "Usage counts are self-reported and can be manipulated — read them as a hint, not as proof."
+    },
+    "intent": {
+      "pitfall": "Pitfall",
+      "repair": "Repair",
+      "howto": "How-to",
+      "optimize": "Optimize",
+      "decision": "Decision"
+    },
+    "quality": {
+      "unverified": "Unverified",
+      "verified": "Verified",
+      "suspect": "Suspect"
+    },
+    "qualityHint": {
+      "unverified": "No review yet — read it as a peer note, not a vetted fact.",
+      "verified": "Confirmed by a reviewer (possibly the author).",
+      "suspect": "Marked doubtful by a reviewer — excluded from default search, still readable here."
+    },
+    "expired": "Expired",
+    "neverExpires": "Never expires",
+    "expiresAt": "Expires {date}",
+    "trustSignal": "{count} users found this helpful",
+    "signals": "Signals",
+    "domains": "Domains",
+    "card": {
+      "createdAt": "Recorded {time}"
+    },
+    "creator": {
+      "deletedHint": "This creator's account has been deleted — the name is kept from their profile.",
+      "orphanHint": "This creator's profile can no longer be resolved (maybe hard-deleted) — showing the first 8 characters of the ID.",
+      "type": {
+        "human": "Human",
+        "agent": "Agent",
+        "system": "System"
+      }
+    },
+    "empty": "No experiences found",
+    "emptyDesc": "Nothing matches the current filters.",
+    "emptyHint": "Zero hits is normal at this stage — if you solve the problem yourself, record it so the next person finds it.",
+    "listError": "Failed to load experiences",
+    "retry": "Retry",
+    "pagination": "Page {page} / {totalPages} · {pageSize} per page · {total} total",
+    "paginationPrev": "Previous page",
+    "paginationNext": "Next page",
+    "detail": {
+      "back": "Back to experiences",
+      "notFound": "Experience not found",
+      "notFoundDesc": "It may have been deleted. Go back to the list and search again.",
+      "notFoundBack": "Back to the list",
+      "content": "Content",
+      "signals": "Signals",
+      "domains": "Domains",
+      "env": "Environment",
+      "sourceProject": "Source project",
+      "createdBy": "Recorded by",
+      "createdAt": "Created",
+      "updatedAt": "Updated",
+      "verifiedBy": "Reviewed by",
+      "verifiedAt": "Reviewed at",
+      "none": "—",
+      "edit": "Edit",
+      "delete": "Delete",
+      "deleteConfirmTitle": "Delete this experience?",
+      "deleteConfirmDesc": "It disappears from the list and from search. There is no restore button in the UI.",
+      "deleteFailed": "Delete failed",
+      "deleted": "Experience deleted"
+    },
+    "feedback": {
+      "title": "Did it help?",
+      "hint": "Answer after you APPLY it — this is not about whether the search found it.",
+      "helped": "Helped",
+      "notHelpful": "Did not help",
+      "helpedCount": "{count} found this helpful",
+      "notHelpfulCount": "{count} did not",
+      "distinctCount": "{count} distinct users confirmed it works",
+      "expiredNotice": "This entry has expired, so feedback is closed.",
+      "failed": "Failed to submit feedback",
+      "thanks": "Thanks for the feedback"
+    },
+    "review": {
+      "title": "Final review",
+      "onlyAdmin": "Final review is limited to an admin or an experience space reviewer (owner / reviewer).",
+      "current": "Current quality: {quality}",
+      "verify": "Verify",
+      "suspect": "Mark suspect",
+      "reasonPlaceholder": "Why this verdict (required — recorded in the audit trail)",
+      "reasonRequired": "A reason is required",
+      "verified": "Entry verified",
+      "suspected": "Entry marked suspect",
+      "failed": "Review failed"
+    },
+    "members": {
+      "title": "Experience space members",
+      "owner": "Space admin",
+      "reviewer": "Reviewer",
+      "human": "Human",
+      "agent": "Agent",
+      "setOwner": "Make space admin",
+      "setReviewer": "Make reviewer",
+      "inviteFailed": "{succeeded} invited, {failed} failed"
+    },
+    "judgment": {
+      "title": "Machine pre-check (observation period) · reference only",
+      "suppressed": "Hidden: compare it after you finish the review",
+      "resultHint": "Recorded successfully. The pre-check below is a reference only — it never changes the quality and never blocks recording.",
+      "dimension": {
+        "completeness": "Completeness",
+        "reusability": "Reusability",
+        "signalQuality": "Signal quality",
+        "duplicate": "Duplicate",
+        "intentSuggestion": "Type suggestion",
+        "domainSuggestion": "Domain suggestion",
+        "admissionSuggestion": "Admission (cross-project)"
+      },
+      "admission": {
+        "admit": "admit — transfers to other projects",
+        "needs_human": "borderline — a reviewer should decide",
+        "reject": "reject — low value for a cross-project base"
+      },
+      "rubricVersion": "rubric {version}",
+      "level": {
+        "missing": "missing",
+        "thin": "thin",
+        "partial": "partial",
+        "complete": "complete",
+        "one_off": "one-off",
+        "narrow": "narrow",
+        "broad": "broad",
+        "noise": "noise",
+        "weak": "weak",
+        "distinctive": "distinctive"
+      },
+      "verdict": {
+        "distinct": "distinct",
+        "possible_duplicate": "possible duplicate",
+        "likely_duplicate": "likely duplicate",
+        "keep": "current value is fine",
+        "none_fits": "no existing tag fits",
+        "suggested": "suggested: {value}"
+      }
+    },
+    "form": {
+      "createTitle": "Record an experience",
+      "editTitle": "Edit experience",
+      "editIntro": "Editing the title, summary, content or signals resets the quality to unverified.",
+      "title": "Title",
+      "titlePlaceholder": "One line naming the symptom or the outcome",
+      "summary": "Summary",
+      "summaryPlaceholder": "Why this matters / when to read it (shown in the list)",
+      "content": "Content",
+      "contentPlaceholder": "Markdown — the four-section skeleton is pre-filled",
+      "sectionSymptom": "Symptom",
+      "sectionRootCause": "Root cause",
+      "sectionFix": "Fix",
+      "sectionHowVerified": "How verified",
+      "intent": "Type",
+      "signals": "Signals",
+      "signalsPlaceholder": "Type one keyword token, then press Enter — e.g. ECONNREFUSED",
+      "signalsHint": "The primary search entry point: one distinguishing keyword per chip (max 20, ≤50 chars each, no commas). Entries match when they share at least one signal.",
+      "domains": "Domains",
+      "domainsPlaceholder": "e.g. devops — press Enter to add",
+      "domainsHint": "Open vocabulary (max 20). Reusing existing tags makes the entry findable.",
+      "env": "Environment",
+      "envHint": "Keys are fixed (os / tool / version / runtime); values are free text and matched exactly.",
+      "envOs": "OS",
+      "envTool": "Tool",
+      "envVersion": "Version",
+      "envRuntime": "Runtime",
+      "expiresAt": "Expires at",
+      "expiresAtHint": "Leave empty for a never-expiring entry (a past date is rejected).",
+      "sourceProject": "Source project",
+      "sourceProjectPlaceholder": "repo slug, e.g. agent-chamber",
+      "secretWarning": "Never record secrets, API keys or personal data — every authenticated actor can read the experience base.",
+      "requiredHint": "Title, summary, content, type and at least one signal are required.",
+      "submitCreate": "Record",
+      "submitEdit": "Save",
+      "submitting": "Saving...",
+      "createSuccess": "Experience recorded — searchable immediately (unverified until an admin reviews it).",
+      "updateSuccess": "Experience updated",
+      "createFailed": "Failed to record the experience",
+      "updateFailed": "Failed to update the experience",
+      "chipEmpty": "Type a keyword first",
+      "chipTooLong": "Each keyword can be at most 50 characters",
+      "chipComma": "One keyword per chip — commas are not allowed",
+      "chipTooMany": "At most {max} entries",
+      "removeChip": "Remove",
+      "conflict": "This entry changed while you were editing. The latest version has been reloaded — review your edit and submit again.",
+      "possibleDuplicates": "Similar entries already exist — read them before adding a duplicate:",
+      "warnings": "Heads-up:"
+    },
+    "searchEntry": {
+      "label": "Search the experience base",
+      "hint": "Cross-project notes with symptoms and fixes. Zero hits is normal."
+    },
+    "clearFilters": "Clear all filters",
+    "backToFirstPage": "Back to page 1"
   }
 }

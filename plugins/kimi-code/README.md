@@ -103,7 +103,7 @@ boardId/topicId 未填时自动推断绑定对象：
 **模式 A（MCP 模式，推荐）**：
 
 1. 在 mcp.json（项目 `.kimi-code/mcp.json` 或用户级 `~/.kimi-code/mcp.json`）配 chamber server，示例照 `templates/mcp.json`：`url` + `headers.X-API-Key` 填你的 key。**此文件含机密，勿入库**；
-2. 复制 `templates/agent-chamber.json` → 项目 `.kimi-code/agent-chamber.json`，填 `boardId` / `docSpaceId` / `topicId` + `mcpServer` 指针（填你刚命名的 server 名）+ 建议显式 `apiBaseUrl`；
+2. 复制 `templates/agent-chamber.json` → `<项目根>/.agent-chamber/agent-chamber.json`（跨 harness 中立目录，dsh 插件复用同一文件），填 `boardId` / `docSpaceId` / `topicId` + `mcpServer` 指针（填你刚命名的 server 名）+ 建议显式 `apiBaseUrl`；
 3. **三 UUID 获取**（全站无复制入口，只能从地址栏复制）：
    - **boardId**：打开看板详情页，地址栏 `/boards/` 后 36 位 UUID 即 boardId；
    - **docSpaceId**：打开 DocSpace 页面，地址栏 `/docs/` 后 36 位 UUID 即 docSpaceId；
@@ -147,6 +147,7 @@ boardId/topicId 未填时自动推断绑定对象：
 | `boardId` / `docSpaceId` / `topicId` | 项目三 ID（地址栏复制） | 可（分支②） |
 | `mcpServer` | mcp.json 内 server 名指针 | 可（惯例名回退） |
 | `apiBaseUrl` | REST base URL | 建议恒显式写（自建 automcp 端口与 REST 端口不同时推导必错） |
+| `webBaseUrl` | web 控制台基座（面板任务深链用） | 可（缺省/空 = 从 `apiBaseUrl` 剥 `/api/v1` 推导；优先级：显式 > 推导） |
 | `apiKey` | 仅 REST-only 或显式覆盖时填（此时文件含机密勿入库） | 可 |
 
 取值优先级（4 步）：绑定文件 `apiKey` → `mcpServer` 指针 → 惯例名（chamber / platform / agent-chamber）→ 合并后恰一个 HTTP server 直用。

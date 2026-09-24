@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import { createElement } from 'react';
+import { unzipSync } from 'fflate';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import DocSpaceDetailPage from './page';
 import { Api } from '@/lib/api';
@@ -39,6 +40,32 @@ const messages: Record<string, string> = {
   'docs.detail.copyMarkdown': 'Copy Markdown',
   'docs.detail.copied': 'Copied',
   'docs.detail.copyMarkdownError': 'Copy failed, please retry',
+  // 空间级 bundle 导出/导入入口（导出 = 双格式菜单）
+  'docs.bundle.export.title': 'Export the current space snapshot (JSON)',
+  'docs.bundle.export.editingTitle': 'Exports the server-side version, excluding unsaved edits',
+  'docs.bundle.export.zipFailed': 'Failed to build the human-readable export, please retry',
+  'docs.bundle.export.menu.trigger': 'Export',
+  'docs.bundle.export.menu.jsonLabel': 'Export bundle (JSON)',
+  'docs.bundle.export.menu.jsonDesc':
+    'Full snapshot: all documents + attachment bytes, restorable into the platform',
+  'docs.bundle.export.menu.zipLabel': 'Export human-readable (ZIP)',
+  'docs.bundle.export.menu.zipDesc':
+    'docs directory tree + original attachment files, open directly',
+  // ZIP 内 README 文案（真实链路走 lib 注入，这里给英文快照）
+  'docs.bundle.export.readme.title': '{space} (human-readable export)',
+  'docs.bundle.export.readme.exportedAt': 'Exported at: {time}',
+  'docs.bundle.export.readme.docs': 'Documents: {count}',
+  'docs.bundle.export.readme.attachments': 'Original attachment files: {count}',
+  'docs.bundle.export.readme.unpacked': 'Attachments referenced but not packed: {count}',
+  'docs.bundle.export.readme.linksRewritten': 'Attachment links were rewritten to relative paths',
+  'docs.bundle.export.readme.invalidTitle': 'Documents with invalid paths',
+  'docs.bundle.export.readme.invalidHint': 'These documents had illegal paths',
+  'docs.bundle.export.readme.invalidItem': '`{from}` → `{to}`',
+  'docs.bundle.export.readme.restoreHint':
+    'This ZIP cannot be imported back; to restore, use "Export bundle (JSON)".',
+  'docs.bundle.import.button': 'Import bundle',
+  'docs.bundle.import.title': 'Restore documents from an export file',
+  'docs.bundle.import.disabledEditing': 'Finish or cancel editing before import',
 };
 
 jest.mock('next-intl', () => ({
@@ -66,17 +93,22 @@ jest.mock('next/link', () => {
   };
 });
 
+/** 当前会话用户角色（bundle 入口测试需要切换「全读者」与「admin」两态） */
+let mockUserRole = 'admin';
+
 jest.mock('@/stores/auth.store', () => ({
   // admin 角色 → canManage 为 true，编辑按钮可见
   useAuthStore: (selector: (state: unknown) => unknown) =>
-    selector({ user: { id: 'u1', role: 'admin' } }),
+    selector({ user: { id: 'u1', role: mockUserRole } }),
 }));
 
 const mockToastError = jest.fn();
+const mockToastWarning = jest.fn();
 jest.mock('@/lib/notify', () => ({
   confirm: jest.fn().mockResolvedValue(true),
   toast: {
     error: (...args: unknown[]) => mockToastError(...args),
+    warning: (...args: unknown[]) => mockToastWarning(...args),
     success: jest.fn(),
   },
 }));
@@ -93,6 +125,7 @@ jest.mock('@/lib/api', () => ({
       getDocContent: jest.fn(),
       getDocByPath: jest.fn(),
       getDiagramHtml: jest.fn(),
+      exportSpaceBundle: jest.fn(),
     },
     // v1.37 owner 代理：页面新增我的 agent 列表查询（非 admin 只返回自己拥有的 agents）；
     // listAll 返回数组（循环翻页拉全），非分页响应
@@ -108,6 +141,25 @@ jest.mock('@/components/docs/doc-editor', () => ({
 }));
 jest.mock('@/components/docs/batch-upload-dialog', () => ({
   BatchUploadDialog: () => null,
+}));
+// 导入对话框内部链路自带单测（import-bundle-dialog.test.tsx），本文件只验入口 + 刷新接线：
+// mock 暴露 onImported / onOpenChange 触发点，并按 open 受控渲染（与真实组件同约定）
+jest.mock('@/components/docs/import-bundle-dialog', () => ({
+  ImportBundleDialog: ({
+    open,
+    onOpenChange,
+    onImported,
+  }: {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+    onImported: () => void;
+  }) =>
+    open ? (
+      <>
+        <button onClick={onImported}>mock-bundle-imported</button>
+        <button onClick={() => onOpenChange(false)}>mock-bundle-close</button>
+      </>
+    ) : null,
 }));
 
 // react-markdown / remark-gfm 为纯 ESM，Jest 不转换 node_modules，stub 之
@@ -173,6 +225,7 @@ const mockApi = Api.docs as unknown as {
   getDocContent: jest.Mock;
   getDocByPath: jest.Mock;
   getDiagramHtml: jest.Mock;
+  exportSpaceBundle: jest.Mock;
 };
 
 /** 最小可用空间对象（admin → creatorId 无需匹配） */
@@ -215,14 +268,17 @@ const paginated = (items: unknown[]) => ({
   hasPrev: false,
 });
 
+/** 页面元素（rerender 复用：同一 QueryClient 重渲染，模拟 SPA 内换 ?doc= 而组件不卸载） */
+const pageElement = (queryClient: QueryClient) => (
+  <QueryClientProvider client={queryClient}>
+    <DocSpaceDetailPage />
+  </QueryClientProvider>
+);
+
 function renderPage() {
   // retry: false —— 查询失败立即进入 isError，避免默认 3 次重试拖慢断言
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <DocSpaceDetailPage />
-    </QueryClientProvider>,
-  );
+  return render(pageElement(queryClient));
 }
 
 /** 基础 mock 装配：空空间 + 空树 + 空 facets + 空列表（各 describe 按需覆盖） */
@@ -448,20 +504,34 @@ describe('DocSpaceDetailPage 侧边栏视图模式 + 文档匹配（懒加载）
       tags: [],
       categories: [],
     });
-    // 模拟服务端 tree 语义：根层返回目录 + 根级散文件；docs/ 子层返回 Alpha
-    mockApi.getTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) =>
-      params?.prefix === 'docs/'
-        ? Promise.resolve({
-            prefix: 'docs/',
-            folders: { items: [], total: 0, hasMore: false },
-            docs: {
-              items: [{ id: 'doc-3', path: 'docs/a.md', title: 'Alpha', docType: 'guide' }],
-              total: 1,
-              hasMore: false,
-            },
-          })
-        : Promise.resolve(treeRoot),
-    );
+    // 模拟服务端 tree 语义：根层返回目录 + 根级散文件；docs/ 子层返回 Alpha；
+    // guides/ 子层返回独立叶子（当前 doc path = guides/t.md → 祖先链自动展开 guides/；
+    // 若该层也回 treeRoot，其 folders 含 path='guides/' 且已展开 → 无界递归渲染/无界请求）
+    mockApi.getTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) => {
+      if (params?.prefix === 'docs/') {
+        return Promise.resolve({
+          prefix: 'docs/',
+          folders: { items: [], total: 0, hasMore: false },
+          docs: {
+            items: [{ id: 'doc-3', path: 'docs/a.md', title: 'Alpha', docType: 'guide' }],
+            total: 1,
+            hasMore: false,
+          },
+        });
+      }
+      if (params?.prefix === 'guides/') {
+        return Promise.resolve({
+          prefix: 'guides/',
+          folders: { items: [], total: 0, hasMore: false },
+          docs: {
+            items: [{ id: 'doc-1', path: 'guides/t.md', title: 'Doc T', docType: 'guide' }],
+            total: 1,
+            hasMore: false,
+          },
+        });
+      }
+      return Promise.resolve(treeRoot);
+    });
     // 模拟服务端过滤语义：q= 按 title/path 子串过滤；type= 按 docType 过滤
     mockApi.listDocs.mockImplementation(
       (_spaceId: string, opts?: { q?: string; type?: string }) => {
@@ -494,8 +564,19 @@ describe('DocSpaceDetailPage 侧边栏视图模式 + 文档匹配（懒加载）
     expect(screen.getByText('docs')).toBeInTheDocument();
     expect(screen.getByText('guides')).toBeInTheDocument();
     expect(screen.getByText('README')).toBeInTheDocument(); // 标题≈文件名去重 → 主标签为文件名（2026-09-02 拍板）
-    // 未展开的目录不拉子层（只发过根层请求）
-    expect(mockApi.getTree).toHaveBeenCalledTimes(1);
+    // 根层 + guides/ 子层（当前 doc path = guides/t.md → 祖先链自动展开，懒加载同步拉取）
+    await waitFor(() => {
+      expect(mockApi.getTree).toHaveBeenCalledTimes(2);
+    });
+    expect(mockApi.getTree).toHaveBeenCalledWith(
+      'space-1',
+      expect.objectContaining({ prefix: 'guides/' }),
+    );
+    // 不在祖先链上的目录（docs/）保持折叠，不拉子层
+    expect(mockApi.getTree).not.toHaveBeenCalledWith(
+      'space-1',
+      expect.objectContaining({ prefix: 'docs/' }),
+    );
     // 分类模式特征（未分类标签）不应出现
     expect(screen.queryByText('Uncategorized')).not.toBeInTheDocument();
     // 目录按钮选中态
@@ -930,5 +1011,406 @@ describe('DocSpaceDetailPage 复制 Markdown 原文按钮', () => {
     await waitFor(() => {
       expect(mockApi.getDocContent).toHaveBeenCalledTimes(3);
     });
+  });
+});
+
+/**
+ * 分类模式选中同步（D8）：activeCategorySlug gate（只有命中文档的分类才自动翻页）
+ * + 命中文档所属分类折叠时自动重展开（含同分类内换文档）。
+ */
+describe('DocSpaceDetailPage 分类模式选中同步（activeCategorySlug gate / 折叠重展开）', () => {
+  const treeDocs = [
+    { id: 'doc-1', title: 'Doc T', path: 'guides/t.md', docType: 'guide' },
+    { id: 'doc-2', title: 'Doc U', path: 'guides/u.md' },
+    { id: 'doc-5', title: 'Gamma', path: 'guides/nested/g.md' },
+    { id: 'doc-9', title: 'Misc Doc', path: 'misc/m.md' },
+  ];
+
+  /** 空间分类：cat-1（命中文档所在）+ cat-2（非命中） */
+  const categorySpace = {
+    ...spaceFixture,
+    categories: [
+      { id: 'cat-1', name: 'Guides', slug: 'guides' },
+      { id: 'cat-2', name: 'Misc', slug: 'misc' },
+    ],
+  };
+
+  /** 构造 listDocs 一页（hasNext/total 可控，用于多页自动翻页场景） */
+  const pageOf = (items: unknown[], page: number, hasNext: boolean, total = items.length) => ({
+    items,
+    total,
+    page,
+    pageSize: 50,
+    totalPages: hasNext ? page + 1 : page,
+    hasNext,
+    hasPrev: page > 1,
+  });
+
+  /** 指定分类收到的 listDocs 请求次数（有界断言用） */
+  const callsFor = (slug: string) =>
+    mockApi.listDocs.mock.calls.filter(
+      ([, opts]: [string, { category?: string }?]) => opts?.category === slug,
+    ).length;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    localStorage.clear();
+    mockBase();
+    // ?doc= 由 mockSearchParams 驱动（本 describe 内会改写，逐用例复位）
+    mockSearchParams.set('doc', 'doc-1');
+    mockApi.getSpace.mockResolvedValue(categorySpace);
+    mockApi.getFacets.mockResolvedValue({
+      types: [],
+      tags: [],
+      categories: [
+        { slug: 'guides', name: 'Guides', count: 2 },
+        { slug: 'misc', name: 'Misc', count: 1 },
+      ],
+    });
+    // 当前文档属于 cat-1（slug=guides）
+    mockApi.getDoc.mockResolvedValue({ ...docFixture, categoryId: 'cat-1' });
+    mockApi.getTree.mockResolvedValue(emptyTree);
+    localStorage.setItem('docs:sidebar-mode', 'category');
+  });
+
+  afterEach(() => {
+    mockSearchParams.set('doc', 'doc-1');
+  });
+
+  it('gate：非命中分类恰好 1 次请求；命中分类自动翻到目标所在页后停止（有界）', async () => {
+    mockApi.listDocs.mockImplementation(
+      (_spaceId: string, opts?: { category?: string; page?: number }) => {
+        if (opts?.category === 'guides') {
+          // 目标 doc-1 在第 2 页（第 1 页只有别的文档）→ 自动翻一页命中
+          return opts?.page === 2
+            ? Promise.resolve(pageOf([treeDocs[0], treeDocs[1]], 2, false, 3))
+            : Promise.resolve(pageOf([treeDocs[2]], 1, true, 3));
+        }
+        // 非命中分类：hasNext 恒 true——缺 gate 时会一路翻到页数上限（本断言即防此）
+        return Promise.resolve(pageOf([treeDocs[3]], 1, true, 100));
+      },
+    );
+
+    renderPage();
+    await screen.findByText('Test Space');
+
+    await waitFor(() => {
+      expect(mockApi.listDocs).toHaveBeenCalledWith(
+        'space-1',
+        expect.objectContaining({ category: 'guides', page: 2 }),
+      );
+    });
+    expect(callsFor('guides')).toBe(2); // 第 2 页命中即停（不再继续翻）
+    expect(callsFor('misc')).toBe(1); // 非命中分类零翻页
+  });
+
+  it('命中文档所属分类折叠时自动重展开；同分类内换文档（categoryId 不变）也重展开', async () => {
+    mockApi.listDocs.mockImplementation((_spaceId: string, opts?: { category?: string }) =>
+      opts?.category === 'guides'
+        ? Promise.resolve(paginated([treeDocs[0], treeDocs[1], treeDocs[2]]))
+        : Promise.resolve(paginated([])),
+    );
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(pageElement(queryClient));
+    await screen.findByText('Test Space');
+    // 分类区块展开态：Guides 下文档可见（Gamma 只出现在分类列表，避免多重匹配）
+    expect(await screen.findByText('Gamma')).toBeInTheDocument();
+
+    // 用户手动折叠 Guides
+    fireEvent.click(screen.getByText('Guides'));
+    expect(screen.queryByText('Gamma')).not.toBeInTheDocument();
+
+    // 同分类内换文档：selectedDocId 变、categoryId 不变 → 分类重展开（D8 复核新-3）
+    // 顺带断言重展开后的新 active 行滚动到可视区（DocTreeItem 的 D5 滚动，清记录后看新增调用）
+    const scrollSpy = Element.prototype.scrollIntoView as unknown as jest.Mock;
+    scrollSpy.mockClear();
+    mockSearchParams.set('doc', 'doc-2');
+    view.rerender(pageElement(queryClient));
+
+    expect(await screen.findByText('Gamma')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(scrollSpy).toHaveBeenCalledWith({ block: 'nearest' });
+    });
+    expect(scrollSpy).toHaveBeenCalledTimes(1); // 仅新 active 行（doc-2）滚动
+  });
+});
+
+/**
+ * 空间级 bundle 导出/导入入口（页头按钮 + 导出下载链路）。
+ * 对话框内部链路（五态机/预检/结果面板）见 import-bundle-dialog.test.tsx。
+ */
+describe('DocSpaceDetailPage 空间级 bundle 导出/导入入口', () => {
+  /** 导出端点返回的 bundle（apiRequest 已解包 → 返回的就是 bundle 本体） */
+  const bundleFixture = {
+    formatVersion: 2,
+    exportedAt: '2026-09-15T00:00:00Z',
+    space: { name: 'Test Space', visibility: 'open' },
+    docs: [{ path: 'a.md' }],
+  };
+
+  /** 用 FileReader 读 Blob 文本（jsdom 的 Blob 未实现 text()） */
+  const readBlob = (blob: Blob) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(blob);
+    });
+
+  /** 用 FileReader 读 Blob 字节（ZIP 断言用；jsdom 的 Blob 未实现 arrayBuffer()） */
+  const readBlobBytes = (blob: Blob) =>
+    new Promise<Uint8Array>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(blob);
+    });
+
+  /** 最近一次锚点点击的 download 属性（click 被 stub，改在 stub 内记录） */
+  let clickedDownload = '';
+  const anchorDownloadName = () => clickedDownload;
+
+  /** ZIP 根目录名（lib 用 now 生成，测试内按当天 UTC 复算，避免硬编码日期） */
+  const zipRoot = `docspace-test-space-${new Date().toISOString().slice(0, 10)}`;
+
+  let createObjectURL: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBase();
+    mockUserRole = 'admin';
+    mockApi.exportSpaceBundle.mockResolvedValue(bundleFixture);
+    createObjectURL = jest.fn(() => 'blob:test');
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      writable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      writable: true,
+      value: jest.fn(),
+    });
+    // 锚点点击在 jsdom 会触发未实现的导航，桩掉（顺带记录 download 名）
+    clickedDownload = '';
+    jest.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      clickedDownload = this.download;
+    });
+  });
+
+  afterEach(() => {
+    mockUserRole = 'admin';
+    jest.restoreAllMocks();
+  });
+
+  it('导出菜单对全读者可见；导入按钮仅 canManage 可见（非作者非编辑者无导入入口）', async () => {
+    mockUserRole = 'user';
+    mockApi.getSpace.mockResolvedValue({ ...spaceFixture, creatorId: 'other' });
+
+    renderPage();
+    await screen.findByText('Test Space');
+
+    expect(await screen.findByRole('button', { name: 'Export' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Import bundle' })).not.toBeInTheDocument();
+  });
+
+  it('canManage 时导入按钮可见且带 title', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    const importButton = await screen.findByRole('button', { name: 'Import bundle' });
+    expect(importButton).toBeEnabled();
+    expect(importButton).toHaveAttribute('title', 'Restore documents from an export file');
+  });
+
+  it('点触发钮 → 浮层两选项各带一行说明（认知差异写在选项旁）', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
+
+    const jsonItem = await screen.findByTestId('export-menu-json');
+    const zipItem = screen.getByTestId('export-menu-zip');
+    expect(within(jsonItem).getByText('Export bundle (JSON)')).toBeInTheDocument();
+    expect(
+      within(jsonItem).getByText(
+        'Full snapshot: all documents + attachment bytes, restorable into the platform',
+      ),
+    ).toBeInTheDocument();
+    expect(within(zipItem).getByText('Export human-readable (ZIP)')).toBeInTheDocument();
+    expect(
+      within(zipItem).getByText('docs directory tree + original attachment files, open directly'),
+    ).toBeInTheDocument();
+  });
+
+  it('选 JSON 项 → 拉取 bundle 并下载 pretty JSON（Blob type + createObjectURL + 延时 revoke）', async () => {
+    jest.useFakeTimers();
+    const revokeSpy = URL.revokeObjectURL as jest.Mock;
+    renderPage();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
+    fireEvent.click(screen.getByTestId('export-menu-json'));
+
+    await waitFor(() => expect(mockApi.exportSpaceBundle).toHaveBeenCalledWith('space-1'));
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+
+    const blob = createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob.type).toBe('application/json');
+    const text = await readBlob(blob);
+    expect(JSON.parse(text)).toEqual(bundleFixture);
+    expect(text).toContain('\n  '); // pretty 打印（后端用途 = 落 git diff / 离线备份）
+    // 导出后自检未超限 → 不弹警告
+    expect(mockToastWarning).not.toHaveBeenCalled();
+    // 选项点击后浮层关闭（动作与关闭链路解耦，但不留悬挂浮层）
+    expect(screen.queryByTestId('export-menu-panel')).not.toBeInTheDocument();
+
+    // revoke 延时 1s（数 MB 下载防中断）
+    expect(revokeSpy).not.toHaveBeenCalled();
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(revokeSpy).toHaveBeenCalledWith('blob:test');
+    jest.useRealTimers();
+  });
+
+  it('选 ZIP 项 → 同一 endpoint 拉 bundle，下载 application/zip（内容可解出 README + docs 条目）', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
+    fireEvent.click(screen.getByTestId('export-menu-zip'));
+
+    await waitFor(() => expect(mockApi.exportSpaceBundle).toHaveBeenCalledWith('space-1'));
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+
+    const blob = createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob.type).toBe('application/zip');
+    // ZIP 条目表由 lib 单测覆盖，这里只验页面接线产出的是**可解压的合法 zip** 且根目录就位
+    const bytes = await readBlobBytes(blob);
+    const unzipped = unzipSync(bytes);
+    const entries = Object.keys(unzipped).sort();
+    expect(entries).toContain(`${zipRoot}/README.md`);
+    expect(entries).toContain(`${zipRoot}/a.md`);
+    // jsdom 无 TextDecoder，解码走 Node Buffer（与 lib 手写 UTF-8 逐字节可比）
+    expect(Buffer.from(unzipped[`${zipRoot}/README.md`]).toString('utf8')).toContain(
+      'cannot be imported back',
+    );
+    // 下载名 = 根目录名 + .zip（由锚点 download 属性决定）
+    expect(anchorDownloadName()).toBe(`${zipRoot}.zip`);
+    expect(mockToastError).not.toHaveBeenCalled();
+  });
+
+  it('ZIP 生成失败 → zip 专属失败 toast（与 JSON 失败文案区分）', async () => {
+    mockApi.exportSpaceBundle.mockRejectedValueOnce(new Error('boom'));
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
+    fireEvent.click(screen.getByTestId('export-menu-zip'));
+
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith({ title: 'boom' }));
+  });
+
+  it('编辑中：导入按钮禁用并给出原因；导出触发钮不禁用，仅 title 提示不含未保存编辑（R4）', async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    const importButton = await screen.findByRole('button', { name: 'Import bundle' });
+    expect(importButton).toBeDisabled();
+    expect(importButton).toHaveAttribute('title', 'Finish or cancel editing before import');
+
+    const exportButton = screen.getByRole('button', { name: 'Export' });
+    expect(exportButton).toBeEnabled();
+    expect(exportButton).toHaveAttribute(
+      'title',
+      'Exports the server-side version, excluding unsaved edits',
+    );
+  });
+
+  it('页头按钮组 flex-wrap justify-end；三栏定高改 xl 限定（去掉行内 style）', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    const exportTrigger = await screen.findByRole('button', { name: 'Export' });
+    // 菜单根容器（relative）在页头按钮组内 —— 触发钮多了一层菜单包裹，故取祖父节点
+    expect(exportTrigger.closest('[data-testid="export-menu"]')?.parentElement).toHaveClass(
+      'flex-wrap',
+      'justify-end',
+    );
+
+    const firstAside = document.querySelector('aside') as HTMLElement;
+    const columns = firstAside.parentElement as HTMLElement;
+    expect(columns).toHaveClass('xl:h-[calc(100vh-9rem)]');
+    // 行内定高已移除：<xl 时三栏自然流式滚动，按钮换行不再把底边顶出视口
+    expect(columns).not.toHaveAttribute('style');
+  });
+});
+
+/**
+ * 回导成功后的刷新清单（D5）：空间/树/聚合四键 + 正文类查询**整类前缀失效**。
+ *
+ * 用 open/onOpenChange 受控的 mock 对话框触发 onImported（真实对话框内部链路见其自身单测）。
+ */
+describe('DocSpaceDetailPage 回导成功后查询失效清单（D5）', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBase();
+    mockUserRole = 'admin';
+  });
+
+  afterEach(() => {
+    mockUserRole = 'admin';
+    jest.restoreAllMocks();
+  });
+
+  it('onImported → 空间四键 + doc/doc-content/doc-content-full/filtered/search-docs/search 前缀全部失效', async () => {
+    const invalidateSpy = jest.spyOn(QueryClient.prototype, 'invalidateQueries');
+
+    renderPage();
+    await screen.findByText('Test Space');
+
+    // 对话框受控：未开始时 mock 不渲染任何内容
+    expect(screen.queryByRole('button', { name: 'mock-bundle-imported' })).not.toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import bundle' }));
+    fireEvent.click(screen.getByRole('button', { name: 'mock-bundle-imported' }));
+
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalled();
+    });
+    const invalidated = invalidateSpy.mock.calls.map(
+      (call) => (call[0] as { queryKey?: unknown[] } | undefined)?.queryKey,
+    );
+    expect(invalidated).toEqual(
+      expect.arrayContaining([
+        ['docs', 'space', 'space-1'],
+        ['docs', 'tree'],
+        ['docs', 'facets'],
+        ['docs', 'spaces'],
+        ['docs', 'doc'],
+        ['docs', 'doc-content'],
+        ['docs', 'doc-content-full'],
+        ['docs', 'filtered'],
+        ['docs', 'search-docs'],
+        ['docs', 'search'],
+      ]),
+    );
+  });
+
+  it('关闭对话框走 onOpenChange（受控开关由页面持有）', async () => {
+    renderPage();
+    await screen.findByText('Test Space');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import bundle' }));
+    expect(screen.getByRole('button', { name: 'mock-bundle-imported' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'mock-bundle-close' }));
+    expect(screen.queryByRole('button', { name: 'mock-bundle-imported' })).not.toBeInTheDocument();
   });
 });

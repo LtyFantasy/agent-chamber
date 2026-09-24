@@ -40,6 +40,7 @@ import {
  * 索引全部 partial（平台惯例），与 migration 同名同列同 where，防 generate 噪声；
  * idx_attachments_uploader_created 的 created_at DESC 方向仅 migration 可表达
  * （TypeORM @Index 无 order 选项），generate 噪声可接受——平台手写 migration 不 generate。
+ * uq_attachments_thumb_key 是 partial **unique**（P2 批 1）：只约束有缩略图的行。
  */
 @Entity('attachments')
 @Index('idx_attachments_uploader_created', ['uploaderId', 'createdAt'], {
@@ -50,6 +51,7 @@ import {
 @Index('idx_attachments_sha256', ['sha256'], { where: 'deleted_at IS NULL' })
 @Index('idx_attachments_deleted_gc', ['deletedAt'], { where: 'deleted_at IS NOT NULL' })
 @Unique('uq_attachments_object_key', ['objectKey'])
+@Index('uq_attachments_thumb_key', ['thumbKey'], { unique: true, where: 'thumb_key IS NOT NULL' })
 export class Attachment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -58,7 +60,14 @@ export class Attachment {
   @Column({ type: 'uuid', nullable: false, name: 'uploader_id' })
   uploaderId: string;
 
-  /** MinIO bucket（入库冗余列：支持未来多 bucket 分流，P0 恒为配置 bucket） */
+  /**
+   * MinIO bucket（入库冗余列：支持未来多 bucket 分流，P0–P2 恒为配置 bucket）。
+   *
+   * ⚠️ 多 bucket 提醒（PM M8）：孤儿对象清扫（attachment-gc.service.ts
+   * `sweepOrphanObjectsOlderThan`）只扫**配置 bucket**（storage.getBucket()）——
+   * 若未来真做分流写入，其它 bucket 的对象不会被误删（保护集是全表的，键仍在
+   * Set 内），但也**不会被清扫**；届时清扫需改为遍历 `SELECT DISTINCT bucket`。
+   */
   @Column({ type: 'varchar', length: 63, nullable: false })
   bucket: string;
 
@@ -116,4 +125,34 @@ export class Attachment {
   /** 软删标准写法（select:false——GC 查询需显式 addSelect，见 attachment-gc.service） */
   @DeleteDateColumn({ type: 'timestamptz', nullable: true, name: 'deleted_at', select: false })
   deletedAt: Date | null;
+
+  /**
+   * 缩略图对象键 `<uuid>.thumb.webp`（P2 批 1）。
+   *
+   * NULL = 该附件没有缩略图（存量行不回溯生成 / fail-open 生成失败）——
+   * "有无缩略图" 的唯一判定来源，禁止用其他 thumb_* 列的组合反推。
+   * partial unique 索引 WHERE thumb_key IS NOT NULL（与 migration 同名同 where）：
+   * 软删行不释放键（uuid 不重用），与 object_key 的全表唯一同规。
+   */
+  @Column({ type: 'varchar', length: 512, nullable: true, name: 'thumb_key' })
+  thumbKey: string | null;
+
+  /** 缩略图宽（px）；与 thumbHeight/thumbSizeBytes/thumbSha256 **同生共死**（应用层维护：全 NULL 或全非 NULL） */
+  @Column({ type: 'int', nullable: true, name: 'thumb_width' })
+  thumbWidth: number | null;
+
+  /** 缩略图高（px）；语义同 thumbWidth（首帧尺寸，≤ ATTACHMENT_THUMB_MAX_EDGE） */
+  @Column({ type: 'int', nullable: true, name: 'thumb_height' })
+  thumbHeight: number | null;
+
+  /**
+   * 缩略图字节数（PG bigint，读出为 string——DTO 出口显式 Number()，
+   * 与 sizeBytes 同规、同转换点纪律）；不计入上传配额（配额只计原图）。
+   */
+  @Column({ type: 'bigint', nullable: true, name: 'thumb_size_bytes' })
+  thumbSizeBytes: string | null;
+
+  /** 缩略图内容 SHA-256（hex 64，null 当且仅当 thumbKey 为 null），兼作 GET /:id/thumbnail 的 ETag */
+  @Column({ type: 'char', length: 64, nullable: true, name: 'thumb_sha256' })
+  thumbSha256: string | null;
 }

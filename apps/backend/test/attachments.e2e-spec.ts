@@ -36,7 +36,16 @@
  * ⑤ bucket 匿名拒读（无凭证直连 MinIO getObject 被拒——private 断言）；
  * ⑥ FK SET NULL：硬删 topic 后附件落无绑定态（局外人 404、上传者 200）；
  * ⑦ linkHealth：含附件 URL 的 doc 重算后 broken 不含附件条目（§4.2）；
- * ⑧ X-API-Key 真实认证路径（agent 上传走 guard API Key 分支）。
+ * ⑧ X-API-Key 真实认证路径（agent 上传走 guard API Key 分支）；
+ * ⑨ 缩略图变体（P2 批 1）：真实 PNG 上传 → thumb 对象（webp ≤512）+ 行 5 列 +
+ *    投影第 6 键 + GET /thumbnail 200 五头 + 授权 404 一致性 + 删除双删（双 404）；
+ *    伪图（sharp 解不了码）→ fail-open：行 5 列 null + 第 6 键缺席 + 404·12008。
+ * ⑩ 短时签名 URL（P2 批 2）：铸造 200 no-store + 无凭证读 200（字节一致/五头/
+ *    Cache-Control: private）+ audit 无 token；thumbnail 变体全链 + 两端点 12008
+ *    逐字；负例矩阵（无/数组/篡改/错误 aid/会话 token/其它密钥族/过期）→ 400·401
+ *    对应码；**双向回归**：铸造 token 打两类守卫族端点 → 401（本套件刻意让
+ *    attachmentUrl.secret == jwt.secret，使该 401 只能由 payload 形状断言解释）；
+ *    软删后公开端点 404·12000。
  *
  * 环境约定（telemetry/briefing 范式）：PG 或 MinIO 不可达 → warn + 整套 skip；
  * RUN 后缀隔离，afterAll 按 FK 依赖逆序硬删 + MinIO 对象逐个清空。
@@ -64,10 +73,13 @@ import {
 } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { AttachmentController } from '../src/modules/attachments/attachment.controller';
+import { AttachmentPublicController } from '../src/modules/attachments/attachment-public.controller';
 import { AttachmentService } from '../src/modules/attachments/attachment.service';
+import { AttachmentSignedUrlService } from '../src/modules/attachments/attachment-signed-url.service';
 import { AttachmentStorageService } from '../src/modules/attachments/storage.service';
 import { AttachmentAccessService } from '../src/modules/attachments/attachment-access.service';
 import { MulterLimitErrorInterceptor } from '../src/modules/attachments/multer-error.interceptor';
+import { JwtStrategy } from '../src/modules/auth/jwt.strategy';
 import { TopicController } from '../src/modules/topic/topic.controller';
 import { TopicService } from '../src/modules/topic/topic.service';
 import { DocService } from '../src/modules/docspace/doc.service';
@@ -112,7 +124,12 @@ import { DocVersion } from '../src/database/entities/doc-version.entity';
 import { TaskDocLink } from '../src/database/entities/task-doc-link.entity';
 import { DocRoute } from '../src/database/entities/doc-route.entity';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
-import { makePngBuffer } from '../src/modules/attachments/test-image-fixtures';
+import {
+  makePngBuffer,
+  makeAnimatedGifBuffer,
+  makeRealPngBuffer,
+} from '../src/modules/attachments/test-image-fixtures';
+import sharp from 'sharp';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -227,10 +244,17 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     const auditService = new AuditService(ds.getRepository(AuditLog), ownerProxy, actorProfile);
 
     jwtService = new JwtService({ secret: 'test-secret' });
-    // ConfigService：JwtOrApiKeyGuard 读 jwt.secret；StorageService 读 minio.*
+    // ConfigService：JwtOrApiKeyGuard 读 jwt.secret；StorageService 读 minio.*；
+    // AttachmentSignedUrlService 读 attachmentUrl.secret/ttlDefaultSeconds
     const configMock = {
       get: (key: string): unknown => {
         if (key === 'jwt.secret') return 'test-secret';
+        // 附件签名密钥**刻意与会话密钥同值**（仅本套件）：这样"铸造 token 作 Bearer
+        // 打会话端点必须 401"才是真证据——签名合法，唯一的墙是 payload 形状断言
+        // （B1-A）。若两钥不同，测试只能证明"签名不匹配"，证明不了断言有效。
+        // 生产环境该同值会被 config fail-fast 拒绝（attachment-url.config.ts）。
+        if (key === 'attachmentUrl.secret') return 'test-secret';
+        if (key === 'attachmentUrl.ttlDefaultSeconds') return 300;
         if (key === 'minio.endPoint') return MINIO_CONFIG.endPoint;
         if (key === 'minio.port') return MINIO_CONFIG.port;
         if (key === 'minio.useSSL') return MINIO_CONFIG.useSSL;
@@ -241,17 +265,21 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
       },
     };
 
-    // 最小 Nest 模块：Attachment/Topic 两 controller + 真实服务链 + 真实
-    // JwtOrApiKeyGuard（Bearer JWT 签发 + API Key sha256 查表双路径）+ 生产同款
+    // 最小 Nest 模块：Attachment/Topic 两 controller + AttachmentPublicController
+    // （P2 批 2 公开端点）+ 真实服务链 + 真实 JwtOrApiKeyGuard（Bearer JWT 签发 +
+    // API Key sha256 查表双路径）+ 真实 JwtStrategy（TopicController 的
+    // @UseGuards(JwtAuthGuard) 端点走 passport 'jwt'，即全局守卫同族）+ 生产同款
     // 全局管线（ValidationPipe / ResponseInterceptor / AllExceptionsFilter /
     // /api/v1 前缀）。不走 AppModule：避免 schedule/WS 等无关启动面。
     moduleRef = await Test.createTestingModule({
-      controllers: [AttachmentController, TopicController],
+      controllers: [AttachmentController, AttachmentPublicController, TopicController],
       providers: [
         AttachmentService,
+        AttachmentSignedUrlService,
         AttachmentStorageService,
         AttachmentAccessService,
         MulterLimitErrorInterceptor,
+        JwtStrategy,
         TopicService,
         // AttachmentService 的 doc 绑定写校验链依赖（findById 真实例）；
         // RouteHealthService/DiagramRendererService 是 DocService 的非触达注入点，空桩
@@ -551,6 +579,69 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     return ds.getRepository(Attachment).findOne({ where: { id } });
   }
 
+  /** 读 MinIO 对象字节（缩略图内容断言；对象不存在时 reject，由调用方转成布尔） */
+  async function readObjectBytes(key: string): Promise<Buffer> {
+    const stream = await minioClient.getObject(MINIO_CONFIG.bucket, key);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks);
+  }
+
+  /** 对象是否存在（statObject 语义——软删/GC 后应为 false） */
+  async function objectExists(key: string): Promise<boolean> {
+    return minioClient
+      .statObject(MINIO_CONFIG.bucket, key)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  /** 真实 PNG（sharp 可解码）上传——缩略图成功生成路径专用 */
+  function uploadRealPng(
+    token: string,
+    buffer: Buffer,
+    query: string,
+    filename = 'e2e-real.png',
+  ): request.Test {
+    return request(app.getHttpServer())
+      .post(`${API_PREFIX}/attachments?${query}`)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('file', buffer, { filename, contentType: 'image/png' });
+  }
+
+  /** 收原始字节响应体（StreamableFile 端点的 supertest 解析器） */
+  function collectBytes(
+    res: request.Response,
+    cb: (err: Error | null, body: unknown) => void,
+  ): void {
+    const chunks: Buffer[] = [];
+    res.on('data', (c: Buffer) => chunks.push(c));
+    res.on('end', () => cb(null, Buffer.concat(chunks)));
+  }
+
+  /** 铸造签名 URL（Bearer），返回原始响应（状态码由调用方断言） */
+  function mintSignedUrl(
+    token: string,
+    attachmentId: string,
+    body: Record<string, unknown> = {},
+  ): request.Test {
+    return request(app.getHttpServer())
+      .post(`${API_PREFIX}/attachments/${attachmentId}/signed-url`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(body);
+  }
+
+  /** 读公开端点（JSON 响应解析——错误体断言用；成功时是二进制，需 collectBytes 版） */
+  function getPublicContent(attachmentId: string, token: string): request.Test {
+    return request(app.getHttpServer()).get(
+      `${API_PREFIX}/public/attachments/${attachmentId}/content?token=${token}`,
+    );
+  }
+
+  /** 读公开端点（原始字节解析——200 响应体逐位比对用） */
+  function getPublicContentBytes(attachmentId: string, token: string): request.Test {
+    return getPublicContent(attachmentId, token).buffer(true).parse(collectBytes);
+  }
+
   // ─── ① 全链路 ────────────────────────────────────────────────
 
   it('全链：上传→元数据→内容（字节一致+五头）→删除→再读 404', async () => {
@@ -713,13 +804,19 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     expect(sent.body.data.metadata).toBeUndefined();
     created.messageIds.push(sent.body.data.id);
 
-    // SQL 直查 metadata.attachments 索引形状（sizeBytes number）
+    // SQL 直查 metadata.attachments 索引形状（sizeBytes number + required hasThumbnail）
     const rows: Array<{ attachments: Array<Record<string, unknown>> | null }> = await ds.query(
       `SELECT metadata->'attachments' AS attachments FROM messages WHERE id = $1`,
       [sent.body.data.id],
     );
     expect(rows[0].attachments).toEqual([
-      { id: attId, originalName: '绑定.png', mimeType: 'image/png', sizeBytes: 33 },
+      {
+        id: attId,
+        originalName: '绑定.png',
+        mimeType: 'image/png',
+        sizeBytes: 33,
+        hasThumbnail: false, // 伪图 → fail-open 无缩略图（P2 批 1 索引 required 布尔）
+      },
     ]);
   });
 
@@ -1004,5 +1101,450 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     expect(brokenHrefs).toContain('ghost.md');
     expect(brokenHrefs).not.toContain('/attachments/');
     expect(path).toContain('att-e2e/');
+  });
+
+  // ─── ⑧ 缩略图变体（P2 批 1）──────────────────────────────────
+
+  it('缩略图全链：真实 PNG 上传 → thumb 对象/行列/投影第 6 键 → GET /thumbnail 200 五头 → 授权 404 一致性', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'thumb-up');
+    const outsider = await createHuman(UserRole.EDITOR, 'thumb-out');
+    // PRIVATE topic：局外人对读取路径应得 404·12000（而不是 12008）
+    const topic = await createTopic(uploader.id, 'private');
+    const png = await makeRealPngBuffer(1024, 768);
+
+    const up = await uploadRealPng(
+      uploader.token,
+      png,
+      `topicId=${topic.id}`,
+      '链路 图.png',
+    ).expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+    expect(data.thumbnailContentUrl).toBe(`${API_PREFIX}/attachments/${data.id}/thumbnail`);
+
+    // 行 5 列（同生共死）+ 对象字节自洽（webp、最长边 512、sha256/size 对齐）
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+    expect(row.thumbKey).toMatch(/^[0-9a-f-]{36}\.thumb\.webp$/);
+    expect(row.thumbKey).not.toBe(row.objectKey);
+    expect(row.thumbWidth).toBe(512);
+    expect(row.thumbHeight).toBe(384);
+    const thumbBytes = await readObjectBytes(row.thumbKey!);
+    expect(thumbBytes.subarray(0, 4).toString('ascii')).toBe('RIFF');
+    expect(thumbBytes.subarray(8, 12).toString('ascii')).toBe('WEBP');
+    expect(Number(row.thumbSizeBytes)).toBe(thumbBytes.length);
+    expect(row.thumbSha256).toBe(crypto.createHash('sha256').update(thumbBytes).digest('hex'));
+    const meta = await sharp(thumbBytes).metadata();
+    expect(meta.format).toBe('webp');
+    expect(Math.max(meta.width!, meta.height!)).toBe(512);
+
+    // GET /thumbnail：200 + 五头（Content-Type/nosniff/Disposition/缓存/ETag）+ 字节与对象一致
+    const thumbRes = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${data.id}/thumbnail`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .buffer(true)
+      .parse((res, cb) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => cb(null, Buffer.concat(chunks)));
+      })
+      .expect(200);
+    expect(Buffer.compare(thumbRes.body as Buffer, thumbBytes)).toBe(0);
+    expect(thumbRes.headers['content-type']).toBe('image/webp');
+    expect(thumbRes.headers['x-content-type-options']).toBe('nosniff');
+    expect(thumbRes.headers['content-disposition']).toContain("inline; filename*=UTF-8''");
+    expect(thumbRes.headers['content-disposition']).toContain('_thumb.webp');
+    expect(thumbRes.headers['cache-control']).toBe('private, max-age=3600');
+    expect(thumbRes.headers['etag']).toBe(`"${row.thumbSha256}"`);
+
+    // 授权 404 一致性：局外人对缩略图端点同样是 404·12000（不是 12008——不泄露存在性）
+    const denied = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${data.id}/thumbnail`)
+      .set('Authorization', `Bearer ${outsider.token}`)
+      .expect(404);
+    expect(denied.body.code ?? denied.body.error?.code).toBe(ErrorCode.ATTACHMENT_NOT_FOUND);
+
+    // 投影（第 4 表面）：消息响应带条件第 6 键；SQL 直查索引含 required hasThumbnail
+    const sent = await request(app.getHttpServer())
+      .post(`${API_PREFIX}/topics/${topic.id}/messages`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .send({ content: '看图', attachmentIds: [data.id] })
+      .expect(201);
+    created.messageIds.push(sent.body.data.id);
+    expect(sent.body.data.attachments).toEqual([
+      {
+        id: data.id,
+        originalName: '链路 图.png',
+        mimeType: 'image/png',
+        sizeBytes: data.sizeBytes,
+        contentUrl: `${API_PREFIX}/attachments/${data.id}/content`,
+        thumbnailContentUrl: `${API_PREFIX}/attachments/${data.id}/thumbnail`,
+      },
+    ]);
+    const idxRows: Array<{ attachments: Array<Record<string, unknown>> }> = await ds.query(
+      `SELECT metadata->'attachments' AS attachments FROM messages WHERE id = $1`,
+      [sent.body.data.id],
+    );
+    expect(idxRows[0].attachments).toEqual([
+      {
+        id: data.id,
+        originalName: '链路 图.png',
+        mimeType: 'image/png',
+        sizeBytes: data.sizeBytes,
+        hasThumbnail: true,
+      },
+    ]);
+
+    // 删除：行软删 → 两个读取端点都 404·12000；原图 + 缩略图对象双双清空
+    await request(app.getHttpServer())
+      .delete(`${API_PREFIX}/attachments/${data.id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+    for (const endpoint of ['content', 'thumbnail']) {
+      const gone = await request(app.getHttpServer())
+        .get(`${API_PREFIX}/attachments/${data.id}/${endpoint}`)
+        .set('Authorization', `Bearer ${uploader.token}`)
+        .expect(404);
+      expect([endpoint, gone.body.code ?? gone.body.error?.code]).toEqual([
+        endpoint,
+        ErrorCode.ATTACHMENT_NOT_FOUND,
+      ]);
+    }
+    expect(await objectExists(row.objectKey)).toBe(false);
+    expect(await objectExists(row.thumbKey!)).toBe(false);
+  });
+
+  it('缩略图 fail-open：伪图（解不了码）→ 上传 201 无第 6 键 + 行 5 列 null + GET /thumbnail 404·12008', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'thumb-fo');
+    const topic = await createTopic(uploader.id, 'open');
+
+    const up = await uploadPng(uploader.token, `topicId=${topic.id}`, '伪图.png').expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+    // 四表面同一口径：无缩略图 = 字面缺键（Object.hasOwn === false，绝不 null/''）
+    expect(Object.hasOwn(data, 'thumbnailContentUrl')).toBe(false);
+
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey);
+    expect(row.thumbKey).toBeNull();
+    expect(row.thumbWidth).toBeNull();
+    expect(row.thumbHeight).toBeNull();
+    expect(row.thumbSizeBytes).toBeNull();
+    expect(row.thumbSha256).toBeNull();
+
+    // 无缩略图 → 404·12008（与"不存在/无权"的 12000 刻意分码），消息指导改用 /content
+    const res = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${data.id}/thumbnail`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(404);
+    expect(res.body.code ?? res.body.error?.code).toBe(ErrorCode.ATTACHMENT_THUMBNAIL_UNAVAILABLE);
+    expect(res.body.message ?? res.body.error?.message).toBe(
+      'No thumbnail available for this attachment; use /attachments/:id/content for the original',
+    );
+    // 原图仍可读（fail-open 不阻断主链路）
+    await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${data.id}/content`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+  });
+
+  it('缩略图端点为 gif 首帧：多帧 GIF 上传 → thumb 尺寸为单帧（非堆叠）', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'thumb-gif');
+    const topic = await createTopic(uploader.id, 'open');
+    const animatedGif = makeAnimatedGifBuffer();
+
+    const up = await request(app.getHttpServer())
+      .post(`${API_PREFIX}/attachments?topicId=${topic.id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .attach('file', animatedGif, { filename: 'anim.gif', contentType: 'image/gif' })
+      .expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+    // 2x2 双帧 GIF：首帧缩略图 2x2（若解码全部帧会得 2x4 堆叠）
+    expect([row.thumbWidth, row.thumbHeight]).toEqual([2, 2]);
+  });
+
+  // ─── ⑨ 短时签名 URL（P2 批 2）────────────────────────────────
+  //
+  // 双向回归（security B1）证据链：本套件刻意让 attachmentUrl.secret == jwt.secret
+  // （见 configMock 注释），因此以下两条 401 只能由 payload 形状断言解释：
+  // ① 铸造 token 作 Bearer 打 JwtOrApiKeyGuard 端点 → 401 UNAUTHORIZED；
+  // ② 铸造 token 作 Bearer 打 JwtAuthGuard（passport 策略）端点 → 401 TOKEN_INVALID；
+  // ③ 反向：用户会话 token 打公开端点 → 401·12006（scope 断言）。
+
+  it('签名 URL 全链（original）：铸造 200 no-store → 无凭证读 200 字节一致五头 → audit 无 token', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'sign-full');
+    const topic = await createTopic(uploader.id, 'open');
+    const png = await makeRealPngBuffer(800, 600);
+
+    const up = await uploadRealPng(
+      uploader.token,
+      png,
+      `topicId=${topic.id}`,
+      '签名 图.png',
+    ).expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    // 铸造：200 + no-store（响应体含能力凭证，任何缓存留存都等于凭证扩散）
+    const minted = await mintSignedUrl(uploader.token, data.id, {}).expect(200);
+    expect(minted.headers['cache-control']).toBe('no-store');
+    expect(minted.body.data.variant).toBe('original');
+    expect(minted.body.data.signedUrl).toContain(
+      `${API_PREFIX}/public/attachments/${data.id}/content?token=`,
+    );
+    // 默认 TTL 300s（expiresAt 与签发时刻同源）
+    expect(
+      Math.abs(new Date(minted.body.data.expiresAt).getTime() - (Date.now() + 300_000)),
+    ).toBeLessThan(10_000);
+    const token = (minted.body.data.signedUrl as string).split('token=')[1];
+
+    // 无凭证（无 Authorization / 无 X-API-Key）GET → 200 + 字节与对象存储逐位一致 + 五头
+    const res = await getPublicContentBytes(data.id, token).expect(200);
+    expect(Buffer.compare(res.body as Buffer, await readObjectBytes(row.objectKey))).toBe(0);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['content-disposition']).toContain("inline; filename*=UTF-8''");
+    // 能力 URL 禁共享缓存：恒 private 且无 max-age（对照 /content 的 private, max-age=3600）
+    expect(res.headers['cache-control']).toBe('private');
+    expect(res.headers['etag']).toBe(`"${row.sha256}"`);
+
+    // audit：mint_attachment_url 行落库，newData 仅 {variant, ttlSeconds, expiresAt}
+    const auditRows: Array<{ action: string; new_data: Record<string, unknown> }> = await ds.query(
+      `SELECT action::text AS action, new_data FROM audit_logs
+       WHERE entity_type = 'attachment' AND entity_id = $1`,
+      [data.id],
+    );
+    const mintAudits = auditRows.filter((r) => r.action === 'mint_attachment_url');
+    expect(mintAudits).toHaveLength(1);
+    expect(mintAudits[0].new_data).toEqual({
+      variant: 'original',
+      ttlSeconds: 300,
+      expiresAt: minted.body.data.expiresAt,
+    });
+    // 能力凭证绝不进审计面
+    expect(JSON.stringify(mintAudits[0])).not.toContain(token);
+  });
+
+  it('签名 URL 全链（thumbnail）：铸造 variant=thumbnail → webp 字节一致；无缩略图附件铸造/消费均 404·12008 逐字', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'sign-thumb');
+    const topic = await createTopic(uploader.id, 'open');
+    const png = await makeRealPngBuffer(1024, 768);
+
+    const up = await uploadRealPng(uploader.token, png, `topicId=${topic.id}`).expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    // 显式 ttlSeconds=120 + thumbnail 变体
+    const minted = await mintSignedUrl(uploader.token, data.id, {
+      variant: 'thumbnail',
+      ttlSeconds: 120,
+    }).expect(200);
+    expect(minted.body.data.variant).toBe('thumbnail');
+    const token = (minted.body.data.signedUrl as string).split('token=')[1];
+
+    const res = await getPublicContentBytes(data.id, token).expect(200);
+    expect(Buffer.compare(res.body as Buffer, await readObjectBytes(row.thumbKey!))).toBe(0);
+    expect(res.headers['content-type']).toBe('image/webp');
+    expect(res.headers['content-disposition']).toContain('_thumb.webp');
+    expect(res.headers['etag']).toBe(`"${row.thumbSha256}"`);
+    expect(res.headers['cache-control']).toBe('private');
+
+    // 无缩略图附件（头部伪图 → 批 1 fail-open：thumb 5 列 null）
+    const upFo = await uploadPng(uploader.token, `topicId=${topic.id}`, '伪图.png').expect(201);
+    const foId = upFo.body.data.id as string;
+    created.attachmentIds.push(foId);
+    created.objectKeys.push((await readAttachmentRow(foId))!.objectKey);
+
+    // 铸造侧 fail-fast：variant=thumbnail → 404·12008 逐字（说明原因 + 替代变体）
+    const deniedMint = await mintSignedUrl(uploader.token, foId, { variant: 'thumbnail' }).expect(
+      404,
+    );
+    expect(deniedMint.body.code).toBe(ErrorCode.ATTACHMENT_THUMBNAIL_UNAVAILABLE);
+    expect(deniedMint.body.message).toBe(
+      'No thumbnail available for this attachment (uploaded before v1.75 or generation failed); ' +
+        'mint with variant=original instead',
+    );
+
+    // original 变体照常可铸造、可读（fail-open 不影响原图能力）
+    const okMint = await mintSignedUrl(uploader.token, foId, {}).expect(200);
+    await getPublicContent(foId, (okMint.body.data.signedUrl as string).split('token=')[1]).expect(
+      200,
+    );
+
+    // 消费侧 12008（铸造侧已拦，此处手工签一枚 thumb 变体 token 覆盖该分支）
+    const handToken = jwtService.sign(
+      { aid: foId, var: 'thumbnail', scope: 'attachment:content' },
+      { secret: 'test-secret', issuer: 'attachment-url', algorithm: 'HS256', expiresIn: 300 },
+    );
+    const pubDenied = await getPublicContent(foId, handToken).expect(404);
+    expect(pubDenied.body.code).toBe(ErrorCode.ATTACHMENT_THUMBNAIL_UNAVAILABLE);
+    expect(pubDenied.body.message).toBe(
+      'No thumbnail available for this signed URL; mint with variant=original instead',
+    );
+  });
+
+  it('签名 URL 负例矩阵 + 双向回归：无/篡改/数组/错误 aid/会话 token/过期 → 400/401 对应码；铸造 token 打两类守卫族端点 → 401', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'sign-neg');
+    const topic = await createTopic(uploader.id, 'open');
+
+    const up = await uploadRealPng(
+      uploader.token,
+      await makeRealPngBuffer(64, 64),
+      `topicId=${topic.id}`,
+    ).expect(201);
+    const id = up.body.data.id as string;
+    created.attachmentIds.push(id);
+    const row = (await readAttachmentRow(id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    const up2 = await uploadPng(uploader.token, `topicId=${topic.id}`, 'other.png').expect(201);
+    const otherId = up2.body.data.id as string;
+    created.attachmentIds.push(otherId);
+    created.objectKeys.push((await readAttachmentRow(otherId))!.objectKey);
+
+    const minted = await mintSignedUrl(uploader.token, id, {}).expect(200);
+    const token = (minted.body.data.signedUrl as string).split('token=')[1];
+
+    // 无 token → 400（DTO 形状层；12006/12007 只表达"凭证本身不可用"——plan §②.6
+    // 文案只列签名/scope/aid 三断言与过期，缺失/空串/数组属格式错误，铁律 #21 分工）
+    const missing = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/public/attachments/${id}/content`)
+      .expect(400);
+    expect(missing.body.code).toBe(ErrorCode.BAD_REQUEST);
+    // 数组形态（Express 多值 query）→ 400（拒数组，不把数组喂进验签器）
+    await request(app.getHttpServer())
+      .get(`${API_PREFIX}/public/attachments/${id}/content?token=a&token=b`)
+      .expect(400);
+
+    // 篡改 token → 401·12006 逐字
+    const tampered = `${token.slice(0, -1)}${token.slice(-1) === 'a' ? 'b' : 'a'}`;
+    const t1 = await getPublicContent(id, tampered).expect(401);
+    expect(t1.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_INVALID);
+    expect(t1.body.message).toBe(
+      'Signed URL token is invalid (bad signature, wrong scope, or attachment id mismatch). ' +
+        'Mint a new URL via POST /attachments/:id/signed-url; this public URL needs no API key.',
+    );
+
+    // 错误 aid：拿 id 的 token 打另一附件 → 401·12006
+    const t2 = await getPublicContent(otherId, token).expect(401);
+    expect(t2.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_INVALID);
+
+    // 用户会话 token（scope 断言挡下）→ 401·12006
+    const t3 = await getPublicContent(id, uploader.token).expect(401);
+    expect(t3.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_INVALID);
+
+    // 其它密钥族 token（如刷新 token，签名不符）→ 401·12006
+    const foreignToken = jwtService.sign(
+      { sub: uploader.id, type: 'refresh' },
+      { secret: 'another-credential-family-secret', expiresIn: '7d' },
+    );
+    const t4 = await getPublicContent(id, foreignToken).expect(401);
+    expect(t4.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_INVALID);
+
+    // 过期（手签 expiresIn 为负）→ 401·12007 逐字（与 12006 分码）
+    const expiredToken = jwtService.sign(
+      { aid: id, var: 'original', scope: 'attachment:content' },
+      { secret: 'test-secret', issuer: 'attachment-url', algorithm: 'HS256', expiresIn: -10 },
+    );
+    const t5 = await getPublicContent(id, expiredToken).expect(401);
+    expect(t5.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_EXPIRED);
+    expect(t5.body.message).toBe(
+      'Signed URL has expired. Mint a new URL via POST /attachments/:id/signed-url.',
+    );
+
+    // 篡改 token + 不存在 id → 401 而非 404（无效凭证不得借 404 探测存在性）
+    const t6 = await getPublicContent(crypto.randomUUID(), tampered).expect(401);
+    expect(t6.body.code).toBe(ErrorCode.ATTACHMENT_SIGNATURE_INVALID);
+
+    // 双向回归①：铸造 token 作 Bearer 打 JwtOrApiKeyGuard 端点 → 401（无 API Key 兜底）
+    const g1 = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/mine`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+    expect(g1.body.code).toBe(ErrorCode.UNAUTHORIZED);
+
+    // 双向回归②：铸造 token 作 Bearer 打 JwtAuthGuard（passport 'jwt'，全局守卫同族）端点
+    // → 401·TOKEN_INVALID（随机 UUID：即便守卫被绕过也不会删到真数据）
+    const g2 = await request(app.getHttpServer())
+      .delete(`${API_PREFIX}/topics/${crypto.randomUUID()}`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+    expect(g2.body.code).toBe(ErrorCode.TOKEN_INVALID);
+  });
+
+  it('软删后公开端点 404·12000：能力 URL 无撤销列表，软删是唯一失效手段（同一 token 立即失效）', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'sign-del');
+    const topic = await createTopic(uploader.id, 'open');
+
+    const up = await uploadRealPng(
+      uploader.token,
+      await makeRealPngBuffer(48, 48),
+      `topicId=${topic.id}`,
+    ).expect(201);
+    const id = up.body.data.id as string;
+    created.attachmentIds.push(id);
+    const row = (await readAttachmentRow(id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    const minted = await mintSignedUrl(uploader.token, id, {}).expect(200);
+    const token = (minted.body.data.signedUrl as string).split('token=')[1];
+    await getPublicContent(id, token).expect(200);
+
+    // 软删（token 未失效——签名/声明与行状态无关；失效来自行不可见）
+    await request(app.getHttpServer())
+      .delete(`${API_PREFIX}/attachments/${id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+
+    const gone = await getPublicContent(id, token).expect(404);
+    expect(gone.body.code).toBe(ErrorCode.ATTACHMENT_NOT_FOUND);
+    // 对象也随删除双删（原图 + 缩略图）
+    expect(await objectExists(row.objectKey)).toBe(false);
+    expect(await objectExists(row.thumbKey!)).toBe(false);
+  });
+
+  it('铸造端点负例：越界 TTL/非法 variant → 400；非 UUID → 400；未认证 → 401；无缩略图变体 → 404·12008', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'sign-mint-neg');
+    const topic = await createTopic(uploader.id, 'open');
+    const up = await uploadRealPng(
+      uploader.token,
+      await makeRealPngBuffer(32, 32),
+      `topicId=${topic.id}`,
+    ).expect(201);
+    const id = up.body.data.id as string;
+    created.attachmentIds.push(id);
+    const row = (await readAttachmentRow(id))!;
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    // DTO 边界（诚实拒，不静默钳制）
+    await mintSignedUrl(uploader.token, id, { ttlSeconds: 59 }).expect(400);
+    await mintSignedUrl(uploader.token, id, { ttlSeconds: 3601 }).expect(400);
+    await mintSignedUrl(uploader.token, id, { variant: 'webp' }).expect(400);
+    // 格式层：非 UUID 早于 service（ParseUUIDPipe）
+    await mintSignedUrl(uploader.token, 'not-a-uuid', {}).expect(400);
+    // 鉴权：无凭证 → 401
+    await request(app.getHttpServer())
+      .post(`${API_PREFIX}/attachments/${id}/signed-url`)
+      .send({})
+      .expect(401);
+    // 合法边界值两端均可铸造（60 / 3600）
+    await mintSignedUrl(uploader.token, id, { ttlSeconds: 60 }).expect(200);
+    await mintSignedUrl(uploader.token, id, { ttlSeconds: 3600 }).expect(200);
   });
 });

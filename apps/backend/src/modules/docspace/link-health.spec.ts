@@ -117,6 +117,34 @@ describe('link-health', () => {
         expect(extractDocLinks(content)).toEqual(['before.md', 'after.md']);
       });
     });
+
+    // Bug 3452547c 回归：atLineStart 在非围栏行不复位 → 行内每字符重扫行尾 = O(n²)，
+    // 3MB 单行长文档 upsert 实测 99% CPU 8 分钟挂死。3s 阈值只拦复杂度回归
+    // （修复后单遍扫描为百 ms 级），宽松到不构成 CI 抖动源。
+    describe('长行性能（Bug 3452547c O(n²) 回归）', () => {
+      it('3MB 单行（无链接）秒级完成', () => {
+        const content = '# 大文档\n\n' + 'x'.repeat(3 * 1024 * 1024);
+        const start = Date.now();
+        expect(extractDocLinks(content)).toEqual([]);
+        expect(Date.now() - start).toBeLessThan(3000);
+      }, 15000);
+
+      it('3MB 单行尾部链接仍被提取（长行不丢链接）', () => {
+        const content = 'x'.repeat(3 * 1024 * 1024) + ' [real](outside.md)';
+        const start = Date.now();
+        expect(extractDocLinks(content)).toEqual(['outside.md']);
+        expect(Date.now() - start).toBeLessThan(3000);
+      }, 15000);
+
+      it('长行内 code span 屏蔽语义不变', () => {
+        const content =
+          'x'.repeat(1024 * 1024) +
+          ' `[code](inside.md)` ' +
+          'y'.repeat(1024 * 1024) +
+          ' [real](outside.md)';
+        expect(extractDocLinks(content)).toEqual(['outside.md']);
+      }, 15000);
+    });
   });
 
   // ─── resolveHrefToDocPath（v1.61.0 严格 POSIX 源目录解析矩阵）────────────────

@@ -25,3 +25,14 @@ export { CODE_ENTRY_TYPE };
 
 /** codeEntryType 联合类型（供 DTO/类型标注复用；shared 同款导出） */
 export type { CodeEntryType } from '@agent-chamber/shared';
+
+/**
+ * DocSpace 写族统一的幂等 entityType 标记（idempotency_records.entity_type 列）。
+ *
+ * 幂等键作用域 `uq_idempotency_actor_key (actor_id, client_request_id)` 是**全平台共享**的：
+ * entityType 是模块身份标记，同键被其他模块占用时靠它判定冲突（409 IDEMPOTENCY_KEY_CONFLICT）。
+ *
+ * 归属说明：通用幂等实现已上移 `apps/backend/src/common/services/idempotency.helper.ts`
+ * （v1.63.0 幂等 helper 抽公共）；**模块标记留在模块内**（实现属 common，身份属各模块）。
+ */
+export const DOC_IDEMPOTENCY_ENTITY_TYPE = 'doc';

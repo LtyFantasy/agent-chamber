@@ -16,7 +16,10 @@
  *     P1 起响应层投影恒存在 attachments: MessageAttachment[] 5 字段
  *     （contentUrl 由 buildContentUrl 派生），不透原始 metadata；与
  *     seatLabel/seatCoordinator 单键透传并存——attachments 恒存在是机器契约，
- *     勿按 seatLabel 条件缺省先例改回（见 topic-response.dto.ts JSDoc）
+ *     勿按 seatLabel 条件缺省先例改回（见 topic-response.dto.ts JSDoc）。
+ *     P2 批 1：索引条目增 required `hasThumbnail` 布尔，投影按 `=== true`
+ *     追加条件第 6 键 thumbnailContentUrl（buildThumbnailUrl 派生；缺席 =
+ *     无缩略图回退 contentUrl，永不为 null/空串）。
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyTopicIds
@@ -111,7 +114,7 @@ import {
   WakePolicy,
 } from '@agent-chamber/shared';
 import type { TopicDetail, MessageAttachment } from '@agent-chamber/shared';
-import { buildContentUrl } from '../attachments/dto/attachment-response.dto';
+import { buildContentUrl, buildThumbnailUrl } from '../attachments/dto/attachment-response.dto';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -1405,15 +1408,20 @@ export class TopicService {
    *
    * 返回按输入顺序（含重复，与 ≤9 上限语义一致）映射的 metadata.attachments
    * 索引条目；sizeBytes 显式 Number()（bigint string → number，批 1 钉死的转换点）。
-   * 返回类型钉为 Omit<MessageAttachment, 'contentUrl'>（缺 contentUrl：索引落库
-   * 不含投影 URL，contentUrl 是响应层投影时经 buildContentUrl 派生的）——
-   * 防索引形状与投影条目漂移（P1）。
+   * 返回类型钉为 Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl'>
+   * & { hasThumbnail: boolean }：索引落库**不含**任何投影 URL（contentUrl /
+   * thumbnailContentUrl 都是响应层经 buildContentUrl / buildThumbnailUrl 派生的）；
+   * 索引只存布尔 `hasThumbnail`（**required**，写路径恒产出——optional 会弱化
+   * 缺席语义的 pin），响应层据此条件展开 thumbnailContentUrl。防索引形状与投影
+   * 条目漂移（P1 钉钉、P2 批 1 扩展）。
    */
   private async validateAttachmentsForMessage(
     topicId: string,
     senderId: string,
     attachmentIds: string[],
-  ): Promise<Omit<MessageAttachment, 'contentUrl'>[]> {
+  ): Promise<
+    Array<Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl'> & { hasThumbnail: boolean }>
+  > {
     const rows = await this.attachmentRepo.find({ where: { id: In(attachmentIds) } });
     const byId = new Map(rows.map((row) => [row.id, row]));
     return attachmentIds.map((id) => {
@@ -1441,6 +1449,9 @@ export class TopicService {
         originalName: attachment.originalName,
         mimeType: attachment.mimeType,
         sizeBytes: Number(attachment.sizeBytes),
+        // 索引只存布尔（URL 是响应层派生物）：发送时刻的缩略图有无快照，
+        // 之后缩略图生成/丢失都不改写历史索引（投影按索引走，见 projectAttachments）
+        hasThumbnail: !!attachment.thumbKey,
       };
     });
   }
@@ -1519,8 +1530,12 @@ export class TopicService {
    * 防御过滤（存量为脏的兜底，plan §1 快照语义）：非数组 → []；条目非对象 /
    * id/originalName/mimeType 非 string / sizeBytes 无法转有限 number → 丢弃
    * （NaN 经 JSON.stringify 序列化成 null 会破坏 number 契约——评审 N1）。
-   * 输出恒 5 字段：contentUrl 由 buildContentUrl 单一拼装点派生（相对路径，
-   * 下载需拼 base + 携带凭证），不验证归属——归属/权限由 /content 端点鉴权兜底。
+   * 输出恒 5 字段 + **条件第 6 键**（P2 批 1）：contentUrl 由 buildContentUrl
+   * 单一拼装点派生（相对路径，下载需拼 base + 携带凭证）；索引 `hasThumbnail`
+   * **严格 `=== true`** 才追加 thumbnailContentUrl（buildThumbnailUrl 派生），
+   * 其余情形（false / 缺键 / 非布尔垃圾值）字面缺键——绝不落 null/空串；
+   * hasThumbnail 自身是存储态、不透传（strip，不出现在响应）。
+   * 不验证归属——归属/权限由 /content、/thumbnail 端点鉴权兜底。
    *
    * @param metadata 消息实体的 metadata（jsonb，可能为 undefined/null）
    * @returns 恒存在数组（无附件 = []）
@@ -1542,12 +1557,15 @@ export class TopicService {
       )
       .map((entry) => {
         const id = entry.id as string;
+        // 缺席语义：hasThumbnail 严格 === true 才出现 thumbnailContentUrl 键；
+        // 无缩略图时字面缺键（不回退 null/''）——四表面同一口径（P2 批 1）
         return {
           id,
           originalName: entry.originalName as string,
           mimeType: entry.mimeType as string,
           sizeBytes: Number(entry.sizeBytes),
           contentUrl: buildContentUrl(id),
+          ...(entry.hasThumbnail === true ? { thumbnailContentUrl: buildThumbnailUrl(id) } : {}),
         };
       });
   }

@@ -6,7 +6,10 @@
  *   - 主文档: plans/big-barda-big-barda-pantha.md §2 D8（web 批量上传）
  *   - 补充: plans/big-barda-big-barda-pantha.md §7 A3（lint 范围外还原禁令）
  *
- * [踩坑索引] （暂无）
+ * [踩坑索引]
+ *   - BATCH-UP-1(live FileList): 浏览器 `input.files` 是 live 引用——先 `value=''` 重置会把
+ *     已捕获的 FileList 一起清空（选择静默无响应，生产存量 bug，任务 66012ed7）。
+ *     安全方向：**先 `Array.from(files)` 快照再重置**；jsdom FileList 非 live，单测测不出
  *
  * [铁律关联] #1（每次 session 必读 AGENTS.md/INDEX.md） #12（写/改文件分批、匹配现有风格）
  *
@@ -194,9 +197,12 @@ export function BatchUploadDialog({
 
   const handleFileSelect = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = e.target.files;
+      // 先快照再重置：浏览器 input.files 是 **live FileList**——先 `value=''` 会把
+      // 已捕获的 FileList 一起清空（倒读 length=0），选择静默无响应（生产实证 bug）；
+      // jsdom 的 FileList 非 live，单测测不出此顺序依赖（66012ed7 踩坑）。
+      const files = Array.from(e.target.files ?? []);
       e.target.value = ''; // 重置 input，允许重复选同一文件
-      if (!files || files.length === 0) return;
+      if (files.length === 0) return;
 
       const pending: PendingFile[] = [];
       const rejected: { name: string; size: number }[] = [];

@@ -1,23 +1,42 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: .kimi/plans/miss-martian-polaris-superboy.md §Step 4
- *   - 补充: .kimi/plan-mcp-phase2.md §2 (custom tools 扩展点)
- *   - 补充: AGENTS.md §7 (关键数字速查)
+ * [功能概念]
+ *   - MCP JSON-RPC over HTTP 服务器（initialize / tools/list / tools/call）
+ *   - 接口调用频率统计的 MCP 侧采集点（上下文建立 + invocation 上报）
  *
- * [踩坑索引] -
+ * [代码职责]
+ *   - 手工 JSON-RPC 分发（不依赖 @modelcontextprotocol/sdk）+ MCP client 认证解析
+ *   - `handleToolsCall` = tools/call 的**唯一出口**：structuredContent 归一化、
+ *     ALS 上下文建立（toolName / surface）、每次调用恰好一次 fire-and-forget 上报
+ *   - `fallbackAuth`（server 默认认证）与 `extractClientAuth`（client 头透传）共同
+ *     决定生效凭据，也决定上报走哪条凭据、是否标 viaFallbackAuth
  *
- * [铁律关联] #7(编译优先) #11(注释强制) #17(测试契约)
+ * [权威文档]
+ *   - 主文档: docs/api-definition.md §Usage Stats — 上报契约 + 统计口径专章
+ *   - 补充: docs/architecture.md §automcp — MCP 通道在链路中的位置
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
+ * [关键不变量]
+ *   - **上报在 `handleToolsCall` 整层包裹，四个出口恰好一次**（自动映射 / custom /
+ *     tool-not-found / 两个 pre-name 出口）；`executeToolCall` 内部不得再包一层——
+ *     重复上报 = 计数翻倍且不报错，属静默数据污染
+ *   - **无凭据不上报**（clientAuth 与 fallbackAuth 皆空）：未认证调用在 REST 与上报
+ *     两条通道均不可见，这是刻意的口径代价（文档口径专章）
+ *   - `viaFallbackAuth = clientAuth 缺失且存在服务端默认认证`：后端据此落
+ *     actor_type='system'（共享 --api-key 时 distinctActors 失真，此标记是其过滤器）
+ *   - 上报失败绝不影响工具响应（fail-open，实现见 usage-reporter）
  *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [关联代码]
+ *   - server/tool-context.ts — ALS 上下文与头名常量的单一定义点
+ *   - server/usage-reporter.ts — 上报发送（本文件只做认证解析与出口挂载）
+ *   - proxy/http-proxy.ts — 原子映射工具执行 + 头注入点 ①
+ *
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面（四出口是否仍恰好上报一次）
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -35,6 +54,8 @@ import type {
   CustomToolContext,
 } from '../types';
 import { HttpProxy } from '../proxy/http-proxy';
+import { INVALID_TOOL_NAME, normalizeToolName, runWithToolContext } from './tool-context';
+import { reportToolInvocation } from './usage-reporter';
 
 /**
  * 尝试把 text 解析为结构化内容
@@ -93,7 +114,11 @@ function withStructuredContent(result: ToolCallResult): ToolCallResult {
     return result;
   }
 
-  return { ...result, content: [{ type: 'text', text: '[structured]' }], structuredContent: parsed };
+  return {
+    ...result,
+    content: [{ type: 'text', text: '[structured]' }],
+    structuredContent: parsed,
+  };
 }
 
 /**
@@ -108,6 +133,13 @@ export class McpServer {
   private readonly proxy: HttpProxy;
   private readonly basePath: string;
   private readonly baseUrl: string;
+  /**
+   * 本实例的 MCP 暴露面（`mcp` / `mcp-full` / `unknown`）
+   *
+   * 由 serve 启动参数解析一次后全程不变（D4c），随每次 tools/call 进入 ALS 上下文，
+   * 最终以 `X-MCP-Surface` 头与上报载荷两种形式抵达后端。
+   */
+  private readonly surface: string;
   private toolMappings: ToolMapping[] = [];
   private customTools: CustomTool[] = [];
   private fallbackAuth?: AuthConfig;
@@ -119,14 +151,24 @@ export class McpServer {
    * @param port - 监听端口
    * @param proxy - HTTP 代理器实例（用于转发 tool call）
    * @param basePath - MCP JSON-RPC endpoint 的 base path（默认 /mcp）
-   * @param baseUrl - 目标 API 的基础 URL（用于 custom tools 上下文）
+   * @param baseUrl - 目标 API 的基础 URL（custom tools 上下文 + invocation 上报的 base URL）
+   * @param surface - MCP 暴露面（默认 `'unknown'`：MCP 但暴露面不明，刻意不用空串——
+   *                  空串在统计口径里表示"非 MCP 流量"）
    */
-  constructor(app: Application, port: number, proxy: HttpProxy, basePath = '/mcp', baseUrl = '') {
+  constructor(
+    app: Application,
+    port: number,
+    proxy: HttpProxy,
+    basePath = '/mcp',
+    baseUrl = '',
+    surface = 'unknown',
+  ) {
     this.app = app;
     this.port = port;
     this.proxy = proxy;
     this.basePath = basePath;
     this.baseUrl = baseUrl;
+    this.surface = surface;
   }
 
   /**
@@ -172,7 +214,26 @@ export class McpServer {
       this.customTools.push(ct);
     }
 
-    this.fallbackAuth = fallbackAuth;
+    // 只在显式传入时更新默认认证：省略该参数不应清空既有配置——serve 入口先
+    // setFallbackAuth(auth) 再 registerCustomTools(tools)，若这里被 undefined 覆盖，
+    // invocation 上报会因"无凭据"被整片跳过（静默丢计数，无任何报错）
+    if (fallbackAuth !== undefined) {
+      this.fallbackAuth = fallbackAuth;
+    }
+  }
+
+  /**
+   * 设置 server 默认认证（fallbackAuth）
+   *
+   * 由 serve 入口在构造后立即注入，使 `/mcp`（无 custom tools）与 `/mcp-full` 两种
+   * 实例都持有同一份默认认证——usage 上报与 custom tools 的 `ctx.auth` 都依赖它
+   * （`clientAuth ?? fallbackAuth`）。`registerCustomTools` 会写入同一字段，两者
+   * 取值同源（都来自 serve 的 `--api-key` / `--bearer-token`），重复赋值无副作用。
+   *
+   * @param auth - 服务端默认认证；无默认认证时传 undefined（上报随之跳过）
+   */
+  setFallbackAuth(auth?: AuthConfig): void {
+    this.fallbackAuth = auth;
   }
 
   /**
@@ -356,15 +417,98 @@ export class McpServer {
   /**
    * 处理 tools/call 请求
    *
-   * 统一出口：所有路径（自动映射 / custom / 错误信封）都过 withStructuredContent
-   * 归一化——JSON 成功响应收敛为单载荷（structuredContent 唯一数据 + text 占位
-   * '[structured]'），错误/非 JSON 响应原样不动。
+   * 统一出口：所有路径（自动映射 / custom / tool-not-found / 两个 pre-name 出口）
+   * 都过 withStructuredContent 归一化——JSON 成功响应收敛为单载荷（structuredContent
+   * 唯一数据 + text 占位 '[structured]'），错误/非 JSON 响应原样不动。
+   *
+   * 同时是 usage stats 的唯一采集点（D4b），一次调用做两件事：
+   * 1. 用 ALS 把 `{toolName, surface}` 建立为本次调用的上下文——下游两个注入点
+   *    （http-proxy / platform-client）据此加 `X-MCP-Tool` / `X-MCP-Surface` 头；
+   * 2. 执行完成后 fire-and-forget 上报一次 invocation（成败、耗时、凭据来源）。
+   *
+   * 包裹点刻意放在**本层整层**：executeToolCall 内部的任一分支再包一层都会让同一次
+   * 调用上报两次（计数翻倍且无任何报错）。
    */
   private async handleToolsCall(
     req: Request,
     params: Record<string, unknown> | undefined,
   ): Promise<ToolCallResult> {
-    return withStructuredContent(await this.executeToolCall(req, params));
+    const toolName = this.resolveToolName(params);
+
+    return runWithToolContext({ toolName, surface: this.surface }, async () => {
+      const startedAt = Date.now();
+      let result: ToolCallResult;
+
+      try {
+        result = withStructuredContent(await this.executeToolCall(req, params));
+      } catch (error) {
+        // executeToolCall 内部已把 handler 异常收敛为 isError 信封，正常不会走到这里；
+        // 真抛了（如代理层意外错误）也要留一次失败计数再放行给 handleJsonRpc → -32603
+        this.reportInvocation(req, toolName, false, Date.now() - startedAt);
+        throw error;
+      }
+
+      // ok 语义 = MCP 结果信封的成败（工具自身/上游的 4xx-5xx 都体现为 isError:true）
+      this.reportInvocation(req, toolName, result.isError !== true, Date.now() - startedAt);
+      return result;
+    });
+  }
+
+  /**
+   * 解析本次 tools/call 的 tool 名（覆盖两个 pre-name 出口）
+   *
+   * params 缺失、`name` 非字符串——这两个出口连名字都没有，用哨兵 `'__invalid__'`
+   * 而非空串：空串在后端口径里表示"非 MCP 流量"，两者语义不能相撞。
+   *
+   * @param params - JSON-RPC 请求的 params
+   * @returns 可安全入头与入上报载荷的工具名（已归一化）
+   */
+  private resolveToolName(params: Record<string, unknown> | undefined): string {
+    if (params === undefined) {
+      return INVALID_TOOL_NAME;
+    }
+
+    const name = (params as unknown as ToolCallParams).name;
+    if (typeof name !== 'string') {
+      return INVALID_TOOL_NAME;
+    }
+
+    return normalizeToolName(name);
+  }
+
+  /**
+   * 上报一次 invocation（fire-and-forget，绝不抛、绝不 await）
+   *
+   * 认证解析与工具执行完全同源：`clientAuth ?? fallbackAuth`——上报必须用"这次调用
+   * 实际用的那把凭据"，否则 401 会让计数静默丢失。
+   *
+   * **无凭据（两者皆空）或 baseUrl 未配置时跳过上报**：未认证的 MCP 调用在 REST
+   * （guard 短路不计）与上报（无凭据无法认证）两条通道均不可见，这是 D1 的既定口径代价。
+   *
+   * @param req - 原始 HTTP 请求（取 client 透传的认证头）
+   * @param toolName - 已解析并归一化的工具名
+   * @param ok - 本次调用是否成功
+   * @param latencyMs - 工具执行耗时（ms）
+   */
+  private reportInvocation(req: Request, toolName: string, ok: boolean, latencyMs: number): void {
+    const clientAuth = this.extractClientAuth(req);
+    const auth = clientAuth ?? this.fallbackAuth;
+
+    if (auth === undefined || this.baseUrl === '') {
+      return;
+    }
+
+    reportToolInvocation({
+      baseUrl: this.baseUrl,
+      auth,
+      toolName,
+      surface: this.surface,
+      ok,
+      latencyMs,
+      // 走服务端默认认证 = 身份不可信（共享 --api-key / 单 token），后端据此落
+      // actor_type='system'，让 distinctActors 失真可被过滤
+      viaFallbackAuth: clientAuth === undefined,
+    });
   }
 
   /**

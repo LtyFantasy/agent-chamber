@@ -18,7 +18,7 @@ export const TITLE_MAX = 40;
  */
 export function formatNotConfigured() {
   return [
-    '[agent-chamber] 未检测到接入配置：项目无 .kimi-code/agent-chamber.json（或 mcp.json 未配 chamber server）。',
+    '[agent-chamber] 未检测到接入配置：项目无 .agent-chamber/agent-chamber.json（或 mcp.json 未配 chamber server）。',
     '接入三步：① 登录 chamber（无账号找管理员申请，注册是 admin-only）→ Agents 页创建 agent 复制 API key；② 按插件 README「接入 playbook」初始化（MCP 模式/ REST-only 任一）；③ 重启会话生效。',
   ].join('\n');
 }
@@ -34,7 +34,7 @@ export function formatNotConfigured() {
 export function formatUnbound(name, activeTasksTotal, unreadTotal) {
   return [
     `[agent-chamber] 已认证 chamber（agent: ${name}）· 活跃任务 ${activeTasksTotal} · 未读 ${unreadTotal}`,
-    '本项目未绑定 board：在 .kimi-code/agent-chamber.json 填入 boardId / docSpaceId / topicId 后重启会话，即可注入项目 digest。没有 board 就先去 web 建一个。',
+    '本项目未绑定 board：在 .agent-chamber/agent-chamber.json 填入 boardId / docSpaceId / topicId 后重启会话，即可注入项目 digest。没有 board 就先去 web 建一个。',
   ].join('\n');
 }
 
@@ -49,7 +49,7 @@ export function formatUnbound(name, activeTasksTotal, unreadTotal) {
  *   4. topic 行：unreadCounts 前 3「topic「name」: 未读 n」+ 折叠「其余 k 个 topic 共 m 条」，全部一行
  *   5. nextUp 行：`nextUp（board 策展队列）: 前 3 标题`（digest 失败 → 整行省略）
  *   6. 深拉通道行
- * 消歧（评审 A2/P3）：board 行口径 = hook 拉取的 statuses=todo,in_progress（我的待办）；
+ * 消歧（评审 A2/P3）：board 行口径 = hook 拉取的活跃任务（statuses 省略 = 服务端默认活跃集 backlog/todo/in_progress/blocked）；
  * nextUp 行口径 = 绑定 board 的策展队列（含 backlog/非我任务），文案「board 策展队列」区分两个数据源。
  * @param {object} briefing fetchBriefing 结果 {name, activeTasksTotal, activeItems, unreadTotal, unreadCounts}
  * @param {object|null} digest fetchDigest 结果 {boardName, nextUp}；digest 失败降级时传 null（省 nextUp 行）
@@ -186,7 +186,7 @@ function formatTopicLine(unreadCounts) {
  * @returns {string}
  */
 export function formatConfigError(reason) {
-  return `[agent-chamber] chamber 连接异常（${reason}）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。`;
+  return `[agent-chamber] chamber 连接异常（${reason}）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。`;
 }
 
 /**

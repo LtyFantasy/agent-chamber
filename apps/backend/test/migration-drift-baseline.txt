@@ -1,0 +1,88 @@
+# =============================================================================
+# 迁移漂移基线（test/migration-drift.e2e-spec.ts 的比对基准）
+# =============================================================================
+# 语义：集合相等 —— 解析时忽略本文件所有 # 注释与空行；每行 `#` 之前的部分是一条
+#       待生成变更语句。任何新增/消失项都会让 migration-drift 套件变红。
+# 基准来源：全新临时库跑完全部 migration 后，与实体元数据比对得到的 diff
+#           （即"迁移链产物 vs 实体"，**不是** dev 库的 diff——dev 库不是迁移链产物）。
+# 更新：UPDATE_DRIFT_BASELINE=1 pnpm --filter @agent-chamber/backend test:e2e -- migration-drift
+#       更新结果必须随代码一并提交 review；禁止静默改动基线（= 关掉门禁）。
+# 敏感度：基线对 PG 大版本敏感（本地开发库 15.x，生产 16.x）——升 PG 大版本须重审。
+# 分段：# [A]/[B]/[C] 为人工归类（新出现的项会落到 # [?] 段，出现即需人工判断）。
+# 盲区：纯表达式索引（indkey 全 0，TypeORM 索引查询 INNER JOIN pg_attribute
+#       attnum=ANY(indkey) 滤除）与 trigger（从不加载）不进 diff/基线——当前实例：
+#       idx_experience_entries_env_{os,tool,version,runtime} + trg_experience_entries_
+#       search_vector + 经验库零命中轻表 experience_search_events 的 PK 之外无裸 SQL 产物。
+#       守卫 = 经验库 e2e 的 indexdef/trigger 断言（test/experience.e2e-spec.ts §⑪，plan §7）。
+#       ⚠️ 本段是人工注释：`UPDATE_DRIFT_BASELINE=1` 重写会连注释一起重生成而**丢失**
+#       这几行（2026-09-21 批 2 实测；2026-09-22 第二期批 1 重写再次实测），重写后如发现
+#       本段消失请照上文重新补回。
+#       第二期补充：experience_judgments 的两条索引**可见**（已进 [B] 段，DESC 排序不改变
+#       可见性），但其 **DESC 全序语义与表级 reloptions 不在本门禁的比对面内**——那两项由
+#       test/experience.e2e-spec.ts 的 indexdef / pg_class.reloptions 断言守卫。
+# =============================================================================
+# [A] 命名差异 — 迁移显式名（idx_*/uq_*/显式 FK 名）↔ 实体隐式 @Index 期望的 IDX_<hash>；可修（改实体声明名），属另一个工程 —— 36 条
+ALTER TABLE "board_members" ADD CONSTRAINT "FK_ca2c72a39c80199717012df3932" FOREIGN KEY ("board_id") REFERENCES "boards"("id") ON DELETE CASCADE ON UPDATE NO ACTION    # A
+ALTER TABLE "board_members" DROP CONSTRAINT "FK_board_members_board_id"    # A
+ALTER TABLE "doc_sections" ADD CONSTRAINT "FK_b033b2ba6327f8ca7e562f3893a" FOREIGN KEY ("doc_id") REFERENCES "docs"("id") ON DELETE CASCADE ON UPDATE NO ACTION    # A
+ALTER TABLE "doc_sections" DROP CONSTRAINT "doc_sections_doc_id_fkey"    # A
+ALTER TABLE "doc_space_members" ADD CONSTRAINT "FK_25e6f3ecbbff1de3071565e107e" FOREIGN KEY ("space_id") REFERENCES "doc_spaces"("id") ON DELETE CASCADE ON UPDATE NO ACTION    # A
+ALTER TABLE "doc_space_members" DROP CONSTRAINT "doc_space_members_space_id_fkey"    # A
+CREATE INDEX "IDX_0a2eebfe4f67795c7a0fb36f25" ON "docs" ("created_by")    # A
+CREATE INDEX "IDX_0db31159195f6d03d45b94211b" ON "doc_spaces" ("creator_id")    # A
+CREATE INDEX "IDX_160c1f7c5a2472d556fdba671b" ON "board_members" ("actor_id")    # A
+CREATE INDEX "IDX_1dc4555a02b33724824884f329" ON "doc_spaces" ("board_id")    # A
+CREATE INDEX "IDX_30690f58d423d54ede7651d5e2" ON "doc_routes" ("space_id")    # A
+CREATE INDEX "IDX_46c7ebc81cb466d8fbb0dcb3e9" ON "docs" ("space_id")    # A
+CREATE INDEX "IDX_490540bbc54f698745c4c48b1d" ON "milestones" ("board_id")    # A
+CREATE INDEX "IDX_8f0ac81c015a71cb49f972b24f" ON "task_doc_links" ("doc_id")    # A
+CREATE INDEX "IDX_b839e855b9f0ba27c6768f7626" ON "doc_spaces" ("topic_id")    # A
+CREATE INDEX "IDX_cf8321415edda616f67d1e0767" ON "docs" ("category_id")    # A
+CREATE INDEX "IDX_ea17202285a2039712f83a886e" ON "doc_categories" ("space_id")    # A
+CREATE INDEX "IDX_ef12c2e1a440169a5b0ad9af35" ON "doc_sections" ("doc_id", "position")    # A
+CREATE INDEX "IDX_f2f81242010820fe32b50aecf4" ON "doc_space_members" ("actor_id")    # A
+CREATE UNIQUE INDEX "IDX_97672ac88f789774dd47f7c8be" ON "users" ("email")    # A
+CREATE UNIQUE INDEX "IDX_fe0bb3f6520ee0469504521e71" ON "users" ("username")    # A
+DROP INDEX "public"."IDX_a8eaa8aae9df08c92ddd446996"    # A
+DROP INDEX "public"."IDX_b383987bfa6e6a8745085621d0"    # A
+DROP INDEX "public"."idx_board_members_actor_id"    # A
+DROP INDEX "public"."idx_doc_categories_space_id"    # A
+DROP INDEX "public"."idx_doc_routes_space_id"    # A
+DROP INDEX "public"."idx_doc_sections_doc_id_position"    # A
+DROP INDEX "public"."idx_doc_space_members_actor_id"    # A
+DROP INDEX "public"."idx_doc_spaces_board_id"    # A
+DROP INDEX "public"."idx_doc_spaces_creator_id"    # A
+DROP INDEX "public"."idx_doc_spaces_topic_id"    # A
+DROP INDEX "public"."idx_docs_category_id"    # A
+DROP INDEX "public"."idx_docs_created_by"    # A
+DROP INDEX "public"."idx_docs_space_id"    # A
+DROP INDEX "public"."idx_milestones_board_id"    # A
+DROP INDEX "public"."idx_task_doc_links_doc_id"    # A
+#
+# [B] 裸 SQL 产物 — TypeORM 表达不了或实体未建模：GIN trgm/tsvector 索引、部分唯一索引、chk_* CHECK、attachments 显式 FK（曾含"部分索引重建对"，2026-09-19 实证系列可空性漂移的下游产物，随 C 类清偿自动消失——见文件头注释） —— 25 条
+ALTER TABLE "attachments" DROP CONSTRAINT "attachments_doc_id_fkey"    # B
+ALTER TABLE "attachments" DROP CONSTRAINT "attachments_topic_id_fkey"    # B
+ALTER TABLE "attachments" DROP CONSTRAINT "attachments_uploader_id_fkey"    # B
+ALTER TABLE "attachments" DROP CONSTRAINT "chk_attachments_binding"    # B
+ALTER TABLE "doc_spaces" DROP CONSTRAINT "chk_doc_spaces_binding"    # B
+ALTER TABLE "experience_feedback" DROP CONSTRAINT "experience_feedback_experience_id_fkey"    # B
+ALTER TABLE "topic_participants" DROP CONSTRAINT "chk_tp_active_has_joined_at"    # B
+DROP INDEX "public"."idx_doc_sections_content_trgm"    # B
+DROP INDEX "public"."idx_doc_sections_search_vector"    # B
+DROP INDEX "public"."idx_docs_source_sha"    # B
+DROP INDEX "public"."idx_docs_title_trgm"    # B
+DROP INDEX "public"."idx_experience_entries_content_trgm"    # B
+DROP INDEX "public"."idx_experience_entries_domains"    # B
+DROP INDEX "public"."idx_experience_entries_search_vector"    # B
+DROP INDEX "public"."idx_experience_entries_signals"    # B
+DROP INDEX "public"."idx_experience_entries_sort"    # B
+DROP INDEX "public"."idx_experience_judgments_created_at_id"    # B
+DROP INDEX "public"."idx_experience_judgments_experience_created_at"    # B
+DROP INDEX "public"."idx_topic_participants_status"    # B
+DROP INDEX "public"."uq_doc_categories_space_slug"    # B
+DROP INDEX "public"."uq_doc_spaces_slug"    # B
+DROP INDEX "public"."uq_docs_space_path"    # B
+DROP INDEX "public"."uq_experience_feedback_actor_key"    # B
+DROP INDEX "public"."uq_experience_feedback_experience_actor"    # B
+DROP INDEX "public"."uq_milestones_board_version"    # B
+#

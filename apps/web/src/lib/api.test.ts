@@ -138,6 +138,66 @@ describe('Api.docs.getTree / getFacets / getDocByPath（懒加载目录树 v1.70
   });
 });
 
+describe('Api.docs 空间级导出 / 回导 bundle', () => {
+  beforeEach(() => {
+    mockRequest.mockReset();
+  });
+
+  it('exportSpaceBundle：GET /doc-spaces/:id/export + 显式 120s 超时（大空间远超声明的 30s 默认）', async () => {
+    const bundle = {
+      formatVersion: 2,
+      exportedAt: '2026-09-15T00:00:00Z',
+      space: { name: 'S' },
+    };
+    mockRequest.mockResolvedValueOnce({ data: { data: bundle } });
+
+    // apiRequest 解包 response.data.data → 返回的就是 bundle 本体（不是 { data: bundle }）
+    await expect(Api.docs.exportSpaceBundle('space-1')).resolves.toEqual(bundle);
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'GET',
+        url: '/doc-spaces/space-1/export',
+        timeout: 120000,
+      }),
+    );
+  });
+
+  it('importSpaceBundle：POST 端点 + bundle 原样作请求体 + 显式 120s 超时', async () => {
+    const bundle = { formatVersion: 2, space: { name: 'S' }, docs: [{ path: 'a.md' }] };
+    mockRequest.mockResolvedValueOnce({
+      data: { data: { formatVersion: 2, importedAt: '2026-09-15T00:00:00Z' } },
+    });
+
+    await Api.docs.importSpaceBundle('space-1', bundle);
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: '/doc-spaces/space-1/import-bundle',
+        data: bundle,
+        timeout: 120000,
+      }),
+    );
+  });
+
+  it('importSpaceBundle：overwriteSpaceMeta 仅 true 时传 params（false/缺省不带，由后端缺省处理）', async () => {
+    mockRequest.mockResolvedValue({ data: { data: {} } });
+    const bundle = { formatVersion: 2, space: { name: 'S' } };
+
+    await Api.docs.importSpaceBundle('space-1', bundle, true);
+    expect(mockRequest).toHaveBeenLastCalledWith(
+      expect.objectContaining({ params: { overwriteSpaceMeta: true } }),
+    );
+
+    await Api.docs.importSpaceBundle('space-1', bundle, false);
+    expect(mockRequest).toHaveBeenLastCalledWith(expect.objectContaining({ params: undefined }));
+
+    await Api.docs.importSpaceBundle('space-1', bundle);
+    expect(mockRequest).toHaveBeenLastCalledWith(expect.objectContaining({ params: undefined }));
+  });
+});
+
 describe('Api 拦截器（authHooks 注入，review-0831 任务 04e8d744 拆环）', () => {
   afterEach(() => {
     // setAuthHooks 是模块级变量，注入后跨用例残留——重置回默认空钩子（铁律 #17）

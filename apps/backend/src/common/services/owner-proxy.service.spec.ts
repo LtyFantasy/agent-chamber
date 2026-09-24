@@ -12,6 +12,7 @@ describe('OwnerProxyService', () => {
     agentRepo = {
       exists: jest.fn(),
       find: jest.fn(),
+      findOne: jest.fn(),
     } as unknown as jest.Mocked<Repository<Agent>>;
     service = new OwnerProxyService(agentRepo);
   });
@@ -96,6 +97,26 @@ describe('OwnerProxyService', () => {
       const result = await service.getOwnedAgentIds(null);
       expect(result).toEqual([]);
       expect(agentRepo.find).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getAgentOwnerId', () => {
+    it('returns the owner id when the agent row exists', async () => {
+      agentRepo.findOne.mockResolvedValue({ id: 'agent-1', ownerId: 'human-1' } as Agent);
+      const result = await service.getAgentOwnerId('agent-1');
+      expect(result).toBe('human-1');
+      expect(agentRepo.findOne).toHaveBeenCalledWith({ where: { id: 'agent-1' } });
+    });
+
+    it('returns null when the agent row is missing（语义 = 无该 agents 行，≠ 无 owner）', async () => {
+      agentRepo.findOne.mockResolvedValue(null);
+      await expect(service.getAgentOwnerId('agent-missing')).resolves.toBeNull();
+      expect(agentRepo.findOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('short-circuits on empty input without querying DB（findOne({id: undefined}) 同族坑）', async () => {
+      await expect(service.getAgentOwnerId('')).resolves.toBeNull();
+      expect(agentRepo.findOne).not.toHaveBeenCalled();
     });
   });
 });

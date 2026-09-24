@@ -13,7 +13,7 @@
  *     hash → 带同一 token 正式 move」的数据源
  *   - 补充: plan fire-jericho-she-hulk.md（v1.63.0 Board 任务 7d918c7b）：move 加
  *     clientRequestId 幂等（此前零防重）——重放返回首次 DocMoveResult 快照 +
- *     idempotentReplay:true，文档不会二次移动；helper 见 doc-idempotency.helper.ts
+ *     idempotentReplay:true，文档不会二次移动；helper 见 common/services/idempotency.helper.ts
  *
  * [踩坑索引]
  *   - Hument 事故（topic msg 6dbc4da3）：乐观锁 TOCTOU → 事务外快速失败 + 事务内
@@ -56,17 +56,17 @@ import { AuditLog } from '../../database/entities/audit-log.entity';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { DocService } from './doc.service';
-import { DOC_SOURCE_NATIVE } from './doc-constants';
+import { DOC_IDEMPOTENCY_ENTITY_TYPE, DOC_SOURCE_NATIVE } from './doc-constants';
 import { EventService } from '../event/event.service';
 import { extractDocLinks, resolveHrefToDocPath, matchDocReferenceLink } from './link-health';
 import type { MoveDocDto } from './dto';
 import { UnifiedActor } from '../../common/types/actor.types';
-// v1.63.0 DocSpace 写族幂等（Board 任务 7d918c7b）：helper 与 DocService 共用
+// v1.63.0 DocSpace 写族幂等（Board 任务 7d918c7b）：通用实现已上移 common/services
 import {
   buildIdempotencyContext,
   tryIdempotentReplay,
   insertIdempotencyInTx,
-} from './doc-idempotency.helper';
+} from '../../common/services/idempotency.helper';
 
 /**
  * DocSpace 原子 move + move impact（v1.60.0-dev P1 双件 73cadb0d / 8d763914）
@@ -419,7 +419,7 @@ export class DocMoveService {
     // 幂等包裹（最外层写入口，v1.63.0）：无键零开销旁路；有键先查重放——命中直接
     // 返回首次快照（跳过全部校验链与 dryRun 分支：首次已验证过，重放零副作用且文档
     // 不会二次移动）。requestHash 只含写语义字段（dryRun 是预演不登记幂等，不参与指纹）
-    const ctx = buildIdempotencyContext(actor, dto.clientRequestId, {
+    const ctx = buildIdempotencyContext(DOC_IDEMPOTENCY_ENTITY_TYPE, actor, dto.clientRequestId, {
       docId,
       toPath: dto.toPath,
       expectedContentHash: dto.expectedContentHash,

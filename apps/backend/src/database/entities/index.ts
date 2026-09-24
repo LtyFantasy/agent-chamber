@@ -31,3 +31,13 @@ export { RoundtableRunner } from './roundtable-runner.entity';
 export { RoundtableSeat } from './roundtable-seat.entity';
 export { RoundtablePermissionRequest } from './roundtable-permission-request.entity';
 export { Attachment } from './attachment.entity';
+export { ApiUsageStatsHourly } from './api-usage-stats-hourly.entity';
+export { ExperienceEntry } from './experience-entry.entity';
+export { ExperienceFeedback } from './experience-feedback.entity';
+export { ExperienceSearchEvent } from './experience-search-event.entity';
+// 第二期（经验库自治治理面）双表：
+// - ExperienceSpaceMember = 空间成员角色（owner/reviewer，终审权委托）
+// - ExperienceJudgmentRecord = 判断日志（append-only 语料；类名刻意不带 "Record" 之外的
+//   区分见实体文件头——shared 的 `ExperienceJudgment` 是 jsonb 快照形状，同名会撞）
+export { ExperienceSpaceMember } from './experience-space-member.entity';
+export { ExperienceJudgmentRecord } from './experience-judgment-record.entity';

@@ -21,12 +21,14 @@ const messages: Record<string, string> = {
   'nav.topics': 'Topics',
   'nav.boards': 'Boards',
   'nav.docs': 'Docs',
+  'nav.experiences': 'Experiences',
   'nav.search': 'Search',
   'nav.settings': 'Settings',
   'nav.monitoring': 'Monitoring',
   'nav.skill': 'Skill',
   'nav.closeMenu': 'Close menu',
   'nav.pendingApprovals': '{count} roundtable approvals pending',
+  'nav.pendingExperienceReviews': '{count} experiences awaiting final review',
   'nav.language': 'Language',
   'nav.logout': 'Logout',
 };
@@ -76,14 +78,33 @@ jest.mock('@/lib/api', () => ({
     monitoring: {
       getHealth: jest.fn(),
     },
+    // 经验库待终审角标（admin 专属）：facets 聚合的 byQuality.unverified
+    experiences: {
+      facets: jest.fn(),
+    },
   },
 }));
 
 const mockCount = Api.roundtable.pendingPermissionRequestCount as jest.Mock;
 const mockHealth = Api.monitoring.getHealth as jest.Mock;
+const mockFacets = Api.experiences.facets as jest.Mock;
 
 /** /health 默认应答（无 version 字段 → 版本角标默认隐藏，不影响既有角标用例） */
 const HEALTH_FALLBACK = { status: 'ok' as const, timestamp: '2026-08-15T00:00:00Z', uptime: 1 };
+
+/**
+ * 经验库 facets 默认应答：byIntent/byQuality **键全量**（后端契约，未命中 = 0），
+ * 全零 → 待终审角标默认不显示，不影响既有用例。
+ */
+const FACETS_FALLBACK = {
+  total: 0,
+  byIntent: { pitfall: 0, repair: 0, howto: 0, optimize: 0, decision: 0 },
+  byQuality: { unverified: 0, verified: 0, suspect: 0 },
+  availableDomains: [],
+  /** 第二期：角色级总览门（服务端判定；admin 天然 true）——缺省按"可终审"给，
+   *  负例（非终审人）由用例显式覆盖为 false */
+  viewerIsReviewer: true,
+};
 
 function renderSidebar() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -103,6 +124,7 @@ describe('Sidebar 圆桌审批全局角标', () => {
     });
     mockCount.mockResolvedValue({ count: 3 });
     mockHealth.mockResolvedValue(HEALTH_FALLBACK);
+    mockFacets.mockResolvedValue(FACETS_FALLBACK);
   });
 
   afterEach(() => {
@@ -139,6 +161,8 @@ describe('Sidebar 圆桌审批全局角标', () => {
 
     await screen.findByText('Topics');
     expect(mockCount).not.toHaveBeenCalled();
+    // 经验库待终审角标同理：未登录不发 facets 请求
+    expect(mockFacets).not.toHaveBeenCalled();
   });
 });
 
@@ -154,6 +178,7 @@ describe('Sidebar 用户区（v1.49.0 布局两栏化）', () => {
     jest.clearAllMocks();
     mockCount.mockResolvedValue({ count: 0 });
     mockHealth.mockResolvedValue(HEALTH_FALLBACK);
+    mockFacets.mockResolvedValue(FACETS_FALLBACK);
     useAuthStore.setState({
       user: { id: 'u1', email: 'u@x.io', name: 'Test User', role: 'admin' },
       isAuthenticated: true,
@@ -202,6 +227,7 @@ describe('Sidebar 版本角标', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockCount.mockResolvedValue({ count: 0 });
+    mockFacets.mockResolvedValue(FACETS_FALLBACK);
     useAuthStore.setState({
       user: { id: 'u1', email: 'u@x.io', name: 'U', role: 'admin' },
       isAuthenticated: true,
@@ -237,5 +263,118 @@ describe('Sidebar 版本角标', () => {
 
     await screen.findByText('Topics');
     expect(container.querySelector('[data-testid="sidebar-version"]')).toBeNull();
+  });
+});
+
+/**
+ * 经验库导航项与「待终审」角标（批 4）：导航项常量注册 + admin 专属角标。
+ *
+ * 角标语义 = facets 端点 `byQuality.unverified`（已录入未终审的积压量）：
+ * - admin 且积压 > 0 → 挂在 /experiences 导航项上；
+ * - 积压 = 0 → 不显示；
+ * - 非 admin → **不发 facets 请求**（终审是 admin 面，普通用户看到积压量无从处置）。
+ */
+describe('Sidebar 经验库导航与待终审角标', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCount.mockResolvedValue({ count: 0 });
+    mockHealth.mockResolvedValue(HEALTH_FALLBACK);
+    mockFacets.mockResolvedValue(FACETS_FALLBACK);
+  });
+
+  afterEach(() => {
+    act(() => {
+      useAuthStore.setState({ user: null, isAuthenticated: false });
+    });
+  });
+
+  /** 设定登录用户（role 决定角标是否可见） */
+  function signIn(role: 'admin' | 'editor') {
+    useAuthStore.setState({
+      user: { id: 'u1', email: 'u@x.io', name: 'U', role },
+      isAuthenticated: true,
+    });
+  }
+
+  it('导航项存在且指向 /experiences', async () => {
+    signIn('admin');
+    renderSidebar();
+
+    const link = (await screen.findByText('Experiences')).closest('a');
+    expect(link).toHaveAttribute('href', '/experiences');
+  });
+
+  it('admin + 待终审 > 0：显示数字角标，且导航项直达待终审面（minor 7）', async () => {
+    signIn('admin');
+    mockFacets.mockResolvedValue({
+      ...FACETS_FALLBACK,
+      total: 7,
+      byQuality: { unverified: 7, verified: 0, suspect: 0 },
+      suspectCount: 2,
+      viewerIsReviewer: true,
+    });
+    renderSidebar();
+
+    const badge = await screen.findByTestId('nav-experiences-pending-count');
+    expect(badge).toHaveTextContent('7');
+    // 有积压 → href 带 quality=unverified（列表页支持该 searchParams 初始化过滤态）
+    expect((await screen.findByText('Experiences')).closest('a')).toHaveAttribute(
+      'href',
+      '/experiences?quality=unverified',
+    );
+  });
+
+  it('待终审 = 0：不显示角标，href 保持原值', async () => {
+    signIn('admin');
+    const { container } = renderSidebar();
+
+    const link = (await screen.findByText('Experiences')).closest('a');
+    expect(container.querySelector('[data-testid="nav-experiences-pending-count"]')).toBeNull();
+    expect(link).toHaveAttribute('href', '/experiences');
+  });
+
+  it('非 admin 且服务端说不可审（viewerIsReviewer=false）→ 有积压也不显示角标', async () => {
+    signIn('editor');
+    // 第二期：facets 查询对**全体登录用户**发起（角色只有服务端知道，web 不再按 role 推门）
+    mockFacets.mockResolvedValue({
+      ...FACETS_FALLBACK,
+      total: 7,
+      byQuality: { unverified: 7, verified: 0, suspect: 0 },
+      viewerIsReviewer: false,
+    });
+    const { container } = renderSidebar();
+
+    await screen.findByText('Experiences');
+    expect(mockFacets).toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="nav-experiences-pending-count"]')).toBeNull();
+  });
+
+  it('非 admin 但服务端说可审（空间 owner/reviewer）→ 显示角标（admin 不再是唯一终审人）', async () => {
+    signIn('editor');
+    mockFacets.mockResolvedValue({
+      ...FACETS_FALLBACK,
+      total: 4,
+      byQuality: { unverified: 4, verified: 0, suspect: 0 },
+      viewerIsReviewer: true,
+    });
+    renderSidebar();
+
+    const badge = await screen.findByTestId('nav-experiences-pending-count');
+    expect(badge).toHaveTextContent('4');
+  });
+
+  it('viewerIsReviewer 缺失（旧后端/迁移窗口）→ **fail-closed**：不显示角标', async () => {
+    signIn('admin');
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 解构剔除只为构造"旧后端无该字段"的响应，值本身不用
+    const { viewerIsReviewer: _omitted, ...withoutFlag } = FACETS_FALLBACK;
+    mockFacets.mockResolvedValue({
+      ...withoutFlag,
+      total: 7,
+      byQuality: { unverified: 7, verified: 0, suspect: 0 },
+    });
+    const { container } = renderSidebar();
+
+    await screen.findByText('Experiences');
+    expect(container.querySelector('[data-testid="nav-experiences-pending-count"]')).toBeNull();
   });
 });

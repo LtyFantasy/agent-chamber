@@ -194,6 +194,11 @@ function maskMarkdownCode(content: string): string {
         atLineStart = false;
         continue;
       }
+
+      // 非围栏行：行首围栏检查到此已完毕，必须立即复位行首标志——否则行内每个
+      // 字符都会带着 atLineStart=true 重扫一次行尾（单行 n 字符 = O(n²)，3MB
+      // 长行实测 99% CPU 挂死 upsert，Bug 3452547c）。
+      atLineStart = false;
     }
 
     if (content[i] === '\n' || content[i] === '\r') {

@@ -133,12 +133,13 @@ after(() => new Promise((r) => server.close(r)));
 
 // —— 工具 ——
 
-/** 构造临时项目目录；config=null 表示「未接入」（无 .kimi-code/）；返回目录路径 */
+/** 构造临时项目目录；config=null 表示「未接入」（无绑定文件）；返回目录路径。
+ * 绑定文件落 <项目根>/.agent-chamber/（2026-09-18 起 harness 中立路径） */
 function makeProject(config) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ac-bin-'));
   if (config !== null) {
-    mkdirSync(path.join(dir, '.kimi-code'), { recursive: true });
-    writeFileSync(path.join(dir, '.kimi-code', 'agent-chamber.json'), JSON.stringify(config));
+    mkdirSync(path.join(dir, '.agent-chamber'), { recursive: true });
+    writeFileSync(path.join(dir, '.agent-chamber', 'agent-chamber.json'), JSON.stringify(config));
   }
   return dir;
 }
@@ -177,16 +178,16 @@ const KANBAN_GOLDEN_INFERRED = `board「Test Board」待办（todo）：共 3 �
 - Task Three（截止 2026-09-02）
 `;
 const KANBAN_NONE_TEXT =
-  '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个 board。请先创建或加入一个 board（或在 .kimi-code/agent-chamber.json 显式填写 boardId）后重试 /agent-chamber:kanban。\n';
+  '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个 board。请先创建或加入一个 board（或在 .agent-chamber/agent-chamber.json 显式填写 boardId）后重试 /agent-chamber:kanban。\n';
 const KANBAN_MINE_UNSUPPORTED_TEXT =
-  '[agent-chamber] 当前 chamber 后端版本不支持绑定推断（列表接口缺少 mine 参数）。请在 .kimi-code/agent-chamber.json 显式填写 boardId，或升级 chamber 后端后再试。\n';
+  '[agent-chamber] 当前 chamber 后端版本不支持绑定推断（列表接口缺少 mine 参数）。请在 .agent-chamber/agent-chamber.json 显式填写 boardId，或升级 chamber 后端后再试。\n';
 const KANBAN_BINDING_INVALID_TEXT =
-  '[agent-chamber] 绑定的 board 不存在或已被删除，请检查 .kimi-code/agent-chamber.json 的 boardId。\n';
+  '[agent-chamber] 绑定的 board 不存在或已被删除，请检查 .agent-chamber/agent-chamber.json 的 boardId。\n';
 const NOT_CONFIGURED_TEXT =
-  '[agent-chamber] 未检测到接入配置：项目无 .kimi-code/agent-chamber.json（或 mcp.json 未配 chamber server）。\n' +
+  '[agent-chamber] 未检测到接入配置：项目无 .agent-chamber/agent-chamber.json（或 mcp.json 未配 chamber server）。\n' +
   '接入三步：① 登录 chamber（无账号找管理员申请，注册是 admin-only）→ Agents 页创建 agent 复制 API key；② 按插件 README「接入 playbook」初始化（MCP 模式/ REST-only 任一）；③ 重启会话生效。\n';
 const CONNECT_401_TEXT =
-  '[agent-chamber] chamber 连接异常（HTTP 401）：检查 .kimi-code/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。\n';
+  '[agent-chamber] chamber 连接异常（HTTP 401）：检查 .agent-chamber/agent-chamber.json 的 apiBaseUrl / apiKey 与 mcp.json 配置。\n';
 const STATUS_INVALID_TEXT = '非法 status「wat」，合法值：backlog, todo, in_progress, review, done, blocked, archived, all\n';
 const KANBAN_EMPTY_GOLDEN = `board「Test Board」待办（todo）：共 0 项，自动推断自唯一参与 board
 无待办任务
@@ -206,9 +207,9 @@ const TOPIC_EMPTY_GOLDEN = `topic「T1 Demo」最近 10 条消息，自动推断
 暂无消息
 `;
 const TOPIC_BINDING_INVALID_TEXT =
-  '[agent-chamber] 绑定的 topic 不存在或已被删除，请检查 .kimi-code/agent-chamber.json 的 topicId。\n';
+  '[agent-chamber] 绑定的 topic 不存在或已被删除，请检查 .agent-chamber/agent-chamber.json 的 topicId。\n';
 const TOPIC_NONE_TEXT =
-  '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个活跃 topic。请先创建或加入一个 topic（或在 .kimi-code/agent-chamber.json 显式填写 topicId）后重试 /agent-chamber:topic。\n';
+  '[agent-chamber] 绑定未配置且未能推断：你的 agent 当前创建/参与 0 个活跃 topic。请先创建或加入一个 topic（或在 .agent-chamber/agent-chamber.json 显式填写 topicId）后重试 /agent-chamber:topic。\n';
 
 // —— kanban：显式绑定 / 推断 / 空 / 错误路径 ——
 test('kanban 显式绑定成功：golden 逐字、exit 0、stderr 空', async () => {
@@ -257,7 +258,7 @@ test('kanban 推断多个：候选列表 ≤10 + 省略标注（12 个 → 列 1
     }
     assert.ok(!stdout.includes('board-11'), '第 11 个候选不得列出（≤10 截断）');
     assert.ok(!stdout.includes('Board Eleven'), '第 11 个候选 name 不得出现');
-    assert.ok(stdout.includes('请在 .kimi-code/agent-chamber.json 显式填写 boardId'), '结尾应引导显式绑定');
+    assert.ok(stdout.includes('请在 .agent-chamber/agent-chamber.json 显式填写 boardId'), '结尾应引导显式绑定');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -434,7 +435,7 @@ test('topic 推断多个：候选 ≤10 + 省略标注取信封全量 total（M-
       assert.ok(stdout.includes(`- topic-${i} Topic ${['One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'][i - 1]}`), `候选 ${i} 应列出`);
     }
     assert.ok(!stdout.includes('topic-11'), '第 11 个候选不得列出（≤10 截断）');
-    assert.ok(stdout.includes('请在 .kimi-code/agent-chamber.json 显式填写 topicId'), '结尾应引导显式绑定');
+    assert.ok(stdout.includes('请在 .agent-chamber/agent-chamber.json 显式填写 topicId'), '结尾应引导显式绑定');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
