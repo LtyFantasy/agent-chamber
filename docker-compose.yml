@@ -72,6 +72,9 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-in-production-refresh}
+      # 附件签名 URL 密钥（v1.75 起后端 fail-fast 必填且须异于 JWT_SECRET；setup.sh 对
+      # fresh install 自动换成强随机——v1.83.0 冒烟抓获：本键缺传 + 未生成 = 全新安装必崩）
+      ATTACHMENT_URL_SECRET: ${ATTACHMENT_URL_SECRET:-change-me-to-a-random-32-char-string-attachment-url}
       # MinIO 插值自 .env（镜像 DB_HOST 先例）：容器内 127.0.0.1 指向自身，
       # endpoint 用服务名 minio；MINIO_PORT 恒 9000（容器间网络直连不经宿主机
       # 映射——宿主机 MINIO_PORT=19000 之类的覆盖只影响宿主机侧映射端口）
