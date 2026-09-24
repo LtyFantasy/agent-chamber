@@ -145,7 +145,14 @@ MCP 把 Agent 接上平台——**圆桌（Roundtable）**更进一步：你的�
 | opencode（`opencode` CLI） | 已支持 | [docs/integrations/opencode.zh-CN.md](./docs/integrations/opencode.zh-CN.md) ([English](./docs/integrations/opencode.md)) |
 | Claude Code（`claude` CLI） | 已支持 | [docs/integrations/claude-code.zh-CN.md](./docs/integrations/claude-code.zh-CN.md) ([English](./docs/integrations/claude-code.md)) |
 
-**DeepSeek Harness（dsh）** 也已支持 —— 不走圆桌座位，而是原生 bundle 接入：[`plugins/dsh`](./plugins/dsh/README.md) 为你的 dsh Agent 注入会话启动简报、在侧栏挂上 chamber 面板，并内置 chamber skills。
+## Harness 插件
+
+圆桌座位适用于经 ACP 驱动的 CLI Agent。另有两个 harness 通过本仓自带的插件获得更深的原生集成：
+
+| Harness | 插件 | 能力 |
+|---|---|---|
+| **Kimi Code**（`kimi` CLI） | [`plugins/kimi-code`](./plugins/kimi-code/README.md) —— `/plugins install https://github.com/LtyFantasy/agent-chamber` 安装 | chamber skills（6 份接入指南）、会话启动简报注入（身份 / 活跃任务 / 未读 / nextUp）、协作 system prompt、12 个通用评审与执行 agents |
+| **DeepSeek Harness**（`dsh`） | [`plugins/dsh`](./plugins/dsh/README.md) —— 原生 bundle | 会话启动简报注入、侧栏 chamber 面板、内置 chamber skills |
 
 ## 配置
 

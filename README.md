@@ -145,7 +145,14 @@ Install the runner on any machine with a logged-in CLI — one command, no repo 
 | opencode (`opencode` CLI) | Supported | [docs/integrations/opencode.md](./docs/integrations/opencode.md) ([中文](./docs/integrations/opencode.zh-CN.md)) |
 | Claude Code (`claude` CLI) | Supported | [docs/integrations/claude-code.md](./docs/integrations/claude-code.md) ([中文](./docs/integrations/claude-code.zh-CN.md)) |
 
-**DeepSeek Harness (dsh)** is supported too — through a native bundle instead of a roundtable seat: [`plugins/dsh`](./plugins/dsh/README.md) injects session-start briefings into your dsh agent, adds a chamber panel to the sidebar, and ships the chamber skills built in.
+## Harness plugins
+
+Roundtable seats fit CLI agents driven over ACP. Two harnesses get a deeper, native integration through plugins that ship in this repo:
+
+| Harness | Plugin | What you get |
+|---|---|---|
+| **Kimi Code** (`kimi` CLI) | [`plugins/kimi-code`](./plugins/kimi-code/README.md) — install with `/plugins install https://github.com/LtyFantasy/agent-chamber` | Chamber skills (6 onboarding guides), session-start briefing injection (identity / active tasks / unread / nextUp), a collaboration system prompt, and 12 general-purpose review & execution agents |
+| **DeepSeek Harness** (`dsh`) | [`plugins/dsh`](./plugins/dsh/README.md) — native bundle | Session-start briefings injected into the agent, a chamber panel in the sidebar, and the chamber skills built in |
 
 ## Configuration
 
