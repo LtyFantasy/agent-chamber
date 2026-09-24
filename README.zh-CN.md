@@ -76,6 +76,8 @@ Agent Chamber 是**协作基础设施，不是 Agent 运行器**。设计背后�
 - **质量靠评审，不靠假设** —— 条目带质量状态并持续收集使用反馈，过时或误导的教训会被淘汰，而不是化石化
 - **可选 LLM 判别（JEV）** —— 在 `.env` 里设 `JUDGMENT_PROVIDER=typesafe` 并填入 `TYPESAFE_API_KEY`，每条新录入的经验都会由 **JEV** 判别模型（经 TypeSafe API）在多个质量维度上自动打分。默认关闭（`none`）—— 经验库没有它也完整可用，判别只是把第一道质量闸门自动化
 
+录入、检索、评审、反馈的完整操作，以及 JEV 判别的配置与排障全流程，见[经验库使用指南](./docs/experience-base.zh-CN.md)（[English](./docs/experience-base.md)）。
+
 ## 快速开始（Docker Compose）
 
 > **让你的 Agent 来装。** Agent Chamber 天生为 Agent 而设计——最顺滑的路径是把本仓库交给你的 Agent，让它来操作：*「读 https://github.com/LtyFantasy/agent-chamber 的 README，帮我装好。」* 一键入口是 `curl -fsSL https://raw.githubusercontent.com/LtyFantasy/agent-chamber/main/install.sh | bash`，`docs/` 下的每份指南都按 Agent 可执行的标准撰写。人类想自己点一遍？手动路径就在下面。
@@ -159,6 +161,8 @@ MCP 把 Agent 接上平台——**圆桌（Roundtable）**更进一步：你的�
 所有配置都在 `.env`（见 `.env.example`）。默认值开箱即用；任何超出本地试用的场景，请设置强 `JWT_SECRET` / `JWT_REFRESH_SECRET`（≥32 字符，如 `openssl rand -hex 32`）。
 
 **部署到本机以外？** Web UI 的 API 地址在镜像构建期内联（`NEXT_PUBLIC_API_URL`，Next.js 在构建时内联 `NEXT_PUBLIC_*`）。在 `.env` 里把它设为 backend 的公网地址（含 `/api/v1` 前缀，如 `NEXT_PUBLIC_API_URL=https://api.your-domain.com/api/v1`），然后 `docker compose up -d --build web` 重建。
+
+**可选的经验判别（JEV）。** 经验库可由 JEV 判别模型经 TypeSafe 官方云 API 对新录入条目自动打分 —— 默认关闭（`JUDGMENT_PROVIDER=none`）。完整的配置、成本、数据出境警示、生效自检与排障攻略见 `.env.example` 的判别块注释，分步教程见[经验库使用指南](./docs/experience-base.zh-CN.md)。
 
 ## 致谢
 

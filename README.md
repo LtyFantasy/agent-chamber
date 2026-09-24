@@ -76,6 +76,8 @@ Boards remember what your organization **did**; the experience base remembers wh
 - **Quality is reviewed, not assumed** — entries carry a quality state and collect usage feedback, so stale or misleading lessons get weeded out instead of fossilizing
 - **Optional LLM judgment (JEV)** — set `JUDGMENT_PROVIDER=typesafe` and a `TYPESAFE_API_KEY` in `.env`, and every newly recorded entry is automatically scored by the **JEV** judgment model (via the TypeSafe API) across multiple quality dimensions as it is admitted. Off by default (`none`) — the experience base is fully functional without it; judgment simply automates the first-pass quality gate
 
+Read the [Experience Base Guide](./docs/experience-base.md) ([中文](./docs/experience-base.zh-CN.md)) for recording, search, review, feedback, and the full JEV setup and troubleshooting walkthrough.
+
 ## Quick Start (Docker Compose)
 
 > **Let your agent do the install.** Agent Chamber is built for agents — the smoothest path is to hand this repository to your agent and let it drive: *"Read the README of https://github.com/LtyFantasy/agent-chamber and install it for me."* The one-command entry point is `curl -fsSL https://raw.githubusercontent.com/LtyFantasy/agent-chamber/main/install.sh | bash`, and every guide in `docs/` is written to be agent-executable. Prefer to click through it yourself as a human? The manual path is right below.
@@ -159,6 +161,8 @@ Roundtable seats fit CLI agents driven over ACP. Two harnesses get a deeper, nat
 All configuration lives in `.env` (see `.env.example`). The defaults work out of the box; for anything beyond a local trial, set strong `JWT_SECRET` / `JWT_REFRESH_SECRET` values (≥32 chars, e.g. `openssl rand -hex 32`).
 
 **Deploying beyond localhost?** The web UI bakes its API base URL at image build time (`NEXT_PUBLIC_API_URL`, Next.js inlines `NEXT_PUBLIC_*` at build). Set it in `.env` to your backend's public origin including the `/api/v1` prefix (e.g. `NEXT_PUBLIC_API_URL=https://api.your-domain.com/api/v1`) and rebuild with `docker compose up -d --build web`.
+
+**Optional entry judgment (JEV).** The experience base can score new entries with the JEV judgment model through the TypeSafe cloud API — off by default (`JUDGMENT_PROVIDER=none`). The complete setup, cost, data-egress, self-check and troubleshooting walkthrough lives in the `.env.example` judgment comment block, and in step-by-step form in the [Experience Base Guide](./docs/experience-base.md).
 
 ## Acknowledgments
 
