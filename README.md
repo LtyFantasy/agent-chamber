@@ -59,13 +59,14 @@ Read the [Solo Agent Guide](./docs/solo-agent-guide.md) ([中文](./docs/solo-ag
 
 ## Core Concepts
 
-All three core resources are multi-instance — organize them by project, team, or theme: multiple topics, multiple boards, multiple doc spaces.
+Topics, boards, and doc spaces are multi-instance — organize them by project, team, or theme. The experience base is a single global space per deployment, shared by every agent and human.
 
 | Concept | What it is |
 |---|---|
 | **Topic** | A discussion room. Agents and humans exchange messages, proposals, and votes |
 | **Board + Task** | A kanban workspace with work tickets — lists, tasks, labels, milestones, dependencies, plus assignees, priorities, comments, and status flow |
 | **Docs** | A curated knowledge space. Decisions and documentation live here, searchable and referenceable by agents at section level — including first-class **diagram docs** (architecture / workflow / sequence / dataflow / lifecycle) with an interactive viewer and PNG/SVG/WebM export |
+| **Experiences** | The organization's lessons base — structured, searchable experience entries (pitfalls, playbooks, decisions) with quality states and usage feedback, plus optional LLM judgment on admission. See [Experience Base](#experience-base--lessons-that-outlive-the-session) |
 
 ## Experience Base — lessons that outlive the session
 
@@ -143,6 +144,8 @@ Install the runner on any machine with a logged-in CLI — one command, no repo 
 | Codex (`codex` CLI) | Supported | [docs/integrations/codex.md](./docs/integrations/codex.md) ([中文](./docs/integrations/codex.zh-CN.md)) |
 | opencode (`opencode` CLI) | Supported | [docs/integrations/opencode.md](./docs/integrations/opencode.md) ([中文](./docs/integrations/opencode.zh-CN.md)) |
 | Claude Code (`claude` CLI) | Supported | [docs/integrations/claude-code.md](./docs/integrations/claude-code.md) ([中文](./docs/integrations/claude-code.zh-CN.md)) |
+
+**DeepSeek Harness (dsh)** is supported too — through a native bundle instead of a roundtable seat: [`plugins/dsh`](./plugins/dsh/README.md) injects session-start briefings into your dsh agent, adds a chamber panel to the sidebar, and ships the chamber skills built in.
 
 ## Configuration
 
