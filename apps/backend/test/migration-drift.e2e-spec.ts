@@ -77,10 +77,11 @@
  *
  * 为什么要"基线"而不是"断言清单为空"（实测事实，勿删这段）：
  *   本仓的 schema 契约**天然不等于** TypeORM 的 schema 表达——实测在全新迁移库上 diff
- *   恒为 61 条（第二期批 1 前为 59 条、经验库批 1 前为 51 条、C 类清偿前为 81 条），分两族：
+ *   恒为 62 条（DocSpace 预过滤批前为 61 条、第二期批 1 前为 59 条、经验库批 1 前为 51 条、
+ *   C 类清偿前为 81 条），分两族：
  *     A 命名差异 36：迁移用显式名（`idx_*`/`uq_*`/显式 FK 名），实体用隐式 `@Index([...])`
  *       → 元数据期望 `IDX_<hash>`；改实体声明名可消，但属另一个工程。
- *     B 裸 SQL 产物 25（第二期批 1 前为 23；经验库批 1 前为 15）：TypeORM 表达不了或实体未建模——GIN
+ *     B 裸 SQL 产物 26（DocSpace 预过滤批前为 25；第二期批 1 前为 23；经验库批 1 前为 15）：TypeORM 表达不了或实体未建模——GIN
  *       trgm/tsvector 索引、部分唯一索引（含 `uq_docs_space_path`）、`chk_*` CHECK、
  *       attachments 显式 FK、经验库 8 条（4 GIN + 排序部分表达式索引 + 双 UNIQUE + FK）、
  *       第二期 2 条（`experience_judgments` 的 `(created_at DESC, id DESC)` 全序索引 +

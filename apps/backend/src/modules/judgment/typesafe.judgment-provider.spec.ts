@@ -14,9 +14,13 @@
  * 密钥纪律（仓库 NIT-1）：本文件的 key 假值**全合成**——只借用公开前缀形态，后缀与任何真实
  * Key 无关；断言标记一律取自假值内部，绝不出现真 Key 的任何片段。
  */
-import type { ExperienceCheckInput, JudgmentOutcome } from './judgment-provider.interface';
-import { JUDGMENT_CONTENT_EXCERPT_LIMIT } from './judgment-rubric';
-import { buildTypesafeSystemoneUrl, TypeSafeJudgmentProvider } from './typesafe.judgment-provider';
+import {
+  JUDGMENT_CONTENT_EXCERPT_LIMIT,
+  experienceRecordCheckCapability,
+} from '../experience/judgment/judgment-rubric';
+import type { ExperienceCheckInput } from '../experience/judgment/judgment-rubric';
+import { buildTypesafeSystemoneUrl } from './judgment.transport';
+import { TypeSafeJudgmentProvider } from './typesafe.judgment-provider';
 
 const BASE_URL = 'https://api.typesafe.test/';
 /** 合成假 key（前缀是公开形态，后缀全合成；绝不含真实 Key 任何连续片段） */
@@ -162,7 +166,7 @@ describe('TypeSafeJudgmentProvider', () => {
     it('ok：请求体 = {state, model, questions} + Bearer 鉴权 + redirect:error', async () => {
       fetchMock.mockResolvedValue(new Response(officialPayload(), { status: 200 }));
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expectRequestContract();
       expect(outcome.status).toBe('ok');
       if (outcome.status !== 'ok') return;
@@ -175,35 +179,35 @@ describe('TypeSafeJudgmentProvider', () => {
     it('ok：七维归一化 + **快照 model 取响应自报**（≠ 请求模型）', async () => {
       fetchMock.mockResolvedValue(new Response(officialPayload(), { status: 200 }));
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('ok');
       if (outcome.status !== 'ok') return;
 
-      expect(outcome.judgment.provider).toBe('typesafe');
+      expect(outcome.meta.provider).toBe('typesafe');
       // 快照值是**上游自报**：配置里的请求模型只是请求参数，不得顶替它
-      expect(outcome.judgment.model).toBe(UPSTREAM_MODEL);
-      expect(outcome.judgment.model).not.toBe(REQUEST_MODEL);
-      expect(outcome.judgment.judgedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-      expect(outcome.judgment.completeness).toEqual({ level: 'partial', confidence: 0.7 });
-      expect(outcome.judgment.signalQuality).toEqual({ level: 'weak', confidence: 0.32 });
-      expect(outcome.judgment.duplicate).toEqual({ verdict: 'distinct', confidence: 0.92 });
-      expect(outcome.judgment.intentSuggestion).toEqual({
+      expect(outcome.meta.model).toBe(UPSTREAM_MODEL);
+      expect(outcome.meta.model).not.toBe(REQUEST_MODEL);
+      expect(outcome.meta.judgedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(outcome.value.completeness).toEqual({ level: 'partial', confidence: 0.7 });
+      expect(outcome.value.signalQuality).toEqual({ level: 'weak', confidence: 0.32 });
+      expect(outcome.value.duplicate).toEqual({ verdict: 'distinct', confidence: 0.92 });
+      expect(outcome.value.intentSuggestion).toEqual({
         verdict: 'keep',
         value: null,
         confidence: 0.51,
       });
-      expect(outcome.judgment.domainSuggestion).toEqual({
+      expect(outcome.value.domainSuggestion).toEqual({
         verdict: 'suggested',
         value: 'docker',
         confidence: 0.97,
       });
       // 第 7 维（v1.82.0）：准入建议（observe-only 建议文本，不影响任何写入行为）
-      expect(outcome.judgment.admissionSuggestion).toEqual({
+      expect(outcome.value.admissionSuggestion).toEqual({
         verdict: 'needs_human',
         confidence: 0.42,
       });
-      // rubric 代际写入快照（训练/校准数据据此分代统计）
-      expect(outcome.judgment.rubricVersion).toBe('v2');
+      // rubric 代际写入元数据（训练/校准数据据此分代统计）
+      expect(outcome.meta.rubricVersion).toBe('v2');
       // 语料价值：raw 原样留档（含 probabilities / usage）
       expect(outcome.response.raw).toMatchObject({ model: UPSTREAM_MODEL });
       expect(outcome.latencyMs).toBeGreaterThanOrEqual(0);
@@ -214,7 +218,7 @@ describe('TypeSafeJudgmentProvider', () => {
       fetchMock.mockResolvedValue(new Response(officialPayload(), { status: 200 }));
       const longInput = { ...INPUT, content: 'x'.repeat(JUDGMENT_CONTENT_EXCERPT_LIMIT + 100) };
 
-      const outcome = await provider.checkEntry(longInput);
+      const outcome = await provider.run(experienceRecordCheckCapability, longInput);
       if (outcome.status !== 'ok') throw new Error('expected ok');
       const state = outcome.request.state as Record<string, unknown>;
       expect(String(state.content)).toHaveLength(JUDGMENT_CONTENT_EXCERPT_LIMIT);
@@ -237,7 +241,7 @@ describe('TypeSafeJudgmentProvider', () => {
         new Response(`{"error":"unauthorized: invalid key ${API_KEY}"}`, { status: 401 }),
       );
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       const error = String((outcome.response as { error: string }).error);
       expect(error).toContain('credential');
@@ -248,7 +252,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('HTTP 403 → error：同样点名凭证问题', async () => {
       fetchMock.mockResolvedValue(new Response('forbidden', { status: 403 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toContain('credential');
       expectNoLeak(outcome);
@@ -273,7 +277,7 @@ describe('TypeSafeJudgmentProvider', () => {
         ),
       );
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       const response = outcome.response as { error: string };
       expect(response.error).toBe('judgment provider validation failed (HTTP 422)');
@@ -283,7 +287,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('HTTP 429 → error：固定标签带 `— upstream asks for backoff`', async () => {
       fetchMock.mockResolvedValue(new Response('slow down', { status: 429 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toBe(
         'judgment provider rate limited (HTTP 429) — upstream asks for backoff',
@@ -293,7 +297,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('HTTP 529 → error：固定标签带 `— upstream asks for backoff`', async () => {
       fetchMock.mockResolvedValue(new Response('overloaded', { status: 529 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toBe(
         'judgment provider overloaded (HTTP 529) — upstream asks for backoff',
@@ -303,7 +307,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('HTTP 500 → error（只回状态码，不回错误体）', async () => {
       fetchMock.mockResolvedValue(new Response('upstream boom with secret=abc', { status: 500 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       const error = String((outcome.response as { error: string }).error);
       expect(error).toContain('500');
@@ -313,7 +317,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('网络不可达（transport error）→ error（不 throw）', async () => {
       fetchMock.mockRejectedValue(Object.assign(new Error('ECONNREFUSED'), { name: 'TypeError' }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toContain('transport');
       expectNoLeak(outcome);
@@ -323,7 +327,7 @@ describe('TypeSafeJudgmentProvider', () => {
       fetchMock.mockRejectedValue(
         Object.assign(new Error('unexpected redirect'), { name: 'TypeError' }),
       );
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toContain('redirect');
       expectNoLeak(outcome);
@@ -331,7 +335,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('超时（fetch 阶段 TimeoutError）→ **status=timeout**（与 error 分码）', async () => {
       fetchMock.mockRejectedValue(Object.assign(new Error('timed out'), { name: 'TimeoutError' }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('timeout');
       expect(String((outcome.response as { error: string }).error)).toContain('8000ms');
       expectNoLeak(outcome);
@@ -345,7 +349,7 @@ describe('TypeSafeJudgmentProvider', () => {
         text: () => Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
       } as unknown as Response);
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('timeout');
       expect(String((outcome.response as { error: string }).error)).toContain('8000ms');
       expectNoLeak(outcome);
@@ -353,7 +357,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('空 body（网关异常兜底）→ error（不是 500/抛错）', async () => {
       fetchMock.mockResolvedValue(new Response('', { status: 200 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toContain('empty body');
       expectNoLeak(outcome);
@@ -361,7 +365,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
     it('非 JSON body → error', async () => {
       fetchMock.mockResolvedValue(new Response('<html>gateway</html>', { status: 200 }));
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
       expect(String((outcome.response as { error: string }).error)).toContain('not JSON');
       expectNoLeak(outcome);
@@ -380,10 +384,10 @@ describe('TypeSafeJudgmentProvider', () => {
         ),
       );
 
-      const outcome = await provider.checkEntry(INPUT);
+      const outcome = await provider.run(experienceRecordCheckCapability, INPUT);
       expect(outcome.status).toBe('error');
-      // 不落半真快照（快照会被 reviewer 当 ground truth 对照）
-      expect('judgment' in outcome).toBe(false);
+      // 不落半真快照（快照会被 reviewer 当 ground truth 对照）：产物键必须缺席
+      expect('value' in outcome).toBe(false);
       const response = outcome.response as { error: string; rawShape?: string[] };
       expect(response.error).toContain('whitelist');
       // rawShape 只留"形状诊断"的**键名**（`echo` 是键名，允许；键值是回显载荷，不允许）
@@ -435,12 +439,12 @@ describe('TypeSafeJudgmentProvider', () => {
 
       const latencies: number[] = [];
       for (let index = 0; index < SAMPLES; index += 1) {
-        const outcome: JudgmentOutcome = await live.checkEntry(INPUT);
+        const outcome = await live.run(experienceRecordCheckCapability, INPUT);
         expect(outcome.status).toBe('ok');
         if (outcome.status !== 'ok') return;
-        expect(outcome.judgment.provider).toBe('typesafe');
+        expect(outcome.meta.provider).toBe('typesafe');
         // 响应自报版本 ID（'unknown' = 上游没给 model，属契约破损）
-        expect(outcome.judgment.model).not.toBe('unknown');
+        expect(outcome.meta.model).not.toBe('unknown');
         // 六维齐全或逐维合法 null：归一化在官方 REST 上同样成立
         for (const dim of [
           'completeness',
@@ -450,13 +454,15 @@ describe('TypeSafeJudgmentProvider', () => {
           'intentSuggestion',
           'domainSuggestion',
         ]) {
-          expect(outcome.judgment).toHaveProperty(dim);
+          expect(outcome.value).toHaveProperty(dim);
         }
         latencies.push(outcome.latencyMs);
         expectNoLeak(outcome);
         // 快照证据留档（六维 + 上游自报 model）：末次样本落一行，供实弹报告直接引用
         if (index === SAMPLES - 1) {
-          console.log(`[typesafe live] snapshot=${JSON.stringify(outcome.judgment)}`);
+          console.log(
+            `[typesafe live] snapshot=${JSON.stringify({ ...outcome.meta, ...outcome.value })}`,
+          );
         }
       }
 

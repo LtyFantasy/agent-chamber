@@ -98,6 +98,12 @@ function clampLimit(raw: unknown, fallback: number): number {
  * 元素即命中 ⇒ **加更多 signal 是扩大而不是缩小结果集**，元素是归一化后的精确相等，
  * 不是子串包含）；四个 env 参数是精确相等；各参数**之间**是 AND；`q` 是**过滤 + 排序**
  * （融合分低于 0.08 的条目会被丢弃，所以"传了 q 却零命中"是有意义的信号，不是 bug）。
+ *
+ * `q` 检索语义（v1.86 中文根治）：q 先经编译器——CJK 逐字 bigram ts 腿 OR 融合 trgm 兜底腿
+ * （英文/标识符走 ts 词位腿），再叠加 **K-gate 精度门**（命中不同 bigram 数 ≥K 才召回：
+ * ≤4 CJK 字 K=1、更长 K=2）——短 CJK 查询不再零命中，但**无共享 bigram 的异措辞召回会被
+ * 门拒**（经验库精度优先：误命中代价 > 漏命中，设计意图而非 bug）；确信相关却被门拒时
+ * 改走 `signals` 精确通道。
  */
 export const searchExperiencesTool: CustomTool = {
   tool: {
@@ -112,7 +118,16 @@ export const searchExperiencesTool: CustomTool = {
       'parameters are ANDed with each other. `q` is both a FILTER and a ranking signal (fused ' +
       'ts_rank + pg_trgm similarity, floored at 0.08): unrelated entries are dropped, and when q ' +
       'is present it takes over ordering (quality tier → fused score → usage → freshness) while ' +
-      '`sort` is ignored. Suspect entries are excluded unless you pass quality="suspect" ' +
+      '`sort` is ignored. q RETRIEVAL SEMANTICS (v1.86 CJK fix): q is compiled first — CJK is ' +
+      'tokenized per character into bigram ts arms OR-fused with a pg_trgm fallback arm ' +
+      '(English/identifiers use the ts term arm), then a K-gate precision gate applies: an entry ' +
+      'is recalled only if it matches at least K distinct bigrams (K=1 for queries of ≤4 CJK ' +
+      'characters, K=2 for longer). Short CJK queries therefore DO match, but a paraphrase that ' +
+      'shares no bigram with an entry is rejected by the gate — that is the intended ' +
+      'precision-first design (a false hit here costs more than a miss), NOT a bug. If you are ' +
+      'confident an entry is relevant but the gate rejected it, switch to the `signals` channel ' +
+      '(normalized exact tokens, ANY-overlap). signals remains the primary entry point. ' +
+      'Suspect entries are excluded unless you pass quality="suspect" ' +
       '(the review/appeal path); expired entries are excluded unless includeExpired=true. ' +
       'WORKFLOW: search_experiences → read_experience (full text of the promising ids) → apply ' +
       'the fix → report_experience_feedback with whether it actually worked. ' +
@@ -150,11 +165,13 @@ export const searchExperiencesTool: CustomTool = {
           maxLength: 200,
           description:
             'Optional full-text query (max 200 chars). Fused scoring: ts_rank(search_vector, ' +
-            'plainto_tsquery) × 1.0 + similarity(content, q) × 0.6 + similarity(title, q) × 0.8, ' +
-            'filtered at 0.08. This is the path that works for non-English text and for ' +
-            'DIFFERENT WORDS meaning the same thing (e.g. entry recorded as "端口映射失效", search ' +
-            '"端口不可达"). q is a filter as well as a ranking signal — prefer it over signals ' +
-            'when you do not know the exact normalized token the author used.',
+            'compiled tsquery) × 1.0 + similarity(content, q) × 0.6 + similarity(title, q) × 0.8, ' +
+            'filtered at 0.08. v1.86 CJK fix: the query is compiled with per-character bigram ts ' +
+            'arms OR-fused with a pg_trgm fallback, then a K-gate precision gate applies (K=1 for ' +
+            'queries of ≤4 CJK chars, K=2 for longer) — short CJK queries now match, but a ' +
+            'paraphrase sharing no bigram with an entry is rejected by the gate (precision-first ' +
+            'by design). Prefer `signals` when you know the exact normalized token; use q for ' +
+            '2-4 character domain terms or identifiers.',
         },
         signals: buildStringArraySchema({
           description:

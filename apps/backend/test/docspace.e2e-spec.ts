@@ -2,7 +2,7 @@ import request = require('supertest');
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createTestingApp } from './test-setup';
-import { ErrorCode, TaskStatus } from '@agent-chamber/shared';
+import { ErrorCode, TaskStatus, DOC_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
 import { JwtOrApiKeyGuard } from '../src/common/guards/jwt-or-api-key.guard';
 
 jest.mock('bcrypt', () => ({
@@ -516,10 +516,14 @@ describe('DocSpaceController (e2e)', () => {
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
-        expect(Array.isArray(res.body.data)).toBe(true);
-        expect(res.body.data.length).toBeGreaterThanOrEqual(1);
-        expect(res.body.data[0]).toHaveProperty('docId', docId);
-        expect(res.body.data[0]).toHaveProperty('docTitle', '测试文档');
+        // v1.86 信封契约（主脑裁决 #1）：裸数组 → `{ hits, hint? }`；
+        // 本 fixture 最高分 0.09 < DOC_SEARCH_WEAK_HIT_SCORE（基准 0.3 × W1，现构 0.9
+        // ——弱命中家族）⇒ hint 在场
+        expect(Array.isArray(res.body.data.hits)).toBe(true);
+        expect(res.body.data.hits.length).toBeGreaterThanOrEqual(1);
+        expect(res.body.data.hits[0]).toHaveProperty('docId', docId);
+        expect(res.body.data.hits[0]).toHaveProperty('docTitle', '测试文档');
+        expect(res.body.data.hint).toBe(DOC_SEARCH_ZERO_HIT_HINT);
       });
   });
 

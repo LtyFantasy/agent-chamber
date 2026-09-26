@@ -15,6 +15,7 @@ import type { UnifiedActor } from '../../common/types/actor.types';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocSearchService } from '../docspace/doc-search.service';
 import type { DocSearchHit, DocSearchHitWithSpace } from '@agent-chamber/shared';
+import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
 
 /** 创建一个链式 QueryBuilder mock */
 function createMockQueryBuilder() {
@@ -176,7 +177,7 @@ describe('SearchService', () => {
     // DocSearchService 默认空命中：type=all 的既有用例（不关心 docs）不会因 docs 分支崩掉；
     // docs 专项用例在 setupDocSearchMock 中覆盖默认值
     mockDocSearchService = {
-      search: jest.fn().mockResolvedValue([]),
+      search: jest.fn().mockResolvedValue({ hits: [] }),
     } as unknown as jest.Mocked<DocSearchService>;
 
     mockAccessQuery = {
@@ -338,7 +339,8 @@ describe('SearchService', () => {
     spaceRows: Array<{ id: string; spaceId: string }> = [],
   ) {
     mockAccessQuery.getAccessibleDocSpaceIds.mockResolvedValue(accessibleSpaceIds);
-    mockDocSearchService.search.mockResolvedValue(hits);
+    // v1.86 起 doc-search 返回信封 `{ hits, hint? }`（主脑裁决 #1）
+    mockDocSearchService.search.mockResolvedValue({ hits });
     mockDocRepo.find.mockResolvedValue(spaceRows as unknown as Doc[]);
   }
 
@@ -634,6 +636,124 @@ describe('SearchService', () => {
   });
 
   // ============================================================================
+  // keycap 加分（G3 `1️⃣` 真回归；v1.87 批次 1，REV-5 标定）
+  // ============================================================================
+  describe('keycap 加分（messages 面 rank 表达式）', () => {
+    const HUMAN: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+    /** `1️⃣` = '1' + U+FE0F + U+20E3（源码字面会被编辑器/工具链改写，故显式拼码点） */
+    const KC = '1\uFE0F\u20E3';
+
+    /** 取主查询 QB 的 `addSelect(expr, 'rank')` 实参（别名 rank 是 B-55 类错误的锚点） */
+    const rankExprOf = (): string => {
+      const call = messageQb.addSelect.mock.calls.find((c) => c[1] === 'rank');
+      return String(call?.[0] ?? '');
+    };
+
+    it('查询含 keycap ⇒ rank 叠加 `LIKE ALL` 子句，模式串与加分值都走参数绑定', async () => {
+      setupMessageSearchMock(['topic-1'], [makeMsg()], 1, new Map());
+      await service.search({ q: KC, type: 'messages', page: 1, pageSize: 20 }, HUMAN);
+
+      const expr = rankExprOf();
+      expect(expr).toContain('LIKE ALL(:keycapPatterns)');
+      // `::float8` 两侧是**承重**的：`ELSE 0` 的整数分支会让 PG 把 boost 推成 integer，
+      // 小数 2.7 报 `invalid input syntax for type integer`（真库实测 500）。
+      // ⚠️ 本断言只钉**形态**；PG 类型推断的真库契约在 search-invariants.e2e ⑭。
+      expect(expr).toContain('THEN :keycapBoost::float8 ELSE 0::float8 END');
+      // 无插值：模板串里只出现参数名，keycap 字面（U+20E3）绝不进 SQL
+      expect(expr).not.toContain('\u20E3');
+      expect(expr).not.toContain(KC);
+      // 参数绑定形态（值 = LIKE 模式串，两端 % 包裹）
+      expect(messageQb.setParameter).toHaveBeenCalledWith('keycapPatterns', [`%${KC}%`]);
+      // 加分值 = REV-5 标定终值（staging 实测 '1' 泛化行最高 ts 2.6000001 + 0.1）
+      expect(messageQb.setParameter).toHaveBeenCalledWith('keycapBoost', 2.7);
+    });
+
+    it('查询不含 keycap ⇒ 不挂子句也不绑定参数（`LIKE ALL` 空数组恒真 = 给所有行加分）', async () => {
+      setupMessageSearchMock(['topic-1'], [makeMsg()], 1, new Map());
+      await service.search({ q: 'hello', type: 'messages', page: 1, pageSize: 20 }, HUMAN);
+
+      expect(rankExprOf()).not.toContain('LIKE ALL');
+      expect(messageQb.setParameter).not.toHaveBeenCalledWith('keycapPatterns', expect.anything());
+      expect(messageQb.setParameter).not.toHaveBeenCalledWith('keycapBoost', expect.anything());
+    });
+
+    it('tasks 面不带 keycap 子句（本修复只针对 messages 面，tasks 回归面不在此）', async () => {
+      setupTaskSearchMock(['board-1'], [makeTask({ id: 'task-1', title: 'hello' })], 1, new Map());
+      await service.search({ q: KC, type: 'tasks', page: 1, pageSize: 20 }, HUMAN);
+
+      const taskRankExpr = String(
+        taskQb.addSelect.mock.calls.find((c) => c[1] === 'rank')?.[0] ?? '',
+      );
+      expect(taskRankExpr).not.toContain('LIKE ALL');
+    });
+  });
+
+  // ============================================================================
+  // 零命中日志（计划 §2.6 四路之 message / task 两 surface；1-b 遗留补测）
+  // ============================================================================
+  describe('零命中日志（surface=message / task）', () => {
+    const HUMAN: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
+
+    it('type=messages 零命中 ⇒ logSearchZeroHit 恰调一次（surface=message）', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        setupMessageSearchMock(['topic-1'], [], 0, new Map());
+        const result = await service.search(
+          { q: '不存在的词', type: 'messages', page: 1, pageSize: 20 },
+          HUMAN,
+        );
+
+        expect(result.messages!.total).toBe(0);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({
+          surface: 'message',
+          query: '不存在的词',
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('type=tasks 零命中 ⇒ logSearchZeroHit 恰调一次（surface=task）', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        setupTaskSearchMock(['board-1'], [], 0, new Map());
+        const result = await service.search(
+          { q: '不存在的词', type: 'tasks', page: 1, pageSize: 20 },
+          HUMAN,
+        );
+
+        expect(result.tasks!.total).toBe(0);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({ surface: 'task', query: '不存在的词' });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('有命中 ⇒ 不落零命中日志（防"总是落"的静默噪音：日志一泛滥就没人看了）', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        setupMessageSearchMock(
+          ['topic-1'],
+          [makeMsg({ id: 'msg-1', content: 'hello', senderId: 'sender-1' })],
+          1,
+          new Map([['msg-1', '<<<hello>>>']]),
+        );
+        mockActorRepo.find.mockResolvedValue([]);
+        mockAgentRepo.findBy.mockResolvedValue([]);
+        mockUserRepo.findBy.mockResolvedValue([]);
+
+        await service.search({ q: 'hello', type: 'messages', page: 1, pageSize: 20 }, HUMAN);
+
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  // ============================================================================
   // search with type=docs（v1.48.0：全局搜索接入 DocSpace 文档）
   // ============================================================================
   describe('search with type=docs', () => {
@@ -674,11 +794,15 @@ describe('SearchService', () => {
         docTitle: 'Architecture',
       });
       expect(result.docs![1].spaceId).toBe('space-1');
-      // 权限白名单 + limit=20 透传给 DocSearchService
-      expect(mockDocSearchService.search).toHaveBeenCalledWith(['space-1'], {
-        q: 'hello',
-        limit: 20,
-      });
+      // 权限白名单 + limit=20 透传给 DocSearchService（第三参 = 判别重排的 actor/traceId 上下文）
+      expect(mockDocSearchService.search).toHaveBeenCalledWith(
+        ['space-1'],
+        {
+          q: 'hello',
+          limit: 20,
+        },
+        expect.anything(),
+      );
     });
 
     it('should pass null (admin all-spaces) to DocSearchService and skip spaceId query on empty hits', async () => {
@@ -689,7 +813,11 @@ describe('SearchService', () => {
 
       expect(result.docs).toEqual([]);
       // admin：白名单为 null 原样透传（DocSearchService 语义：null=全量不过滤）
-      expect(mockDocSearchService.search).toHaveBeenCalledWith(null, { q: 'hello', limit: 20 });
+      expect(mockDocSearchService.search).toHaveBeenCalledWith(
+        null,
+        { q: 'hello', limit: 20 },
+        expect.anything(),
+      );
       // 空命中短路：不触发 docRepo 补查（避免无谓查询）
       expect(mockDocRepo.find).not.toHaveBeenCalled();
     });
@@ -702,7 +830,11 @@ describe('SearchService', () => {
 
       expect(result.docs).toEqual([]);
       // 空白名单语义对齐 messages/tasks：透传 []（DocSearchService 内部短路），不触发补查
-      expect(mockDocSearchService.search).toHaveBeenCalledWith([], { q: 'hello', limit: 20 });
+      expect(mockDocSearchService.search).toHaveBeenCalledWith(
+        [],
+        { q: 'hello', limit: 20 },
+        expect.anything(),
+      );
       expect(mockDocRepo.find).not.toHaveBeenCalled();
     });
   });
@@ -727,8 +859,9 @@ describe('SearchService', () => {
 
       // 防止 TypeORM 0.3.30 在 skip/take + innerJoin + orderBy(计算别名) 时
       // 生成 `distinctAlias.rank does not exist` 的回归
+      // v1.86：rank 表达式换编译产物绑定（`:compiledQ`）+ cd flag 0
       expect(messageQb.addSelect).toHaveBeenCalledWith(
-        'ts_rank(m.search_vector, plainto_tsquery(:q))',
+        "ts_rank_cd(m.search_vector, to_tsquery('simple', :compiledQ))",
         'rank',
       );
       expect(messageQb.orderBy).toHaveBeenCalledWith('rank', 'DESC');
@@ -750,7 +883,7 @@ describe('SearchService', () => {
       await service.search(dto, { id: 'user-1', type: ActorType.HUMAN });
 
       expect(taskQb.addSelect).toHaveBeenCalledWith(
-        'ts_rank(task.search_vector, plainto_tsquery(:q))',
+        "ts_rank_cd(task.search_vector, to_tsquery('simple', :compiledQ))",
         'rank',
       );
       expect(taskQb.orderBy).toHaveBeenCalledWith('rank', 'DESC');

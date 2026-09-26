@@ -7,8 +7,8 @@
  *   - 补充: plan forge-jubilee-robin.md Workstream B（跨 topic 未读计数）
  *
  * [踩坑索引]
- *   - WS-B: 未读 SQL 语义（无游标/锚点软删→全量、行值比较 after、自己发的计入）
- *     mock 测不出 PG 真实执行（铁律 #23 精神），本套件直连真 PG 验证七场景；
+ *   - WS-B: 未读 SQL 语义（无游标/锚点软删→全量、行值比较 after、自发排除（v1.85））
+ *     mock 测不出 PG 真实执行（铁律 #23 精神），本套件直连真 PG 验证八场景；
  *     PG now() 同事务同值 → 消息 created_at 必须显式 UPDATE 才能确定全序
  *
  * [铁律关联] #17(测试契约) #23(jsonb查询集成覆盖) #8(测试绑定)
@@ -26,14 +26,15 @@
 /**
  * GET /agents/me/unread 跨 topic 未读计数 —— 真实 PG 集成套件（WS-B，2026-08-27）
  *
- * 覆盖（plan forge-jubilee-robin.md Workstream B 七语义）：
- * ① 无游标（last_read_message_id IS NULL）→ 该 topic 全量未删消息计数；
+ * 覆盖（plan forge-jubilee-robin.md Workstream B 七语义 + v1.85 自发排除八场景）：
+ * ① 无游标（last_read_message_id IS NULL）→ 该 topic 全量未读计数（未删且非自发）；
  * ② 游标中段 → 只计 (created_at, id) 行值比较之后的消息；
- * ③ 自己发的消息计入（无 sender 过滤，与 TopicService.getUnread 同语义）；
+ * ③ 自己发的消息**不**计入未读（v1.85）——发送者用第二个 actor 作对照，system 消息仍计入；
  * ④ status='left' 的旧参与行排除；
- * ⑤ 游标消息被软删 → 锚点 join 落空 → 降级全量；
+ * ⑤ 游标消息被软删 → 锚点 join 落空 → 降级全量（真 COUNT，仍排除自发）；
  * ⑥ unreadCount=0 的 topic 不出现在结果（HAVING 过滤）；
- * ⑦ 无任何参与行 → 空数组。
+ * ⑦ 无任何参与行 → 空数组；
+ * ⑧ topic 内只有自发消息 → unreadCount=0 → 不出现（自发排除的直接锁）。
  *
  * 与 deleted-actor-projection.e2e-spec.ts 同款环境约定：本地开发库 chamber-postgres
  * （localhost:8744），PG 不可达整套降级跳过；RUN 后缀隔离测试数据，afterAll 按 FK
@@ -311,12 +312,15 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
     }
   }
 
-  it('① 无游标 → 该 topic 全量未删消息计数', async () => {
+  it('① 无游标 → 该 topic 全量未读计数（未删且非自发）', async () => {
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+    // 发送者用第二个 actor：本用例锁定「无游标 → 全量」本身，
+    // 自发排除由 ③/⑧ 单独锁定，两者互不掩盖
+    const sender = await createAgentWithOwner();
     const topic = await createTopic(agent);
-    await createMessages(topic.id, agent.id, 3);
+    await createMessages(topic.id, sender.id, 3);
 
     const result = await agentService.findMyUnreadCounts(agent.id);
 
@@ -327,8 +331,9 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+    const sender = await createAgentWithOwner();
     const topic = await createTopic(agent);
-    const msgs = await createMessages(topic.id, agent.id, 3);
+    const msgs = await createMessages(topic.id, sender.id, 3);
     // 游标 = 第 2 条消息 → 只计第 3 条
     await setReadCursor(topic.id, agent.id, msgs[1].id);
 
@@ -337,42 +342,45 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
     expect(result).toEqual([{ topicId: topic.id, topicName: topic.title, unreadCount: 1 }]);
   }, 30000);
 
-  it('③ 自己发的消息计入（无 sender 过滤，与 getUnread 同语义）', async () => {
+  it('③ 自己发的消息不计入未读（裸插自发消息——旧「无 sender 过滤」语义已废）', async () => {
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
     const topic = await createTopic(agent);
     await ensureSystemActor();
-    // 1 条自己发 + 1 条 system 发，无游标 → 全量 2（若 SQL 误排自己发的会是 1）
+    // 1 条自己发 + 1 条 system 发，无游标 → 未读应为 1（自发被排除；若 SQL 误含自发会是 2）
     await createMessages(topic.id, agent.id, 1);
     await createMessages(topic.id, SYSTEM_ACTOR_ID, 1);
 
     const result = await agentService.findMyUnreadCounts(agent.id);
 
-    expect(result).toEqual([{ topicId: topic.id, topicName: topic.title, unreadCount: 2 }]);
+    expect(result).toEqual([{ topicId: topic.id, topicName: topic.title, unreadCount: 1 }]);
   }, 30000);
 
   it('④ status=left 的旧参与行排除', async () => {
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+    // 发送者用第二个 actor：让本用例只验证 status 过滤，不与自发排除混淆
+    const sender = await createAgentWithOwner();
     const topic = await createTopic(agent, { status: 'left' });
-    await createMessages(topic.id, agent.id, 2);
+    await createMessages(topic.id, sender.id, 2);
 
     const result = await agentService.findMyUnreadCounts(agent.id);
 
     expect(result).toEqual([]);
   }, 30000);
 
-  it('⑤ 游标消息被软删 → 锚点落空 → 降级全量（未删消息数）', async () => {
+  it('⑤ 游标消息被软删 → 锚点落空 → 降级全量（未删且非自发）', async () => {
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+    const sender = await createAgentWithOwner();
     const topic = await createTopic(agent);
-    const msgs = await createMessages(topic.id, agent.id, 3);
+    const msgs = await createMessages(topic.id, sender.id, 3);
     // 游标 = 第 1 条消息，随后软删该消息 → 锚点 join 落空 → 降级全量。
-    // 全量口径 = 未删消息数（message_count 由 DB trigger 同步递减，与
-    // getUnread 的 topic.messageCount 降级路径一致）→ 3 条中软删 1 条 = 2
+    // 全量口径（v1.85）= 未软删 **且非自发** 的消息数 → 3 条中软删 1 条 = 2
+    // （不再依赖 topics.message_count，SQL 直接 COUNT）
     await setReadCursor(topic.id, agent.id, msgs[0].id);
     await ds.getRepository(Message).softDelete({ id: msgs[0].id });
 
@@ -385,8 +393,9 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+    const sender = await createAgentWithOwner();
     const topic = await createTopic(agent);
-    const msgs = await createMessages(topic.id, agent.id, 3);
+    const msgs = await createMessages(topic.id, sender.id, 3);
     // 游标 = 最后一条消息 → 无新消息 → unreadCount=0 → 不出现
     await setReadCursor(topic.id, agent.id, msgs[2].id);
 
@@ -399,6 +408,20 @@ describe('GET /agents/me/unread 跨 topic 未读计数 — 真实 PG 集成', ()
     if (!dbAvailable) return;
 
     const agent = await createAgentWithOwner();
+
+    const result = await agentService.findMyUnreadCounts(agent.id);
+
+    expect(result).toEqual([]);
+  }, 30000);
+
+  it('⑧ 只有自发消息的 topic 不出现在结果（v1.85 自发排除直接锁）', async () => {
+    if (!dbAvailable) return;
+
+    const agent = await createAgentWithOwner();
+    const topic = await createTopic(agent);
+    // 无游标 + 3 条全是自己发的（裸插，绕过 sendMessage 的游标推进）→
+    // COUNT(m.id) = 0 → HAVING 过滤掉该 topic（旧 SQL 会报 unreadCount=3）
+    await createMessages(topic.id, agent.id, 3);
 
     const result = await agentService.findMyUnreadCounts(agent.id);
 

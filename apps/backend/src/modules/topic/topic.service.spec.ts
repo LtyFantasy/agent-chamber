@@ -3084,21 +3084,27 @@ describe('TopicService', () => {
   });
 
   describe('getUnread', () => {
-    it('should return total message count when no participant record exists', async () => {
+    it('should count non-self messages when no participant record exists (degraded path)', async () => {
       const topic = createMockTopic({ messageCount: 15 });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(null);
 
-      // fetchUnreadMessages — 无锚点从话题开头取，返回 15 条消息
+      // 降级路径（v1.85）：先真 COUNT（排除自发），再取前 limit 条同谓词消息
+      const countQbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(15),
+      };
+      // 发送者均为 user-2（非当前 actor）→ 15 条全部算未读
       const msgs = Array.from({ length: 15 }, (_, i) =>
-        createMockMessage({ id: `msg-${i + 1}`, senderId: 'user-1', senderType: ActorType.HUMAN }),
+        createMockMessage({ id: `msg-${i + 1}`, senderId: 'user-2', senderType: ActorType.HUMAN }),
       );
-      const qbMock = createMockQueryBuilder(msgs, 15);
-      mockMessageRepo.createQueryBuilder.mockReturnValue(
-        qbMock as unknown as SelectQueryBuilder<Message>,
-      );
+      const fetchQbMock = createMockQueryBuilder(msgs, 15);
+      mockMessageRepo.createQueryBuilder
+        .mockReturnValueOnce(countQbMock as unknown as SelectQueryBuilder<Message>)
+        .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
       mockUserRepo.findBy.mockResolvedValue([
-        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+        { id: 'user-2', displayName: 'Bob', avatarUrl: null } as User,
       ]);
       mockAgentRepo.findBy.mockResolvedValue([]);
 
@@ -3111,24 +3117,34 @@ describe('TopicService', () => {
       expect(result.topicId).toBe('topic-1');
       expect(result.unreadCount).toBe(15);
       expect(result.messages).toHaveLength(15);
-      expect(result.hasMore).toBe(false); // 15 messages returned, 15 unread → no more
+      expect(result.hasMore).toBe(false); // 同口径：15 未读 / 15 返回 → 无更多
+      // 降级路径不再取 topic.messageCount，改真 COUNT 且带 sender 排除（与主路径同谓词）
+      expect(countQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
     });
 
-    it('should return total message count when lastReadMessageId is null', async () => {
+    it('should count non-self messages when lastReadMessageId is null (degraded path)', async () => {
       const topic = createMockTopic({ messageCount: 20 });
       const participant = createMockParticipant({ lastReadMessageId: null });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(participant);
 
+      // 降级路径（v1.85）：真 COUNT（排除自发）+ 同谓词消息列表，不再读 topic.messageCount
+      const countQbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(20),
+      };
       const msgs = Array.from({ length: 20 }, (_, i) =>
-        createMockMessage({ id: `msg-${i + 1}`, senderId: 'user-1', senderType: ActorType.HUMAN }),
+        createMockMessage({ id: `msg-${i + 1}`, senderId: 'user-2', senderType: ActorType.HUMAN }),
       );
-      const qbMock = createMockQueryBuilder(msgs, 20);
-      mockMessageRepo.createQueryBuilder.mockReturnValue(
-        qbMock as unknown as SelectQueryBuilder<Message>,
-      );
+      const fetchQbMock = createMockQueryBuilder(msgs, 20);
+      mockMessageRepo.createQueryBuilder
+        .mockReturnValueOnce(countQbMock as unknown as SelectQueryBuilder<Message>)
+        .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
       mockUserRepo.findBy.mockResolvedValue([
-        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+        { id: 'user-2', displayName: 'Bob', avatarUrl: null } as User,
       ]);
       mockAgentRepo.findBy.mockResolvedValue([]);
 
@@ -3137,6 +3153,9 @@ describe('TopicService', () => {
       expect(result.unreadCount).toBe(20);
       expect(result.messages).toHaveLength(20);
       expect(result.hasMore).toBe(false);
+      expect(countQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
     });
 
     it('should return unread count based on lastReadMessageId', async () => {
@@ -3156,9 +3175,9 @@ describe('TopicService', () => {
         andWhere: jest.fn().mockReturnThis(),
         getCount: jest.fn().mockResolvedValue(7),
       };
-      // Second createQueryBuilder: fetch QB (returns empty)
+      // Second createQueryBuilder: fetch QB（与 count 同谓词，返回 1 条非自发消息）
       const fetchMsgs = [
-        createMockMessage({ id: 'msg-6', senderId: 'user-1', senderType: ActorType.HUMAN }),
+        createMockMessage({ id: 'msg-6', senderId: 'user-2', senderType: ActorType.HUMAN }),
       ];
       const fetchQbMock = createMockQueryBuilder(fetchMsgs as Message[], 1);
       mockMessageRepo.createQueryBuilder
@@ -3166,7 +3185,7 @@ describe('TopicService', () => {
         .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
 
       mockUserRepo.findBy.mockResolvedValue([
-        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+        { id: 'user-2', displayName: 'Bob', avatarUrl: null } as User,
       ]);
       mockAgentRepo.findBy.mockResolvedValue([]);
 
@@ -3180,22 +3199,38 @@ describe('TopicService', () => {
       expect(result.lastReadMessageId).toBe('msg-5');
       expect(result.hasMore).toBe(true); // 7 unread, only 1 returned
 
-      // count QB uses tie-break after predicate (subquery row comparison)
+      // count QB：tie-break after 行值比较 + sender 排除
       expect(countQbMock.andWhere).toHaveBeenCalledWith(
-        '(msg.created_at, msg.id) > (SELECT rm.created_at, rm.id FROM messages rm WHERE rm.id = :lastReadId)',
-        { lastReadId: 'msg-5' },
+        '(message.created_at, message.id) > (SELECT am.created_at, am.id FROM messages am WHERE am.id = :anchorId)',
+        { anchorId: 'msg-5' },
       );
+      expect(countQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
+      // list QB 同谓词（count / list / hasMore 同口径的唯一来源）
+      expect(fetchQbMock.andWhere).toHaveBeenCalledWith(
+        '(message.created_at, message.id) > (SELECT am.created_at, am.id FROM messages am WHERE am.id = :anchorId)',
+        { anchorId: 'msg-5' },
+      );
+      expect(fetchQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
     });
 
-    it('should return total message count when actorId is not provided', async () => {
+    it('should return raw topic message total when actorId is not provided (not unread semantics)', async () => {
       const topic = createMockTopic({ messageCount: 10 });
       mockTopicRepo.findOne.mockResolvedValue(topic);
 
       const result = await service.getUnread('topic-1', { limit: 20 });
 
       expect(result.topicId).toBe('topic-1');
+      // 无 actor 上下文 → 无从定义「谁的未读」，回退话题消息总量（含自发），不参与未读语义
       expect(result.unreadCount).toBe(10);
+      expect(result.messages).toEqual([]);
       expect(result.hasMore).toBe(false);
+      // 该分支不查参与行、不构造消息查询（行为与 v1.85 前逐字一致）
+      expect(mockParticipantRepo.findOne).not.toHaveBeenCalled();
+      expect(mockMessageRepo.createQueryBuilder).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when topic not found', async () => {
@@ -3229,10 +3264,10 @@ describe('TopicService', () => {
 
       await service.getUnread('topic-1', { limit: 20 }, 'user-1', ActorType.HUMAN);
 
-      // count QB: tie-break after predicate (subquery row comparison)
+      // count QB: tie-break after 行值比较（参数名随单一谓词构造点统一为 anchorId）
       expect(qbMock.andWhere).toHaveBeenCalledWith(
-        '(msg.created_at, msg.id) > (SELECT rm.created_at, rm.id FROM messages rm WHERE rm.id = :lastReadId)',
-        { lastReadId: 'msg-5' },
+        '(message.created_at, message.id) > (SELECT am.created_at, am.id FROM messages am WHERE am.id = :anchorId)',
+        { anchorId: 'msg-5' },
       );
     });
 
@@ -3241,9 +3276,16 @@ describe('TopicService', () => {
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(null);
 
+      // 降级路径两段查询：COUNT（排除自发，此处 5）+ 前 limit 条同谓词消息
+      const countQbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(5),
+      };
+      // 发送者都非当前 actor（user-2 / agent-1）
       const msg1 = createMockMessage({
         id: 'msg-1',
-        senderId: 'user-1',
+        senderId: 'user-2',
         senderType: ActorType.HUMAN,
       });
       const msg2 = createMockMessage({
@@ -3252,12 +3294,12 @@ describe('TopicService', () => {
         senderType: ActorType.AGENT,
       });
       const fetchQbMock = createMockQueryBuilder([msg1, msg2], 2);
-      mockMessageRepo.createQueryBuilder.mockReturnValue(
-        fetchQbMock as unknown as SelectQueryBuilder<Message>,
-      );
+      mockMessageRepo.createQueryBuilder
+        .mockReturnValueOnce(countQbMock as unknown as SelectQueryBuilder<Message>)
+        .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
 
       mockUserRepo.findBy.mockResolvedValue([
-        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+        { id: 'user-2', displayName: 'Bob', avatarUrl: null } as User,
       ]);
       mockAgentRepo.findBy.mockResolvedValue([
         { id: 'agent-1', name: 'Bot', avatarUrl: null } as Agent,
@@ -3268,10 +3310,11 @@ describe('TopicService', () => {
       expect(result.unreadCount).toBe(5);
       expect(result.messages).toHaveLength(2);
       expect(result.hasMore).toBe(true); // 5 > 2
-      expect(result.messages[0].senderName).toBe('Alice');
+      expect(result.messages[0].senderName).toBe('Bob');
       expect(result.messages[1].senderName).toBe('Bot');
       // fetchUnreadMessages: ASC + ASC order
       expect(fetchQbMock.orderBy).toHaveBeenCalledWith('message.createdAt', 'ASC');
+      expect(fetchQbMock.addOrderBy).toHaveBeenCalledWith('message.id', 'ASC');
     });
 
     it('should return hasMore=true when unreadCount > messages.length', async () => {
@@ -3290,9 +3333,9 @@ describe('TopicService', () => {
         andWhere: jest.fn().mockReturnThis(),
         getCount: jest.fn().mockResolvedValue(80),
       };
-      // fetch QB returns only 5 messages (limit)
+      // fetch QB returns only 5 messages (limit)；发送者非当前 actor
       const msgs = Array.from({ length: 5 }, (_, i) =>
-        createMockMessage({ id: `msg-${i + 51}`, senderId: 'user-1', senderType: ActorType.HUMAN }),
+        createMockMessage({ id: `msg-${i + 51}`, senderId: 'user-2', senderType: ActorType.HUMAN }),
       );
       const fetchQbMock = createMockQueryBuilder(msgs, 5);
       mockMessageRepo.createQueryBuilder
@@ -3300,7 +3343,7 @@ describe('TopicService', () => {
         .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
 
       mockUserRepo.findBy.mockResolvedValue([
-        { id: 'user-1', displayName: 'Alice', avatarUrl: null } as User,
+        { id: 'user-2', displayName: 'Bob', avatarUrl: null } as User,
       ]);
       mockAgentRepo.findBy.mockResolvedValue([]);
 
@@ -3332,6 +3375,39 @@ describe('TopicService', () => {
 
       // fetchUnreadMessages should be called with limit 20 (default)
       expect(fetchQbMock.take).toHaveBeenCalledWith(20);
+    });
+
+    it('should keep count/list/hasMore in one口径: self-sent only → unreadCount=0 and no messages', async () => {
+      // 场景：参与者无游标，topic 里只有他自己发的消息（裸插/历史数据，绕过 sendMessage 游标）
+      // → 真 COUNT 为 0、messages 为空、hasMore=false（三口径一致）。旧实现会回退
+      // topic.messageCount(=3) 报出非零未读并把自发消息塞进 messages。
+      const topic = createMockTopic({ messageCount: 3 });
+      const participant = createMockParticipant({ lastReadMessageId: null });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockParticipantRepo.findOne.mockResolvedValue(participant);
+
+      const countQbMock = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(0),
+      };
+      const fetchQbMock = createMockQueryBuilder([], 0);
+      mockMessageRepo.createQueryBuilder
+        .mockReturnValueOnce(countQbMock as unknown as SelectQueryBuilder<Message>)
+        .mockReturnValueOnce(fetchQbMock as unknown as SelectQueryBuilder<Message>);
+
+      const result = await service.getUnread('topic-1', { limit: 20 }, 'user-1', ActorType.HUMAN);
+
+      expect(result.unreadCount).toBe(0);
+      expect(result.messages).toEqual([]);
+      expect(result.hasMore).toBe(false);
+      // 两个 QB 出自同一谓词构造点 → 带同一 sender 排除条件
+      expect(countQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
+      expect(fetchQbMock.andWhere).toHaveBeenCalledWith('message.sender_id <> :actorId', {
+        actorId: 'user-1',
+      });
     });
   });
 

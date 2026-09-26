@@ -55,8 +55,9 @@ describe('SearchController', () => {
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
 
-      expect(await controller.search(dto, actor)).toBe(result);
-      expect(service.search).toHaveBeenCalledWith(dto, actor);
+      // v1.85.0 批次 3：控制器额外透传归一化后的请求 id（`@RequestId()`；直调时为 null）
+      expect(await controller.search(dto, actor, null)).toBe(result);
+      expect(service.search).toHaveBeenCalledWith(dto, actor, null);
       expect(service.search).toHaveBeenCalledTimes(1);
     });
 
@@ -72,8 +73,12 @@ describe('SearchController', () => {
 
       const actor: UnifiedActor = { id: 'user-1', type: ActorType.HUMAN };
 
-      await controller.search(dto, actor);
-      expect(service.search).toHaveBeenCalledWith(expect.objectContaining({ type: 'all' }), actor);
+      await controller.search(dto, actor, 'req_unit_test');
+      expect(service.search).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'all' }),
+        actor,
+        'req_unit_test',
+      );
     });
   });
 });

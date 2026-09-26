@@ -1,4 +1,4 @@
-import { IsOptional, IsString, Min, Max, IsInt, IsIn, IsISO8601 } from 'class-validator';
+import { IsOptional, IsString, Min, Max, IsInt, IsIn, IsISO8601, MaxLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { DOC_SEARCH_SORT_VALUES, type DocSearchSort } from '@agent-chamber/shared';
@@ -16,9 +16,18 @@ import { DOC_SEARCH_SORT_VALUES, type DocSearchSort } from '@agent-chamber/share
  */
 export class DocSearchDto {
   @IsString()
+  /**
+   * ⚠️ 上限 200 字符（v1.85.0 批次 3）：查询词会作为**重排出境体的第一段**（q + state + questions
+   * ≤16KB），无上限的长 q 能单独把出境预算吃光。**不设下限**（空 q 是合法形态，语义由
+   * service 的空查询短路承担——加 `@MinLength` 会改变既有契约）。
+   */
+  @MaxLength(200)
   @ApiProperty({
-    description: 'Search query string',
+    description:
+      'Search query string (max 200 characters). When model-assisted ranking is enabled, the ' +
+      'query text leaves your network together with a byte-bounded excerpt of the candidates.',
     example: 'architecture design',
+    maxLength: 200,
   })
   q: string;
 

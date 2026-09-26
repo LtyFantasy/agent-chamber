@@ -223,6 +223,11 @@ export function projectDocHit(hit: Record<string, unknown>): Record<string, unkn
   if (hit['contentTruncated'] !== undefined) {
     projected['contentTruncated'] = hit['contentTruncated'];
   }
+  // 透传重排标记（v1.85.0 批次 3）：调用方据此知道"这条命中的页内位置由模型排序决定"
+  // （**只在重排启用且成功时出现**；缺省不出现 = SQL 序）
+  if (hit['reranked'] === true) {
+    projected['reranked'] = true;
+  }
   return projected;
 }
 

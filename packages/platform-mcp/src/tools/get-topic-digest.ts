@@ -41,6 +41,9 @@ import { projectMessages, projectMessagesPage, projectTopic } from './project';
  * - unread.messages 保持全文不截断（可行动增量）
  * - 起步去重：unreadCount > 0 时省略 recentMessages（与 unread 增量重叠）；
  *   显式传 includeRecent=true 强制携带；unread 端点失败降级（unreadCount 未知）时保留 recentMessages
+ *   注（v1.85 unread 口径）：unreadCount 不含自己发的消息（发送即已读 + 服务端 sender 排除），
+ *   故自己刚发完消息时 unreadCount 为 0、recentMessages **不会**被去重省略——
+ *   这正是 agent 确认自己刚发出内容的位置。
  *
  * 返回形状：{ topic, recentMessages?, unread? }
  * - recentMessages 为分页对象 { messages, nextCursor, hasMore }
@@ -62,6 +65,9 @@ export const getTopicDigestTool: CustomTool = {
       '0 = no truncation, full text) is truncated to a snippet ' +
       '(contentTruncated: true) — use topic_controller_get_messages to page through full text. ' +
       'unread includes unread count and incremental messages (full text, never truncated). ' +
+      'unreadCount excludes messages you sent yourself (sending advances your own read cursor), ' +
+      'so right after you post a message unreadCount stays 0 and recentMessages is NOT omitted — ' +
+      'that is where you confirm your own just-sent message. ' +
       'When unreadCount > 0, recentMessages is omitted for deduplication; ' +
       'pass includeRecent=true explicitly to force inclusion. ' +
       'markRead defaults to true — viewing the digest is treated as having read up to the latest; ' +

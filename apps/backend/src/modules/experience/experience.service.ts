@@ -115,6 +115,14 @@ import {
 } from '@agent-chamber/shared';
 import { AuditAction } from '@agent-chamber/shared';
 import type { UnifiedActor } from '../../common/types/actor.types';
+import { compileQuery, type CompiledQuery } from '../../common/utils/search/tsquery-compiler';
+import {
+  buildSearchSql,
+  COMPILED_Q_PARAM,
+  type SearchSqlGroup,
+} from '../../common/utils/search/search-sql';
+import { SEARCH_KGATE_K_OVERRIDE } from '../../common/utils/search/search-tuning';
+import { logSearchZeroHit } from '../../common/utils/search/zero-hit-log';
 import {
   buildIdempotencyContext,
   insertIdempotencyInTx,
@@ -524,14 +532,33 @@ export class ExperienceService {
     const pageSize = query.pageSize ?? EXPERIENCE_DEFAULT_PAGE_SIZE;
 
     const qb = this.baseQuery('e', filters);
-    this.applyFilters(qb, filters);
-    this.applyOrder(qb, filters);
+    // 同一 q 的现构产物只算一次（纯函数同入同出）：applyFilters（过滤 + 门）/
+    // applyOrder（层内 cd 排序）/ fetchPage（透出 score）/ 零命中日志（截断元数据）
+    // 四处共用 —— 此前各自现构 ⇒ 单次 search 重复编译 4 次（终审 MINOR-2）。
+    const scoreSql = filters.q ? buildExperienceScoreSql(filters.q) : null;
+    this.applyFilters(qb, filters, scoreSql);
+    this.applyOrder(qb, filters, scoreSql);
 
     const total = await countOf(qb);
-    const { items, rawScores } = await this.fetchPage(qb, page, pageSize, Boolean(filters.q));
+    const { items, rawScores } = await this.fetchPage(
+      qb,
+      page,
+      pageSize,
+      scoreSql?.scoreExpr ?? null,
+    );
 
     // 零命中埋点（服务侧自落，fail-open；只记「真检索」，见 recordSearchEvent 注释）
     await this.recordSearchEvent(filters, total > 0, page);
+    // 零命中结构化日志（计划 §2.6：四路搜索零命中分支各调一次；仅 q 检索的未命中
+    // 才算「搜索零命中」——纯过滤浏览空结果不是检索语义）
+    if (filters.q && total === 0 && scoreSql !== null) {
+      logSearchZeroHit(this.logger, {
+        surface: 'experience',
+        query: filters.q,
+        queryTruncated: scoreSql.compiled.queryTruncated,
+        armTruncatedCount: scoreSql.compiled.armTruncatedCount,
+      });
+    }
 
     const availableDomains = await this.fetchAvailableDomains(filters);
     // 本页一次批量解析（N+1 防线；空页 → 空 Map，不发查询）
@@ -1146,7 +1173,11 @@ export class ExperienceService {
    * GIN 完全用不上）；env 用 `->>` 精确相等（四条表达式 btree 各自的形态）；q 用
    * plainto_tsquery + 绑定参数（**禁字符串拼接**，ORDER BY 亦不拼接用户输入）。
    */
-  private applyFilters(qb: SelectQueryBuilder<ExperienceEntry>, filters: NormalizedQuery): void {
+  private applyFilters(
+    qb: SelectQueryBuilder<ExperienceEntry>,
+    filters: NormalizedQuery,
+    scoreSqlIn?: ExperienceQueryScoreSql | null,
+  ): void {
     const p = (key: string, value: unknown) => qb.setParameter(key, value);
 
     if (filters.signals?.length) {
@@ -1192,10 +1223,25 @@ export class ExperienceService {
       p('createdById', filters.createdById);
     }
     if (filters.q) {
-      // q 是**过滤 + 排序**（plan §2）：低于分数下限的条目直接不进结果集
-      qb.andWhere(`${SCORE_EXPRESSION} >= :scoreFloor`);
+      // q 是**过滤 + 排序**（plan §2）：低于分数下限的条目直接不进结果集。
+      // 打分按调用现构（buildExperienceScoreSql 头注）：ts 项 `:compiledQ` 绑定，
+      // trgm 两项 raw `:q`；isEmpty 时 trgm-only（不绑 ts 参数、不挂门）。
+      // 同一 q 的现构产物由调用方一次算好下传（`scoreSqlIn`）：纯函数同入同出，
+      // 一次 search 内 applyFilters / applyOrder / fetchPage / 零命中分支共用一份，
+      // 避免同查询重复编译 4 次（终审 MINOR-2）；未传时本处兜底现构（其他调用方零改动）。
+      const scoreSql = scoreSqlIn ?? buildExperienceScoreSql(filters.q);
+      qb.andWhere(`${scoreSql.scoreExpr} >= :scoreFloor`);
       p('q', filters.q);
       p('scoreFloor', EXPERIENCE_SCORE_FLOOR);
+      if (!scoreSql.compiled.isEmpty) {
+        p(COMPILED_Q_PARAM, scoreSql.compiled.tsquery);
+        // K-gate 结构门（**experience 挂门**，主脑裁决 #2）：作用于过滤候选集，
+        // groupCount 走同一 applyFilters 自动继承（口径一致）
+        if (scoreSql.kGateExpr !== null) {
+          qb.andWhere(scoreSql.kGateExpr);
+          qb.setParameters(scoreSql.kGateParams);
+        }
+      }
     }
   }
 
@@ -1210,12 +1256,19 @@ export class ExperienceService {
    *
    * 所有路径都以 `id ASC` 兜底：分页稳定性要求排序**全序**（否则同分条目在页间漂移）。
    */
-  private applyOrder(qb: SelectQueryBuilder<ExperienceEntry>, filters: NormalizedQuery): void {
+  private applyOrder(
+    qb: SelectQueryBuilder<ExperienceEntry>,
+    filters: NormalizedQuery,
+    scoreSqlIn?: ExperienceQueryScoreSql | null,
+  ): void {
     if (filters.q) {
       // 融合分需要在 SELECT 里出现吗？不需要——PG 的 ORDER BY 可直接用表达式；
       // 但为了让响应能透出 score，fetchPage 会在有 q 时额外 select 该表达式。
+      // 排序 = quality 层优先、层内 cd（打分与 applyFilters 同一现构产物 ⇒ 零漂移；
+      // `scoreSqlIn` 由调用方一次算好下传，未传时兜底现构）
+      const scoreSql = scoreSqlIn ?? buildExperienceScoreSql(filters.q);
       qb.orderBy(`(e.quality = 'verified')`, 'DESC')
-        .addOrderBy(SCORE_EXPRESSION, 'DESC')
+        .addOrderBy(scoreSql.scoreExpr, 'DESC')
         .addOrderBy('e.distinct_helped_count', 'DESC')
         .addOrderBy('e.updated_at', 'DESC')
         .addOrderBy('e.id', 'ASC');
@@ -1235,19 +1288,21 @@ export class ExperienceService {
    * 取一页数据（有 q 时同时取原始融合分，供响应透出 `score`）。
    *
    * `getRawAndEntities` 的 raw 行与 entities 按索引一一对应（无 join，不存在笛卡尔放大）。
+   *
+   * @param scoreExpr 有 q 时的融合分表达式（buildExperienceScoreSql 现构产物；无 q 传 null）
    */
   private async fetchPage(
     qb: SelectQueryBuilder<ExperienceEntry>,
     page: number,
     pageSize: number,
-    withScore: boolean,
+    scoreExpr: string | null,
   ): Promise<{ items: ExperienceEntry[]; rawScores: (number | undefined)[] }> {
     qb.skip((page - 1) * pageSize).take(pageSize);
-    if (!withScore) {
+    if (scoreExpr === null) {
       const items = await qb.getMany();
       return { items, rawScores: items.map(() => undefined) };
     }
-    qb.addSelect(SCORE_EXPRESSION, 'experience_score');
+    qb.addSelect(scoreExpr, 'experience_score');
     const { entities, raw } = await qb.getRawAndEntities();
     const rawScores = (raw as Record<string, unknown>[]).map((row) =>
       row.experience_score === undefined || row.experience_score === null
@@ -1733,15 +1788,52 @@ export class ExperienceService {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * 融合打分 SQL 表达式（**ORDER BY / WHERE / SELECT 三处共用同一字符串**）。
+ * 融合打分 SQL 的**按调用现构**产物（v1.86 中文根治接线：旧 `SCORE_EXPRESSION`
+ * 模块常量退役——编译产物随查询而变，常量形态无法承载 `:compiledQ` 绑定）。
  *
- * 权重来自常量单源（`EXPERIENCE_RANK_WEIGHTS`）；`q` 恒以绑定参数传入
- * （`:q`）——**禁把用户输入拼进 SQL**。表达式与迁移里的排序索引同形，便于 PG 复用。
+ * 纪律（计划 §2.2）：ORDER BY / WHERE / SELECT 三处消费同一辅助函数产物（等价于旧
+ * 「三处共用同一字符串」）；trgm 两项保留 raw `:q` 绑定；ts 项 = `ts_rank_cd(
+ * e.search_vector, to_tsquery('simple', :compiledQ))`（flag 0，长度无关；包裹硬契约——
+ * 裸绑定走 tsqueryin 原子语义，2026-09-26 1-b 实证）× 自有权重；isEmpty ⇒ trgm-only
+ * （去 ts 项，契约③按面枚举：doc-search/experience → trgm-only）。
  */
-const SCORE_EXPRESSION =
-  `(ts_rank(e.search_vector, plainto_tsquery('simple', :q)) * ${EXPERIENCE_RANK_WEIGHTS.TS_RANK}` +
-  ` + similarity(e.content, :q) * ${EXPERIENCE_RANK_WEIGHTS.TRGM_CONTENT}` +
-  ` + similarity(e.title, :q) * ${EXPERIENCE_RANK_WEIGHTS.TRGM_TITLE})`;
+interface ExperienceQueryScoreSql {
+  /** 编译产物（`:compiledQ` 绑定与截断元数据来源；isEmpty 时不绑 ts 参数） */
+  compiled: CompiledQuery;
+  /** 融合分表达式（WHERE floor / ORDER BY / SELECT 三处共用） */
+  scoreExpr: string;
+  /** K-gate 结构门（**experience 挂门**，主脑裁决 #2；无 arm 时为 null 不挂） */
+  kGateExpr: string | null;
+  /** K-gate 绑定参数集（展开 setParameters 下发，F1 硬约束） */
+  kGateParams: Record<string, string | number>;
+}
+
+/**
+ * 构造有 q 时的融合打分 SQL 组（纯函数，按调用现构）。
+ * @param q 已归一化查询串（normalizeQuery 已 trim、纯空白不进入本路径）
+ */
+function buildExperienceScoreSql(q: string): ExperienceQueryScoreSql {
+  const compiled = compileQuery(q);
+  const trgmTerms =
+    `similarity(e.content, :q) * ${EXPERIENCE_RANK_WEIGHTS.TRGM_CONTENT}` +
+    ` + similarity(e.title, :q) * ${EXPERIENCE_RANK_WEIGHTS.TRGM_TITLE}`;
+  if (compiled.isEmpty) {
+    // trgm-only：ts 腿结构上不可能命中（编译产物无词项），去 ts 项
+    return { compiled, scoreExpr: `(${trgmTerms})`, kGateExpr: null, kGateParams: {} };
+  }
+  const group = buildSearchSql(
+    { vector: 'e.search_vector', text: 'e.content' },
+    compiled,
+    { startSel: '<<<', stopSel: '>>>' },
+    SEARCH_KGATE_K_OVERRIDE,
+  ) as SearchSqlGroup;
+  return {
+    compiled,
+    scoreExpr: `(${group.scoreExpr} * ${EXPERIENCE_RANK_WEIGHTS.TS_RANK} + ${trgmTerms})`,
+    kGateExpr: group.kGateExpr,
+    kGateParams: group.kGateParams,
+  };
+}
 
 /**
  * 数组归一化：trim + lowercase + 去重（保持首次出现顺序）。

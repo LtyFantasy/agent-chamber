@@ -17,9 +17,15 @@
  * [关键不变量]
  *   - **append-only**：应用层无 UPDATE/DELETE 路径（保留策略/清除 = admin 走 DB 人工窗口，
  *     含按条目级联清）。**条目软删 ≠ 本表清除**（明文写进文档）。
- *   - **`request` NOT NULL 不许破**：`status='skipped'`（限流跳过，未调 provider）也要写
- *     占位 `{skipped:true, reason:'judgment_rate_limited'}`——否则插入撞 23502 会连带
- *     拖垮录入主流程。
+ *   - **`request` NOT NULL 不许破**：`status='skipped'`（闸门跳过，未调 provider）也要写
+ *     占位 `{skipped:true, reason:'<EXPERIENCE_JUDGMENT_SKIPPED_REASONS 之一>'}`——否则插入
+ *     撞 23502 会连带拖垮主流程。`reason` 是**跳过原因族**（闸 / 出境 / 可见性），值域单源 =
+ *     shared `EXPERIENCE_JUDGMENT_SKIPPED_REASONS`（v1.85.0 前只有 actor 一级，历史行逐字为
+ *     `judgment_rate_limited`；v1.85.0 批次 2 追加 `egress_blocked` / `visibility_blocked`）。
+ *   - **skipped 行写入有界**：**每个"闸级别 + 能力 + actor"组合每窗口至多一条**占位行，
+ *     上界 = 派生式 `(级别数 + 1) × 能力数`（见 `modules/judgment/judgment-quota.service.ts` 的
+ *     `judgmentSkipRowBound`），否则行数正比请求数、update/搜索路径可被刷爆本表。
+ *     超限尝试照旧计入对应级别的额度计数（**不许当免费通道**）。
  *   - **失败与跳过都落库**：`ok`/`error`/`timeout`/`skipped` 四态齐落；"未判"与"判失败"的
  *     区分 = 查本表 status（缓存列 `judgment=null` 二者不分，且**不自动重判**为明文决策）。
  *   - 体积纪律（应用层，**不是 DB CHECK**）：`request.state.content` = 正文节选 ≤2000 字符
@@ -86,7 +92,9 @@ export class ExperienceJudgmentRecord {
   /**
    * 操作类型（裸 varchar(32)；值域单源 = shared `EXPERIENCE_JUDGMENT_OPERATIONS`）
    *
-   * 本阶段唯一产出值 `record_check`；`rerank`/`autotag` 是预留（对应功能 plan §13 不做）。
+   * v1.85.0 起产出两种值：`record_check`（经验库录入/改写的七维判定）与 `rerank`
+   * （DocSpace 搜索重排，落**标量 + id**、不落原文；`experience_id` 为 null）。
+   * `autotag` 仍是预留值（对应功能未做）。
    */
   @Column({ type: 'varchar', length: 32, nullable: false })
   operation: ExperienceJudgmentOperation;
@@ -128,7 +136,8 @@ export class ExperienceJudgmentRecord {
    *
    * `state.content` 只放正文**节选**（≤2000 字符 + contentTruncated/contentLength 标记）
    * ——全量正文入库会让本表成为"正文第二副本"的无限增长面。
-   * `status='skipped'` 时写占位 `{skipped:true, reason:'judgment_rate_limited'}`（不破 NOT NULL）。
+   * `status='skipped'` 时写占位 `{skipped:true, reason:'<三级闸之一>'}`（不破 NOT NULL；值域
+   * 单源 = shared `EXPERIENCE_JUDGMENT_SKIPPED_REASONS`）。
    * 序列化硬顶 16KB（超限截断 + `truncated:true`）。
    */
   @Column({ type: 'jsonb', nullable: false })

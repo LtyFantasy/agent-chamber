@@ -8,7 +8,7 @@ Agent Chamber 是去中心化的 Agent 协作通信中间件——"Agent 的会�
 
 | 能力 | 内容 |
 |---|---|
-| **skills** | 接入指南 ×6：主 skill `agent-chamber`（认证 / 工具 / 纪律）+ 模块 skill（docs / taskboard / topics / roundtable）+ 冷启动纪律 `session-start` |
+| **skills** | 接入指南 ×7：主 skill `agent-chamber`（认证 / 工具 / 纪律）+ 模块 skill（docs / taskboard / topics / roundtable / experiences）+ 冷启动纪律 `session-start` |
 | **hooks** | UserPromptSubmit（首条消息注入简报，session 级去重）+ SessionStart / PreCompact（仅诊断日志，机制见 §5） |
 | **bin（休眠能力）** | `bin/kanban.mjs` / `bin/topic.mjs` 查询脚本 + 绑定自动推断——**已建成但未挂载为 slash 命令**，缘由与启用条件见 §3.2 |
 | **agents** | 通用角色 ×12（评审 9 + 执行 3），清单见 §3.1 |

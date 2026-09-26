@@ -18,7 +18,7 @@
  *       §1）。2026-08-26 统一批 A2。
  *   B-55: searchMessages/searchTasks 中 skip/take + innerJoin + orderBy('rank')，
  *          若未 addSelect rank 会触发 TypeORM 0.3.30 distinctAlias 类错误。
- *          当前已显式 addSelect ts_rank(...) AS rank；单测锁住该约束防回归。
+ *          当前已显式 addSelect ts_rank_cd(...) AS rank；单测锁住该约束防回归。
  *          见 memory/2026-07-02.md §1。
  *   B-50: SearchService 曾内联私有白名单方法，与 Policy 规则不同步，缺少
  *          invited/editor 条件。修复：统一注入 AccessQueryService，白名单规则
@@ -28,6 +28,24 @@
  *       全文/customFields 泄露到搜索结果。修复：显式构造摘要对象（contentSnippet
  *       ≤200 字符 / descriptionSnippet ≤200 字符），senderType/senderName 批量注入，
  *       boardId/topicId 批量推断。见 memory/2026-07-25.md。
+ *   SIMPLE-REGCONFIG(活跃 bug 已修): ts_rank/@@ 曾用 `plainto_tsquery(:q)` 无 regconfig
+ *       （生产 default=english ⇒ 英文消息/任务检索部分失效）。v1.86 起 tsquery 一律由
+ *       编译器（common/utils/search/tsquery-compiler.ts）产出、经 `:compiledQ` 绑定下发
+ *       （F1：只经 QueryBuilder setParameter；SQL 侧经导出组 `to_tsquery('simple', …)`
+ *       包裹——裸绑定走 tsqueryin 原子语义，2026-09-26 1-b 实证）；文档侧解析仅在
+ *       headline 显式 'simple'。
+ *       **messages/tasks 不挂 K-gate**（主脑裁决 #2）；空查询（含纯标点 isEmpty）短路
+ *       返回空（契约③按面枚举）；零命中落 logSearchZeroHit（surface message/task）。
+ *   KEYCAP-LIKE-G3(keycap 真回归): `1️⃣` 经剥离族（零宽/变体表，与 DB 函数同表）归一为裸
+ *       `'1'`，**向量侧信息已丢失** ⇒ 查询侧无法从编译产物还原。修复 = messages 面 rank
+ *       表达式叠加「原文 `LIKE ALL(:keycapPatterns)` 命中则 +:keycapBoost」；模式串由
+ *       common/utils/search/keycap-tokens.ts 产出（原始 q 上提取、`%`/`_` 强制转义、多
+ *       keycap 须全中）。安全方向: 改 rank 表达式先跑 search.service.spec 的形态断言；
+ *       空数组必须不挂子句（`LIKE ALL('{}')` 恒真 = 给所有行加分）；**`THEN :boost`/`ELSE 0`
+ *       两侧必须显式 `::float8`**（整数分支会把 boost 推成 integer，小数标定值 2.7 报
+ *       `invalid input syntax for type integer` ⇒ messages 面整体 500——真库实测；mock 单测
+ *       测不出 PG 类型推断，真库契约见 test/search-invariants.e2e-spec.ts ⑭）。README §7
+ *       发现⑩ 是该回归的原始记录、⑬ 是 boost 标定与已知局限。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -35,7 +53,7 @@
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
  * =============================================================================
  */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { Message } from '../../database/entities/message.entity';
@@ -49,9 +67,44 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
 import { SearchQueryDto } from './dto';
 import type { PaginatedResponse, DocSearchHitWithSpace } from '@agent-chamber/shared';
+import { compileQuery, type CompiledQuery } from '../../common/utils/search/tsquery-compiler';
+import {
+  buildSearchSql,
+  COMPILED_Q_PARAM,
+  type SearchSqlGroup,
+} from '../../common/utils/search/search-sql';
+import { logSearchZeroHit } from '../../common/utils/search/zero-hit-log';
+import { cleanupHeadlineSnippet } from '../../common/utils/search/snippet-cleanup';
+import { extractKeycapTokens } from '../../common/utils/search/keycap-tokens';
 
 /** 全局搜索文档一路的固定返回条数（对齐空间内搜索 MAX_LIMIT=20，非分页 MVP 决策） */
 const GLOBAL_DOC_SEARCH_LIMIT = 20;
+
+/**
+ * keycap LIKE 模式数组的绑定参数名（保留名纪律：**不得**取 PG 类型名——TypeORM 0.3.30
+ * 的参数替换正则无 lookbehind，真注册同名参数会让 `::类型` cast 被静默替换，
+ * 见 common/utils/search/search-sql.ts 的保留参数名注）。
+ */
+const KEYCAP_PATTERNS_PARAM = 'keycapPatterns';
+
+/** keycap 加分值的绑定参数名（与模式串分开绑定：数值与数组不可共用参数） */
+const KEYCAP_BOOST_PARAM = 'keycapBoost';
+
+/**
+ * messages 面 keycap 加分（G3 `1️⃣` 真回归修复；REV-5 标定规则）。
+ *
+ * 标定规则 = `max(0.2, 实测 '1' 泛化行最高 ts 分 + 0.1)`；**实测**（staging 2026-09-26，
+ * 评估身份可达 topic 集内 721 条命中 `'1'` 的消息）：最高 ts = **2.6000001** ⇒ 取值 **2.7**
+ * （2.6000001 + 0.1 按十分位取整）。语义 = 「原文含该 keycap 字面的行，其 rank 在标定
+ * 语料下高于全部泛化 `'1'` 行」——语料增长后若泛化行最高 ts 超 2.8 需按同一规则重标；
+ * 不加分时标注目标消息名次 508/721（README §7 发现⑩ 的机制性回归）。
+ *
+ * ⚠️ 已知局限（批次 1 实测登记，勿当 bug 重开）：同一 topic 内另有 **8 条**消息含 `1️⃣`，
+ * 加分对它们**一视同仁**，组内仍按各自 `ts_rank_cd` 排序。REV-8（2026-09-26）已裁决：
+ * 评估集锚点改指组内 ts 最高（0.3）消息（9 条皆合法答案、锚点应指最佳答案）——G3
+ * 已转 hit（rank 1，证据 after-keycap-reanchor-staging.json）；本条组内排序局限保留。
+ */
+const MESSAGE_KEYCAP_BOOST = 2.7;
 
 /**
  * 消息搜索结果（摘要视图）
@@ -146,6 +199,8 @@ export interface SearchResponse {
  */
 @Injectable()
 export class SearchService {
+  private readonly logger = new Logger(SearchService.name);
+
   constructor(
     @InjectRepository(Message)
     private messageRepo: Repository<Message>,
@@ -167,7 +222,11 @@ export class SearchService {
    * @param dto 搜索查询参数
    * @returns 按类型分组的分页搜索结果（docs 一路为非分页数组）
    */
-  async search(dto: SearchQueryDto, actor?: UnifiedActor): Promise<SearchResponse> {
+  async search(
+    dto: SearchQueryDto,
+    actor?: UnifiedActor,
+    traceId?: string | null,
+  ): Promise<SearchResponse> {
     const { q, type, page = 1, pageSize = 20 } = dto;
 
     const promises: [
@@ -183,7 +242,7 @@ export class SearchService {
       promises[1] = this.searchTasks(q, page, pageSize, actor);
     }
     if (type === 'all' || type === 'docs') {
-      promises[2] = this.searchDocs(q, actor);
+      promises[2] = this.searchDocs(q, actor, traceId);
     }
 
     const [messages, tasks, docs] = await Promise.all(promises);
@@ -212,15 +271,54 @@ export class SearchService {
     pageSize: number,
     actor?: UnifiedActor,
   ): Promise<PaginatedResponse<MessageSearchResult>> {
+    // 空查询短路返回空（契约③按面枚举：search.service/task q= → 短路；纯标点/全剥离
+    // 查询同样落这里——isEmpty 语义 = 编译期词项表空）
+    const compiled = compileQuery(q);
+    if (compiled.isEmpty) {
+      return this.buildPaginatedResponse([], 0, page, pageSize);
+    }
+    // 共享 SQL 导出组（非 isEmpty ⇒ 非 null）：ts_rank_cd + `@@ :compiledQ` 两点位 +
+    // headline 通道同一 `:compiledQ` 绑定。修活跃 bug：旧 `plainto_tsquery(:q)` 无
+    // regconfig（生产 default=english ⇒ 英文消息检索部分失效）——tsquery 改由编译器
+    // 单源产出，文档侧解析在 headline 显式 'simple'，服务端再无隐式 regconfig 点位。
+    const group = buildSearchSql({ vector: 'm.search_vector', text: 'm.content' }, compiled, {
+      startSel: '<<<',
+      stopSel: '>>>',
+    }) as SearchSqlGroup;
     const accessibleTopicIds = await this.accessQuery.getAccessibleTopicIds(actor);
 
-    // 1. 构建基础查询
+    // keycap 加分（G3，v1.87）：q 含 `1️⃣` 类组合键帽时对**原文**含该字面的行加确定性
+    // boost——剥离族把 keycap 归一为裸 `1`，向量侧信息已丢失（keycap-tokens.ts 文件头），
+    // 故修复只能落在原文列上。多 keycap = `LIKE ALL`（须全中）；空数组**不得**挂
+    // （PG 中 `LIKE ALL('{}')` 恒真 ⇒ 挂了等于给所有行加分）。模式串与数值都走
+    // setParameter 绑定——模板串里只出现参数名，形态由 search.service.spec 钉死。
+    const keycapPatterns = extractKeycapTokens(q);
+    // ⚠️ `::float8` 是**必须的**（批次 1 实测 500 的真凶）：`CASE WHEN … THEN :boost ELSE 0 END`
+    // 里的整数分支 `0` 会让 PG 把绑定参数推成 **integer**，小数 boost（2.7）报
+    // `invalid input syntax for type integer: "2.7"`。两侧都显式取 float8（ts_rank_cd 是 real，
+    // 相加提升为 double precision）。⚠️ mock 单测测不出 PG 类型推断——真库契约由
+    // test/search-invariants.e2e-spec.ts ⑭ 承担（铁律 #23 同款教训）。
+    const rankExpr =
+      keycapPatterns.length > 0
+        ? `(${group.scoreExpr} + CASE WHEN m.content LIKE ALL(:${KEYCAP_PATTERNS_PARAM})` +
+          ` THEN :${KEYCAP_BOOST_PARAM}::float8 ELSE 0::float8 END)`
+        : group.scoreExpr;
+
+    // 1. 构建基础查询（不挂 K-gate——主脑裁决 #2：messages/tasks 只换 compiled
+    //    `@@` + `ts_rank_cd` rank，召回语义变更未授权不做）
     const qb = this.messageRepo
       .createQueryBuilder('m')
-      .addSelect('ts_rank(m.search_vector, plainto_tsquery(:q))', 'rank')
+      .addSelect(rankExpr, 'rank')
       .innerJoin('m.topic', 't')
-      .where('m.search_vector @@ plainto_tsquery(:q)', { q })
-      .andWhere('m.deleted_at IS NULL');
+      .where(group.prefilterExpr)
+      .andWhere('m.deleted_at IS NULL')
+      .setParameter(COMPILED_Q_PARAM, compiled.tsquery);
+    if (keycapPatterns.length > 0) {
+      qb.setParameter(KEYCAP_PATTERNS_PARAM, keycapPatterns).setParameter(
+        KEYCAP_BOOST_PARAM,
+        MESSAGE_KEYCAP_BOOST,
+      );
+    }
 
     // 2. 非 Admin 用户添加权限过滤
     if (accessibleTopicIds !== null) {
@@ -240,10 +338,21 @@ export class SearchService {
       .take(pageSize)
       .getManyAndCount();
 
+    // 零命中可观测（计划 §2.6：四路搜索零命中分支各调一次）
+    if (total === 0) {
+      logSearchZeroHit(this.logger, {
+        surface: 'message',
+        query: q,
+        queryTruncated: compiled.queryTruncated,
+        armTruncatedCount: compiled.armTruncatedCount,
+      });
+    }
+
     // 3. 批量获取高亮摘要
     const highlights = await this.fetchMessageHighlights(
       entities.map((e) => e.id),
-      q,
+      compiled,
+      group,
     );
 
     // 4. 批量解析发送者信息（一次查询完成，避免 N+1）
@@ -285,17 +394,31 @@ export class SearchService {
     pageSize: number,
     actor?: UnifiedActor,
   ): Promise<PaginatedResponse<TaskSearchResult>> {
+    // 空查询短路返回空（契约③按面枚举；同 searchMessages 头注）
+    const compiled = compileQuery(q);
+    if (compiled.isEmpty) {
+      return this.buildPaginatedResponse([], 0, page, pageSize);
+    }
+    const group = buildSearchSql(
+      {
+        vector: 'task.search_vector',
+        text: "COALESCE(task.title, '') || ' ' || COALESCE(task.description, '')",
+      },
+      compiled,
+      { startSel: '<<<', stopSel: '>>>' },
+    ) as SearchSqlGroup;
     const accessibleBoardIds = await this.accessQuery.getAccessibleBoardIds(actor);
 
-    // 1. 构建基础查询
+    // 1. 构建基础查询（不挂 K-gate——主脑裁决 #2）
     const qb = this.taskRepo
       .createQueryBuilder('task')
-      .addSelect('ts_rank(task.search_vector, plainto_tsquery(:q))', 'rank')
+      .addSelect(group.scoreExpr, 'rank')
       .innerJoin('task.list', 'bl')
       .innerJoin('bl.board', 'b')
       .leftJoin('b.topic', 'top')
-      .where('task.search_vector @@ plainto_tsquery(:q)', { q })
-      .andWhere('task.deleted_at IS NULL');
+      .where(group.prefilterExpr)
+      .andWhere('task.deleted_at IS NULL')
+      .setParameter(COMPILED_Q_PARAM, compiled.tsquery);
 
     // 2. 非 Admin 用户添加权限过滤
     if (accessibleBoardIds !== null) {
@@ -315,10 +438,21 @@ export class SearchService {
       .take(pageSize)
       .getManyAndCount();
 
+    // 零命中可观测（计划 §2.6）
+    if (total === 0) {
+      logSearchZeroHit(this.logger, {
+        surface: 'task',
+        query: q,
+        queryTruncated: compiled.queryTruncated,
+        armTruncatedCount: compiled.armTruncatedCount,
+      });
+    }
+
     // 3. 批量获取高亮摘要
     const highlights = await this.fetchTaskHighlights(
       entities.map((e) => e.id),
-      q,
+      compiled,
+      group,
     );
 
     // 4. 批量推断 boardId/topicId（通过 listId → board_list → board 链路）
@@ -360,12 +494,23 @@ export class SearchService {
    * - Admin（getAccessibleDocSpaceIds 返回 null）→ 全量空间
    * - 普通用户 → 可访问空间白名单；空白名单由 DocSearchService 内部短路返回 []
    */
-  private async searchDocs(q: string, actor?: UnifiedActor): Promise<DocSearchHitWithSpace[]> {
+  private async searchDocs(
+    q: string,
+    actor?: UnifiedActor,
+    traceId?: string | null,
+  ): Promise<DocSearchHitWithSpace[]> {
     const accessibleSpaceIds = await this.accessQuery.getAccessibleDocSpaceIds(actor);
-    const hits = await this.docSearchService.search(accessibleSpaceIds, {
-      q,
-      limit: GLOBAL_DOC_SEARCH_LIMIT,
-    });
+    // v1.86 起 doc-search 返回信封 `{ hits, hint? }`（主脑裁决 #1）；全局检索信封无
+    // hint 槽位（计划 §2.6 只约定空间内搜索与 task q= 两路 hint），此处只取 hits
+    const { hits } = await this.docSearchService.search(
+      accessibleSpaceIds,
+      {
+        q,
+        limit: GLOBAL_DOC_SEARCH_LIMIT,
+      },
+      // 全局检索的 doc 段同样可能被重排（判别能力启用时）；traceId 仅作日志线索
+      { actor: actor ?? null, traceId: traceId ?? null },
+    );
 
     if (hits.length === 0) return [];
 
@@ -385,45 +530,49 @@ export class SearchService {
   }
 
   /**
-   * 批量获取消息的高亮摘要
+   * 批量获取消息的高亮摘要（`<<<>>>` 通道；headline 作用于**单字化文本**——原文 CJK
+   * 巨 token 零高亮；产物经 cleanupHeadlineSnippet 清理单字化空格/标记残留）。
+   * 显式 'simple' 点位：文档侧解析 regconfig（tsquery 已由编译器产出，无隐式点位）。
    * @returns Map<messageId, highlight>
    */
-  private async fetchMessageHighlights(ids: string[], q: string): Promise<Map<string, string>> {
+  private async fetchMessageHighlights(
+    ids: string[],
+    compiled: CompiledQuery,
+    group: SearchSqlGroup,
+  ): Promise<Map<string, string>> {
     if (ids.length === 0) return new Map();
 
     const rows = await this.messageRepo
       .createQueryBuilder('m')
       .select('m.id', 'id')
-      .addSelect(
-        "ts_headline('simple', m.content, plainto_tsquery(:q), 'StartSel=<<<,StopSel=>>>')",
-        'highlight',
-      )
+      .addSelect(group.headlineExpr, 'highlight')
       .where('m.id IN (:...ids)', { ids })
-      .setParameter('q', q)
+      .setParameter(COMPILED_Q_PARAM, compiled.tsquery)
       .getRawMany<{ id: string; highlight: string }>();
 
-    return new Map(rows.map((r) => [r.id, r.highlight]));
+    return new Map(rows.map((r) => [r.id, cleanupHeadlineSnippet(r.highlight)]));
   }
 
   /**
-   * 批量获取任务的高亮摘要
+   * 批量获取任务的高亮摘要（通道与清理纪律同 fetchMessageHighlights）。
    * @returns Map<taskId, highlight>
    */
-  private async fetchTaskHighlights(ids: string[], q: string): Promise<Map<string, string>> {
+  private async fetchTaskHighlights(
+    ids: string[],
+    compiled: CompiledQuery,
+    group: SearchSqlGroup,
+  ): Promise<Map<string, string>> {
     if (ids.length === 0) return new Map();
 
     const rows = await this.taskRepo
-      .createQueryBuilder('t')
-      .select('t.id', 'id')
-      .addSelect(
-        "ts_headline('simple', COALESCE(t.title, '') || ' ' || COALESCE(t.description, ''), plainto_tsquery(:q), 'StartSel=<<<,StopSel=>>>')",
-        'highlight',
-      )
-      .where('t.id IN (:...ids)', { ids })
-      .setParameter('q', q)
+      .createQueryBuilder('task')
+      .select('task.id', 'id')
+      .addSelect(group.headlineExpr, 'highlight')
+      .where('task.id IN (:...ids)', { ids })
+      .setParameter(COMPILED_Q_PARAM, compiled.tsquery)
       .getRawMany<{ id: string; highlight: string }>();
 
-    return new Map(rows.map((r) => [r.id, r.highlight]));
+    return new Map(rows.map((r) => [r.id, cleanupHeadlineSnippet(r.highlight)]));
   }
 
   /**

@@ -189,7 +189,10 @@ export interface Message {
 export interface UnreadSummary {
   /** 话题 ID */
   topicId: string;
-  /** 未读数量（全量，不受 limit 影响） */
+  /**
+   * 未读数量（全量，不受 limit 影响）；**自己发的消息不计入未读**（v1.85，
+   * 与 messages/hasMore 同口径，覆盖无游标/锚点悬空的降级路径）
+   */
   unreadCount: number;
   /** 最后阅读的消息 ID */
   lastReadMessageId?: string;

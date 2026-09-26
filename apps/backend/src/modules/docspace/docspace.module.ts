@@ -37,6 +37,7 @@ import { DiagramService } from './diagram.service';
 import { DiagramRendererService } from './diagram-renderer.service';
 import { DiagramController } from './diagram.controller';
 import { AttachmentModule } from '../attachments/attachment.module';
+import { JudgmentModule } from '../judgment/judgment.module';
 
 /**
  * DocSpace 模块。
@@ -73,6 +74,9 @@ import { AttachmentModule } from '../attachments/attachment.module';
     BoardModule,
     EventModule,
     AuditModule,
+    // 判别内核（v1.85.0 批次 3）：搜索重排的闸门/调用/日志行都走内核的通用编排
+    // （`JudgmentRunnerService`）。方向是单向的：内核不认识 docspace。
+    JudgmentModule,
     // bundle formatVersion 2 媒体段（P2 批 5）：媒体读写全在 attachments 模块内聚，
     // 本模块只消费门面——双向 forwardRef 的代价说明见类注释
     forwardRef(() => AttachmentModule),

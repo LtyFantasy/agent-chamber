@@ -7,7 +7,12 @@
  * 统一的"永不 throw"契约不能因为"理论不可达"就破坏。
  */
 import { NoopJudgmentProvider } from './noop.judgment-provider';
-import type { JudgmentOutcome } from './judgment-provider.interface';
+import type { JudgmentOutcome } from './judgment-capability.interface';
+import { experienceRecordCheckCapability } from '../experience/judgment/judgment-rubric';
+import type { ExperienceCheckInput } from '../experience/judgment/judgment-rubric';
+
+/** 任意输入（noop 不读它；只为满足 `run` 的入参形状） */
+const ANY_INPUT = {} as ExperienceCheckInput;
 
 describe('NoopJudgmentProvider（provider=none）', () => {
   it('enabled=false（调用点据此短路：不调用、不写日志、不占额度）', () => {
@@ -16,8 +21,11 @@ describe('NoopJudgmentProvider（provider=none）', () => {
     expect(noop.name).toBe('none');
   });
 
-  it('误调 checkEntry 也不抛（保持"永不 throw"契约）', async () => {
-    const outcome: JudgmentOutcome = await new NoopJudgmentProvider().checkEntry();
+  it('误调 run 也不抛（保持"永不 throw"契约）', async () => {
+    const outcome: JudgmentOutcome = await new NoopJudgmentProvider().run(
+      experienceRecordCheckCapability,
+      ANY_INPUT,
+    );
     expect(outcome.status).toBe('error');
   });
 });

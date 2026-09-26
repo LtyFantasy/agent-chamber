@@ -62,6 +62,7 @@
  */
 import {
   Injectable,
+  Logger,
   NotFoundException,
   BadRequestException,
   ConflictException,
@@ -115,7 +116,15 @@ import { AuditService } from '../audit/audit.service';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { AuditAction } from '@agent-chamber/shared';
 import type { PaginatedResponse, TaskSummary } from '@agent-chamber/shared';
+import { TASK_SEARCH_WEAK_HIT_SCORE, TASK_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
 import type { TaskDocLinkItem } from '@agent-chamber/shared';
+import { compileQuery, type CompiledQuery } from '../../common/utils/search/tsquery-compiler';
+import {
+  buildSearchSql,
+  COMPILED_Q_PARAM,
+  type SearchSqlGroup,
+} from '../../common/utils/search/search-sql';
+import { logSearchZeroHit } from '../../common/utils/search/zero-hit-log';
 
 export interface TaskWithBlockers extends Task {
   blockers?: TaskDependency[];
@@ -167,6 +176,8 @@ export interface TaskPatchDescriptionResult {
 
 @Injectable()
 export class TaskService {
+  private readonly logger = new Logger(TaskService.name);
+
   constructor(
     @InjectRepository(Task)
     private taskRepo: Repository<Task>,
@@ -226,7 +237,7 @@ export class TaskService {
   async findAll(
     query: QueryTaskDto,
     actor?: UnifiedActor,
-  ): Promise<PaginatedResponse<TaskSummary>> {
+  ): Promise<PaginatedResponse<TaskSummary> & { hint?: string }> {
     const page = Math.max(1, +(query.page ?? 1));
     const pageSize = Math.min(100, Math.max(1, +(query.pageSize ?? query.limit ?? 20)));
 
@@ -296,14 +307,44 @@ export class TaskService {
       qb.andWhere('task.labels @> :labels', { labels: query.labels });
     }
 
-    if (query.q) {
-      // 复用 search_vector 进行全文搜索
-      const trimmedQ = query.q.trim();
-      if (trimmedQ) {
-        qb.andWhere("task.search_vector @@ plainto_tsquery('simple', :tsquery)", {
-          tsquery: trimmedQ,
+    // ── q= 全文检索（v1.86 中文根治接线：compiled + rank 通道 + hint 信封加性键）────
+    const trimmedQ = query.q?.trim() ?? '';
+    let compiled: CompiledQuery | null = null;
+    let searchGroup: SearchSqlGroup | null = null;
+    if (trimmedQ) {
+      compiled = compileQuery(trimmedQ);
+      if (compiled.isEmpty) {
+        // 空查询短路返回空（契约③按面枚举：search.service/task q= → 短路——纯标点/
+        // 全剥离查询落这里）。这是「检索无结果」不是缺省列表请求：零命中日志 + hint 照常
+        logSearchZeroHit(this.logger, {
+          surface: 'task',
+          query: trimmedQ,
+          queryTruncated: compiled.queryTruncated,
+          armTruncatedCount: compiled.armTruncatedCount,
         });
+        return {
+          items: [],
+          total: 0,
+          page: +page,
+          pageSize: +pageSize,
+          totalPages: 0,
+          hasNext: false,
+          hasPrev: false,
+          hint: TASK_SEARCH_ZERO_HIT_HINT,
+        };
       }
+      // 不挂 K-gate（主脑裁决 #2：messages/tasks 只换 compiled `@@` + ts_rank_cd rank，
+      // 召回语义变更未授权不做）；`:compiledQ` 只经 setParameter 下发（F1 硬约束），
+      // SQL 侧经导出组 `to_tsquery('simple', …)` 包裹（tsqueryin 原子语义防线，1-b 实证）
+      searchGroup = buildSearchSql(
+        {
+          vector: 'task.search_vector',
+          text: "COALESCE(task.title, '') || ' ' || COALESCE(task.description, '')",
+        },
+        compiled,
+        { startSel: '<<<', stopSel: '>>>' },
+      ) as SearchSqlGroup;
+      qb.andWhere(searchGroup.prefilterExpr).setParameter(COMPILED_Q_PARAM, compiled.tsquery);
     }
 
     if (query.unblocked) {
@@ -324,7 +365,17 @@ export class TaskService {
       );
     }
 
-    if (query.sort === 'statusPriority') {
+    if (searchGroup !== null) {
+      // rank 通道（有 q 时接管排序——搜索请求的相关度是表达意图；先例 search.service.ts
+      // searchTasks，B-55 纪律：skip/take + innerJoin + orderBy('rank') 必须显式
+      // addSelect rank 否则 TypeORM 0.3.30 distinctAlias 类错误）。cd flag 0 直接作 rank；
+      // 次键 createdAt DESC + id ASC 兜底全序（PG 不保证无主序时跨页稳定）。
+      // 注：q 与 sort=statusPriority 同现时 rank 通道优先（q 的相关度语义是搜索意图本体）。
+      qb.addSelect(searchGroup.scoreExpr, 'rank')
+        .orderBy('rank', 'DESC')
+        .addOrderBy('task.createdAt', 'DESC')
+        .addOrderBy('task.id', 'ASC');
+    } else if (query.sort === 'statusPriority') {
       // 状态优先级排序（opt-in）：in_progress > todo > blocked > backlog > 其余
       // （review/done/archived 恒末位）。CASE 权重越小越靠前；updatedAt DESC 次键 +
       // id ASC 第三键兜底稳定分页（PG 不保证无主序时跨页稳定，plan 架构师修订）。
@@ -352,7 +403,23 @@ export class TaskService {
     }
     qb.skip((page - 1) * pageSize).take(pageSize);
 
-    const [items, total] = await qb.getManyAndCount();
+    let items: Task[];
+    let total: number;
+    /** 本页最高 rank（有 q 时用于弱命中 hint 判定；page-max 口径与 doc-search 一致） */
+    let pageTopRank: number | undefined;
+    if (searchGroup !== null) {
+      // 有 q：取实体页 + raw rank 值（getRawAndEntities 的 raw 与 entities 按索引对应）
+      // + 独立 count（与 getManyAndCount 同为两条查询，成本不变）
+      const [{ entities, raw }, count] = await Promise.all([qb.getRawAndEntities(), qb.getCount()]);
+      items = entities;
+      total = count;
+      const ranks = (raw as Record<string, unknown>[])
+        .map((row) => Number(row['rank']))
+        .filter((value) => Number.isFinite(value));
+      pageTopRank = ranks.length > 0 ? Math.max(...ranks) : undefined;
+    } else {
+      [items, total] = await qb.getManyAndCount();
+    }
 
     // 批量解析 assignee 档案（统一批 A2：走公共 ActorProfileService——withDeleted 覆盖
     // 软删 actor，回退链统一 agents.name || displayName，避免 N+1，保持 IN 批次形态）
@@ -394,6 +461,26 @@ export class TaskService {
     });
 
     const totalPages = Math.ceil(total / pageSize);
+    // hint 信封加性键（主脑裁决 #1，零破坏）：仅 q= 检索时可能触发——零命中（落零命中
+    // 日志）或本页最高 rank < TASK_SEARCH_WEAK_HIT_SCORE（0.3）。
+    // ⚠️ 本面 rank 通道是**裸** ts_rank_cd（未乘 SEARCH_TS_W1）⇒ 尺度与"cd 单点 0.1 ×
+    // W1=1.0"的基准线一致，直接读基准值；**不要**换成 doc-search 侧的
+    // DOC_SEARCH_WEAK_HIT_SCORE（那是基准 × W1 的现构，本面会整体失效——两侧分家见
+    // 主脑裁决 R4，批次 1-d2）
+    let hint: string | undefined;
+    if (compiled !== null) {
+      if (total === 0) {
+        logSearchZeroHit(this.logger, {
+          surface: 'task',
+          query: trimmedQ,
+          queryTruncated: compiled.queryTruncated,
+          armTruncatedCount: compiled.armTruncatedCount,
+        });
+        hint = TASK_SEARCH_ZERO_HIT_HINT;
+      } else if (pageTopRank !== undefined && pageTopRank < TASK_SEARCH_WEAK_HIT_SCORE) {
+        hint = TASK_SEARCH_ZERO_HIT_HINT;
+      }
+    }
     return {
       items: enrichedItems,
       total,
@@ -402,6 +489,7 @@ export class TaskService {
       totalPages,
       hasNext: page < totalPages,
       hasPrev: page > 1,
+      ...(hint !== undefined ? { hint } : {}),
     };
   }
 

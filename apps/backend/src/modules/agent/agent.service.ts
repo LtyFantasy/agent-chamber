@@ -36,6 +36,10 @@
  *     非法 ISO / 空窗口(from≥to) / 跨度>90d → 400 VALIDATION_ERROR
  *   - dailyActivity 行不再返回 tokenUsage 键（shared 类型 optional）；
  *     前端 page.tsx:197 条件渲染，不显示假 "0 tokens"
+ *   - findMyUnreadCounts（GET /agents/me/unread）裸 SQL 的未读判据（v1.85）=
+ *     未软删 **且 sender_id ≠ 自己**（`m.sender_id <> tp.participant_id` 写在该
+ *     LEFT JOIN 的 ON 子句内）；与 TopicService.getUnread 同口径——改任一侧必须
+ *     同步另一侧 + test/agent-unread.e2e-spec.ts（真 PG，mock 测不出 SQL 生成）
  *
  * [关联代码]
  *   - agent.controller.ts stats/heartbeat — 权限（JwtOrApiKeyGuard + ensureCan 'write'）+ @ApiQuery
@@ -497,17 +501,24 @@ export class AgentService {
   /**
    * 跨 topic 未读消息计数（GET /agents/me/unread，plan forge-jubilee-robin.md WS-B）。
    *
-   * 语义与 TopicService.getUnread（topic.service.ts:1241-1309）逐条对齐：
-   * - 无游标（last_read_message_id IS NULL）→ 该 topic 全量未删消息计数；
+   * 语义与 TopicService.getUnread 逐条对齐（以函数名为锚，不引用易漂的行号）：
+   * - 无游标（last_read_message_id IS NULL）→ 该 topic 全量未读计数（未软删且非自发）；
    * - 游标消息已软删 → 锚点 join 落空（a.deleted_at IS NULL）→ 降级全量；
-   * - 自己发的消息计入（无 sender 过滤，与 getUnread 同语义）；
+   * - **自己发的消息不计入未读**：主路径靠「发送即已读」游标（v1.69，发送事务内
+   *   单调推进发送者游标），本 SQL 再在 messages 的 ON 条件里加
+   *   `m.sender_id <> tp.participant_id`，兜住游标缺失/锚点悬空的降级路径
+   *   （v1.85 与 getUnread 同口径收口：两边都显式排自发）；
    * - 仅统计 status IN ('invited','active') 的参与行（left 排除，me/topics 同口径）；
    * - 已软删 topic 排除；只返回 unreadCount > 0 的 topic，最多 50 条
    *   （按未读数 DESC、updated_at DESC 排序，截断安全）。
    *
+   * sender 判据只用单列 sender_id：messages.sender_type 列已被 ActorUnification
+   * migration（1781364902335）DROP，且 actors 统一根表 PK（users/agents PK=FK）使
+   * human/agent 跨类型 uuid 碰撞结构上不可能。
+   *
    * 为什么裸 SQL：跨 topic 聚合 + 行值比较 (created_at, id) 一条 SQL 精确复刻
    * getUnread 语义，避免 N+1 逐 topic 查询；行值比较在 DB 内做（微秒精度，
-   * 避免 JS Date 毫秒截断误算锚点自身，同 getUnread :1287 注释）。
+   * 避免 JS Date 毫秒截断误算锚点自身，同 getUnread 的 E3-fix 注释）。
    *
    * @param actorId 当前 actor id
    * @returns TopicUnreadCount[]（无参与/全已读 → 空数组）
@@ -519,6 +530,7 @@ export class AgentService {
        JOIN topics t ON t.id = tp.topic_id AND t.deleted_at IS NULL
        LEFT JOIN messages a ON a.id = tp.last_read_message_id AND a.deleted_at IS NULL
        LEFT JOIN messages m ON m.topic_id = tp.topic_id AND m.deleted_at IS NULL
+         AND m.sender_id <> tp.participant_id
          AND (a.id IS NULL OR (m.created_at, m.id) > (a.created_at, a.id))
        WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}','${ParticipantStatus.ACTIVE}')
        GROUP BY t.id, t.title

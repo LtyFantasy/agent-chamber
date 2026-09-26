@@ -270,7 +270,8 @@ export class AgentController {
     description:
       'Unread message counts per topic for the current agent (cross-topic, plan forge-jubilee-robin.md WS-B). ' +
       'Semantics: only participation rows with status invited/active are counted (left rows excluded); ' +
-      'messages sent by myself ARE counted (the read cursor advances only via get_topic_digest default markRead=true or explicit mark_topic_read); ' +
+      'messages sent by myself are NOT counted (a send advances my own read cursor in the same transaction, ' +
+      'and the count query additionally excludes sender_id = participant_id to cover cursor-less/degraded paths); ' +
       'topics with unreadCount=0 are omitted; at most 50 topics, ordered by unreadCount DESC then topic updatedAt DESC; ' +
       'the result is a snapshot at call time — get_topic_digest(markRead=true) resets these counts.',
   })

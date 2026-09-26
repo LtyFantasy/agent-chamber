@@ -17,7 +17,7 @@ import {
   JUDGMENT_PROVIDERS,
   type JudgmentConfig,
   type JudgmentProviderName,
-} from '../../../config/judgment.config';
+} from '../../config/judgment.config';
 import { createJudgmentProvider, resolveJudgmentConfig } from './judgment-provider.factory';
 import { NoopJudgmentProvider } from './noop.judgment-provider';
 import { TypeSafeJudgmentProvider } from './typesafe.judgment-provider';
@@ -35,6 +35,11 @@ const BASE_SETTINGS: JudgmentConfig = {
   typesafeModel: null,
   timeoutMs: 8000,
   rateLimitPerHour: 60,
+  globalRateLimitPerHour: 240,
+  capabilityRateLimitPerHour: 120,
+  // 能力白名单缺省空集（除恒启用的 record_check 外全关）——与 config 工厂缺省一致
+  capabilities: [],
+  warnings: [],
 };
 
 function settingsOf(overrides: Partial<JudgmentConfig>): JudgmentConfig {
@@ -117,6 +122,11 @@ describe('judgment-provider.factory', () => {
         typesafeModel: null,
         timeoutMs: 8000,
         rateLimitPerHour: 60,
+        // 三级成本闸缺省 + 能力白名单空集 + 无配置来源（未 load 工厂）⇒ 无可告警项
+        globalRateLimitPerHour: 240,
+        capabilityRateLimitPerHour: 120,
+        capabilities: [],
+        warnings: [],
       });
       expect(createJudgmentProvider(configServiceOf(undefined))).toBeInstanceOf(
         NoopJudgmentProvider,
@@ -280,6 +290,43 @@ describe('judgment-provider.factory', () => {
       const provider = createJudgmentProvider(configServiceOf(settingsOf({ provider: 'none' })));
 
       expect(provider).toBeInstanceOf(NoopJudgmentProvider);
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // config warnings 透传打印（v1.85.0 批 1：配置组合异常必须响亮）
+  // ══════════════════════════════════════════════════════════════════════════
+
+  describe('config warnings 透传打印', () => {
+    it('warnings 逐条 warn（一行一条）+ **不影响分派结果**（配置异常不阻断启动）', () => {
+      // 本文件其他用例会改 `process.env.JUDGMENT_PROVIDER`（且不还原）⇒ 这里显式清掉，
+      // 否则退役值 warn 会混进来搅乱计数
+      delete process.env.JUDGMENT_PROVIDER;
+
+      const provider = createJudgmentProvider(
+        configServiceOf(
+          settingsOf({
+            warnings: [
+              'JUDGMENT_GLOBAL_RATE_LIMIT is not a positive integer — falling back to the default of 240 per hour (global) (the configured value was ignored).',
+              'JUDGMENT_CAPABILITY_RATE_LIMIT (200/h) exceeds JUDGMENT_GLOBAL_RATE_LIMIT (100/h) — the per-capability sub-limit can never bind.',
+            ],
+          }),
+        ),
+      );
+
+      expect(provider).toBeInstanceOf(NoopJudgmentProvider); // 分派照旧
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      const text = loggedText(warnSpy);
+      expect(text).toContain('JUDGMENT_GLOBAL_RATE_LIMIT');
+      expect(text).toContain('JUDGMENT_CAPABILITY_RATE_LIMIT');
+    });
+
+    it('无 warnings（缺省组合 / 兜底形状）→ 零 warn（默认部署不刷屏）', () => {
+      delete process.env.JUDGMENT_PROVIDER;
+
+      createJudgmentProvider(configServiceOf(settingsOf({})));
+
       expect(warnSpy).not.toHaveBeenCalled();
     });
   });

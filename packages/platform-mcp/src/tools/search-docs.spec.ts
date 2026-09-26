@@ -35,19 +35,23 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([
-      {
-        docId: 'd1',
-        docPath: 'docs/arch.md',
-        docTitle: 'Architecture',
-        headingPath: '2 Design',
-        position: 1,
-        snippet: 'The system uses...',
-        contentTruncated: false,
-        score: 0.95,
-        internalField: 'should-be-stripped',
-      },
-    ]);
+    request.mockResolvedValueOnce({
+      // v1.86 起上游为信封 `{ hits, hint? }`（主脑裁决 #1）：mock 必须镜像真实响应形态，
+      // 喂裸数组会让投影恒空（终审 BLOCKER-2：3 例因裸数组 mock 恒红却无人见）
+      hits: [
+        {
+          docId: 'd1',
+          docPath: 'docs/arch.md',
+          docTitle: 'Architecture',
+          headingPath: '2 Design',
+          position: 1,
+          snippet: 'The system uses...',
+          contentTruncated: false,
+          score: 0.95,
+          internalField: 'should-be-stripped',
+        },
+      ],
+    });
 
     const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'architecture' }, ctx());
 
@@ -74,27 +78,29 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([
-      {
-        docId: 'd1',
-        docPath: 'docs/a.md',
-        docTitle: 'A',
-        headingPath: null,
-        position: 0,
-        snippet: 's',
-        score: 0.3,
-        boosts: { route: 'primary', taskLinks: 4 },
-      },
-      {
-        docId: 'd2',
-        docPath: 'docs/b.md',
-        docTitle: 'B',
-        headingPath: null,
-        position: 0,
-        snippet: 's',
-        score: 0.2,
-      },
-    ]);
+    request.mockResolvedValueOnce({
+      hits: [
+        {
+          docId: 'd1',
+          docPath: 'docs/a.md',
+          docTitle: 'A',
+          headingPath: null,
+          position: 0,
+          snippet: 's',
+          score: 0.3,
+          boosts: { route: 'primary', taskLinks: 4 },
+        },
+        {
+          docId: 'd2',
+          docPath: 'docs/b.md',
+          docTitle: 'B',
+          headingPath: null,
+          position: 0,
+          snippet: 's',
+          score: 0.2,
+        },
+      ],
+    });
 
     const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
@@ -109,18 +115,20 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([
-      {
-        docId: 'd1',
-        docPath: 'docs/x.md',
-        docTitle: 'X',
-        headingPath: null,
-        position: 0,
-        snippet: 'long...',
-        contentTruncated: true,
-        score: 0.5,
-      },
-    ]);
+    request.mockResolvedValueOnce({
+      hits: [
+        {
+          docId: 'd1',
+          docPath: 'docs/x.md',
+          docTitle: 'X',
+          headingPath: null,
+          position: 0,
+          snippet: 'long...',
+          contentTruncated: true,
+          score: 0.5,
+        },
+      ],
+    });
 
     const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
@@ -133,7 +141,7 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ hits: [] });
 
     await searchDocsTool.handler(
       {
@@ -162,7 +170,7 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ hits: [] });
 
     await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
@@ -175,7 +183,7 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ hits: [] });
 
     await searchDocsTool.handler(
       {
@@ -201,7 +209,7 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ hits: [] });
 
     await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
@@ -260,12 +268,44 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
-    request.mockResolvedValueOnce([]);
+    request.mockResolvedValueOnce({ hits: [] });
 
     const result = await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx());
 
     const text = result.content[0].text;
     expect(text).not.toContain('\n  ');
     expect(() => JSON.parse(text)).not.toThrow();
+  });
+
+  it('hint 透传：信封带 hint 时原样产出（缺省不产出该键）', async () => {
+    // 1-d2 终审补：`search-docs.ts` 的 hint 条件分支此前零覆盖——它是零命中/弱命中/
+    // 降级位置序三类引导的**唯一出口**（消费方 Agent 的行为指令），必须钉住两种形态。
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({
+      hits: [],
+      hint: 'No sections strongly matched. Try shorter 2-4 character domain terms.',
+    });
+
+    const withHint = JSON.parse(
+      (await searchDocsTool.handler({ spaceName: 'My Docs', q: '不存在的词' }, ctx())).content[0]
+        .text,
+    );
+    expect(withHint.hits).toEqual([]);
+    expect(withHint.hint).toContain('No sections strongly matched');
+
+    // 缺省（信封无 hint 键）⇒ 响应里也不产出 hint 键（additive 契约，老客户端无感）
+    const plain = mockRequest();
+    plain.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    plain.mockResolvedValueOnce({ hits: [] });
+
+    const withoutHint = JSON.parse(
+      (await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx())).content[0].text,
+    );
+    expect(withoutHint).not.toHaveProperty('hint');
   });
 });

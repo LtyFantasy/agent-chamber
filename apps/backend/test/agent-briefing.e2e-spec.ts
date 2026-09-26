@@ -431,8 +431,15 @@ describe('GET /agents/me/briefing — 真实 PG 集成（HTTP 层 + API Key）',
     return tasks;
   }
 
-  /** 建 topic + agent 参与行（active）+ 2 条消息（1 短 1 超长 >300 字符），返回 id 与原文 */
-  async function createTopicWithMessages(agentId: string): Promise<{
+  /**
+   * 建 topic + agent 参与行（active）+ 消息，返回 id 与原文。
+   * - 2 条自己发（1 短 1 超长 >300 字符）：recentActivities 截断断言用（my recent output）
+   * - 2 条 otherSenderId 发：unreadCounts 断言用（v1.85 自发消息不计未读）
+   */
+  async function createTopicWithMessages(
+    agentId: string,
+    otherSenderId: string,
+  ): Promise<{
     topicId: string;
     topicName: string;
     shortMsgId: string;
@@ -486,6 +493,19 @@ describe('GET /agents/me/briefing — 真实 PG 集成（HTTP 层 + API Key）',
     );
     created.messageIds.push(longMsg.id);
 
+    // 他人发的 2 条（无游标、未软删）→ 未读计数 = 2；自己那 2 条被 sender 排除
+    for (let i = 0; i < 2; i++) {
+      const otherMsg = await ds.getRepository(Message).save(
+        ds.getRepository(Message).create({
+          topicId: topic.id,
+          senderId: otherSenderId,
+          type: MessageType.CHAT,
+          content: `B other message ${i} ${runSuffix()}`,
+        }),
+      );
+      created.messageIds.push(otherMsg.id);
+    }
+
     return {
       topicId: topic.id,
       topicName: topic.title,
@@ -511,8 +531,12 @@ describe('GET /agents/me/briefing — 真实 PG 集成（HTTP 层 + API Key）',
       }),
     );
     created.depIds.push(dep.id);
+    // 未读断言需要「他人发的」消息（v1.85 自发消息不计未读）；
+    // sender 用完整 agent fixture（actor + agents + api_key 行）——裸 actors 行缺
+    // agents profile，不是线上真实形态，解析链会退化到 displayName 兜底
+    const { agent: otherSender } = await createOwnerAndAgent();
     const { topicId, topicName, shortMsgId, shortContent, longMsgId, longContent } =
-      await createTopicWithMessages(agent.id);
+      await createTopicWithMessages(agent.id, otherSender.id);
 
     const res = await request(app.getHttpServer())
       .get('/api/v1/agents/me/briefing')
@@ -588,7 +612,7 @@ describe('GET /agents/me/briefing — 真实 PG 集成（HTTP 层 + API Key）',
     expect(data.activeTasks.items[2].hasBlockers).toBe(false);
     expect(data.activeTasks.items[3].hasBlockers).toBe(false);
 
-    // ── unreadCounts：2 条消息无游标 → 2 ──
+    // ── unreadCounts：他人发的 2 条消息（无游标）+ 自己那 2 条被排除 → 2 ──
     expect(data.unreadCounts).toEqual([{ topicId, topicName, unreadCount: 2 }]);
 
     // ── recentActivities：message 条目 content 截断（>300 → 300 + contentTruncated）──

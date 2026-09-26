@@ -1351,8 +1351,12 @@ describe('AgentService', () => {
       expect(sql).toContain('(m.created_at, m.id) > (a.created_at, a.id)'); // 行值比较 after 语义
       expect(sql).toContain('HAVING COUNT(m.id) > 0'); // 只返 unreadCount>0
       expect(sql).toContain('LIMIT 50');
-      // 自己发的计入：无 sender 过滤（与 getUnread 同语义）
-      expect(sql).not.toContain('sender_id');
+      // 自发排除（v1.85）：messages 的 ON 条件带 m.sender_id <> tp.participant_id，
+      // 兜住游标缺失/悬空的降级路径（与 getUnread 同口径）
+      expect(sql).toContain('m.sender_id <> tp.participant_id');
+      // sender 判据只用单列 sender_id：messages.sender_type 列已被 ActorUnification
+      // migration（1781364902335）DROP，写回裸 SQL 必然运行期报错 → 回归门禁
+      expect(sql).not.toContain('sender_type');
     });
 
     it('should return empty array when no participation rows', async () => {

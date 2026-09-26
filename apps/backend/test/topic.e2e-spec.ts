@@ -800,7 +800,9 @@ describe('TopicController (e2e)', () => {
     const unreadMsg1 = {
       id: 'msg-6',
       topicId: '00000000-0000-4000-8000-000000000001',
-      senderId: '00000000-0000-4000-8000-000000000005',
+      // 他人（≠ 请求者 ...005）发送：v1.85 未读语义下自发消息不计未读，
+      // 夹具若把 self 消息摆成未读形态，等于把已废语义固化为期望形态
+      senderId: '00000000-0000-4000-8000-000000000006',
       senderType: 'human',
       content: 'unread-1',
       replyToId: null,
@@ -826,6 +828,12 @@ describe('TopicController (e2e)', () => {
         displayName: 'Test User',
         avatarUrl: null,
       },
+      {
+        id: '00000000-0000-4000-8000-000000000006',
+        type: 'human',
+        displayName: 'Test User',
+        avatarUrl: null,
+      },
     ]);
     // 统一批 A1：公共解析服务（actor-profile.service）改走 createQueryBuilder withDeleted 路径
     mockRepos.Actor.createQueryBuilder.mockReturnValue({
@@ -833,17 +841,23 @@ describe('TopicController (e2e)', () => {
       addSelect: jest.fn().mockReturnThis(),
       withDeleted: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
-      getMany: jest
-        .fn()
-        .mockResolvedValue([
-          {
-            id: '00000000-0000-4000-8000-000000000005',
-            type: 'human',
-            displayName: 'Test User',
-            avatarUrl: null,
-            deletedAt: null,
-          },
-        ]),
+      getMany: jest.fn().mockResolvedValue([
+        {
+          id: '00000000-0000-4000-8000-000000000005',
+          type: 'human',
+          displayName: 'Test User',
+          avatarUrl: null,
+          deletedAt: null,
+        },
+        // 未读消息发送者（≠ 请求者 ...005）：profile 解析出真名，senderName 断言不随夹具改动
+        {
+          id: '00000000-0000-4000-8000-000000000006',
+          type: 'human',
+          displayName: 'Test User',
+          avatarUrl: null,
+          deletedAt: null,
+        },
+      ]),
     });
     mockRepos.User.findBy.mockResolvedValue([
       { id: '00000000-0000-4000-8000-000000000005', displayName: 'Test User', avatarUrl: null },

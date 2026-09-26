@@ -20,6 +20,14 @@
 #       第二期补充：experience_judgments 的两条索引**可见**（已进 [B] 段，DESC 排序不改变
 #       可见性），但其 **DESC 全序语义与表级 reloptions 不在本门禁的比对面内**——那两项由
 #       test/experience.e2e-spec.ts 的 indexdef / pg_class.reloptions 断言守卫。
+# 本次新增（2026-09-25 DocSpace 检索预过滤批）：[B] 段 +1 条
+#       `idx_doc_sections_heading_path_trgm`（migration 1791000000000）——检索预过滤
+#       `heading_path % :q` 分支的 GIN trgm 索引（建在**裸列**上；COALESCE 会破坏匹配）。
+#       实体侧刻意零 `@Index`（同形先例 1790200000000 的两条 judgments 索引）：GIN + opclass
+#       是 TypeORM 元数据表达不了的形态，加 `@Index` 只会让未来 generate 产出 **btree** 误建。
+#       守卫 = test/doc-search-prefilter.e2e-spec.ts §⑤ 的 indexdef 断言
+#       （含 `USING gin` + `gin_trgm_ops`，另断言它确实是迁移链产物）。
+#       ⚠️ 同属人工注释：重写会丢失本段，请照上文补回。
 # =============================================================================
 # [A] 命名差异 — 迁移显式名（idx_*/uq_*/显式 FK 名）↔ 实体隐式 @Index 期望的 IDX_<hash>；可修（改实体声明名），属另一个工程 —— 36 条
 ALTER TABLE "board_members" ADD CONSTRAINT "FK_ca2c72a39c80199717012df3932" FOREIGN KEY ("board_id") REFERENCES "boards"("id") ON DELETE CASCADE ON UPDATE NO ACTION    # A
@@ -59,7 +67,7 @@ DROP INDEX "public"."idx_docs_space_id"    # A
 DROP INDEX "public"."idx_milestones_board_id"    # A
 DROP INDEX "public"."idx_task_doc_links_doc_id"    # A
 #
-# [B] 裸 SQL 产物 — TypeORM 表达不了或实体未建模：GIN trgm/tsvector 索引、部分唯一索引、chk_* CHECK、attachments 显式 FK（曾含"部分索引重建对"，2026-09-19 实证系列可空性漂移的下游产物，随 C 类清偿自动消失——见文件头注释） —— 25 条
+# [B] 裸 SQL 产物 — TypeORM 表达不了或实体未建模：GIN trgm/tsvector 索引、部分唯一索引、chk_* CHECK、attachments 显式 FK（曾含"部分索引重建对"，2026-09-19 实证系列可空性漂移的下游产物，随 C 类清偿自动消失——见文件头注释） —— 26 条
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_doc_id_fkey"    # B
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_topic_id_fkey"    # B
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_uploader_id_fkey"    # B
@@ -68,6 +76,7 @@ ALTER TABLE "doc_spaces" DROP CONSTRAINT "chk_doc_spaces_binding"    # B
 ALTER TABLE "experience_feedback" DROP CONSTRAINT "experience_feedback_experience_id_fkey"    # B
 ALTER TABLE "topic_participants" DROP CONSTRAINT "chk_tp_active_has_joined_at"    # B
 DROP INDEX "public"."idx_doc_sections_content_trgm"    # B
+DROP INDEX "public"."idx_doc_sections_heading_path_trgm"    # B
 DROP INDEX "public"."idx_doc_sections_search_vector"    # B
 DROP INDEX "public"."idx_docs_source_sha"    # B
 DROP INDEX "public"."idx_docs_title_trgm"    # B

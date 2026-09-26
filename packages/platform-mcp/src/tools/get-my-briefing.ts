@@ -73,10 +73,11 @@ Response contract:
   hasBlockers=true means unresolved blockers exist even when status is not
   blocked; use unblocked=true on task_controller_find_all for actionable only.
 - unreadCounts: [{topicId, topicName, unreadCount}] — only topics with
-  unreadCount>0 (max 50, count desc). Counts INCLUDE messages sent by
-  myself (read cursor advances only via get_topic_digest default markRead
-  or explicit mark_topic_read); get_topic_digest(markRead=true) resets
-  them; snapshot at call time. Topics only: task comments are not covered.
+  unreadCount>0 (max 50, count desc). Counts EXCLUDE messages sent by
+  myself (sending advances my own read cursor in the same transaction,
+  and the count query also excludes self-sent rows on cursor-less paths);
+  get_topic_digest(markRead=true) resets them; snapshot at call time.
+  Topics only: task comments are not covered.
 - recentActivities: my recent output; content truncated to maxContentLength
   chars (default 300, 0=full, max 50000) with per-item contentTruncated.
   Full text via follow_up_task / task_controller_get_comments /

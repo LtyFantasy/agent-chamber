@@ -6,6 +6,10 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
+import { JudgmentRunnerService } from '../judgment/judgment-runner.service';
+import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
+import { DOC_SEARCH_WEAK_HIT_SCORE } from '../../common/utils/search/search-tuning';
+import { DOC_SEARCH_STRONG_HIT_SCORE, DOC_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
 
 // ─── Mock helpers ──────────────────────────────────────────────
 
@@ -20,6 +24,7 @@ function createMockQueryBuilder(overrides: Record<string, jest.Mock> = {}) {
     where: jest.fn().mockReturnThis(),
     andWhere: jest.fn().mockReturnThis(),
     setParameter: jest.fn().mockReturnThis(),
+    setParameters: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
     addOrderBy: jest.fn().mockReturnThis(),
     groupBy: jest.fn().mockReturnThis(),
@@ -102,6 +107,16 @@ describe('DocSearchService', () => {
   let mockRouteQb: ReturnType<typeof createMockQueryBuilder>;
   let mockTaskLinkQb: ReturnType<typeof createMockQueryBuilder>;
 
+  /**
+   * 判别重排编排器 mock（v1.85.0 批次 3）：**默认未启用**（`isEnabled` 恒 false）——
+   * 既有用例因此全部走原路径，断言与未接入判别前逐字节一致。
+   */
+  let judgment: {
+    isEnabled: jest.Mock;
+    run: jest.Mock;
+    recordSkip: jest.Mock;
+  };
+
   beforeEach(async () => {
     // ── Subquery mock ──
     mockSubQb = createMockQueryBuilder();
@@ -140,6 +155,13 @@ describe('DocSearchService', () => {
     mockTaskLinkRepo = taskLinkRepoPair;
     (mockTaskLinkRepo.createQueryBuilder as jest.Mock).mockReturnValue(mockTaskLinkQb);
 
+    // 判别重排编排器：缺省未启用（能力未开）——用例按需打开并注入逐候选档位
+    judgment = {
+      isEnabled: jest.fn().mockReturnValue(false),
+      run: jest.fn().mockResolvedValue({ status: 'disabled' }),
+      recordSkip: jest.fn().mockResolvedValue(true),
+    };
+
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
         DocSearchService,
@@ -147,6 +169,9 @@ describe('DocSearchService', () => {
         { provide: getRepositoryToken(Doc), useValue: mockDocRepo },
         { provide: getRepositoryToken(DocRoute), useValue: mockRouteRepo },
         { provide: getRepositoryToken(TaskDocLink), useValue: mockTaskLinkRepo },
+        // 判别重排的编排器（v1.85.0 批次 3）：默认**未启用** ⇒ 既有用例全走原路径
+        // （与未接入判别前的行为逐字节一致——这正是"重排是可选增强"的验证基础）
+        { provide: JudgmentRunnerService, useValue: judgment },
       ],
     }).compile();
 
@@ -168,7 +193,7 @@ describe('DocSearchService', () => {
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
-    const hits = await service.search(['space-1'], { q: '搜索' });
+    const { hits } = await service.search(['space-1'], { q: '搜索' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0].score).toBeGreaterThan(0);
@@ -194,13 +219,15 @@ describe('DocSearchService', () => {
 
     // The ts_headline query builder (2nd manager.createQueryBuilder call)
     const mockHeadlineQb = createMockQueryBuilder({
-      getRawOne: jest.fn().mockResolvedValue({ headline: 'This is the <b>full</b> section content.' }),
+      getRawOne: jest
+        .fn()
+        .mockResolvedValue({ headline: 'This is the <b>full</b> section content.' }),
     });
     (mockSectionRepo.manager.createQueryBuilder as jest.Mock)
       .mockReturnValueOnce(mockOuterQb)
       .mockReturnValueOnce(mockHeadlineQb);
 
-    const hits = await service.search(['space-1'], { q: 'full' });
+    const { hits } = await service.search(['space-1'], { q: 'full' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0].score).toBeGreaterThan(0);
@@ -209,9 +236,7 @@ describe('DocSearchService', () => {
 
   // ─── Test 2b: ts_headline options 串语法（bug 9082464c 回归）─────
   it('builds ts_headline with double-quoted empty sels and explicit simple regconfig', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0.15, score: 0.15 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0.15, score: 0.15 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
     const mockHeadlineQb = createMockQueryBuilder({
@@ -227,8 +252,11 @@ describe('DocSearchService', () => {
     // 会被吞为 StartSel 的值（`,StopSel=` 残渣）；空值必须双引号包裹。
     const headlineSql = (mockHeadlineQb.select as jest.Mock).mock.calls[0][0] as string;
     expect(headlineSql).toContain('StartSel="", StopSel=""');
-    // regconfig 必须与 search() 双路打分 ts_rank 的 'simple' 一致（否则高亮位置漂移）
-    expect(headlineSql).toContain("plainto_tsquery('simple', :q)");
+    // v1.86 中文根治：headline 作用于**单字化文本**（原文 CJK 巨 token 零高亮），
+    // tsquery 经 `:compiledQ` 绑定下发（regconfig 仍显式 'simple'，与打分通道一致）
+    expect(headlineSql).toContain(
+      `ts_headline('simple', cjk_unigram_text(s.content), to_tsquery('simple', :compiledQ)`,
+    );
   });
 
   // ─── Test 3: Mixed scoring sorts by composite score DESC ─────
@@ -236,7 +264,12 @@ describe('DocSearchService', () => {
     const rawRows = [
       makeRawRow({ doc_id: 'doc-a', score: 0.5, ts_rank_score: 0, trgm_content_score: 0.5 / 0.6 }),
       makeRawRow({ doc_id: 'doc-c', score: 0.15, ts_rank_score: 0.15, trgm_content_score: 0 }),
-      makeRawRow({ doc_id: 'doc-b', score: 1.2, ts_rank_score: 1.0, trgm_content_score: 0.2 / 0.6 }),
+      makeRawRow({
+        doc_id: 'doc-b',
+        score: 1.2,
+        ts_rank_score: 1.0,
+        trgm_content_score: 0.2 / 0.6,
+      }),
     ];
     // getRawMany already returns them in DB order (ORDER BY is in SQL). Since neither
     // route nor task-link boosts apply in this test, the post-boost re-sort is a no-op —
@@ -252,7 +285,7 @@ describe('DocSearchService', () => {
       .mockReturnValueOnce(mockHeadlineQb)
       .mockReturnValueOnce(mockHeadlineQb);
 
-    const hits = await service.search(['space-1'], { q: 'test' });
+    const { hits } = await service.search(['space-1'], { q: 'test' });
 
     expect(hits).toHaveLength(3);
     // Since DB does ORDER BY score DESC, rows are passed through as-is
@@ -267,7 +300,7 @@ describe('DocSearchService', () => {
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
-    const hits = await service.search(['space-1'], { q: 'noise' });
+    const { hits } = await service.search(['space-1'], { q: 'noise' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0].docId).toBe('doc-keep');
@@ -286,10 +319,7 @@ describe('DocSearchService', () => {
     await service.search(['space-1'], { q: 'test', tag: 'combat' });
 
     // Verify subquery includes tag condition
-    expect(mockSubQb.andWhere).toHaveBeenCalledWith(
-      ':tagVal = ANY(d.tags)',
-      { tagVal: 'combat' },
-    );
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith(':tagVal = ANY(d.tags)', { tagVal: 'combat' });
   });
 
   // ─── Test 6: Type filter ─────────────────────────────────────
@@ -299,10 +329,9 @@ describe('DocSearchService', () => {
     await service.search(['space-1'], { q: 'test', type: 'architecture' });
 
     // Verify subquery includes type condition
-    expect(mockSubQb.andWhere).toHaveBeenCalledWith(
-      'd.doc_type = :docType',
-      { docType: 'architecture' },
-    );
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.doc_type = :docType', {
+      docType: 'architecture',
+    });
   });
 
   // ─── Test 7: Snippet ≤ 300 chars + contentTruncated ──────────
@@ -325,7 +354,7 @@ describe('DocSearchService', () => {
       .mockReturnValueOnce(mockOuterQb)
       .mockReturnValueOnce(mockHeadlineQb);
 
-    const hits = await service.search(['space-1'], { q: 'test' });
+    const { hits } = await service.search(['space-1'], { q: 'test' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0].snippet.length).toBeLessThanOrEqual(SNIPPET_MAX_CHARS);
@@ -344,7 +373,7 @@ describe('DocSearchService', () => {
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
-    const hits = await service.search(['space-1'], { q: 'test' });
+    const { hits } = await service.search(['space-1'], { q: 'test' });
 
     expect(hits).toHaveLength(1);
     // Must NOT contain sectionId
@@ -362,7 +391,7 @@ describe('DocSearchService', () => {
 
   // ─── Test 9: Empty space whitelist returns empty array ───────
   it('should return empty array immediately when accessibleSpaceIds is empty', async () => {
-    const hits = await service.search([], { q: 'test' });
+    const { hits } = await service.search([], { q: 'test' });
 
     expect(hits).toEqual([]);
     // createQueryBuilder('s') IS called before the empty check (line 127)
@@ -400,10 +429,9 @@ describe('DocSearchService', () => {
     await service.search(['space-1'], { q: 'test', category: 'architecture' });
 
     // Verify subquery includes category condition
-    expect(mockSubQb.andWhere).toHaveBeenCalledWith(
-      'dc.slug = :catSlug',
-      { catSlug: 'architecture' },
-    );
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('dc.slug = :catSlug', {
+      catSlug: 'architecture',
+    });
   });
 
   // ─── Bonus: Space whitelist with IDs adds IN filter ──────────
@@ -413,10 +441,9 @@ describe('DocSearchService', () => {
     await service.search(['space-1', 'space-2'], { q: 'test' });
 
     // Subquery should have IN filter on space_id
-    expect(mockSubQb.andWhere).toHaveBeenCalledWith(
-      'd.space_id IN (:...spaceIds)',
-      { spaceIds: ['space-1', 'space-2'] },
-    );
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.space_id IN (:...spaceIds)', {
+      spaceIds: ['space-1', 'space-2'],
+    });
   });
 
   // ─── Bonus: Trgm fallback snippet for non-English matches ────
@@ -432,7 +459,7 @@ describe('DocSearchService', () => {
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
-    const hits = await service.search(['space-1'], { q: '中文搜索' });
+    const { hits } = await service.search(['space-1'], { q: '中文搜索' });
 
     expect(hits).toHaveLength(1);
     // snippet should be built from content via buildTrgmSnippet (not ts_headline)
@@ -445,14 +472,12 @@ describe('DocSearchService', () => {
   // ─── 三路融合 boost（plan §4-C3）───────────────────────────────
 
   it('should boost primaryDocId hits by ×1.5 and expose boosts.route=primary', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // doc-1 是命中路由（intent 0.5 ≥ 0.15）的 primaryDoc
     mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
 
-    const hits = await service.search(['space-1'], { q: '架构' });
+    const { hits } = await service.search(['space-1'], { q: '架构' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
@@ -464,32 +489,32 @@ describe('DocSearchService', () => {
   });
 
   it('should boost secondaryDocId hits by ×1.2 and expose boosts.route=secondary', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // doc-1 是命中路由（intent 0.4 ≥ 0.15）的 secondaryDoc
     mockRouteQb.getRawMany.mockResolvedValue([
-      makeRouteRow({ primary_doc_id: 'doc-other', secondary_doc_id: 'doc-1', intent_similarity: '0.4' }),
+      makeRouteRow({
+        primary_doc_id: 'doc-other',
+        secondary_doc_id: 'doc-1',
+        intent_similarity: '0.4',
+      }),
     ]);
 
-    const hits = await service.search(['space-1'], { q: '再看' });
+    const { hits } = await service.search(['space-1'], { q: '再看' });
 
     expect(hits[0].score).toBeCloseTo(0.2 * 1.2, 6);
     expect(hits[0].boosts).toEqual({ route: 'secondary' });
   });
 
   it('route threshold: intent 0.14 misses (no boost), 0.15 hits (×1.5, ≥ semantics)', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
     // 0.14 < ROUTE_INTENT_FLOOR(0.15) → 不命中
     mockRouteQb.getRawMany.mockResolvedValue([
       makeRouteRow({ intent_similarity: '0.14', category_similarity: '0' }),
     ]);
-    let hits = await service.search(['space-1'], { q: '边界' });
+    let { hits } = await service.search(['space-1'], { q: '边界' });
     expect(hits[0].score).toBeCloseTo(0.2, 6);
     expect(hits[0].boosts).toBeUndefined();
 
@@ -497,29 +522,27 @@ describe('DocSearchService', () => {
     mockRouteQb.getRawMany.mockResolvedValue([
       makeRouteRow({ intent_similarity: '0.15', category_similarity: '0' }),
     ]);
-    hits = await service.search(['space-1'], { q: '边界' });
+    ({ hits } = await service.search(['space-1'], { q: '边界' }));
     expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
     expect(hits[0].boosts).toEqual({ route: 'primary' });
   });
 
   it('route threshold: category 0.29 misses, 0.3 hits (intent can be zero)', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
 
     // 0.29 < ROUTE_CATEGORY_FLOOR(0.3) 且 intent=0 → 不命中
     mockRouteQb.getRawMany.mockResolvedValue([
       makeRouteRow({ intent_similarity: '0', category_similarity: '0.29' }),
     ]);
-    let hits = await service.search(['space-1'], { q: '分类' });
+    let { hits } = await service.search(['space-1'], { q: '分类' });
     expect(hits[0].boosts).toBeUndefined();
 
     // 0.3 = ROUTE_CATEGORY_FLOOR → 命中（category 单独达标即命中）
     mockRouteQb.getRawMany.mockResolvedValue([
       makeRouteRow({ intent_similarity: '0', category_similarity: '0.3' }),
     ]);
-    hits = await service.search(['space-1'], { q: '分类' });
+    ({ hits } = await service.search(['space-1'], { q: '分类' }));
     expect(hits[0].score).toBeCloseTo(0.2 * 1.5, 6);
     expect(hits[0].boosts).toEqual({ route: 'primary' });
   });
@@ -533,11 +556,21 @@ describe('DocSearchService', () => {
     // doc-1：route A 的 primary（×1.5）+ route B 的 secondary（×1.2）→ 取 1.5，绝不叠加 1.8
     // doc-2：route A 的 secondary（×1.2）
     mockRouteQb.getRawMany.mockResolvedValue([
-      makeRouteRow({ id: 'r1', primary_doc_id: 'doc-1', secondary_doc_id: 'doc-2', intent_similarity: '0.5' }),
-      makeRouteRow({ id: 'r2', primary_doc_id: 'doc-3', secondary_doc_id: 'doc-1', intent_similarity: '0.4' }),
+      makeRouteRow({
+        id: 'r1',
+        primary_doc_id: 'doc-1',
+        secondary_doc_id: 'doc-2',
+        intent_similarity: '0.5',
+      }),
+      makeRouteRow({
+        id: 'r2',
+        primary_doc_id: 'doc-3',
+        secondary_doc_id: 'doc-1',
+        intent_similarity: '0.4',
+      }),
     ]);
 
-    const hits = await service.search(['space-1'], { q: '架构' });
+    const { hits } = await service.search(['space-1'], { q: '架构' });
 
     const doc1 = hits.find((h) => h.docId === 'doc-1')!;
     const doc2 = hits.find((h) => h.docId === 'doc-2')!;
@@ -562,7 +595,7 @@ describe('DocSearchService', () => {
       makeTaskLinkRow('doc-8', 8),
     ]);
 
-    const hits = await service.search(['space-1'], { q: '任务' });
+    const { hits } = await service.search(['space-1'], { q: '任务' });
 
     const byId = (id: string) => hits.find((h) => h.docId === id)!;
     expect(byId('doc-3').score).toBeCloseTo(0.2 * 1.15, 6);
@@ -583,13 +616,18 @@ describe('DocSearchService', () => {
   it('boost only re-ranks: hit set after boost equals hit set from SQL (floor already applied)', async () => {
     const rawRows = [
       makeRawRow({ doc_id: 'doc-keep', ts_rank_score: 0, trgm_content_score: 0.15, score: 0.09 }),
-      makeRawRow({ doc_id: 'doc-top', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({
+        doc_id: 'doc-top',
+        ts_rank_score: 0,
+        trgm_content_score: 0.2 / 0.6,
+        score: 0.2,
+      }),
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // doc-keep 是命中路由 primary（0.09×1.5=0.135）——boost 只重排，不得增加/移除命中
     mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow({ primary_doc_id: 'doc-keep' })]);
 
-    const hits = await service.search(['space-1'], { q: 'noise' });
+    const { hits } = await service.search(['space-1'], { q: 'noise' });
 
     expect(hits).toHaveLength(2);
     expect(hits.map((h) => h.docId).sort()).toEqual(['doc-keep', 'doc-top']);
@@ -598,13 +636,11 @@ describe('DocSearchService', () => {
   });
 
   it('omits boosts key when no route or task-link boost applies', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2, score: 0.12 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2, score: 0.12 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // 路由与任务链接均无命中（默认空结果）
 
-    const hits = await service.search(['space-1'], { q: 'plain' });
+    const { hits } = await service.search(['space-1'], { q: 'plain' });
 
     expect(hits).toHaveLength(1);
     expect(hits[0]).not.toHaveProperty('boosts');
@@ -612,14 +648,12 @@ describe('DocSearchService', () => {
   });
 
   it('exposes both route and taskLinks keys when both boosts apply', async () => {
-    const rawRows = [
-      makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-    ];
+    const rawRows = [makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 })];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
     mockTaskLinkQb.getRawMany.mockResolvedValue([makeTaskLinkRow('doc-1', 2)]);
 
-    const hits = await service.search(['space-1'], { q: '架构' });
+    const { hits } = await service.search(['space-1'], { q: '架构' });
 
     expect(hits[0].score).toBeCloseTo(0.2 * 1.5 * 1.1, 6); // 1.5 × (1 + 2×0.05)
     expect(hits[0].boosts).toEqual({ route: 'primary', taskLinks: 2 });
@@ -627,21 +661,43 @@ describe('DocSearchService', () => {
 
   it('re-sorts ties by position ASC after boost (same final score)', async () => {
     const rawRows = [
-      makeRawRow({ doc_id: 'doc-a', section_position: 1, ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-      makeRawRow({ doc_id: 'doc-b', section_position: 0, ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
+      makeRawRow({
+        doc_id: 'doc-a',
+        section_position: 1,
+        ts_rank_score: 0,
+        trgm_content_score: 0.2 / 0.6,
+        score: 0.2,
+      }),
+      makeRawRow({
+        doc_id: 'doc-b',
+        section_position: 0,
+        ts_rank_score: 0,
+        trgm_content_score: 0.2 / 0.6,
+        score: 0.2,
+      }),
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // 无 boost，同分 → position ASC（SQL 结果序 doc-a 在前，重排后 doc-b 在前）
 
-    const hits = await service.search(['space-1'], { q: 'tie' });
+    const { hits } = await service.search(['space-1'], { q: 'tie' });
 
     expect(hits.map((h) => h.docId)).toEqual(['doc-b', 'doc-a']);
   });
 
   it('re-ranks hits by boosted score DESC (boosted doc overtakes higher base score)', async () => {
     const rawRows = [
-      makeRawRow({ doc_id: 'doc-plain', ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
-      makeRawRow({ doc_id: 'doc-boost', ts_rank_score: 0, trgm_content_score: 0.17 / 0.6, score: 0.17 }),
+      makeRawRow({
+        doc_id: 'doc-plain',
+        ts_rank_score: 0,
+        trgm_content_score: 0.2 / 0.6,
+        score: 0.2,
+      }),
+      makeRawRow({
+        doc_id: 'doc-boost',
+        ts_rank_score: 0,
+        trgm_content_score: 0.17 / 0.6,
+        score: 0.17,
+      }),
     ];
     mockOuterQb.getRawMany.mockResolvedValue(rawRows);
     // doc-boost 是命中路由 primary：0.17 × 1.5 = 0.255 > 0.2 → 反超 doc-plain
@@ -649,7 +705,7 @@ describe('DocSearchService', () => {
       makeRouteRow({ primary_doc_id: 'doc-boost', intent_similarity: '0.5' }),
     ]);
 
-    const hits = await service.search(['space-1'], { q: '架构' });
+    const { hits } = await service.search(['space-1'], { q: '架构' });
 
     expect(hits.map((h) => h.docId)).toEqual(['doc-boost', 'doc-plain']);
     expect(hits[0].score).toBeCloseTo(0.255, 5);
@@ -661,7 +717,7 @@ describe('DocSearchService', () => {
     ]);
     mockRouteQb.getRawMany.mockResolvedValue([makeRouteRow()]);
 
-    const hits = await service.search(null, { q: '架构' });
+    const { hits } = await service.search(null, { q: '架构' });
 
     expect(mockRouteQb.where).not.toHaveBeenCalled();
     expect(hits[0].score).toBeCloseTo(0.3, 6);
@@ -671,7 +727,7 @@ describe('DocSearchService', () => {
   it('skips route/task-link boost queries when no hits pass the floor', async () => {
     mockOuterQb.getRawMany.mockResolvedValue([]);
 
-    const hits = await service.search(['space-1'], { q: 'nothing' });
+    const { hits } = await service.search(['space-1'], { q: 'nothing' });
 
     expect(hits).toEqual([]);
     expect(mockRouteRepo.createQueryBuilder).not.toHaveBeenCalled();
@@ -744,7 +800,7 @@ describe('DocSearchService', () => {
       makeRawRow({ ts_rank_score: 0, trgm_content_score: 0.2 / 0.6, score: 0.2 }),
     ]);
 
-    const hits = await service.search(['space-1'], { q: 'test', sort: 'createdAt_desc' });
+    const { hits } = await service.search(['space-1'], { q: 'test', sort: 'createdAt_desc' });
 
     expect(mockOuterQb.orderBy).toHaveBeenCalledWith('sub.doc_created_at', 'DESC');
     expect(mockOuterQb.addOrderBy).toHaveBeenCalledWith('sub.section_position', 'ASC');
@@ -778,5 +834,275 @@ describe('DocSearchService', () => {
 
     expect(mockOuterQb.orderBy).toHaveBeenCalledWith('score', 'DESC');
     expect(mockRouteRepo.createQueryBuilder).toHaveBeenCalled();
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 零命中日志 + 弱命中线（计划 §2.6 四路之一；主脑裁决 R4）
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe('零命中日志与弱命中线', () => {
+    it('零命中分支落 logSearchZeroHit（surface=doc）+ 零命中 hint', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        mockOuterQb.getRawMany.mockResolvedValue([]);
+
+        const res = await service.search(['space-1'], { q: '端口映射失效' });
+
+        expect(res.hits).toEqual([]);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({
+          surface: 'doc',
+          query: '端口映射失效',
+        });
+        expect(res.hint).toBe(DOC_SEARCH_ZERO_HIT_HINT);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('弱命中线读**现构** DOC_SEARCH_WEAK_HIT_SCORE（= 基准 0.3 × W1，R4）', async () => {
+      // 旧口径直读基准 0.3：W1=3 时 cd 单点恰好 0.3 ⇒ `0.3 < 0.3` 为假 ⇒ 弱命中分支整体失效
+      // （1-d1 实测 3~4 条 → 0 条）。故取现构线的两侧各测一次：线内触发、线外不触发。
+      const below = async (score: number): Promise<string | undefined> => {
+        mockOuterQb.getRawMany.mockResolvedValue([makeRawRow({ score })]);
+        const res = await service.search(['space-1'], { q: '端口映射失效' });
+        return res.hint;
+      };
+
+      expect(await below(DOC_SEARCH_WEAK_HIT_SCORE * 0.5)).toBe(DOC_SEARCH_ZERO_HIT_HINT);
+      expect(await below(DOC_SEARCH_WEAK_HIT_SCORE * 1.5)).toBeUndefined();
+      // 前提自证：现构线必须**高于**基准线（否则本用例退化成旧口径的等价物）
+      expect(DOC_SEARCH_WEAK_HIT_SCORE).toBeGreaterThan(DOC_SEARCH_STRONG_HIT_SCORE);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 判别重排（v1.85.0 批次 3）：只在"能力启用 + agent + relevance + 窗口内 + 池非空 +
+  // 可见性全 open"时启用；其余一切结局都走原路径（逐字节一致）
+  // ═══════════════════════════════════════════════════════════════════════
+  describe('判别重排（agent + 能力启用）', () => {
+    const AGENT = { id: 'agent-1', type: 'agent' } as never;
+    const HUMAN = { id: 'human-1', type: 'human' } as never;
+
+    /** 池：8 条（limit=5 ⇒ poolSize=15，池不满）；score 递减，便于断言 SQL 序 */
+    function poolRows(overrides: (index: number) => Record<string, unknown> = () => ({})) {
+      return Array.from({ length: 8 }, (_, index) =>
+        makeRawRow({
+          doc_id: `doc-${index}`,
+          doc_path: `docs/${index}.md`,
+          doc_title: `Doc ${index}`,
+          section_position: index,
+          // ts_rank=0 ⇒ 走 trgm snippet 路径（**不触发 ts_headline 的额外 SQL**：mock 的
+          // `from` 被覆写成"工厂函数"形态，字符串 from 会炸——既有用例同款约定）
+          ts_rank_score: 0,
+          trgm_content_score: 0.2,
+          trgm_heading_score: 0,
+          score: 1 - index / 10, // 递减：SQL 序 = doc-0..doc-7
+          ...overrides(index),
+        }),
+      );
+    }
+
+    beforeEach(() => {
+      judgment.isEnabled.mockReturnValue(true);
+      mockRouteQb.getRawMany.mockResolvedValue([]);
+      mockTaskLinkQb.getRawMany.mockResolvedValue([]);
+    });
+
+    it('启用且成功：按模型档位重排返回页 + reranked:true + 条数与 SQL 序相等', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows());
+      // 页外（i≥5）给最高档，页内给最低档 ⇒ 位置带允许页外进页尾 3 槽
+      judgment.run.mockResolvedValue({
+        status: 'ok',
+        value: { tiers: [0, 0, 0, 0, 0, 3, 3, 3] },
+        meta: { provider: 'typesafe', model: 'm', judgedAt: 'now', rubricVersion: 'v1' },
+      });
+
+      const { hits } = await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: AGENT });
+
+      expect(hits.map((hit) => hit.docId)).toEqual(['doc-0', 'doc-1', 'doc-5', 'doc-6', 'doc-7']);
+      expect(hits).toHaveLength(5); // 与 SQL 序路径条数相等
+      expect(hits.every((hit) => hit.reranked === true)).toBe(true);
+      expect(judgment.run).toHaveBeenCalledTimes(1);
+      // 能力名与身份都透传正确（能力=rerank；身份=agent）
+      const [capability, , actor] = judgment.run.mock.calls[0];
+      expect(capability.name).toBe('rerank');
+      expect(actor).toBe(AGENT);
+    });
+
+    it('provider 失败 ⇒ fail-open 回**原路径**（与人类同结果，无 reranked 标记）', async () => {
+      // 终审 MAJOR-3：非成功结局统一走 `searchBySqlOrder` ⇒ 与人类（未启用重排）**逐字同结果**。
+      // 两次查询：① 池查询（LIMIT poolSize）；② 回落原路径（LIMIT limit OFFSET offset）
+      mockOuterQb.getRawMany
+        .mockResolvedValueOnce(poolRows())
+        .mockResolvedValueOnce(poolRows().slice(0, 5));
+      judgment.run.mockResolvedValue({ status: 'timeout' });
+
+      const { hits } = await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: AGENT });
+
+      expect(hits.map((hit) => hit.docId)).toEqual(['doc-0', 'doc-1', 'doc-2', 'doc-3', 'doc-4']);
+      expect(hits.some((hit) => hit.reranked === true)).toBe(false);
+    });
+
+    it('NEW-4：重排路径同样透传时间窗过滤（createdAfter/createdBefore 进池查询 WHERE）', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows());
+      judgment.run.mockResolvedValue({
+        status: 'ok',
+        value: { tiers: [0, 0, 0, 0, 0, 3, 3, 3] },
+        meta: { provider: 'typesafe', model: 'm', judgedAt: 'now', rubricVersion: 'v1' },
+      });
+
+      await service.search(
+        ['space-1'],
+        {
+          q: 'test',
+          limit: 5,
+          createdAfter: '2026-08-08T00:00:00.000Z',
+          createdBefore: '2026-08-15T23:59:59.999Z',
+        },
+        { actor: AGENT },
+      );
+
+      // 池查询与原路径共用 `buildScoredQuery` ⇒ 时间窗谓词必须同样出现在子查询 WHERE 上
+      // （`searchWithRerank` 的 filters 形参若窄化掉时间窗，这里会因"查不到谓词"而红）
+      expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.created_at >= :createdAfter', {
+        createdAfter: '2026-08-08T00:00:00.000Z',
+      });
+      expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.created_at <= :createdBefore', {
+        createdBefore: '2026-08-15T23:59:59.999Z',
+      });
+      // 且重排确实生效（不是提前回退）
+      expect(judgment.run).toHaveBeenCalledTimes(1);
+    });
+
+    it('MAJOR-3：**带 boost 且 boost 跨过页边界**时，非成功结局仍与人类结果有序相同', async () => {
+      // 判别性构造（复审 NEW-1）：夹具 score = 1 − index/10 ⇒ doc-5 = 0.5，被 primary route
+      // 加成 ×1.5 = **0.75 > doc-3 的 0.7** ⇒ 按"池内 boost 序" doc-5 能挤进 `slice(0,5)`；
+      // 而原路径是"先 SQL 取页（doc-0..doc-4）、再页内 boost"⇒ doc-5 不该出现。
+      // ⚠️ 旧夹具用 doc-7（0.3×1.5 = 0.45 < doc-4 的 0.6）**不具判别性**：池切片同样不含它，
+      // 旧实现照样绿（复审指出的测试强度缺陷）。
+      mockOuterQb.getRawMany
+        .mockResolvedValueOnce(poolRows())
+        .mockResolvedValueOnce(poolRows().slice(0, 5));
+      mockRouteQb.getRawMany.mockResolvedValue([
+        makeRouteRow({
+          primary_doc_id: 'doc-5',
+          intent_similarity: '0.9',
+          category_similarity: '0',
+        }),
+      ]);
+      judgment.run.mockResolvedValue({ status: 'timeout' });
+
+      const { hits: agentHits } = await service.search(
+        ['space-1'],
+        { q: 'test', limit: 5 },
+        { actor: AGENT },
+      );
+
+      // 人类（未启用重排）：同一条原路径（单次查询）
+      mockOuterQb.getRawMany.mockReset();
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows().slice(0, 5));
+      const { hits: humanHits } = await service.search(
+        ['space-1'],
+        { q: 'test', limit: 5 },
+        { actor: HUMAN },
+      );
+
+      expect(agentHits.map((hit) => hit.docId)).toEqual(humanHits.map((hit) => hit.docId));
+      // 页外候选 doc-5 **不得**因 boost 被拉进页（池切片会把它排到第 4 位 = 本用例的判别点）
+      expect(agentHits.map((hit) => hit.docId)).not.toContain('doc-5');
+    });
+
+    it('人类身份 ⇒ 走原路径（不调用判别、web 面不受判别延迟影响）', async () => {
+      // SQL 会按 LIMIT 5 只返回 5 行，mock 不模拟 LIMIT ⇒ 夹具直接给 5 行（模拟真实返回）
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows().slice(0, 5));
+      const { hits } = await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: HUMAN });
+      expect(judgment.run).not.toHaveBeenCalled();
+      expect(hits.map((hit) => hit.docId)).toEqual(['doc-0', 'doc-1', 'doc-2', 'doc-3', 'doc-4']);
+    });
+
+    it('越窗页（offset 不是 limit 的整数倍 / offset+limit > poolSize）⇒ 原路径', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows().slice(0, 5));
+      const { hits } = await service.search(
+        ['space-1'],
+        { q: 'test', limit: 5, offset: 3 },
+        { actor: AGENT },
+      );
+      expect(judgment.run).not.toHaveBeenCalled();
+      expect(hits).toHaveLength(5);
+    });
+
+    it('池内候选属非 open 空间 ⇒ 跳过重排 + 落 visibility_blocked 标量行 + **不带候选清单**', async () => {
+      mockOuterQb.getRawMany
+        .mockResolvedValueOnce(
+          poolRows((index) =>
+            index === 6 ? { space_visibility: 'private' } : { space_visibility: 'open' },
+          ),
+        ) // ① 池查询（LIMIT poolSize）
+        .mockResolvedValueOnce(poolRows().slice(0, 5)); // ② 回落原路径（LIMIT limit OFFSET offset）
+
+      const { hits } = await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: AGENT });
+
+      expect(judgment.recordSkip).toHaveBeenCalledWith('rerank', AGENT, 'visibility_blocked');
+      expect(judgment.run).not.toHaveBeenCalled();
+      // 回原路径（不是池切片）：结果与未启用重排时一致
+      expect(hits.map((hit) => hit.docId)).toEqual(['doc-0', 'doc-1', 'doc-2', 'doc-3', 'doc-4']);
+    });
+
+    it('空池 ⇒ **不发起付费调用**（与既有 rows.length===0 早退同语义）', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+      const { hits } = await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: AGENT });
+      expect(hits).toEqual([]);
+      expect(judgment.run).not.toHaveBeenCalled();
+    });
+
+    it('能力未启用（isEnabled=false）⇒ 完全不碰内核', async () => {
+      judgment.isEnabled.mockReturnValue(false);
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows());
+      await service.search(['space-1'], { q: 'test', limit: 5 }, { actor: AGENT });
+      expect(judgment.run).not.toHaveBeenCalled();
+      // 原路径的 SQL 排序（无池查询的额外 doc_id 平局键）
+      expect(mockOuterQb.orderBy).toHaveBeenCalledWith('score', 'DESC');
+    });
+
+    it('落行载荷含标量集（候选 id / sqlRanks / finalOrderKeys / traceId），且日志与返回同一次求解', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue(poolRows());
+      judgment.run.mockResolvedValue({
+        status: 'ok',
+        value: { tiers: [0, 0, 0, 0, 0, 3, 3, 3] },
+        meta: { provider: 'typesafe', model: 'm', judgedAt: 'now', rubricVersion: 'v1' },
+      });
+
+      await service.search(
+        ['space-1'],
+        { q: 'test', limit: 5 },
+        { actor: AGENT, traceId: 'req_trace1' },
+      );
+
+      const input = judgment.run.mock.calls[0][1] as {
+        plan: { candidates: Array<{ key: string }> };
+        eligibleForPromotion: number;
+        traceId: string | null;
+        decide: (value: unknown) => { finalOrderKeys: string[] | null; sqlTop1Key: string | null };
+      };
+      expect(input.traceId).toBe('req_trace1');
+      expect(input.eligibleForPromotion).toBe(8 - 5); // 页外池行数 = 3
+      expect(input.plan.candidates.map((candidate) => candidate.key)).toEqual([
+        'c0',
+        'c1',
+        'c2',
+        'c3',
+        'c4',
+        'c5',
+        'c6',
+        'c7',
+      ]);
+      // 决策闭包带记忆：第二次调用返回同一对象（日志载荷与返回序读同一次求解）
+      const first = input.decide({ tiers: [0, 0, 0, 0, 0, 3, 3, 3] });
+      const second = input.decide(null);
+      expect(second).toBe(first);
+      expect(first.finalOrderKeys).toEqual(['c0', 'c1', 'c5', 'c6', 'c7', 'c2', 'c3', 'c4']);
+      expect(first.sqlTop1Key).toBe('c0');
+    });
   });
 });

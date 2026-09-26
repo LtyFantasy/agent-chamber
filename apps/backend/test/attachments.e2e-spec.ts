@@ -884,6 +884,13 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     );
     expect(unreadBy.get(m1Id)!.attachments).toEqual(projection);
     expect(unreadBy.get(m2Id)!.attachments).toEqual([]);
+
+    // REST 降级路径（reader 无游标 → 降级分支）行为锁（v1.85）：unreadCount 走真 COUNT
+    // 而非旧 topics.message_count 口径；2 条消息均出自 uploader（≠ 请求者 reader）→ 全计未读；
+    // messages 从话题开头全量给出（2 ≤ limit 50）→ hasMore=false
+    expect(unread.body.data.unreadCount).toBe(2);
+    expect(unread.body.data.messages).toHaveLength(2);
+    expect(unread.body.data.hasMore).toBe(false);
   });
 
   it('sendMessage：他人附件 → 403·12004', async () => {

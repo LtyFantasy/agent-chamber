@@ -13,6 +13,7 @@
  */
 import judgmentConfig, {
   JUDGMENT_PROVIDERS,
+  isJudgmentCapabilityEnabled,
   type JudgmentConfig,
   type JudgmentProviderName,
 } from './judgment.config';
@@ -141,6 +142,9 @@ describe('judgmentConfig', () => {
       'JUDGMENT_PROVIDER',
       'JUDGMENT_TIMEOUT_MS',
       'JUDGMENT_RATE_LIMIT',
+      'JUDGMENT_GLOBAL_RATE_LIMIT',
+      'JUDGMENT_CAPABILITY_RATE_LIMIT',
+      'JUDGMENT_CAPABILITIES',
       'TYPESAFE_BASE_URL',
       'TYPESAFE_API_KEY',
       'TYPESAFE_DEFAULT_MODEL',
@@ -283,5 +287,197 @@ describe('judgmentConfig', () => {
     const config = factory();
     expect(config.provider).toBe('typesafe'); // 请求值原样保留（降级发生在 DI 层）
     expect(config.apiKey).toBeNull();
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 三级成本闸（v1.85.0 批 1）：数值旋钮 + 响亮化 warnings
+  // ══════════════════════════════════════════════════════════════════════════
+
+  it('缺省：三级闸 240 / 120 / 60 + warnings 空数组', () => {
+    clearJudgmentEnv();
+
+    const config = factory();
+    expect(config.globalRateLimitPerHour).toBe(240);
+    expect(config.capabilityRateLimitPerHour).toBe(120);
+    expect(config.rateLimitPerHour).toBe(60);
+    expect(config.warnings).toEqual([]); // 缺省组合（120 ≤ 240）无异常
+  });
+
+  it('两新键合法值生效（小数向下取整；与既有键互不干扰）', () => {
+    clearJudgmentEnv();
+    process.env.JUDGMENT_GLOBAL_RATE_LIMIT = '500';
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = '250.9';
+
+    const config = factory();
+    expect(config.globalRateLimitPerHour).toBe(500);
+    expect(config.capabilityRateLimitPerHour).toBe(250);
+    expect(config.warnings).toEqual([]);
+  });
+
+  it('解析回退（NaN / 非正数）→ 回落缺省**并各产一条 warning**（响亮化）', () => {
+    clearJudgmentEnv();
+    process.env.JUDGMENT_GLOBAL_RATE_LIMIT = 'abc';
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = '-1';
+
+    const config = factory();
+    expect(config.globalRateLimitPerHour).toBe(240);
+    expect(config.capabilityRateLimitPerHour).toBe(120);
+    expect(config.warnings).toHaveLength(2);
+    // 顺序稳定 = 启动日志顺序（超时 / actor / 全局 / 能力）
+    expect(config.warnings[0]).toContain('JUDGMENT_GLOBAL_RATE_LIMIT');
+    expect(config.warnings[1]).toContain('JUDGMENT_CAPABILITY_RATE_LIMIT');
+    // 回显的是**回落缺省值**（已净化片段），不是 env 原值
+    expect(config.warnings[0]).toContain('240');
+  });
+
+  it('空串 / 纯空白 = "未配置"（compose `${VAR:-}`）→ 回落缺省且**零 warning**（误报守卫）', () => {
+    clearJudgmentEnv();
+    for (const blank of ['', '   ']) {
+      process.env.JUDGMENT_GLOBAL_RATE_LIMIT = blank;
+      process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = blank;
+      process.env.JUDGMENT_TIMEOUT_MS = blank;
+      process.env.JUDGMENT_RATE_LIMIT = blank;
+
+      const config = factory();
+      expect(config.warnings).toEqual([]);
+      expect(config.globalRateLimitPerHour).toBe(240);
+      expect(config.capabilityRateLimitPerHour).toBe(120);
+      expect(config.timeoutMs).toBe(8000);
+    }
+  });
+
+  it('warnings **绝不内嵌 env 原值**（喂 key 形态 / 带 userinfo 的畸形值 → 输出不含它们）', () => {
+    clearJudgmentEnv();
+    // 假值**全合成**（仓库密钥纪律 NIT-1）：只借用公开前缀形态，后缀与任何真实 key 无关
+    const fakeKey = 'apikey_deadbeef';
+    process.env.JUDGMENT_GLOBAL_RATE_LIMIT = fakeKey;
+    // 带 userinfo 的 URL 是另一类典型手滑输入（JUDGMENT-USERINFO-LOG 同族）
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = 'https://user:hunter2@example.invalid';
+
+    const warnings = factory().warnings.join('\n');
+    expect(warnings).toContain('JUDGMENT_GLOBAL_RATE_LIMIT'); // 键名可以出现
+    expect(warnings).toContain('JUDGMENT_CAPABILITY_RATE_LIMIT');
+    expect(warnings).not.toContain(fakeKey); // 原值绝不出现
+    expect(warnings).not.toContain('hunter2');
+    expect(warnings).not.toContain('example.invalid');
+    expect(warnings).toContain('240'); // 出现的是回落缺省值
+  });
+
+  it('键间不变量：capability > global ⇒ 一条 warning（不抛错、值原样保留不 clamp）', () => {
+    clearJudgmentEnv();
+    process.env.JUDGMENT_GLOBAL_RATE_LIMIT = '100';
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = '200';
+
+    const config = factory();
+    // 不 clamp：配置组合异常只告警（判别是增强项，配置错误不该阻断启动），实际由更严的闸决定
+    expect(config.globalRateLimitPerHour).toBe(100);
+    expect(config.capabilityRateLimitPerHour).toBe(200);
+    expect(config.warnings).toHaveLength(1);
+    expect(config.warnings[0]).toContain('JUDGMENT_CAPABILITY_RATE_LIMIT');
+    expect(config.warnings[0]).toContain('JUDGMENT_GLOBAL_RATE_LIMIT');
+
+    // 相等是合法组合（子额度与全局闸同时触发）⇒ 不告警
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = '100';
+    expect(factory().warnings).toEqual([]);
+  });
+
+  it('键间不变量：actor > global ⇒ 一条 warning（与 capability>global 同规，终审 F5）', () => {
+    clearJudgmentEnv();
+    process.env.JUDGMENT_GLOBAL_RATE_LIMIT = '10';
+    process.env.JUDGMENT_CAPABILITY_RATE_LIMIT = '10'; // 先把能力级置合法，隔离出 actor 级错配
+    process.env.JUDGMENT_RATE_LIMIT = '50';
+
+    const config = factory();
+    // 不 clamp：只告警（实际由更严的全局闸决定），值与配置一致
+    expect(config.rateLimitPerHour).toBe(50);
+    expect(config.warnings).toHaveLength(1);
+    // 前缀断言：避免 'JUDGMENT_GLOBAL_RATE_LIMIT' 里的子串把 "谁越界" 判错
+    expect(config.warnings[0].startsWith('JUDGMENT_RATE_LIMIT ')).toBe(true);
+    expect(config.warnings[0]).toContain('JUDGMENT_GLOBAL_RATE_LIMIT');
+
+    // 相等同样合法（actor 与全局闸同时触发）⇒ 不告警
+    process.env.JUDGMENT_RATE_LIMIT = '10';
+    expect(factory().warnings).toEqual([]);
+  });
+
+  describe('JUDGMENT_CAPABILITIES（能力白名单；缺省空集）', () => {
+    it('缺省（未配置）→ 空集 + record_check 恒启用（不受本键管辖）', () => {
+      clearJudgmentEnv();
+      const config = factory();
+      expect(config.capabilities).toEqual([]);
+      expect(config.warnings).toEqual([]);
+      // 恒启用：经验库录入判定由 JUDGMENT_PROVIDER 单独管辖
+      expect(isJudgmentCapabilityEnabled(config, 'record_check')).toBe(true);
+      // 受管能力缺省关（出境类功能的唯一可接受缺省）
+      expect(isJudgmentCapabilityEnabled(config, 'rerank')).toBe(false);
+    });
+
+    it('trim / 滤空串 / 小写归一 / 去重（compose 空串与手写空格不得改变语义）', () => {
+      clearJudgmentEnv();
+      // provider 置真：本条只考察**解析**本身，避免组合 warning 混进断言
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.JUDGMENT_CAPABILITIES = ' Rerank ,, rerank ,  ';
+      const config = factory();
+      expect(config.capabilities).toEqual(['rerank']);
+      expect(config.warnings).toEqual([]); // 空白串不算配置错误（不误报）
+      expect(isJudgmentCapabilityEnabled(config, 'rerank')).toBe(true);
+    });
+
+    it('列出 record_check → 一条 warning 且**不入选**（它恒启用，用户多半以为能关它）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_CAPABILITIES = 'record_check';
+      const config = factory();
+      expect(config.capabilities).toEqual([]);
+      expect(config.warnings).toHaveLength(1);
+      expect(config.warnings[0]).toContain('JUDGMENT_CAPABILITIES');
+      expect(config.warnings[0]).toContain('record_check');
+      expect(config.warnings[0]).toContain('ALWAYS on');
+    });
+
+    it('未实现 / 拼错的名字 → 一条 warning（名字经净化）+ 不入选', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_CAPABILITIES = 'autotag, rernak';
+      const config = factory();
+      expect(config.capabilities).toEqual([]);
+      expect(config.warnings).toHaveLength(2);
+      expect(config.warnings[0]).toContain('autotag');
+      expect(config.warnings[1]).toContain('rernak');
+      // 已知值域被点名（用户据此改对拼写）
+      expect(config.warnings[0]).toContain('rerank');
+    });
+
+    it('非法能力名回显被净化：换行被剔除、超长被截断、key 形态脱敏（防伪造日志行/回显密钥）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_CAPABILITIES = `bad\nname, apikey_secret_value, ${'x'.repeat(60)}`;
+      const text = factory().warnings.join('\n');
+      // 换行被剔除 ⇒ 伪造不出第二条日志行；超长被截断
+      expect(text).not.toContain('bad\nname');
+      expect(text).not.toContain('x'.repeat(33));
+      // key 形态只回显前缀 + `***`（绝不回显后缀）
+      expect(text).toContain('apikey_***');
+      expect(text).not.toContain('secret_value');
+    });
+
+    it('配了能力却 provider=none → 组合 warning（"配了却没跑"必须响亮）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'none';
+      process.env.JUDGMENT_CAPABILITIES = 'rerank';
+      const config = factory();
+      expect(config.capabilities).toEqual(['rerank']);
+      expect(config.warnings).toHaveLength(1);
+      expect(config.warnings[0]).toContain('rerank');
+      expect(config.warnings[0]).toContain('JUDGMENT_PROVIDER=none');
+    });
+
+    it('provider=typesafe + 能力 → 零 warning（合法组合不刷屏）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.JUDGMENT_CAPABILITIES = 'rerank';
+      const config = factory();
+      expect(config.capabilities).toEqual(['rerank']);
+      expect(config.warnings).toEqual([]);
+    });
   });
 });

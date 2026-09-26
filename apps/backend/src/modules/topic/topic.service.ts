@@ -31,11 +31,15 @@
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
- *   UNREAD-CURSOR: 游标只在 markAsRead/digest 推进——自己发的消息计入自己未读、
- *       join/邀请后全历史未读（2026-08-28 Kimi-Kairos 反馈采纳）。修复（v1.69）：
- *       发送即已读（AUTO_JOIN_SQL $3 单调推进，含旧锚点软删 NOT EXISTS 逃生口，
- *       与 markAsRead 防回退语义对齐）+ join/邀请建行游标初始化（re-join 保留原
- *       游标=离开期间未读）；行值比较全部 DB 内完成（E3-fix 精度教训）。
+ *   UNREAD-CURSOR: 游标只在 markAsRead/digest 推进；v1.69 起「发送即已读」——
+ *       修复原症状「自己发的消息算自己未读 + join/邀请后全历史未读」
+ *       （2026-08-28 Kimi-Kairos 反馈采纳）：发送即已读（AUTO_JOIN_SQL $3 单调推进，
+ *       含旧锚点软删 NOT EXISTS 逃生口，与 markAsRead 防回退语义对齐）+
+ *       join/邀请建行游标初始化（re-join 保留原游标=离开期间未读）；
+ *       行值比较全部 DB 内完成（E3-fix 精度教训）。**v1.85 收口**：getUnread 的
+ *       降级路径（无游标 / 锚点悬空）不再取 topic.messageCount，改真 COUNT 并统一
+ *       带 sender 排除（buildUnreadMessageQb 单一谓词构造点）→ count/list/hasMore
+ *       同口径，自发消息在任何路径下都不算自己未读。
  *       见 .kimi/plans/unread-cursor-semantics.md。
  *   A2.5: 写入口（inviteAgent/addEditor/create/update 的 invitedAgentIds）统一走
  *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND）。
@@ -1614,12 +1618,18 @@ export class TopicService {
    * 获取话题未读消息数与增量消息列表。
    *
    * 消息全序 = (created_at, id) ASC（plan §2.1 tie-break 契约）。
-   * - 如果参与者没有 lastReadMessageId（首次进入话题/锚点消息已删），
-   *   返回 topic.messageCount 作为 unreadCount，messages 从话题开头取前 limit 条。
+   *
+   * 未读判据（v1.85 收口）：**自己发的消息不算自己未读**（sender_id <> actorId）。
+   * 主路径由「发送即已读」游标（v1.69：sendMessage 事务内单调推进发送者游标）天然排除；
+   * 本方法在 count / list / hasMore 三口径上再显式带上 sender 排除，覆盖游标缺失
+   * （无 participant 行 / lastReadMessageId 为空）与锚点悬空（游标消息被软删）两条
+   * **降级路径**——否则降级会把自发消息误算成未读（旧实现直接取 topic.messageCount）。
+   * - 无游标 → 全量未读 = 该 topic 未删且非自发的消息数，messages 从话题开头取前 limit 条；
    * - 否则返回 lastReadMessageId 之后的新消息数量（全序 after 语义），
    *   以及按全序 ASC 的前 limit 条未读消息。
    *
    * @param query.limit 返回消息条数 1~50，默认 20；不影响 unreadCount
+   * @param actorId 当前 actor；省略时仅返回话题消息总量，不参与未读语义（见下方分支注释）
    */
   async getUnread(
     topicId: string,
@@ -1630,7 +1640,10 @@ export class TopicService {
     const topic = await this.findById(topicId);
     const limit = Math.min(Math.max(Number(query.limit) || 20, 1), 50);
 
-    // ── 无 actorId → 仅返回全量未读数 ──
+    // ── 无 actorId → 仅返回消息总量 ──
+    // 没有 actor 上下文就无从定义「谁的未读」，故回退话题消息总量（含自发、含语义上的
+    // 全量口径），**不参与未读语义**。生产不可达：controller 恒传 actor.id；
+    // 该分支只服务直调 service 的场景（如内部统计），行为与 v1.85 前逐字一致。
     if (!actorId) {
       return { topicId, unreadCount: topic.messageCount, messages: [], hasMore: false };
     }
@@ -1641,13 +1654,9 @@ export class TopicService {
 
     // ── 无有效锚点（从未读过 or 无 participant 行）→ 全量未读，messages 从头给 ──
     if (!participant || !participant.lastReadMessageId) {
-      const messages = await this.fetchUnreadMessages(topicId, null, limit);
-      return {
-        topicId,
-        unreadCount: topic.messageCount,
-        messages,
-        hasMore: topic.messageCount > messages.length,
-      };
+      const unreadCount = await this.countUnreadMessages(topicId, null, actorId);
+      const messages = await this.fetchUnreadMessages(topicId, null, limit, actorId);
+      return { topicId, unreadCount, messages, hasMore: unreadCount > messages.length };
     }
 
     // 锚点存在性校验（软删则降级为全量未读）；谓词用子查询行比较，无需读回 createdAt
@@ -1657,30 +1666,26 @@ export class TopicService {
     });
 
     if (!lastReadMessage) {
-      // 锚点消息已删 → 降级为全量未读，messages 从头给
-      const messages = await this.fetchUnreadMessages(topicId, null, limit);
-      return {
-        topicId,
-        unreadCount: topic.messageCount,
-        messages,
-        hasMore: topic.messageCount > messages.length,
-      };
+      // 锚点消息已删 → 降级为全量未读，messages 从头给（与上一段同谓词，仅 anchor 为 null）
+      const unreadCount = await this.countUnreadMessages(topicId, null, actorId);
+      const messages = await this.fetchUnreadMessages(topicId, null, limit, actorId);
+      return { topicId, unreadCount, messages, hasMore: unreadCount > messages.length };
     }
 
     // tie-break after 语义：子查询行比较（DB 内微秒精度，避免 JS Date 毫秒截断误算锚点自身）
-    const countQb = this.messageRepo
-      .createQueryBuilder('msg')
-      .where('msg.topic_id = :topicId', { topicId })
-      .andWhere(
-        '(msg.created_at, msg.id) > (SELECT rm.created_at, rm.id FROM messages rm WHERE rm.id = :lastReadId)',
-        { lastReadId: participant.lastReadMessageId },
-      )
-      .andWhere('msg.deleted_at IS NULL');
-
-    const unreadCount = await countQb.getCount();
+    const unreadCount = await this.countUnreadMessages(
+      topicId,
+      participant.lastReadMessageId,
+      actorId,
+    );
 
     // 取前 limit 条未读消息
-    const messages = await this.fetchUnreadMessages(topicId, participant.lastReadMessageId, limit);
+    const messages = await this.fetchUnreadMessages(
+      topicId,
+      participant.lastReadMessageId,
+      limit,
+      actorId,
+    );
 
     return {
       topicId,
@@ -1692,18 +1697,20 @@ export class TopicService {
   }
 
   /**
-   * 按全序 (created_at, id) ASC 拉取前 limit 条未读消息。
-   * anchorId 为 null 时从话题开头取；否则按 after 语义取锚点之后的消息
-   * （子查询行比较，DB 内微秒精度）。
-   *
-   * 消息对象形状与 getMessages 返回一致（含 senderName/senderAvatar 注入），
-   * 复用 resolveActorProfiles 与同一映射逻辑。
+   * 未读消息谓词唯一构造点（count 与 list 共用，防两口径漂移）：
+   * - 限定 topic、排除软删消息；
+   * - **排除自己发的消息**（`sender_id <> :actorId`）——主路径靠游标「发送即已读」，
+   *   降级路径靠本谓词，两条路径语义一致（sender 判据只用单列 sender_id：
+   *   messages.sender_type 列已在 ActorUnification migration 中 DROP，actors 统一根表
+   *   PK 使跨类型 uuid 碰撞结构上不可能）；
+   * - anchorId 非 null 时追加 (created_at, id) 行值比较 after 语义（DB 内微秒精度）。
    */
-  private async fetchUnreadMessages(topicId: string, anchorId: string | null, limit: number) {
+  private buildUnreadMessageQb(topicId: string, anchorId: string | null, actorId: string) {
     const qb = this.messageRepo
       .createQueryBuilder('message')
       .where('message.topic_id = :topicId', { topicId })
-      .andWhere('message.deleted_at IS NULL');
+      .andWhere('message.deleted_at IS NULL')
+      .andWhere('message.sender_id <> :actorId', { actorId });
 
     if (anchorId) {
       qb.andWhere(
@@ -1712,7 +1719,42 @@ export class TopicService {
       );
     }
 
-    qb.orderBy('message.createdAt', 'ASC').addOrderBy('message.id', 'ASC').take(limit);
+    return qb;
+  }
+
+  /**
+   * 未读消息计数——与 fetchUnreadMessages 同谓词（同 buildUnreadMessageQb），
+   * 保证 unreadCount 与 messages 长度、hasMore 三者永远同口径。
+   */
+  private async countUnreadMessages(
+    topicId: string,
+    anchorId: string | null,
+    actorId: string,
+  ): Promise<number> {
+    return this.buildUnreadMessageQb(topicId, anchorId, actorId).getCount();
+  }
+
+  /**
+   * 按全序 (created_at, id) ASC 拉取前 limit 条未读消息。
+   * anchorId 为 null 时从话题开头取；否则按 after 语义取锚点之后的消息
+   * （子查询行比较，DB 内微秒精度）。
+   *
+   * 谓词与 countUnreadMessages 同源：自己发的消息既不计入 unreadCount，
+   * 也不出现在 messages 里。
+   *
+   * 消息对象形状与 getMessages 返回一致（含 senderName/senderAvatar 注入），
+   * 复用 resolveActorProfiles 与同一映射逻辑。
+   */
+  private async fetchUnreadMessages(
+    topicId: string,
+    anchorId: string | null,
+    limit: number,
+    actorId: string,
+  ) {
+    const qb = this.buildUnreadMessageQb(topicId, anchorId, actorId)
+      .orderBy('message.createdAt', 'ASC')
+      .addOrderBy('message.id', 'ASC')
+      .take(limit);
 
     const items = await qb.getMany();
 

@@ -55,6 +55,7 @@ import { DocSearchService } from './doc-search.service';
 import { DocSpaceService } from './docspace.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
+import { RequestId } from '../../common/decorators/request-id.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import {
   UpsertDocDto,
@@ -294,16 +295,44 @@ export class DocController {
   @ApiOperation({
     summary: 'Search documents in a DocSpace',
     description:
-      'Search documents within a specific DocSpace using dual-scoring (ts_rank + pg_trgm). ' +
+      'Search documents within a specific DocSpace (v1.86: CJK unigram vectors + compiled ' +
+      'tsquery + K-gate precision gate; single-char / high-frequency queries degrade to ' +
+      'positional order with a hint). ' +
       'Supports optional filters: type, tag, category, limit, offset (pagination), ' +
       'createdAfter/createdBefore (ISO time window, inclusive). ' +
       'sort=relevance (default) ranks by score + intent fusion boosts; ' +
       'sort=createdAt_desc/createdAt_asc orders by doc creation time and skips boost fusion. ' +
-      'Returns ranked DocSearchHit[] with snippet and composite score.',
+      'Response envelope: { hits: DocSearchHit[], hint?: string } — hint appears only on ' +
+      'zero/weak hits (guidance to rephrase) or on degraded positional-order results ' +
+      '(not relevance-sorted). ' +
+      'Model-assisted ranking (rerank): when enabled by the operator, agent (API-key) searches ' +
+      'with sort=relevance may have the page reordered by the judgment provider — this sends the ' +
+      'query text and a byte-bounded excerpt (≈240B) of up to 50 candidate rows (no docId/path) ' +
+      'off-network. Hits affected by it carry reranked:true; hits without it are in SQL order. ' +
+      'Paging window: rerank only applies when offset is a multiple of limit and ' +
+      'offset+limit ≤ min(limit+10, 50) — so limit=5 covers offset∈{0,5,10} and limit=20 covers ' +
+      'only offset=0; outside that window the SQL order is returned and page ordering is NOT ' +
+      'comparable across pages (use score to re-sort yourself). Rerank may also pull up to 3 ' +
+      'candidates from just outside the page into its last 3 slots.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
-  @ApiQuery({ name: 'q', required: true, description: 'Search query string', type: String })
-  @ApiQuery({ name: 'type', required: false, description: 'Filter by document type', type: String })
+  @ApiQuery({
+    name: 'q',
+    required: true,
+    description:
+      'Search query string (max 200 characters — longer input gets 400). ' +
+      'Ranking may be model-assisted (see the endpoint description); in that case the query ' +
+      'text plus a byte-bounded excerpt of the candidate rows leaves your network for the ' +
+      'configured judgment provider (TypeSafe cloud API). Queries that look like credentials ' +
+      'are never sent (the call is skipped and logged as egress_blocked).',
+    type: String,
+  })
+  @ApiQuery({
+    name: 'type',
+    required: false,
+    description: 'Filter by document type',
+    type: String,
+  })
   @ApiQuery({ name: 'tag', required: false, description: 'Filter by tag', type: String })
   @ApiQuery({
     name: 'category',
@@ -348,11 +377,16 @@ export class DocController {
     @Param('id', ParseUUIDPipe) spaceId: string,
     @Query() query: DocSearchDto,
     @CurrentActor() actor: UnifiedActor,
+    @RequestId() requestId: string | null,
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
     const accessibleSpaceIds = [spaceId];
-    return this.docSearchService.search(accessibleSpaceIds, query);
+    // actor / traceId 只为判别重排服务（未启用时二者都不被读取——原路径不碰内核）
+    return this.docSearchService.search(accessibleSpaceIds, query, {
+      actor: actor ?? null,
+      traceId: requestId,
+    });
   }
 
   // ─── Global doc routes (by doc ID) ──────────────────────────

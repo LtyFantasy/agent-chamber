@@ -7,6 +7,7 @@ import {
   IsIn,
   Min,
   Max,
+  MaxLength,
   ValidationOptions,
   ValidationArguments,
   registerDecorator,
@@ -107,6 +108,10 @@ export class QueryTaskDto implements QueryTaskInput {
 
   @IsOptional()
   @IsString()
+  // 四消费方查询 DTO 上限对齐 200（DocSearchDto / SearchQueryDto / QueryExperienceDto
+  // 同款）——DTO 是闸门，编译器 SEARCH_QUERY_MAX_LENGTH=200 硬截断是闸门被绕过时的
+  // 兜底（守卫：test/dto-maxlength-guard.e2e-spec.ts）
+  @MaxLength(200)
   @ApiPropertyOptional({ description: 'Search keyword', example: 'Search keyword' })
   q?: string;
 

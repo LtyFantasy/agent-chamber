@@ -612,7 +612,9 @@ export interface ExperienceJudgmentLog {
   latencyMs?: number | null;
   /**
    * 判断输入（jsonb 原样）。结构 = `{questions, state}`；`status='skipped'` 时为占位
-   * `{skipped:true, reason:'judgment_rate_limited'}`（**保 NOT NULL 不变量**，杜绝 23502）。
+   * `{skipped:true, reason:'<EXPERIENCE_JUDGMENT_SKIPPED_REASONS 之一>'}`（**保 NOT NULL
+   * 不变量**，杜绝 23502）。`reason` 标明撞的是哪一级成本闸（actor / 全局 / 能力子额度），
+   * 值域单源 = shared `EXPERIENCE_JUDGMENT_SKIPPED_REASONS`。
    * 序列化硬顶 16KB（超限截断 + `truncated:true`）。
    */
   request: Record<string, unknown>;

@@ -127,7 +127,8 @@ export const listDocsTool: CustomTool = {
       'List documents in a DocSpace as a flat paginated inventory (wrapper of GET /doc-spaces/:id/docs). ' +
       'Resolves spaceName via three-layer match (exact → prefix → substring, case-insensitive). ' +
       '0 or >1 candidates returns isError:true + structured candidate info — never silently picks one. ' +
-      'Filters: pathPrefix (e.g. "memory/"), category (slug), docType, tag, q (ILIKE on title/path). ' +
+      'Filters: pathPrefix (e.g. "memory/"), category (slug), docType, tag, q (literal ILIKE on ' +
+      'title/path — for full-text content search use search_docs). ' +
       'Paginated: page (default 1) + pageSize (default 20, max 100); response is ' +
       '{items,total,page,pageSize,totalPages,hasNext,hasPrev} — loop on hasNext to fetch everything. ' +
       'Each item carries contentHash (SHA-256 of the original upsert payload — the optimistic-' +
@@ -162,7 +163,10 @@ export const listDocsTool: CustomTool = {
         q: {
           type: 'string',
           description:
-            'Optional: full-text keyword (ILIKE on title + path). Mutually exclusive with exact path lookups.',
+            'Optional: literal substring match on title + path (ILIKE, case-insensitive) — use it ' +
+            'when you already know a fragment of the title or path. It does NOT search document ' +
+            'body content: for full-text search over content (including Chinese) use search_docs ' +
+            'instead. Mutually exclusive with exact path lookups.',
         },
         page: {
           type: 'number',

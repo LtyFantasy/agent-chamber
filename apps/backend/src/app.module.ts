@@ -26,7 +26,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { APP_FILTER, APP_INTERCEPTOR, APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
-import { SnakeNamingStrategy } from './database/snake-naming.strategy';
+import { buildTypeOrmOptions } from './database/typeorm-options';
 import { RequestIdMiddleware } from './common/interceptors/request-id.middleware';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
@@ -41,8 +41,6 @@ import jwtConfig from './config/jwt.config';
 import minioConfig from './config/minio.config';
 import attachmentUrlConfig from './config/attachment-url.config';
 import judgmentConfig from './config/judgment.config';
-
-import * as entities from './database/entities';
 
 import { AuthModule } from './modules/auth/auth.module';
 import { UserModule } from './modules/user/user.module';
@@ -79,21 +77,10 @@ import { ExperienceModule } from './modules/experience/experience.module';
     // 注册一次全模块可注入 EventEmitter2。EventService.create() 末尾 emit('event.created')，
     // 12 个事件写入方零改动；roundtable 模块用 @OnEvent('event.created') 订阅。
     EventEmitterModule.forRoot(),
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: process.env.DB_HOST || 'localhost',
-      port: parseInt(process.env.DB_PORT || '5432', 10),
-      username: process.env.DB_USERNAME || 'agent_chamber',
-      password: process.env.DB_PASSWORD || '***',
-      // DB_NAME 优先，DB_DATABASE 为 .env.example 历史键名 fallback（A5：向后兼容）
-      database: process.env.DB_NAME || process.env.DB_DATABASE || 'agent_chamber',
-      entities: Object.values(entities),
-      namingStrategy: new SnakeNamingStrategy(),
-      synchronize: false,
-      migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
-      migrationsRun: true,
-      logging: process.env.NODE_ENV === 'development',
-    }),
+    // 连接选项由 database/typeorm-options.ts 的工厂单点提供（**禁止在此写内联选项对象**：
+    // 两份选项必然漂移，而这一份是生产运行时唯一事实源）。工厂化是为了让「连接级会话
+    // 默认值 extra 确实被装配」成为可单测断言的事实——见 typeorm-options.spec.ts。
+    TypeOrmModule.forRoot(buildTypeOrmOptions()),
     // A6 登录限流（@nestjs/throttler，内存存储，单实例生产足够）。
     // v2 收窄决策：全局默认不设有效限流（limit 极大 = 实际关闭），避免误伤
     // events/poll 游标轮询、SSE 长连接、platform-mcp 编排（一次语义调用 = 多次 REST）

@@ -240,8 +240,9 @@ export const EXPERIENCE_JUDGMENT_LOG_PAYLOAD_MAX_BYTES = 16 * 1024;
 /** 判定失败 `{error}` 文案上限（plan §1.2：≤2000 字符） */
 export const EXPERIENCE_JUDGMENT_ERROR_MAX_LENGTH = 2000;
 
-/** `status='skipped'` 行的 request 占位 reason（限流跳过；保住 request NOT NULL 不变量） */
-export const EXPERIENCE_JUDGMENT_SKIPPED_REASON = 'judgment_rate_limited';
+// `status='skipped'` 行的 request 占位 reason **值域单源已上移 shared**
+// （`EXPERIENCE_JUDGMENT_SKIPPED_REASONS`）：三级成本闸各一个值，这里不再保留单常量——
+// 两处各写一份字面量正是"新增一级闸却漏改统计口径"的漂移源。
 
 // ─── 密钥闸门（POST /experiences 内容体检）────────────────────────────────
 

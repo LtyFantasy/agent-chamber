@@ -176,6 +176,45 @@ describe('AllExceptionsFilter', () => {
     );
   });
 
+  // SQLSTATE 显式码表（检索中文根治批次 1-b，security ②）：输入类码 → 400
+  it.each(['22021', '42601', '54001'])(
+    'should map SQLSTATE %s to 400 VALIDATION_ERROR（固定文案不回显用户输入）',
+    (sqlstate) => {
+      const driverError = new Error('some driver message with user input echo');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (driverError as any).code = sqlstate;
+      const exception = new QueryFailedError('SELECT', [], driverError);
+
+      filter.catch(exception, mockHost as unknown as ArgumentsHost);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(HttpStatus.BAD_REQUEST);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: ErrorCode.VALIDATION_ERROR,
+          message: 'Invalid query input',
+        }),
+      );
+    },
+  );
+
+  // 明文不映射（服务端缺陷语义，500 留 stack）：22012 / 22023 / 22P02（9082464c 家族）
+  it.each(['22012', '22023', '22P02'])(
+    'should NOT map SQLSTATE %s（保持 500 INTERNAL_ERROR，服务端缺陷不伪装成用户错误）',
+    (sqlstate) => {
+      const driverError = new Error('server-side defect');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (driverError as any).code = sqlstate;
+      const exception = new QueryFailedError('SELECT', [], driverError);
+
+      filter.catch(exception, mockHost as unknown as ArgumentsHost);
+
+      expect(mockResponse.status).toHaveBeenCalledWith(HttpStatus.INTERNAL_SERVER_ERROR);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ code: ErrorCode.INTERNAL_ERROR }),
+      );
+    },
+  );
+
   it('should map PostgreSQL foreign key violation to 400 VALIDATION_ERROR', () => {
     const exception = new QueryFailedError(
       'INSERT',

@@ -611,7 +611,81 @@ export interface DocSearchHit {
     route?: 'primary' | 'secondary';
     taskLinks?: number;
   };
+  /**
+   * 该命中是否**来自判别重排**（v1.85.0 批次 3；additive 可选键）——**只在重排启用且成功时出现**。
+   *
+   * 语义边界：
+   * - 出现 ⇒ 本条命中的页内位置由模型排序 + 位置带求解决定（可能与 SQL 序不同）；
+   * - **不出现** ⇒ SQL 序（未启用重排 / 人类与 web 调用 / 时间序 / 越窗页 / 闸门跳过 / fail-open）；
+   * - ⚠️ **页间顺序不可比**：重排只会重排**窗口内**的候选，跨页比较请用 `score` 自排；
+   * - ⚠️ 重排可能把**页外**候选提进返回页（最多占页尾 3 个槽位）——"重排"是排序增强，
+   *   不是召回增强，但**响应层面确实可能出现未启用时看不到的结果**（承诺边界见 api-definition）。
+   */
+  reranked?: true;
 }
+
+// ─── 搜索响应信封与零命中引导（v1.86 中文根治批次 1-b，计划 v1.5 §2.6 + 主脑裁决 #1）───
+
+/**
+ * DocSpace 搜索 HTTP 响应信封（`GET /doc-spaces/:id/search`）。
+ *
+ * 契约变更（2026-09-26 主脑裁决 #1）：响应由裸数组 `DocSearchHit[]` 改为信封
+ * `{ hits, hint? }`——`hint` 缺省不出现（additive，老客户端读 hits 之外字段无影响）。
+ * 消费方三处同改：web `apps/web/src/lib/api.ts` 返回类型 + `docs/[id]/page.tsx` 解构 +
+ * platform-mcp `search-docs.ts`（取 body.hits 并透传 hint）。
+ */
+export interface DocSearchResponse {
+  /** 命中列表（排序语义见 DocSearchHit.reranked 与 hint 的位置序声明） */
+  hits: DocSearchHit[];
+  /**
+   * 零命中/弱命中/降级引导（仅触发时出现）：
+   * - 零命中或最高分低于**本面活阈值** → DOC_SEARCH_ZERO_HIT_HINT；
+   * - 单 CJK 字 / df 降级路径（未按相关度排序）→ DOC_SEARCH_POSITIONAL_ORDER_HINT。
+   * 红线（security ③）：hint 术语来源固定（静态词表/本次已召回结果），**禁提权重查**。
+   */
+  hint?: string;
+}
+
+/**
+ * 强命中分数线的 **W1=1 基准尺度**：ts_rank_cd flag 0 × W1=1.0 下 ≥0.3 强命中 /
+ * ~0.1 单点 / <0.08 不过地板（计划 §2.6 score 可读刻度）。
+ *
+ * ⚠️ **本常量不是活阈值，只是基准刻度**——它随 W1 漂移，两个消费方的活阈值形态不同
+ * （2026-09-26 批次 1-d2 拆分，主脑裁决 R4）：
+ * - **doc-search**：ts 腿乘了活旋钮 `SEARCH_TS_W1` ⇒ 活阈值 = 基准 × W1
+ *   （`DOC_SEARCH_WEAK_HIT_SCORE`，定义在 backend `common/utils/search/search-tuning.ts`）。
+ *   直接读本常量 = 刻度漂移：W1=3.0 时 cd 单点 `0.1×3=0.3` 恰触线 ⇒ 弱命中分支失效
+ *   （1-d1 实测 3~4 条 → 0 条），1-d2 起一律读活阈值。
+ * - **task q=**：其 rank 通道是**裸** `ts_rank_cd`（未乘 W1）⇒ 尺度与基准一致，
+ *   直接使用本值（`TASK_SEARCH_WEAK_HIT_SCORE`）。
+ *
+ * 拆分理由：本常量原名带 `DOC_SEARCH_` 前缀却被 task q= 复用（1-b 现场决定 #5
+ * 「DOC_ 常量跨域复用」坑）——两侧尺度已不同，故两侧各持一个具名活阈值，本常量退回
+ * 「基准」语义，只作两处活阈值的刻度来源。
+ */
+export const DOC_SEARCH_STRONG_HIT_SCORE = 0.3;
+
+/**
+ * 文档检索零命中/弱命中引导原文（REST 信封 `hint` 字段单源；形态对齐
+ * `EXPERIENCE_ZERO_HIT_HINT`——消费方 Agent 的行为指令，必须逐字稳定）。
+ *
+ * 内容 = 计划 §2.6 四要素：换 2–4 字术语 / `list_doc_routes` 策展意图 / 英文标识符
+ * 锚点 / 措辞不匹配类属 v1 边界的说明。
+ */
+export const DOC_SEARCH_ZERO_HIT_HINT =
+  'No sections strongly matched. Try shorter 2-4 character domain terms, browse curated ' +
+  'intent via list_doc_routes, or anchor on an exact English identifier (file/symbol name). ' +
+  'Paraphrase mismatches (same concept, different wording) are a known v1 boundary — ' +
+  'they need v3 semantic retrieval, not more retries.';
+
+/**
+ * 位置序声明引导（单 CJK 字查询 / df 降级路径专用，计划 §2.5）：候选经全文索引精确
+ * 过滤，但**未按相关度排序**（常数分 + section_position/doc_id 位置序）——用更长的
+ * 查询词换取相关度排序。
+ */
+export const DOC_SEARCH_POSITIONAL_ORDER_HINT =
+  'Single-character or very high-frequency query: results are matched exactly but NOT ' +
+  'ranked by relevance (ordered by section position). Use a longer query for relevance ranking.';
 
 // ─── Overview ────────────────────────────────────────────
 

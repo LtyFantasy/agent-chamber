@@ -1,8 +1,8 @@
 ---
 name: docs
 description: 平台 DocSpace（知识库）子 skill。覆盖三层消费模型（overview → search → read）、文档 upsert/delete、source 写入隔离（native vs git ingest）、任务-文档关联与 ingest 同步约定。Agent 阅读或产出平台文档时使用。
-version: 1.3.5
-updatedAt: 2026-09-16
+version: 1.3.6
+updatedAt: 2026-09-26
 ---
 
 # 文档知识库（DocSpace）— Agent 知识库
@@ -11,8 +11,8 @@ updatedAt: 2026-09-16
 > 文档由 Agent 生产、人类审阅；native 优先（平台 DB 即真相源），git ingest 为可选只读适配器。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
 >
-> **Skill 版本**: v1.3.2
-> **更新日期**: 2026-08-29
+> **Skill 版本**: v1.3.6
+> **更新日期**: 2026-09-26
 
 ---
 
@@ -63,8 +63,9 @@ search_docs { "spaceName": "...", "q": "权限模型", "limit": 5 }
 # REST: GET /doc-spaces/:id/search?q=...&type=&tag=&category=&limit=
 ```
 
-- 双路打分：`ts_rank × 1.0`（英文/标识符）+ `similarity(content) × 0.6` + `similarity(headingPath) × 0.8`（中文滑窗 pg_trgm），合成分数下限 `0.08` 过滤零相关噪音。
-- 返回 hits：`{docId, docPath, docTitle, headingPath, position, snippet, score}`。**记下 `docId` + `position`** 供下一步精读。
+- **v1.86 起双路打分**：q 先经编译器（CJK 逐字 bigram ts 腿 + trgm 兜底腿 **OR 融合**，英文/标识符走 ts 词位腿），合成分 = `ts_rank_cd × 3.0` + `similarity(headingPath) × 0.5` + `similarity(content) × 0.6`，下限 `0.08` 过滤零相关噪音（弱命中线 `0.9`）。单 CJK 字查询走单字路径（常数分 `0.1`——可搜但低分、按节位而非相关度排序）。
+- **响应是 `{hits, hint?}` 信封**（v1.86 起，不再是裸数组）：零命中**或最高分 < 0.9（弱命中）**时带 `hint` 消费指引——**要读**并据此调整：换更贴近文档原词的 2–4 字术语 / 缩短查询 / 改走 `list_doc_routes` 策展意图 / 锚定英文标识符；单字与高频降级路径另带「未按相关度排序」声明。
+- 返回 `hits`：`{docId, docPath, docTitle, headingPath, position, snippet, score}`。**记下 `docId` + `position`** 供下一步精读。
 - **v1.55 起**：`offset`（跳过 N 条，配合 `limit` 穷尽翻页，上限 100000）+ `sort`（`relevance` 缺省｜`createdAt_desc`｜`createdAt_asc`，时间序接管 ORDER BY、跳过 boost 融合、不透出 boosts）+ `createdAfter`/`createdBefore`（ISO 8601，含边界）——「读最近 N 天日记」：`sort="createdAt_desc"&createdAfter=<now-7天>&limit=20`。
 
 ### 2.3 read — 大纲 / 精读
@@ -125,7 +126,7 @@ upsert_doc {
 
 | 字段 | 规范 |
 |------|------|
-| `summary` | 1–2 句 ≤500 字符；读者是「决定要不要读这篇的检索 Agent」；回答**这是什么 + 什么场景该读它**；**关键标识符原文必须出现**（工具名/端点名/英文术语——它们是检索锚点，实测中文短语检索偏弱）；不复述标题、不写"本文档介绍了" |
+| `summary` | 1–2 句 ≤500 字符；读者是「决定要不要读这篇的检索 Agent」；回答**这是什么 + 什么场景该读它**；**关键标识符原文必须出现**（工具名/端点名/英文术语——标识符/英文术语是最强检索锚点）；中文短语检索自 v1.86 起已根治（CJK 单字化 ts 检索），不再是弱项；不复述标题、不写"本文档介绍了" |
 | `docType` | 受控词表优先：`guide` / `reference` / `api` / `architecture` / `operations` / `index` / `note`；别造新词 |
 | `category` | 先 `get_docs_overview` 看现有分类再归位；不造近义分类；确无合适才新建 |
 | `tags` | 3–5 个；标识符/技术术语优先（检索锚点） |

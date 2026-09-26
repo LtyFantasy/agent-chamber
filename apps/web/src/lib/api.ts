@@ -57,7 +57,7 @@ import type {
   DocDetail,
   DocSectionContent,
   DocFullContent,
-  DocSearchHit,
+  DocSearchResponse,
   DocSpaceOverview,
   TaskDocLinkItem,
   CreateDocSpaceInput,
@@ -881,7 +881,9 @@ const docs = {
   search: (
     spaceId: string,
     params: { q: string; type?: string; tag?: string; category?: string; limit?: number },
-  ) => apiRequest<DocSearchHit[]>('GET', `/doc-spaces/${spaceId}/search`, undefined, { params }),
+    // v1.86 起响应为信封 `{ hits, hint? }`（主脑裁决 #1；hint = 零命中/弱命中引导或
+    // 降级位置序声明）
+  ) => apiRequest<DocSearchResponse>('GET', `/doc-spaces/${spaceId}/search`, undefined, { params }),
 
   // ── 懒加载目录树 / 聚合计数（v1.70.0-dev）──
   /**

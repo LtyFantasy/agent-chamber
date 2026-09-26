@@ -87,7 +87,12 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
 /**
  * search_docs — 文档语义搜索
  *
- * 解析 spaceName → 调用双路检索 → 投影 hits 为紧凑摘要。
+ * 解析 spaceName → 调用双路检索（v1.86 中文根治：q 先经编译器——CJK 逐字 bigram ts 腿
+ * OR 融合 trgm 兜底腿，英文/标识符走 ts 词位腿；融合分 = `ts_rank_cd × 3.0` +
+ * `similarity(heading_path) × 0.5` + `similarity(content) × 0.6`，地板 0.08、弱命中线 0.9）
+ * → 投影 hits 为紧凑摘要。
+ * 响应为信封 `{hits, hint?}`——零命中/弱命中（最高分 < 0.9）/降级位置序时 hint 给消费
+ * 指引（Agent 应读并据此调整查询；文案单源 = shared DOC_SEARCH_*_HINT）。
  * 返回 top-k hits：{docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}。
  * boosts 为三路融合加权来源（plan §4-C3）：route = 策展路由命中（primary ×1.5 / secondary ×1.2）、
  * taskLinks = 关联任务数（×1+min(c,5)×0.05 封顶 ×1.25）；无 boost 的命中省略该键。
@@ -97,8 +102,16 @@ export const searchDocsTool: CustomTool = {
   tool: {
     name: 'search_docs',
     description:
-      'Search documents in a DocSpace using dual-scoring (ts_rank + pg_trgm) ' +
-      'plus intent fusion boosts (curated routes ×1.5/×1.2 and task-link count ×1..×1.25). ' +
+      'Search documents in a DocSpace. Query semantics (v1.86 CJK fix): q is compiled before ' +
+      'scoring — CJK is tokenized per character into bigram ts arms OR-fused with a pg_trgm ' +
+      'fallback arm, while English/identifiers use the ts term arm. Composite score = ' +
+      'ts_rank_cd × 3.0 + similarity(heading_path) × 0.5 + similarity(content) × 0.6, floored ' +
+      'at 0.08; weak-hit line is 0.9. Short CJK terms (2+ chars) now match; a K-gate keeps ' +
+      'only rows sharing ≥K distinct bigrams (K=1 for ≤4 CJK chars, K=2 for longer), so a ' +
+      'paraphrase sharing no bigram is not recalled. A single CJK ' +
+      'character is searchable but scores a constant 0.1 and is ordered by section position, ' +
+      'not relevance. Intent fusion boosts follow (curated routes ×1.5/×1.2 and task-link count ' +
+      '×1..×1.25). ' +
       'Resolves spaceName via three-layer match. ' +
       'Returns top-k hits projected to {docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}. ' +
       'boosts: {route: "primary"|"secondary", taskLinks} explains why a hit ranked high. ' +
@@ -110,7 +123,21 @@ export const searchDocsTool: CustomTool = {
       'combine with sort="createdAt_desc"/"createdAt_asc" to order by creation time ' +
       '(time sort takes over ranking — boost fusion is skipped, score stays raw composite). ' +
       'Example "read diaries of the last 7 days": q="日记", type="memory", ' +
-      'sort="createdAt_desc", createdAfter=<now minus 7 days ISO>, limit=20.',
+      'sort="createdAt_desc", createdAfter=<now minus 7 days ISO>, limit=20. ' +
+      'q is capped at 200 characters (longer input is rejected with 400). ' +
+      'The response is an envelope {hits, hint?}: hint appears on zero hits, weak hits (top ' +
+      'score < 0.9), or degraded positional-order results. READ it and act on it before ' +
+      'retrying — e.g. switch to shorter 2-4 character domain terms closer to the document ' +
+      'wording, or locate the doc by title/path via list_docs instead of full-text q. ' +
+      'Ranking may be model-assisted by the operator ("rerank"): for agent searches with ' +
+      'sort="relevance" the page can be reordered by the configured judgment provider, which ' +
+      'sends the query text and a byte-bounded excerpt (≈240B) of up to 50 candidate rows ' +
+      '(no docId / docPath / position) off-network. Affected hits carry reranked:true; hits ' +
+      'without it are in SQL order. Paging window: rerank applies only when offset is a ' +
+      'multiple of limit AND offset+limit ≤ min(limit+10, 50) — limit=5 covers offset 0/5/10, ' +
+      'limit=20 covers only offset=0. Outside that window page ordering is NOT comparable ' +
+      'across pages — re-sort by score yourself if you need a global order. Rerank can also ' +
+      'pull up to 3 candidates from just outside the page into its last 3 slots.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -150,7 +177,7 @@ export const searchDocsTool: CustomTool = {
           // 枚举值从 shared DOC_SEARCH_SORT_VALUES 单源取值（防 backend DTO 加值后此处漂移）
           enum: [...DOC_SEARCH_SORT_VALUES],
           description:
-            'Optional: sort mode (default "relevance" = dual-scoring + boost fusion). ' +
+            'Optional: sort mode (default "relevance" = composite score + boost fusion). ' +
             '"createdAt_desc"/"createdAt_asc" order by doc creation time and skip boost fusion. ' +
             'Use with createdAfter/createdBefore for time-window queries (e.g. recent diaries).',
         },
@@ -250,13 +277,25 @@ export const searchDocsTool: CustomTool = {
     if (createdBefore !== undefined) params.createdBefore = createdBefore;
 
     try {
-      const hits = await client.request<unknown[]>('GET', `/doc-spaces/${spaceId}/search`, {
-        params,
-      });
-      const projected = projectDocHits(hits);
+      // v1.86 起上游为信封 `{ hits, hint? }`（主脑裁决 #1）：取 body.hits 投影，
+      // hint 原样透传（零命中/弱命中引导或降级位置序声明——消费方 Agent 的行为指令）
+      const body = await client.request<{ hits?: unknown[]; hint?: string }>(
+        'GET',
+        `/doc-spaces/${spaceId}/search`,
+        { params },
+      );
+      const projected = projectDocHits(body.hits ?? []);
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ hits: projected }) }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              hits: projected,
+              ...(typeof body.hint === 'string' ? { hint: body.hint } : {}),
+            }),
+          },
+        ],
       };
     } catch (err: unknown) {
       return handlePlatformError(err, 'search_docs');

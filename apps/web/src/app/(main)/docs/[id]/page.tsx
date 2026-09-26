@@ -267,12 +267,13 @@ export default function DocSpaceDetailPage() {
     if (saved === 'tree' || saved === 'category') setViewMode(saved);
   }, []);
 
-  /** 搜索命中（左栏搜索框，防抖后 q 非空才发） */
-  const { data: searchHits } = useQuery({
+  /** 搜索命中（左栏搜索框，防抖后 q 非空才发）；v1.86 起响应为信封 `{ hits, hint? }` */
+  const { data: searchResult } = useQuery({
     queryKey: ['docs', 'search', spaceId, debouncedSearchQuery],
     queryFn: () => Api.docs.search(spaceId, { q: debouncedSearchQuery, limit: 20 }),
     enabled: !!spaceId && debouncedSearchQuery.trim().length > 0,
   });
+  const searchHits = searchResult?.hits;
 
   /**
    * 搜索 B 组「文档匹配」：服务端 GET docs?q=（title+path ILIKE 既有契约）分页 + 加载更多。

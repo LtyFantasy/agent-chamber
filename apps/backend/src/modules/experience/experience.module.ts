@@ -22,6 +22,10 @@
  *     是），三处审计插桩（终审/软删/越权尝试）直接注入 AuditService
  *   - `OwnerProxyService` **不在此 import**：它由 `@Global() PermissionModule` 导出
  *   - `ActorProfileService` 同理（`@Global() CommonModule`）：`ExperienceMemberService` 直接注入
+ *   - **判别 token 与配额服务来自 `JudgmentModule`**（v1.85.0 批次 2）：`JUDGMENT_PROVIDER` /
+ *     `JUDGMENT_CONFIG` / `JudgmentQuotaService` 由内核声明并导出。本模块**不得**再自行 provide
+ *     它们——重复声明会产生第二个实例（配额桶各持一份 ⇒ 全局闸被静默放大成 N 倍），而 DI
+ *     不会报错、只会静默用错那个。
  *   - `IdempotencyRecord` 仓储在 forFeature 里（录入幂等走 common helper，需要共享表仓储）
  *   - **本模块不注册任何全局 provider**（无 APP_GUARD/APP_INTERCEPTOR）：鉴权走全局兜底 +
  *     方法级声明（见 controller 文件头不变量 1）；usage stats 拦截器零接线自动覆盖
@@ -30,6 +34,7 @@
  *   - experience.controller.ts — 12 端点（8 条目端点 + 4 成员端点；方法级守卫在此声明）
  *   - experience.service.ts — 条目业务规则
  *   - experience-member.service.ts — 成员表与终审资格（第二期批 2；两个 service 均在此注册）
+ *   - modules/judgment/judgment.module.ts — 判别内核（本模块 import 它取 token 与配额服务）
  *   - modules/audit/audit.module.ts — AuditService 来源（非 @Global，必须 import）
  *   - app.module.ts — 本模块的注册点
  *
@@ -53,10 +58,7 @@ import { ExperienceController } from './experience.controller';
 import { ExperienceService } from './experience.service';
 import { ExperienceMemberService } from './experience-member.service';
 import { ExperienceJudgmentService } from './experience-judgment.service';
-import {
-  judgmentConfigProvider,
-  judgmentProviderProvider,
-} from './judgment/judgment-provider.factory';
+import { JudgmentModule } from '../judgment/judgment.module';
 
 /**
  * 经验库模块（平台第四资源：Topic 管人 / Board 管事 / DocSpace 管知识 / Experience 管
@@ -80,6 +82,15 @@ import {
     ]),
     // AuditService（终审/软删/越权尝试三插桩；非 @Global 模块）
     AuditModule,
+    /**
+     * 判别内核（v1.85.0 批次 2）：判别 provider / 配置 / **三级配额（跨能力共享单例）** /
+     * 通用 runner 都从内核来。
+     *
+     * ⚠️ 本模块**不再自行提供** `JUDGMENT_PROVIDER` / `JUDGMENT_CONFIG`——它们是内核的导出物，
+     * 在此重复声明会让 DI 出现两个实例（配额桶各持一份 ⇒ 全局闸被静默放大成 N 倍）。
+     * e2e 的 `overrideProvider(JUDGMENT_PROVIDER)` 仍然有效（按 token 覆盖，与提供方模块无关）。
+     */
+    JudgmentModule,
   ],
   controllers: [ExperienceController],
   providers: [
@@ -93,20 +104,14 @@ import {
      */
     ExperienceMemberService,
     /**
-     * 判别服务接线（第二期批 3）：判定调用/日志落库/快照写 + 判断日志端点。
+     * 判别服务接线（第二期批 3；v1.85.0 批次 2 起闸门/传输上移内核）：判定调用/日志落库/
+     * 快照写 + 判断日志端点。
      *
      * 依赖：`ExperienceJudgmentRecord` 仓储（本模块 forFeature）+ `DataSource`（快照裸 SQL）
-     * + 两个 judgment token（下方 provider 定义）+ `ExperienceMemberService`（端点判权复用）。
+     * + 内核的 `JUDGMENT_PROVIDER` token 与 `JudgmentQuotaService`（**均由 JudgmentModule 导出**）
+     * + `ExperienceMemberService`（端点判权复用）。
      */
     ExperienceJudgmentService,
-    /**
-     * 判别 provider 的两个 token（第二期批 3）：
-     * - `JUDGMENT_PROVIDER` → 真 typesafe 客户端或 noop（按 config；e2e override 成内存 fake）
-     * - `JUDGMENT_CONFIG` → 缺省补齐后的只读配置（service 读 rateLimitPerHour）
-     * 两者都 inject ConfigService（ConfigModule 在 app.module 里 isGlobal）。
-     */
-    judgmentProviderProvider,
-    judgmentConfigProvider,
   ],
   // 导出以便后续批次（platform-mcp 走 REST，不经 Nest DI；web 亦走 REST）——
   // 保持导出是模块惯例，且便于同进程的其它模块复用检索逻辑

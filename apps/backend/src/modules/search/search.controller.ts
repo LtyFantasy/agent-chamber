@@ -3,6 +3,7 @@ import { ApiTags, ApiOperation, ApiQuery, ApiResponse } from '@nestjs/swagger';
 import { SearchService } from './search.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
+import { RequestId } from '../../common/decorators/request-id.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { SearchQueryDto } from './dto';
 
@@ -45,7 +46,12 @@ export class SearchController {
   @ApiResponse({ status: 200, description: 'Search results (paginated, grouped by type)' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
-  async search(@Query() dto: SearchQueryDto, @CurrentActor() actor: UnifiedActor) {
-    return this.searchService.search(dto, actor);
+  async search(
+    @Query() dto: SearchQueryDto,
+    @CurrentActor() actor: UnifiedActor,
+    @RequestId() requestId: string | null,
+  ) {
+    // traceId 透传到 doc 段（全局检索的文档结果同样可能被判别重排）；人类与 web 调用不受影响
+    return this.searchService.search(dto, actor, requestId);
   }
 }

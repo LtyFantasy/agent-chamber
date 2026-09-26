@@ -13,10 +13,11 @@ import {
   buildContentExcerpt,
   buildJudgmentState,
   buildRubricQuestions,
-  extractJudgmentModel,
+  experienceRecordCheckCapability,
   normalizeJevAnswers,
+  type ExperienceCheckInput,
 } from './judgment-rubric';
-import type { ExperienceCheckInput } from './judgment-provider.interface';
+import { extractJudgmentModel } from '../../judgment/judgment.transport';
 
 /** 合法 answers 骨架（实测形状；各用例按需破坏某一维） */
 function validAnswers(): Record<string, unknown> {

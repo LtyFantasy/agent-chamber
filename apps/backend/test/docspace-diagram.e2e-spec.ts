@@ -179,6 +179,8 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
       ds.getRepository(Doc),
       ds.getRepository(DocRoute),
       ds.getRepository(TaskDocLink),
+      // 判别重排内核（v1.85.0 批次 3）：本套件只测文档检索的既有行为 ⇒ 能力恒未启用
+      { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
     );
 
     // bundle round-trip 装配（照 docspace-bundle e2e 先例全构造 DocSpaceService）
@@ -439,7 +441,12 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
     await flushImmediates();
 
     // fixture 组件 label（web-app.architecture.json：id=auth 的组件）
-    const hits = await searchService.search([spaceId], { q: 'Auth Provider' });
+    // v1.86 信封契约（主脑裁决 #1）：service.search 返回 `{ hits, hint? }`。
+    // limit=20（真库复核结论）：编译 OR 链（'auth' | 'provider'）比旧 plainto AND 召回宽，
+    // 且本套件有 4 篇同 fixture（同内容同分）的 architecture 文档——缺省 limit=5 下
+    // 目标文档会被同分平局挤出边界（平局键只有 section_position，全 0 ⇒ PG 堆序任意）；
+    // 本用例钉的是「按 label 召回目标文档」（成员资格），不是名次。
+    const { hits } = await searchService.search([spaceId], { q: 'Auth Provider', limit: 20 });
     const paths = hits.map((h) => h.docPath);
     expect(paths).toContain(`tmp/${RUN}-search.json`);
     // 命中带上 section 级定位（合成节 position=0）

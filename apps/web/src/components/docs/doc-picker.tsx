@@ -83,7 +83,8 @@ export function DocPicker({ boardId, onSelect, disabled, label, buttonClassName 
         const res = await Api.docs.listDocs(space.id, { pageSize: 8 });
         return res.items.map((d) => ({ id: d.id, label: d.title, hint: d.path }));
       }
-      const hits = await Api.docs.search(space.id, { q, limit: 8 });
+      // v1.86 起响应为信封 `{ hits, hint? }`（主脑裁决 #1）——picker 只取 hits
+      const { hits } = await Api.docs.search(space.id, { q, limit: 8 });
       const seen = new Set<string>();
       return hits
         .filter((h) => {

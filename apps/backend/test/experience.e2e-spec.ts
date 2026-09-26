@@ -21,8 +21,11 @@
  *   - **signals 匹配是 ANY-overlap 的精确相等**：共享至少一个即命中（加更多 signal 是**扩大**
  *     结果集）；部分关键词（子串）**不中**——若退化成子串匹配，检索会变成噪声
  *   - **归一化双向对称**：写入 `ECONNREFUSED` 后用小写查询必须命中（两边 trim+lowercase）
- *   - **异词汇召回**：录「端口映射失效」→ 搜「端口不可达」也能召回（trgm 通道的价值所在，
- *     只有 tsvector 通道时这类查询恒零命中）
+ *   - **异词汇召回（受 K-gate 约束，批次 1-d2 起）**：录「端口映射失效」→ 搜「端口不可达」
+ *     **只共享 1 个 bigram** 且查询 5 字 ⇒ 缺省 K=2 ⇒**被结构门拒**（trgm 腿本可抬过
+ *     floor，但门先拒）——这是精度门的设计意图（经验库误命中代价 > 漏命中），不是回归；
+ *     共享 ≥2 bigram 的近形（如「端口映射失效」）照常召回。门的行为由本套件 ⑤ 两条用例
+ *     正反两面钉住
  *   - **反馈三列与反馈行同事务**：并发 N 个不同 actor 的反馈后 `distinct_helped_count == N`
  *     （丢了任何一次更新都会让计数与实际行数不符）
  *   - **反馈不顶 `updated_at`**：否则 `sort=recent` 会被反馈刷屏
@@ -56,9 +59,14 @@
  *   EXPERIENCE-E2E-MIGRATION(共享库往返): 直接 `migration:revert` 会真 DROP 掉共享开发库
  *     的表（并行套件/dev 后端同在）。安全方向: 自持事务内 down→up→ROLLBACK（PG 的 DDL
  *     可回滚），既验证真 DDL 又不改库状态。
- *   EXPERIENCE-E2E-FLOOR(分数下限实证): 单 token 精确匹配的 ts_rank ≈ 0.0608 **低于**
- *     SCORE_FLOOR 0.08 ⇒ q 通道实际靠 trgm 通道（title×0.8 / content×0.6）把分数抬过线。
- *     故 e2e 的 q 断言必须建在"词出现在标题或正文里"的真实语料上（§9 有钉住该行为的用例）。
+ *   EXPERIENCE-E2E-FLOOR(尺度反转，批次 1-d2 核销): 旧 `ts_rank` 单 token 精确匹配 ≈0.0608
+ *     **低于** floor 0.08 ⇒ 旧口径下"标识符只进 signals"的条目**不返回**，该断言（inventory
+ *     A 类）已随批次 1 的反转失效。现口径 = `ts_rank_cd` flag 0：单 token ≈0.1 ≥ 0.08 ⇒
+ *     **会返回**。q 通道的真实价值证明仍成立（trgm 抬分让标题/正文命中排在纯 signals 命中
+ *     之前），故 ⑤ 的用例改为「名次 + 分数」对照而非"返回/不返回"。
+ *   EXPERIENCE-E2E-KGATE(结构门，批次 1 起): experience **挂 K-gate**（doc-search 同款）。
+ *     判据只看 bigram 命中数：查询 5+ CJK 字 ⇒ K=2；ASCII 查询无 arm ⇒ 不挂门（纯标识符
+ *     检索不受门影响）。改判定语料时必须先算 arm 命中数，否则"零召回"会被误读成检索坏。
  * =============================================================================
  */
 
@@ -102,9 +110,12 @@ import { CommonModule } from '../src/common/common.module';
 import { PermissionModule } from '../src/common/permission.module';
 import { ExperienceModule } from '../src/modules/experience/experience.module';
 import { ExperienceService } from '../src/modules/experience/experience.service';
+import { EXPERIENCE_SCORE_FLOOR } from '../src/modules/experience/experience.constants';
+import { chooseKGateK, compileQuery } from '../src/common/utils/search/tsquery-compiler';
 import {
   JUDGMENT_PROVIDER,
   type ExperienceCheckInput,
+  type JudgmentCapability,
   type JudgmentOutcome,
 } from '../src/modules/experience/judgment/judgment-provider.interface';
 import { JUDGMENT_CONFIG } from '../src/modules/experience/judgment/judgment-provider.factory';
@@ -133,10 +144,15 @@ const RUN = `exp-${Date.now().toString(36)}`;
  *
  * 控制面（每个用例改它决定"下次判定"的行为）：
  * - `mode`：ok / error / timeout（映射到 provider 契约的三种结果）
- * - `gate`：一次性闸门（**首次** checkEntry 会 await 它）——用于构造"判定在途期间条目被再改"
+ * - `gate`：一次性闸门（**首次** run 会 await 它）——用于构造"判定在途期间条目被再改"
  *   的版本守卫场景（第二次调用不再阻塞，否则会自锁）
  * - `calls`：收到过的判定输入（断言"发的是什么"）
- * - `judgment`：ok 模式下返回的快照（各用例可换 model 以区分是哪一次判定）
+ * - `meta` / `value`：ok 模式下返回的观测元数据与七维产物（各用例可换 model 以区分哪一次判定）
+ *
+ * ⚠️ v1.85.0 批次 2：provider 契约由 `checkEntry(input)` 升为**能力无关**的
+ * `run(capability, input)`（判别通用化）——fake 必须同步方法签名，否则 service 调 `run` 会
+ * 静默拿到 undefined（fake 用 `useValue` 注入，**无编译期检查**，故这条只能靠 e2e 兜）。
+ * 返回形状同步换成 `{meta, value}`（service 再组装成快照 `{...meta, ...value}`，落库形状不变）。
  */
 const fakeJudgment = {
   enabled: true,
@@ -144,12 +160,16 @@ const fakeJudgment = {
   mode: 'ok' as 'ok' | 'error' | 'timeout',
   gate: null as null | (() => Promise<void>),
   calls: [] as ExperienceCheckInput[],
-  judgment: {
+  /** 观测元数据（provider / model / judgedAt / rubricVersion；真实实现由传输侧产出） */
+  meta: {
     provider: 'jev',
     model: 'jev-fake',
     judgedAt: '2026-09-22T10:00:01.000Z',
-    // rubric 代际（v1.82.0）：真实 provider 由 rubric 常量写入，fixture 照抄以断言透传
+    // rubric 代际（v1.82.0）：真实 provider 由能力常量写入，fixture 照抄以断言透传
     rubricVersion: 'v2',
+  },
+  /** 归一化产物（七维；真实实现由能力的逐字段白名单产出） */
+  value: {
     completeness: { level: 'partial', confidence: 0.7 },
     reusability: { level: 'broad', confidence: 0.6 },
     signalQuality: { level: 'weak', confidence: 0.3 },
@@ -162,9 +182,12 @@ const fakeJudgment = {
     this.mode = 'ok';
     this.gate = null;
     this.calls = [];
-    this.judgment = { ...fakeJudgment.judgment, model: 'jev-fake' };
+    this.meta = { ...fakeJudgment.meta, model: 'jev-fake' };
   },
-  async checkEntry(input: ExperienceCheckInput): Promise<JudgmentOutcome> {
+  async run(
+    _capability: JudgmentCapability<ExperienceCheckInput, unknown>,
+    input: ExperienceCheckInput,
+  ): Promise<JudgmentOutcome> {
     this.calls.push(input);
     // 一次性闸门（只挡第一次，见上方注释）
     if (this.gate) {
@@ -186,23 +209,39 @@ const fakeJudgment = {
     }
     return {
       status: 'ok',
-      judgment: this.judgment as never,
+      meta: this.meta,
+      value: this.value,
       request,
-      response: { normalized: this.judgment, raw: { model: this.judgment.model } },
+      response: { normalized: this.value, raw: { model: this.meta.model } },
       latencyMs: 42,
     };
   },
 };
 
-/** judgment 限流额度（e2e 默认抬高；限流用例临时改小） */
+/**
+ * judgment 成本闸配置（e2e 默认抬高；限流用例临时改小）。
+ *
+ * ⚠️ **三级闸必须同时抬高**：任一级留在小值上都会把本套件打成 skipped（capability 缺省 120
+ * < global 缺省 240 ⇒ 只抬 global 仍会被能力子额度拦下）。限流用例只把 **actor 级**临时改小，
+ * 故其断言的 reason 恒为 `judgment_rate_limited`（其他两级仍被抬高）。
+ */
 const fakeJudgmentConfig: JudgmentConfig = {
   provider: 'typesafe',
-  baseUrl: 'https://api.typesafe.ai',
+  // ⚠️ 钉在本机不可路由端口（`http://127.0.0.1:1`）：万一接线回归让**真 provider** 被实例化
+  // （override 漏了 token / 名字改了），请求只会立刻 ECONNREFUSED 落一行 error，**绝不会**
+  // 打到生产计费 API 上。用真实公网缺省（api.typesafe.ai）时，这种回归会安静地烧钱。
+  baseUrl: 'http://127.0.0.1:1',
   apiKey: 'inline-test-key',
   // typesafe 下 model 是请求参数；**类型标注**让"漏字段"变成编译期 fail-closed
   typesafeModel: 'jev-latest',
   timeoutMs: 8000,
   rateLimitPerHour: 100000,
+  globalRateLimitPerHour: 100000,
+  capabilityRateLimitPerHour: 100000,
+  // 能力白名单：本套件只测 record_check（恒不受管辖）⇒ 空集即缺省形态
+  capabilities: [],
+  // e2e 内联配置：无配置组合异常可言（warning 由 config 工厂产出，本套件 override 掉它）
+  warnings: [],
 };
 
 /**
@@ -1035,7 +1074,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
   // ══════════════════════════════════════════════════════════════════
 
   describe('⑤ 全文融合检索（中文 + 异词汇）', () => {
-    it('中文 q 命中（tsvector 通道；simple 配置不切词但 CJK 整串成 token）', async () => {
+    it('中文 q 命中（tsvector 通道；CJK 单字化后 bigram 短语命中）', async () => {
       if (!dbAvailable) return;
       const id = await seed({
         title: `端口映射失效 ${RUN}`,
@@ -1056,7 +1095,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       expect(data.appliedFilters?.q).toBe('端口映射失效');
     });
 
-    it('异词汇召回：录「端口映射失效」→ 搜「端口不可达」（trgm 通道）', async () => {
+    it('异词汇召回被 K-gate 结构门拦下（精度门设计意图：误命中代价 > 漏命中）', async () => {
       if (!dbAvailable) return;
       // 标题刻意保持**纯 CJK**：pg_trgm 的相似度会被标题里的 ASCII（RUN 后缀）稀释，
       // 而本用例要证明的正是"标题 trigram 重叠足以召回异词汇"（RUN 放 summary 做隔离，
@@ -1068,12 +1107,19 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
         signals: [`vocab-${RUN}`],
       });
 
+      // 门的判据前提（机器自证）：查询 5 个 CJK 字 ⇒ 缺省 K=2；而标题只共享 1 个 bigram
+      // （端-口）⇒ 门拒。trgm 腿本可把它抬过 floor（旧行为 = 召回），门挂上后不再召回。
+      const paraphrase = compileQuery('端口不可达');
+      expect(paraphrase.cjkCharCount).toBe(5);
+      expect(chooseKGateK(paraphrase.cjkCharCount, paraphrase.arms.length)).toBe(2);
+
       const res = await list(`q=%E7%AB%AF%E5%8F%A3%E4%B8%8D%E5%8F%AF%E8%BE%BE`); // 端口不可达
-      const data = (res.body as Envelope<ListData>).data;
-      const hit = data.items.find((i) => i.id === id);
-      expect(hit).toBeDefined();
-      // 融合分透出且高于下限（异词汇召回是 trgm 通道的功劳，不是 tsvector）
-      expect(hit?.score).toBeGreaterThan(0.08);
+      const ids = (res.body as Envelope<ListData>).data.items.map((i) => i.id);
+      expect(ids).not.toContain(id);
+
+      // 门不是"什么都拒"：换成与标题共享 ≥2 bigram 的近形（端口映射失效）即召回
+      const res2 = await list(`q=%E7%AB%AF%E5%8F%A3%E6%98%A0%E5%B0%84%E5%A4%B1%E6%95%88`); // 端口映射失效
+      expect((res2.body as Envelope<ListData>).data.items.map((i) => i.id)).toContain(id);
     });
 
     it('q 是过滤：不相关的条目被排除（低于 SCORE_FLOOR 不进结果集）', async () => {
@@ -1089,11 +1135,12 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       expect(data.items.map((i) => i.id)).not.toContain(unrelated);
     });
 
-    it('分数下限实证：q 命中面靠 trgm 通道抬分（单 token ts_rank ≈0.061 < 0.08）', async () => {
+    it('ts 尺度反转实证：单 token cd 命中现在**会被召回**，标题命中名次与分数更前', async () => {
       if (!dbAvailable) return;
-      // 该条目把标识符只放在 signals 里：ts_rank 通道有匹配（≈0.061）但 title/content
-      // 的 trgm 贡献接近 0 ⇒ 融合分低于 0.08 ⇒ **不返回**。这是 plan §2 权重与
-      // SCORE_FLOOR 的既定交互（详见本文件头 EXPERIENCE-E2E-FLOOR 踩坑条）。
+      // 该条目把标识符只放在 signals 里：search_vector 命中（ts 通道有匹配），
+      // title/content 的 trgm 贡献接近 0。旧 `ts_rank` 尺度下单 token ≈0.0608 < floor 0.08
+      // ⇒ **不返回**；批次 1 换 `ts_rank_cd` flag 0 后单 token ≈0.1 ≥ 0.08 ⇒ **返回**。
+      // 本用例即该 A 类断言反转的显式登记（inventory `experience.e2e-spec.ts:1109-1129`）。
       // 查询串**刻意不含 RUN**：RUN 是所有条目的公共子串，含它会让每条都靠 trgm 命中，
       // 本用例要孤立的正是"标识符只出现在 signals（→ 只进 search_vector）"这一形态
       const token = `qzzidentifier${Date.now().toString(36)}`;
@@ -1101,17 +1148,21 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
         title: '纯中文标题',
         // summary 带 RUN 做隔离（summary 不参与打分），title/content **必须完全无 ASCII**：
         // 一旦有 'How verified' 之类英文，trgm 会与 identifier 共享 'ifi'/'fie' trigram
-        // （实测把融合分从 0.061 抬到 ≈0.105）→ 本用例的隔离前提就没了
+        // （实测把融合分从 cd 单点抬得更高）→ 本用例的"trgm 贡献 ≈ 0"前提就没了
         summary: `没有任何英文标识符出现在标题或正文 ${RUN}`,
         content: '只有中文描述 中文解法 中文验证',
         signals: [token],
       });
 
       const res = await list(`q=${token}`);
-      const ids = (res.body as Envelope<ListData>).data.items.map((i) => i.id);
-      expect(ids).not.toContain(onlyInSignals);
+      const items = (res.body as Envelope<ListData>).data.items;
+      const ids = items.map((i) => i.id);
+      expect(ids).toContain(onlyInSignals);
+      // 分数确实过下限（cd 单点抬过分——这就是断言反转的机制）
+      const signalsOnlyScore = items.find((i) => i.id === onlyInSignals)?.score as number;
+      expect(signalsOnlyScore).toBeGreaterThanOrEqual(EXPERIENCE_SCORE_FLOOR);
 
-      // 对照：同一标识符出现在**标题**里就命中（trgm(title)×0.8 抬过下限）
+      // 对照：同一标识符出现在**标题**里 → trgm(title)×0.8 抬分 ⇒ 名次与分数都更靠前
       const inTitle = await seed({
         title: `${token} 出现在标题`,
         summary: `对照条目 ${RUN}`,
@@ -1119,7 +1170,13 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
         signals: [`other-${RUN}`],
       });
       const res2 = await list(`q=${token}`);
-      expect((res2.body as Envelope<ListData>).data.items.map((i) => i.id)).toContain(inTitle);
+      const items2 = (res2.body as Envelope<ListData>).data.items;
+      const ids2 = items2.map((i) => i.id);
+      expect(ids2).toContain(inTitle);
+      expect(ids2.indexOf(inTitle)).toBeLessThan(ids2.indexOf(onlyInSignals));
+      expect(items2.find((i) => i.id === inTitle)?.score as number).toBeGreaterThan(
+        signalsOnlyScore,
+      );
     });
   });
 
@@ -1991,6 +2048,9 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       expect(fnDef.match(/COALESCE\(/g)?.length).toBe(5);
       expect(fnDef).toContain('to_tsvector');
       expect(fnDef).toContain("'simple'");
+      // v1.86 中文根治：函数体必须作用于单字化文本（CJK 逐字分隔）——只钉 to_tsvector
+      // 会在"函数被换回原文形态"时空转通过（静默错通面，批次 0 清单 B 类）
+      expect(fnDef).toContain('cjk_unigram_text(');
     });
 
     it('trigger 真实生效：更新 signals 后 search_vector 同步（且非内容列更新不重算）', async () => {
@@ -2713,6 +2773,14 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       expect(rows[0].latency_ms).toBe(42);
       expect((rows[0].request as { state: { content: string } }).state.content).toContain('##');
 
+      // 正向断言（v1.85.0 批次 2）：**e2e override 真的生效**——provider 身份是 fake 的 'jev'
+      // （不是真实实现的 'typesafe'），且它确实被调用过一次。
+      // 为什么必须显式钉：fake 走 `useValue` 注入 ⇒ **无编译期类型检查**，provider 契约从
+      // `checkEntry(input)` 升为 `run(capability, input)` 时若 fake 漏改方法名，service 会拿到
+      // 调用不存在的函数（TypeError）或静默 undefined——只有这条断言能把它变成红。
+      expect(fakeJudgment.calls).toHaveLength(1);
+      expect(fakeJudgment.calls[0].content).toContain('##');
+
       // 快照列也写了（详情读路径的缓存）：第 7 维与 rubric 代际随快照落库
       const snapshot = await entrySnapshot(data.id);
       expect(snapshot.judgment).toMatchObject({
@@ -2768,7 +2836,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       const id = await seed({ title: `judge-patch ${RUN}`, signals: [`jp-${RUN}`] });
       const before = (await detail(id)).body as Envelope<DetailData>;
 
-      fakeJudgment.judgment = { ...fakeJudgment.judgment, model: 'jev-fake-v2' } as never;
+      fakeJudgment.meta = { ...fakeJudgment.meta, model: 'jev-fake-v2' } as never;
       const patched = await authed(
         request(app.getHttpServer()).patch(`${API_PREFIX}/experiences/${id}`),
         'agent',
@@ -2822,7 +2890,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
         new Promise<void>((resolve) => {
           release = resolve;
         });
-      fakeJudgment.judgment = { ...fakeJudgment.judgment, model: 'jev-stale-first' } as never;
+      fakeJudgment.meta = { ...fakeJudgment.meta, model: 'jev-stale-first' } as never;
 
       // ① 第一次 PATCH：事务已提交，判定挂起（updated_at = t1）
       const t1 = ((await detail(id)).body as Envelope<DetailData>).data.updatedAt;
@@ -2843,7 +2911,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
 
       try {
         // ② 在途期间再改一次（内容 v2 + 新 token）——它的判定不阻塞，先写入快照
-        fakeJudgment.judgment = { ...fakeJudgment.judgment, model: 'jev-stale-second' } as never;
+        fakeJudgment.meta = { ...fakeJudgment.meta, model: 'jev-stale-second' } as never;
         const t2 = ((await detail(id)).body as Envelope<DetailData>).data.updatedAt;
         await authed(request(app.getHttpServer()).patch(`${API_PREFIX}/experiences/${id}`), 'agent')
           .send({ content: '## Symptom\nversion two\n## How verified\ny', expectedUpdatedAt: t2 })
@@ -2891,7 +2959,8 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       expect(rows[0].request).toMatchObject({ skipped: true, reason: 'judgment_rate_limited' });
       expect(rows[0].response).toBeNull();
 
-      // P2-5：**每窗口每 actor 至多一条** skipped 行——第三次超限不再落行（行写入有界）
+      // P2-5 / v1.85.0：**每「闸级别 + actor」至多一条** skipped 行——第三次超限（同级）不再落行
+      // （行写入有界；本用例只有 actor 级被改小 ⇒ reason 恒为 judgment_rate_limited）
       const third = await createExperience(
         payload({ title: `judge-rate-3 ${RUN}`, signals: [`jr3-${RUN}`] }),
         asRateActor,
@@ -2913,7 +2982,7 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       const callsAfterFirst = fakeJudgment.calls.length;
 
       // 换掉 fake 的结论：若重放走了重判，响应会变成 v9
-      fakeJudgment.judgment = { ...fakeJudgment.judgment, model: 'jev-should-not-run' } as never;
+      fakeJudgment.meta = { ...fakeJudgment.meta, model: 'jev-should-not-run' } as never;
       const replay = await createExperience(
         payload({ title: `judge-replay ${RUN}`, signals: [`jrp-${RUN}`], clientRequestId: key }),
       );

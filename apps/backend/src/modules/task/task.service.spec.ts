@@ -32,6 +32,8 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
+import { TASK_SEARCH_WEAK_HIT_SCORE, TASK_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
 
 function createMockRepo<T extends ObjectLiteral>() {
   const qb = {
@@ -44,9 +46,14 @@ function createMockRepo<T extends ObjectLiteral>() {
     orderBy: jest.fn().mockReturnThis(),
     skip: jest.fn().mockReturnThis(),
     take: jest.fn().mockReturnThis(),
+    setParameter: jest.fn().mockReturnThis(),
+    setParameters: jest.fn().mockReturnThis(),
     getManyAndCount: jest.fn(),
     getMany: jest.fn(),
     getOne: jest.fn(),
+    // q= 检索通道（v1.86）：rank 通道走 getRawAndEntities + 独立 count
+    getRawAndEntities: jest.fn(),
+    getCount: jest.fn(),
   };
   return {
     find: jest.fn().mockResolvedValue([]),
@@ -722,6 +729,63 @@ describe('TaskService', () => {
 
       expect(qb.orderBy).toHaveBeenCalledWith('task.createdAt', 'DESC');
       expect(qb.addOrderBy).not.toHaveBeenCalled();
+    });
+
+    // ─── q= 检索：零命中日志 + 弱命中 hint（计划 §2.6 四路之 task 面；1-b 遗留补测）───
+
+    it('q= 零命中 ⇒ logSearchZeroHit 恰一次（surface=task）+ 零命中 hint', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        const qb = mockTaskRepo.createQueryBuilder();
+        (qb.getRawAndEntities as jest.Mock).mockResolvedValue({ entities: [], raw: [] });
+        (qb.getCount as jest.Mock).mockResolvedValue(0);
+
+        const result = await service.findAll({ q: '不存在的词' });
+
+        expect(result.total).toBe(0);
+        expect(result.hint).toBe(TASK_SEARCH_ZERO_HIT_HINT);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({ surface: 'task', query: '不存在的词' });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('纯标点 q（编译期 isEmpty）⇒ 短路返回空信封 + 落零命中日志（**不发生任何 DB 调用**）', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        // QB 在 isEmpty 判断之前就已构造（服务先建 QB 再编译 q）⇒ 取回同一实例断言"没发查询"
+        const qb = mockTaskRepo.createQueryBuilder();
+        const result = await service.findAll({ q: '!!!' });
+
+        // 契约③按面枚举：task q= 面 isEmpty ⇒ 短路（不是 trgm-only 真检索）
+        expect(result).toMatchObject({ items: [], total: 0, hint: TASK_SEARCH_ZERO_HIT_HINT });
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({ surface: 'task', query: '!!!' });
+        expect(qb.getManyAndCount as jest.Mock).not.toHaveBeenCalled();
+        expect(qb.getRawAndEntities as jest.Mock).not.toHaveBeenCalled();
+        expect(qb.getCount as jest.Mock).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('弱命中 hint 线 = TASK_SEARCH_WEAK_HIT_SCORE（基准 0.3，**不做 W1 换算**）', async () => {
+      const hintFor = async (rank: number): Promise<string | undefined> => {
+        const qb = mockTaskRepo.createQueryBuilder();
+        (qb.getRawAndEntities as jest.Mock).mockResolvedValue({
+          entities: [createMockTask()],
+          raw: [{ rank }],
+        });
+        (qb.getCount as jest.Mock).mockResolvedValue(1);
+        return (await service.findAll({ q: '不存在的词' })).hint;
+      };
+
+      expect(await hintFor(TASK_SEARCH_WEAK_HIT_SCORE * 0.9)).toBe(TASK_SEARCH_ZERO_HIT_HINT);
+      expect(await hintFor(TASK_SEARCH_WEAK_HIT_SCORE * 1.1)).toBeUndefined();
+      // 两侧分家的前提自证（主脑裁决 R4）：本面 rank 是**裸** ts_rank_cd（未乘 SEARCH_TS_W1）
+      // ⇒ 弱命中线恒等于基准 0.3，不得跟着 doc-search 侧缩放（改了这条必红）
+      expect(TASK_SEARCH_WEAK_HIT_SCORE).toBe(0.3);
     });
   });
 

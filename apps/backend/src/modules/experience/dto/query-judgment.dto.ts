@@ -70,8 +70,10 @@ export class QueryJudgmentDto {
   @IsIn([...EXPERIENCE_JUDGMENT_STATUSES])
   @ApiPropertyOptional({
     description:
-      'Filter by result status. `ok` / `error` / `timeout` / `skipped` (rate-limited, no provider ' +
-      'call). Failure rate uses ok+error+timeout as the denominator (skipped excluded).',
+      'Filter by result status. `ok` / `error` / `timeout` / `skipped` (a gate skipped it — no ' +
+      'provider call; reasons: rate limits / egress / visibility). Failure rate uses ' +
+      'ok+error+timeout as the denominator (skipped excluded); fail-open rate additionally ' +
+      'includes every skipped reason.',
     enum: EXPERIENCE_JUDGMENT_STATUSES,
     example: 'ok',
   })

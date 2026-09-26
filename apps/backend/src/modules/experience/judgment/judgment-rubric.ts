@@ -3,16 +3,20 @@
  * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
  * [功能概念]
- *   - 经验库判别的**固定代码侧 rubric**与**逐字段白名单归一化**（防注入面的收口点）
+ *   - 经验库判别的**固定代码侧 rubric**与**逐字段白名单归一化**（防注入面的收口点），
+ *     并以 `JudgmentCapability` 形态实现内核契约（能力名 = `record_check`）
  *
  * [代码职责]
  *   - **七维**问题集（instructions 英文常量 + 词表）与 `state` 组装（正文节选 ≤2000 字符）
- *   - jev 原始 answers → `ExperienceJudgment` 七维的**白名单校验 + clamp**（§0 威胁面缓解）
- *   - rubric 代际标记 `EXPERIENCE_JUDGMENT_RUBRIC_VERSION`（provider 写入快照 `rubricVersion`）
+ *   - 上游原始 answers → `ExperienceJudgment` 七维的**白名单校验 + clamp**（§0 威胁面缓解）
+ *   - rubric 代际标记 `EXPERIENCE_JUDGMENT_RUBRIC_VERSION`（传输侧写入快照 `rubricVersion`）
+ *   - `experienceRecordCheckCapability`：内核契约的实现（三必填 + 追加 redaction + 日志载荷）
+ *   - `ExperienceCheckInput`：本能力的输入契约（条目内容 + 当次词表快照）
  *
  * [权威文档]
  *   - 主文档: 线上 DocSpace `docs/experience-base.md` §12（rubric 表：七维 + rubricVersion 说明，
  *     含"未来形态 = 硬门槛"注记）/§9（翻案率配对 = 校准数据源）
+ *   - 补充: 线上 DocSpace `docs/spec.md` — `JudgmentCapability` 终稿形状
  *   - 历史: .kimi/plans/plan-experience-base-p2.md §3.3（原始六维问题集表——plan 标题记"五维"，
  *     落地后含 domainSuggestion 共六维）/§3.4（快照形状）/
  *     §0（"judgment 键是平台自产字段的注入面"→ 逐字段白名单）
@@ -24,24 +28,31 @@
  *     `Number.isFinite` 且 clamp(0,1)；`suggestedIntent ∈ EXPERIENCE_INTENTS`；
  *     `suggestedDomain ∈ 当次 availableDomains 快照`。任一不合法 ⇒ **该维度 null**。
  *   - **整体形状破损 ⇒ 返回 null**（调用点按 status=error 落日志且不落快照）：answers 不是对象、
- *     **全部维度全 null**（jev 换了协议/被网关改写）都属于这一类——**宁可不落快照，也不落半真快照**
+ *     **全部维度全 null**（上游换了协议/被网关改写）都属于这一类——**宁可不落快照，也不落半真快照**
  *     （快照会被 reviewer 当 ground truth 对照）。
- *   - **observe-only（用户 2026-09-24 拍板）**：新增的 `admissionSuggestion` 与既有各维一样
- *     只是**建议文本**——本文件与调用链上**没有任何**"据此拒绝录入 / 自动改写条目 / 自动升降
+ *   - **observe-only（用户 2026-09-24 拍板）**：`admissionSuggestion` 与既有各维一样只是
+ *     **建议文本**——本文件与调用链上**没有任何**"据此拒绝录入 / 自动改写条目 / 自动升降
  *     quality"的代码路径。未来形态（准入判定为 reject 则拒收）是独立批次，前置条件 =
  *     `docs/experience-base.md` §9 的翻案率配对数据量达标。
- *   - **rubric 代际可辨**：`EXPERIENCE_JUDGMENT_RUBRIC_VERSION` 由 provider 写进快照
- *     `rubricVersion`——训练/校准数据据此区分"这条评语出自哪一代问题集"；旧快照无该字段 = v1。
+ *   - **rubric 代际可辨**：`EXPERIENCE_JUDGMENT_RUBRIC_VERSION` 写入快照 `rubricVersion`
+ *     ——训练/校准数据据此区分"这条评语出自哪一代问题集"；旧快照无该字段 = v1。
  *   - **既有六维的 instructions 与词表不可改**（v1.82.0 明令）：改动即切断校准数据的纵向
  *     可比性——增维可以，改维不行。
+ *   - **`egressAllow` 恒 true 是刻意的**：经验库的出境闸门在 **400 层**
+ *     （`experience.service.ts` 用同一张 `EXPERIENCE_SECRET_PATTERNS` 在写入前拒绝），
+ *     到这里的内容已经过闸——本能力不需要第二道（内核仍会跑 redaction 基线与它同源）。
+ *   - **`toLogPayload` 显式返回 `outcome.request`**：经验库的**语料不变量**就是"日志载荷 =
+ *     实际发包体"（训练脚本要能复现"问了什么"）——这是内核"不落原文"规则的**唯一例外**，
+ *     故必须显式一行写出，不得依赖任何缺省实现。
  *   - score 类维度的档位**必须从 `legend[argmax(probabilities)]` 反查**，不能用 `round(score)`
- *     ：实测 jev 返回 `{score: 1.85, legend:{0:'missing',1:'thin',2:'partial',3:'complete'},
+ *     ：实测上游返回 `{score: 1.85, legend:{0:'missing',1:'thin',2:'partial',3:'complete'},
  *     probabilities:{...}}`，legend 才是权威映射；也**不落 probabilities 全量**（快照只留结论）。
  *   - 字符串限长：`model` 截到 64（列宽）、其余字符串值均来自白名单（天然短）。
  *
  * [关联代码]
- *   - typesafe.judgment-provider.ts — 唯一调用方（发问 + 收 answers + 调本文件的归一化）
- *   - judgment-provider.interface.ts — `ExperienceCheckInput` / `JudgmentOutcome`
+ *   - ../../judgment/judgment-capability.interface.ts — 内核契约（本文件实现它）
+ *   - ../../judgment/typesafe.judgment-provider.ts — 唯一调用方（发问 + 收 answers + 调本文件的归一化）
+ *   - experience-judgment.service.ts — 调用点（额度 / 事务内落库 / 快照守卫）
  *   - packages/shared/src/dto/experience-response.dto.ts — `ExperienceJudgment`（快照形状单源）
  *
  * [持久踩坑]
@@ -57,12 +68,43 @@
  */
 import {
   EXPERIENCE_INTENTS,
+  EXPERIENCE_JUDGMENT_OPERATION,
   type ExperienceIntent,
   type ExperienceJudgment,
 } from '@agent-chamber/shared';
-import type { ExperienceCheckInput } from './judgment-provider.interface';
+import type {
+  JudgmentCapability,
+  JudgmentQuestions,
+} from '../../judgment/judgment-capability.interface';
 
-/** 快照的七维部分（provider/model/judgedAt/rubricVersion 由 provider 客户端补，见文件头） */
+/**
+ * 判定输入（调用点在写事务后组装；能力只做"截节选 + 发问 + 解析"）。
+ *
+ * 注意 `content` 是**正文全文**：截成节选（≤2000 字符 + 截断标记）在 `buildJudgmentState`
+ * 里做——节选长度属于"发给模型什么"的语义，与日志体积纪律同一处定义，避免两处各自截。
+ */
+export interface ExperienceCheckInput {
+  /** 条目标题 */
+  title: string;
+  /** 条目摘要 */
+  summary: string;
+  /** 正文全文（能力负责截节选） */
+  content: string;
+  /** 症状信号（归一化后的小写 token） */
+  signals: string[];
+  /** 领域标签 */
+  domains: string[];
+  /** 环境指纹（键受控值开放） */
+  env: Record<string, string>;
+  /** 当前 intent（用于 intentSuggestion 的 keep 判断） */
+  intent: ExperienceIntent;
+  /** 录入时的疑似重复候选（top-3，供 duplicate 维度判断） */
+  duplicateCandidates: { id: string; title: string; quality: string }[];
+  /** 当次可用领域词表快照（domainSuggestion 的候选值域**必须**取自它） */
+  availableDomains: string[];
+}
+
+/** 快照的七维部分（provider/model/judgedAt/rubricVersion 由传输侧补进 `meta`，见内核契约） */
 export type ExperienceJudgmentDims = Omit<
   ExperienceJudgment,
   'provider' | 'model' | 'judgedAt' | 'rubricVersion'
@@ -156,9 +198,7 @@ export function buildContentExcerpt(content: string): {
  * @param availableDomains 当次可用领域词表快照（domainSuggestion 的候选值域）
  * @returns jev_ask 的 `questions` 参数
  */
-export function buildRubricQuestions(
-  availableDomains: string[],
-): Record<string, Record<string, unknown>> {
+export function buildRubricQuestions(availableDomains: string[]): JudgmentQuestions {
   return {
     completeness: {
       type: 'score',
@@ -411,17 +451,31 @@ export function normalizeJevAnswers(
   return allNull ? null : dims;
 }
 
-/** 模型标识限长（`experience_judgments.model` 列宽 varchar(64)） */
-export const JUDGMENT_MODEL_MAX_LENGTH = 64;
+/** 从已解析响应体取 `answers`（形状破损 → null，由归一化统一判"整体破损"） */
+function readAnswers(raw: unknown): unknown {
+  if (typeof raw !== 'object' || raw === null) return null;
+  return (raw as Record<string, unknown>).answers;
+}
 
 /**
- * 从 jev 内层响应取模型标识（自报值；非字符串或空 → `'unknown'`；限长 64）。
+ * 经验库录入判定能力（内核契约实现；名称 ≡ `EXPERIENCE_JUDGMENT_OPERATIONS[0]`）。
  *
- * rationale：`model` 是**观测字段**（"这批评语是哪个模型打的"），不是判定输入——即使它
- * 被上游改写也不该让整次判定失败，故做保守兜底而不是报错。
+ * 三必填的取值与理由见文件头 [关键不变量]（`egressAllow` 恒 true = 闸门在 400 层；
+ * `toLogPayload` 显式返回发包体 = 语料不变量的唯一例外）。
  */
-export function extractJudgmentModel(inner: Record<string, unknown>): string {
-  const raw = inner.model;
-  if (typeof raw !== 'string' || raw.trim() === '') return 'unknown';
-  return raw.trim().slice(0, JUDGMENT_MODEL_MAX_LENGTH);
-}
+export const experienceRecordCheckCapability: JudgmentCapability<
+  ExperienceCheckInput,
+  ExperienceJudgmentDims
+> = {
+  name: EXPERIENCE_JUDGMENT_OPERATION.RECORD_CHECK,
+  rubricVersion: EXPERIENCE_JUDGMENT_RUBRIC_VERSION,
+  buildQuestions: (input) => buildRubricQuestions(input.availableDomains),
+  buildState: (input) => buildJudgmentState(input),
+  normalize: (raw, input) => normalizeJevAnswers(readAnswers(raw), input.availableDomains),
+  // 无需追加：内核红线基线（两表并集）已与录入闸门同源，追加只会引入第二处漂移面
+  redactionPatterns: [],
+  // 出境闸门在 400 层（录入/改写时同一张 EXPERIENCE_SECRET_PATTERNS 命中即拒绝），见文件头
+  egressAllow: () => true,
+  // 语料不变量：日志载荷 = 实际发包体（训练脚本要能复现"问了什么"）——内核"不落原文"的例外
+  toLogPayload: (_input, outcome) => outcome.request,
+};

@@ -63,9 +63,11 @@ export interface AgentDeletionImpact {
 /**
  * 跨 topic 未读消息计数（GET /agents/me/unread 响应，plan forge-jubilee-robin.md WS-B）
  *
- * 语义与 TopicService.getUnread 对齐（topic.service.ts:1241-1309）：
- * - 无游标（last_read_message_id IS NULL）或游标消息已软删 → 该 topic 全量未删消息计数；
- * - 自己发的消息计入（无 sender 过滤，与 getUnread 同语义）；
+ * 语义与 TopicService.getUnread 对齐（以函数名为锚，不引用易漂的行号）：
+ * - 无游标（last_read_message_id IS NULL）或游标消息已软删 → 该 topic 全量未读计数
+ *   （未软删 **且非自己发** 的消息）；
+ * - 自己发的消息不计入未读：主路径靠「发送即已读」游标（v1.69），SQL 侧再显式排除
+ *   sender_id = participant_id，兜住游标缺失/悬空的降级路径（v1.85 同口径收口）；
  * - 仅统计 status IN ('invited','active') 的参与行（left 排除）；
  * - 只列 unreadCount > 0 的 topic，最多 50 条；结果为调用时刻快照
  *   （get_topic_digest 默认 markRead=true 会推进游标清零计数）。

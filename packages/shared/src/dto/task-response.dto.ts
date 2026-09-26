@@ -2,6 +2,29 @@ import { MilestoneStatus } from '../enums';
 import type { TaskDocLinkItem } from './docspace-response.dto';
 
 /**
+ * 任务列表 q= 检索的零命中/弱命中引导原文（`GET /tasks?q=` 信封 `hint` 字段单源；
+ * 形态对齐 `EXPERIENCE_ZERO_HIT_HINT`——消费方 Agent 的行为指令，必须逐字稳定；
+ * 检索中文根治批次 1-b，计划 v1.5 §2.6 + 主脑裁决 #1「task q= 信封加性 hint? 键」）。
+ */
+export const TASK_SEARCH_ZERO_HIT_HINT =
+  'No tasks matched. Try a shorter 2-4 character keyword from the task title, or anchor ' +
+  'on an exact identifier (file/symbol name). Paraphrase mismatches (same concept, ' +
+  'different wording) are a known v1 boundary — they need v3 semantic retrieval.';
+
+/**
+ * 任务检索弱命中线（本页最高 rank 低于本值时附带 `TASK_SEARCH_ZERO_HIT_HINT`）。
+ *
+ * 取值 = `DOC_SEARCH_STRONG_HIT_SCORE`（0.3）的**基准尺度直用**，不做 W1 换算——task
+ * q= 的 rank 通道是裸 `ts_rank_cd`（未乘 `SEARCH_TS_W1`，见 task.service.ts 的
+ * `addSelect(searchGroup.scoreExpr, 'rank')`），尺度自始至终没变。
+ *
+ * 为什么单独立名（2026-09-26 批次 1-d2，主脑裁决 R4）：doc-search 侧活阈值已改为
+ * `基准 × SEARCH_TS_W1`，两侧尺度分家；继续复用 `DOC_SEARCH_*` 会让"改一边静默影响
+ * 另一边"（1-b 现场决定 #5 跨域复用坑），故两侧各持具名常量。
+ */
+export const TASK_SEARCH_WEAK_HIT_SCORE = 0.3;
+
+/**
  * 任务摘要
  */
 export interface TaskSummary {

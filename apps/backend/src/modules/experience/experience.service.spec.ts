@@ -19,6 +19,7 @@ import {
 } from './experience.constants';
 import type { CreateExperienceDto, QueryExperienceDto, UpdateExperienceDto } from './dto';
 import type { UnifiedActor } from '../../common/types/actor.types';
+import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
 
 /**
  * ExperienceService 单测（plan §7 后端单测清单）。
@@ -897,13 +898,14 @@ describe('ExperienceService', () => {
     it('有 q：融合分既进 WHERE（≥ floor 显式过滤）又进 ORDER BY + SELECT（透出 score）', async () => {
       await service.search({ q: 'port unreachable' } as QueryExperienceDto, agentActor);
       const clauses = predicates(mainQb()).join(' ');
-      expect(clauses).toContain('plainto_tsquery');
+      // v1.86：ts 项换编译产物绑定（`:compiledQ`）+ cd flag 0，无 plainto_tsquery 字面量
+      expect(clauses).toContain(`ts_rank_cd(e.search_vector, to_tsquery('simple', :compiledQ))`);
       expect(clauses).toContain('similarity(e.content');
       expect(clauses).toContain('similarity(e.title');
       expect(param(mainQb(), 'scoreFloor')).toBe(EXPERIENCE_SCORE_FLOOR);
       // ORDER BY：融合分接管排序（verified 层优先 → 融合分 → 去重命中 → 新鲜度 → id）
       const orderKeys = (mainQb().addOrderBy as jest.Mock).mock.calls.map((c) => String(c[0]));
-      expect(orderKeys.join(' ')).toContain('ts_rank');
+      expect(orderKeys.join(' ')).toContain('ts_rank_cd');
       expect(orderKeys).toContain('e.distinct_helped_count');
       expect(orderKeys).toContain('e.updated_at');
       expect(orderKeys).toContain('e.id');
@@ -963,6 +965,32 @@ describe('ExperienceService', () => {
       expect(searchEventRepo.insert).toHaveBeenCalledWith(
         expect.objectContaining({ hadResults: false }),
       );
+    });
+
+    it('零结果 + q ⇒ logSearchZeroHit 恰一次（surface=experience）；无 q 裸浏览不落', async () => {
+      const spy = jest.spyOn(zeroHitLog, 'logSearchZeroHit');
+      try {
+        await service.search({ q: 'nothing matches' } as QueryExperienceDto, agentActor);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0][1]).toMatchObject({
+          surface: 'experience',
+          query: 'nothing matches',
+        });
+
+        spy.mockClear();
+        // 无 q 的纯过滤浏览空结果**不是**检索零命中（计划 §2.6：只记真检索，否则日志与
+        // 零命中率埋点一起灌水）
+        await service.search({} as QueryExperienceDto, agentActor);
+        expect(spy).not.toHaveBeenCalled();
+
+        spy.mockClear();
+        // 有结果时同样不落（零命中日志的语义就是"零命中"）
+        installQueryBuilders({ count: 3, entities: [makeEntry()] });
+        await service.search({ q: 'x' } as QueryExperienceDto, agentActor);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('有结果 → had_results=true（两个口径都落，否则零命中率恒等于 1）', async () => {

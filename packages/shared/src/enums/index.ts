@@ -654,8 +654,9 @@ export const EXPERIENCE_JUDGMENT_OPERATION = {
  *   标签来自已退役的 `jev` MCP 传输（v1.83.0 起不再产生）
  * - `timeout`：超过 `JUDGMENT_TIMEOUT_MS`（默认 8s）硬顶
  * - `skipped`：**限流跳过**（未调用 provider）——`request` 写占位
- *   `{skipped:true, reason:'judgment_rate_limited'}`，`response` 为 null，
- *   **同样计入 actor 判断额度**（行写入有界，防日志表被刷爆）
+ *   `{skipped:true, reason:'<EXPERIENCE_JUDGMENT_SKIPPED_REASONS 之一>'}`，`response` 为 null，
+ *   **同样计入额度**（行写入有界，防日志表被刷爆）。`reason` 区分**撞的是哪一级闸**
+ *   （actor / 全局 / 能力子额度），值域单源见 `EXPERIENCE_JUDGMENT_SKIPPED_REASONS`
  *
  * ⚠️ **失败与跳过都落库**：observe 期的失败率/覆盖率全靠本表；**"未判"与"判失败"的区分
  * = 查本表 status**（条目快照列 `judgment=null` 无法区分，也不自动重判——明文决策）。
@@ -672,6 +673,57 @@ export const EXPERIENCE_JUDGMENT_STATUS = {
   ERROR: EXPERIENCE_JUDGMENT_STATUSES[1],
   TIMEOUT: EXPERIENCE_JUDGMENT_STATUSES[2],
   SKIPPED: EXPERIENCE_JUDGMENT_STATUSES[3],
+} as const;
+
+/**
+ * 判别跳过原因值域（`experience_judgments.request.reason`，`status='skipped'` 行）。
+ *
+ * 三级成本闸各对应一个值（v1.85.0 起）——**枚举化是为了防下游按字面量 grep 时静默漏行**：
+ * 单常量时代只能匹配 `judgment_rate_limited`，新增的两级闸会从"跳过分布"统计里消失。
+ *
+ * - `judgment_rate_limited`：**actor** 级额度（`JUDGMENT_RATE_LIMIT`）超限。⚠️ 历史值
+ *   （v1.85.0 前的 skipped 行）**逐字节就是它**，兼容性要求它字面不变
+ * - `global_rate_limit`：**全局**总闸（`JUDGMENT_GLOBAL_RATE_LIMIT`）超限（跨 actor）
+ * - `capability_rate_limit`：**能力子额度**（`JUDGMENT_CAPABILITY_RATE_LIMIT`）超限
+ * - `egress_blocked`：**出境闸**命中（v1.85.0 批次 2）——能力的 `egressAllow` 判定本次输入
+ *   不得出境（如查询词命中密钥形态）。**不落输入原文**，只落本 reason
+ * - `visibility_blocked`：**可见性闸**命中（v1.85.0 批次 2）——重排候选里有非 open 可见性的
+ *   空间，放弃本次重排。⚠️ **不带 candidateDocIds**：把"哪些文档被挡下"写进日志，等于反向
+ *   泄露"某私有空间里存在这些文档"
+ *
+ * 三级闸都是**进程内软闸**（每实例每小时 / 重启清零 / 多副本上界 ×N），语义与取值见
+ * `.env.example` 判别块与线上 `docs/experience-base.md`。
+ *
+ * ⚠️ **两个分母口径并排**（别混用）：
+ * - **失败率**分母 = `ok + error + timeout`（**排除全部 skipped**）：度量"调用过但失败了"
+ * - **fail-open 率**分母 = 上者 **+ skipped 全 reason**：度量"本该判别却没有结论"
+ *   （额度闸 / 出境闸 / 可见性闸都算"没结论"）
+ */
+export const EXPERIENCE_JUDGMENT_SKIPPED_REASONS = [
+  'judgment_rate_limited',
+  'global_rate_limit',
+  'capability_rate_limit',
+  'egress_blocked',
+  'visibility_blocked',
+] as const;
+
+/** 判别跳过原因 */
+export type ExperienceJudgmentSkippedReason = (typeof EXPERIENCE_JUDGMENT_SKIPPED_REASONS)[number];
+
+/**
+ * 命名访问视图（单源派生自 `EXPERIENCE_JUDGMENT_SKIPPED_REASONS`）。
+ *
+ * 顺序**有语义**（与值域数组同序）：actor → 全局 → 能力 → 出境 → 可见性。消费点按"撞到哪一级"
+ * 取值，不要在调用点重抄字面量（枚举化的唯一意义就是单源）。
+ *
+ * ⚠️ 新增值一律**尾部追加**：`experience.service.ts` 的 400 文案等按序消费点依赖既有下标。
+ */
+export const EXPERIENCE_JUDGMENT_SKIPPED_REASON = {
+  ACTOR_RATE_LIMITED: EXPERIENCE_JUDGMENT_SKIPPED_REASONS[0],
+  GLOBAL_RATE_LIMITED: EXPERIENCE_JUDGMENT_SKIPPED_REASONS[1],
+  CAPABILITY_RATE_LIMITED: EXPERIENCE_JUDGMENT_SKIPPED_REASONS[2],
+  EGRESS_BLOCKED: EXPERIENCE_JUDGMENT_SKIPPED_REASONS[3],
+  VISIBILITY_BLOCKED: EXPERIENCE_JUDGMENT_SKIPPED_REASONS[4],
 } as const;
 
 /**

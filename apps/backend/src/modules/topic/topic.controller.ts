@@ -616,8 +616,11 @@ export class TopicController {
   @ApiOperation({
     summary: 'Get unread messages',
     description:
-      "Get the current actor's unread message count and incremental message list in the topic." +
-      "Use the 'limit' parameter to control the number of returned messages (1–50, default 20).",
+      "Get the current actor's unread message count and incremental message list in the topic. " +
+      'Semantics: messages sent by myself are NOT counted (a send advances my own read cursor in the ' +
+      'same transaction, and the count query additionally excludes sender_id = actorId to cover ' +
+      'cursor-less/degraded paths); ' +
+      "use the 'limit' parameter to control the number of returned messages (1–50, default 20).",
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiQuery({

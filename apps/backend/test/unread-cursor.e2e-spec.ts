@@ -9,7 +9,8 @@
  * [踩坑索引]
  *   - UNREAD-CURSOR: AUTO_JOIN_PARTICIPANT_SQL 的 ON CONFLICT CASE 语义（单调推进方向、
  *     旧锚点软删 NOT EXISTS 逃生口）mock 测不出 PG 真实执行（铁律 #23 精神），
- *     本套件直连真 PG 验证五场景；历史消息 created_at 显式 UPDATE 到 2024 年，
+ *     本套件直连真 PG 验证六场景（v1.85 增「降级路径排自发」行为锁）；历史消息
+ *     created_at 显式 UPDATE 到 2024 年，
  *     新发送消息 now() 天然最新，无需调全序
  *
  * [铁律关联] #17(测试契约) #23(jsonb查询集成覆盖) #8(测试绑定)
@@ -27,7 +28,7 @@
 /**
  * 未读游标语义修正（v1.69，Kimi-Kairos 反馈采纳）—— 真实 PG 集成套件
  *
- * 覆盖（plan unread-cursor-semantics.md §测试 五场景）：
+ * 覆盖（plan unread-cursor-semantics.md §测试 五场景 + v1.85 未读语义收口 1 场景）：
  * ① D1 发送即已读：发送者游标推进到自己刚发的消息，自己消息不计入自己未读；
  *    其他参与者游标不动、未读 +1（ON CONFLICT CASE 比较方向实证）。
  * ② D2 新参与者 join → 游标初始化为当前最新消息，unread=0。
@@ -35,6 +36,8 @@
  * ④ D3 邀请建行游标 = 邀请时刻最新 → 邀请前历史不计，邀请后新消息计 1。
  * ⑤ D1 悬空锚点逃生口：游标锚定消息被软删后再发消息 → 游标正常推进、
  *    unread 不退化为全量（NOT EXISTS 分支方向实证）。
+ * ⑥ v1.85 降级路径排自发：无游标 + 仅自发消息 → unreadCount=0 / messages=[]
+ *    / hasMore=false（REST GET /topics/:id/messages/unread 的真实 PG 行为锁）。
  *
  * 环境约定与 agent-unread.e2e-spec.ts 同款：本地开发库 chamber-postgres
  * （localhost:8744），PG 不可达整套降级跳过；RUN 后缀隔离测试数据，
@@ -397,9 +400,28 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     });
 
     // NOT EXISTS 逃生口：悬空游标仍推进到新消息（比较方向实证——
-    // 若逃生口缺失/写反，游标钉在已删 msg1，getUnread 降级全量=2 而非 0）
+    // 若逃生口缺失/写反，游标钉在已删 msg1，getUnread 降级真 COUNT=1 而非 0：
+    // 降级全量口径（v1.85）= 未软删 **且非自发**，本场景仅 other 的 msgs[1] 一条）
     expect(await getCursor(topic.id, sender.id)).toBe(sent.id);
     const unread = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
     expect(unread.unreadCount).toBe(0);
+  }, 30000);
+
+  it('⑥ v1.85 降级路径排自发：无游标 + 仅自发消息 → unreadCount=0 / messages=[] / hasMore=false', async () => {
+    if (!dbAvailable) return;
+
+    const agent = await createAgentWithOwner();
+    const topic = await createTopic(agent.id);
+    // 参与行存在但游标为 null（从未读过 → 走降级分支）；3 条消息全自己发
+    // （裸插绕过 sendMessage 的「发送即已读」游标推进——否则走游标路径而非降级路径）
+    await createParticipant(topic.id, agent.id);
+    await createHistoryMessages(topic.id, agent.id, 3);
+
+    // 三口径同源（buildUnreadMessageQb）：count/list/hasMore 一致排自发 → 0 / [] / false。
+    // sender 排除若从谓词丢失，此处会得 3 / 3 条（真 PG 行为锁，mock 测不出谓词丢失）
+    const unread = await topicService.getUnread(topic.id, {}, agent.id, ActorType.AGENT);
+    expect(unread.unreadCount).toBe(0);
+    expect(unread.messages).toEqual([]);
+    expect(unread.hasMore).toBe(false);
   }, 30000);
 });
