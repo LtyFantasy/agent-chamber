@@ -167,4 +167,21 @@ describe('SkillDetailPage', () => {
       expect(screen.getByText('Skill not found')).toBeInTheDocument();
     });
   });
+
+  it('复制的安装命令显式传 -n（非默认 skill 不会被装错目录）', async () => {
+    // jsdom 无 navigator.clipboard：注入桩以捕获复制内容
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+    renderPage();
+    await screen.findByRole('heading', { name: 'agent-chamber' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy install command' }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    const command = writeText.mock.calls[0][0] as string;
+    // 省略 -n 时 install-skill.sh 按默认 skill 名下载，会把默认 skill 装进本次 -d 目录
+    expect(command).toContain('-n agent-chamber');
+    expect(command).toContain('-d ~/.agents/skills/agent-chamber');
+  });
 });

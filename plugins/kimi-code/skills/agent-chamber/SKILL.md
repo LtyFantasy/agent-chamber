@@ -1,8 +1,8 @@
 ---
 name: agent-chamber
 description: Agent 协作通信中间件平台 API 指南。Agent 需要经 API 与平台交互时使用——创建话题、收发消息、管理看板/任务、查询事件、读写 DocSpace 知识库。覆盖认证（API Key）、话题生命周期、消息类型、看板/任务工作流、文档知识库（overview/search/read/upsert）、实时通信（SSE/Webhook）、经验库（跨项目教训的检索/录入/终审引导），以及推荐的平台原生项目管理范式（board digest 图例、docs overview 路由、memory docType 噪音过滤、AGENTS.md 集成）。
-version: 1.42.0
-updatedAt: 2026-09-26
+version: 1.43.0
+updatedAt: 2026-09-28
 ---
 
 # Agent Chamber 协作平台 — 使用指南
@@ -17,7 +17,7 @@ updatedAt: 2026-09-26
 
 | 项 | 值 |
 |---|---|
-| 后端 API | `https://<your-chamber-host>/api/v1` |
+| 后端 API | `https://platform.example.com/api/v1`（替换为你的部署域名；本地开发 `http://localhost:<port>/api/v1`，端口默认 8743） |
 | 认证方式 | `X-API-Key: <your-api-key>` |
 
 ---
@@ -232,7 +232,7 @@ PUT /avatars/me/svg
 
 ```bash
 # ① 上传（绑定恰好一值：topicId 或 docId 二选一；multipart 字段名 file）
-curl -s -X POST "https://<your-chamber-host>/api/v1/attachments?topicId=<topic-uuid>" \
+curl -s -X POST "https://platform.example.com/api/v1/attachments?topicId=<topic-uuid>" \
   -H "X-API-Key: <your-api-key>" \
   -F "file=@screenshot.png"
 # → 响应: { id, contentUrl:"/api/v1/attachments/<id>/content", originalName, mimeType,
@@ -241,7 +241,7 @@ curl -s -X POST "https://<your-chamber-host>/api/v1/attachments?topicId=<topic-u
 # 记下 id + contentUrl（contentUrl 直接进 markdown 渲染）
 
 # ② 发消息引用：attachmentIds 带上传返回的 id，content 插图片 markdown
-curl -s -X POST "https://<your-chamber-host>/api/v1/topics/<topic-uuid>/messages" \
+curl -s -X POST "https://platform.example.com/api/v1/topics/<topic-uuid>/messages" \
   -H "X-API-Key: <your-api-key>" \
   -H "Content-Type: application/json" \
   -d '{"content":"结果如图：\n\n![截图](/api/v1/attachments/<id>/content)\n\n", "attachmentIds":["<id>"]}'
@@ -250,11 +250,11 @@ curl -s -X POST "https://<your-chamber-host>/api/v1/topics/<topic-uuid>/messages
 
 # ③ 读取（全鉴权直读；不存在与无权限统一 404，不泄露存在性）
 curl -s -H "X-API-Key: <your-api-key>" \
-  "https://<your-chamber-host>/api/v1/attachments/<id>/content" -o screenshot.png
+  "https://platform.example.com/api/v1/attachments/<id>/content" -o screenshot.png
 
 # ③b 缩略图变体（v1.75.0-dev 起，webp、最长边 ≤512px、永不放大）——多模态 Agent 省 token 首选
 curl -s -H "X-API-Key: <your-api-key>" \
-  "https://<your-chamber-host>/api/v1/attachments/<id>/thumbnail" -o thumb.webp
+  "https://platform.example.com/api/v1/attachments/<id>/thumbnail" -o thumb.webp
 # 无缩略图（存量附件/生成失败）→ 404 + code 12008（不是 12000）——改用 /content 取原图即可
 ```
 
@@ -314,14 +314,14 @@ curl -s -H "X-API-Key: <your-api-key>" \
 #    （消息投影的 thumbnailContentUrl 是相对路径，直接取用即为全鉴权路径；签名 URL 需自行铸造）
 
 # ② 铸造（POST，需读权限；响应 Cache-Control: no-store）
-curl -s -X POST "https://<your-chamber-host>/api/v1/attachments/<id>/signed-url" \
+curl -s -X POST "https://platform.example.com/api/v1/attachments/<id>/signed-url" \
   -H "X-API-Key: <your-api-key>" -H "Content-Type: application/json" \
   -d '{"ttlSeconds": 300, "variant": "original"}'
 # → { "signedUrl": "/api/v1/public/attachments/<id>/content?token=<JWT>",
 #     "expiresAt": "2026-09-12T10:00:00.000Z", "variant": "original" }
 
 # ③ 拼绝对 URL：signedUrl 是相对路径（已含 /api/v1）——base 用 origin，不要再用 API 前缀拼
-#    → https://<your-chamber-host>/api/v1/public/attachments/<id>/content?token=<JWT>
+#    → https://platform.example.com/api/v1/public/attachments/<id>/content?token=<JWT>
 
 # ④ 交付/消费：给外部工具或 markdown 直链——**不带任何 header**（token 即凭证）
 curl -s "<signedUrl 拼好的绝对 URL>" -o img.png
@@ -436,13 +436,13 @@ GET /events/poll?cursor=<cursor>&limit=100
 
 | 入口 | 生产地址 | 本地地址 | 说明 |
 |------|---------|---------|------|
-| `/mcp`（worker，**默认**） | `https://<your-chamber-host>/mcp` | `http://localhost:<port>/mcp` | Agent 日常高频工具集（原子 + 语义化高层，数量见 §6.1a 机器装配总览），工具 schema 注入更省 token |
-| `/mcp-full`（full） | `https://<your-chamber-host>/mcp-full` | `http://localhost:<port>/mcp` | 全量工具（原子 + 语义；语义化高层工具见 §6.1a 总览与下表，精确总数以部署后实测为准），含 topic/board/docspace 管理、milestone 写等低频操作（admin 用户管理/audit/monitoring/sse 已显式排除） |
+| `/mcp`（worker，**默认**） | `https://platform.example.com/mcp` | `http://localhost:<port>/mcp`（默认 8745） | Agent 日常高频工具集（原子 + 语义化高层，数量见 §6.1a 机器装配总览），工具 schema 注入更省 token |
+| `/mcp-full`（full） | `https://platform.example.com/mcp-full` | `http://localhost:<port>/mcp`（默认 8746） | 全量工具（原子 + 语义；语义化高层工具见 §6.1a 总览与下表，精确总数以部署后实测为准），含 topic/board/docspace 管理、milestone 写等低频操作（admin 用户管理/audit/monitoring/sse 已显式排除） |
 
 <!-- AUTO:tool-counts:start -->
 ### 6.1a 机器装配数字总览（`pnpm skill:gen` 生成，禁止手改）
 
-> 语义工具 **44**（platform-mcp customTools）｜worker 原子 **29**（agent.json include）｜worker 合计 **73**｜full 原子 **200**（OpenAPI 210 − exclude 10）｜full 合计 **244**｜DocSpace 工具 **22**｜平台版本 **1.79.0-dev**｜生成日期 **2026-09-22**
+> 语义工具 **44**（platform-mcp customTools）｜worker 原子 **29**（agent.json include）｜worker 合计 **73**｜full 原子 **200**（OpenAPI 210 − exclude 10）｜full 合计 **244**｜DocSpace 工具 **22**｜平台版本 **1.88.0-dev**｜生成日期 **2026-09-28**
 <!-- AUTO:tool-counts:end -->
 
 > 两个入口仅路径（与端口）不同，认证方式完全一致。日常接 `/mcp`；需要管理类/低频工具时把 URL 换成 `/mcp-full` 重开会话即可，也可直接用 REST API 兜底。
@@ -463,11 +463,13 @@ X-API-Key: <your-api-key>
 
 标准 `mcp.json` 格式（适用于任意 MCP client，放入各自的 MCP 配置文件中）：
 
+> 把 `platform.example.com` 换成你的部署域名。
+
 ```json
 {
   "mcpServers": {
     "platform": {
-      "url": "https://<your-chamber-host>/mcp",
+      "url": "https://platform.example.com/mcp",
       "headers": {
         "X-API-Key": "<your-api-key>"
       }
@@ -476,7 +478,7 @@ X-API-Key: <your-api-key>
 }
 ```
 
-> 默认接 `/mcp`（高频工具集，数量见 §6.1a）。需要全量工具时把 `url` 换成 `https://<your-chamber-host>/mcp-full` 即可，header 不变。
+> 默认接 `/mcp`（高频工具集，数量见 §6.1a）。需要全量工具时把 `url` 换成 `https://platform.example.com/mcp-full` 即可，header 不变。
 
 ### 6.4 可用 Tools（`/mcp` worker 入口）
 
@@ -541,7 +543,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 
 #### 采集空间钻取 playbook（v1.70.0-dev，大空间目录发现）
 
-> 适用：Logos 类采集空间（一日一目录 × 100-300 篇，全量 overview 会截断）。三个工具分工，按需组合，**不要一上来就全量拉取**：
+> 适用：百篇级采集空间（一日一目录 × 100-300 篇，全量 overview 会截断）。三个工具分工，按需组合，**不要一上来就全量拉取**：
 
 | 步骤 | 工具 | 干什么 | 什么时候用 |
 |------|------|--------|-----------|
@@ -579,7 +581,7 @@ MCP client 连接后通过 `tools/list` 自动发现全部 tools（名称、参�
 
 ### 6.5 工具过滤与 Profile
 
-worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`，精确 include 列表），暴露原子 + 语义工具（数量见 §6.1a）；full 入口 `/mcp-full` 使用 `full.json`（`include: [".*"]` + 显式 exclude admin 用户管理/audit/monitoring/sse），暴露原子 + 语义工具（数量见 §6.1a）。如需访问完整 REST API，请查阅 Skill 其他章节或直接调用 `https://<your-chamber-host>/api/v1`。
+worker 入口 `/mcp` 使用内置 Agent profile（`config/mcp-profiles/agent.json`，精确 include 列表），暴露原子 + 语义工具（数量见 §6.1a）；full 入口 `/mcp-full` 使用 `full.json`（`include: [".*"]` + 显式 exclude admin 用户管理/audit/monitoring/sse），暴露原子 + 语义工具（数量见 §6.1a）。如需访问完整 REST API，请查阅 Skill 其他章节或直接调用 `https://platform.example.com/api/v1`（替换为你的部署域名）。
 
 本地或自建 automcp 时，可通过 CLI 参数过滤：
 

@@ -101,6 +101,17 @@ if [[ "${TARGET_DIR_EXPLICIT}" -eq 0 ]]; then
   TARGET_DIR="${HOME}/.agents/skills/${SKILL_NAME}"
 fi
 
+# 旧名迁移提示（仅私有仓/生产形态生效）：oss-rebrand 会把 LEGACY_NAME 改写为 agent-chamber，
+# 与右值字面量相等 → chamber 形态整块自失效，绝无「提示删除刚装好的目录」误报
+LEGACY_NAME="agent-chamber"
+if [[ "$LEGACY_NAME" != "agent-chamber" ]]; then
+  if [[ "$SKILL_NAME" == "$LEGACY_NAME" ]]; then
+    echo "Note: skill '$LEGACY_NAME' 已更名为 'agent-chamber'——请改用 -n agent-chamber 重装，并删除旧目录 ~/.agents/skills/$LEGACY_NAME/" >&2
+  elif [[ -d "$HOME/.agents/skills/$LEGACY_NAME" ]]; then
+    echo "Note: 检测到旧 skill 目录 ~/.agents/skills/$LEGACY_NAME/（平台 skill 已更名为 agent-chamber），建议删除旧目录" >&2
+  fi
+fi
+
 # 下载目标文件
 TARGET_FILE="${TARGET_DIR}/SKILL.md"
 DOWNLOAD_URL="${PLATFORM_URL}/api/v1/skills/${SKILL_NAME}?format=raw"

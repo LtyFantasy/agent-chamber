@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/api-definition.md §13. Skill 模块
+ *   - 主文档: docs/api-definition.md §14. Skill 分发 (Skills)
  *   - 补充: ./agents/skills/agent-chamber/SKILL.md
  *
  * [踩坑索引]
@@ -60,9 +60,11 @@ export class SkillService {
   private readonly skillDir: string;
 
   constructor(private readonly configService: ConfigService) {
-    // 默认路径兼容开发与生产：
-    // - 开发：apps/backend/src/modules/skill/ → ../../../../../.agents/skills = agent-chamber/.agents/skills
-    // - 生产：dist/apps/backend/src/modules/skill/ → ../../../../../.agents/skills = dist/.agents/skills（由 build 脚本复制）
+    // Skill 目录来源（优先级：SKILL_DIR 环境变量 > __dirname 相对推导）：
+    // - 开发：apps/backend/.env 的 SKILL_DIR 绝对路径指向外层 .agents/skills/
+    //   （内层 monorepo agent-chamber/ 下无 .agents 目录，故 __dirname 推导在 dev 下不适用）
+    // - 生产：dist/apps/backend/src/modules/skill/ → ../../../../../.agents/skills
+    //   = dist/.agents/skills（build 脚本把 .agents/skills 复制进 dist）
     const defaultSkillDir = path.resolve(__dirname, '../../../../../.agents/skills');
     this.skillDir = this.configService.get<string>('SKILL_DIR') || defaultSkillDir;
   }

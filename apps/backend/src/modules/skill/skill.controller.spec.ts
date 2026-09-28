@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/api-definition.md §13. Skill 模块
+ *   - 主文档: docs/api-definition.md §14. Skill 分发 (Skills)
  *   - 补充: ./agents/skills/agent-chamber/SKILL.md
  *
  * [踩坑索引]
@@ -86,7 +86,11 @@ describe('SkillController', () => {
 
       // JSON 分支返回 detail 由全局 ResponseInterceptor 包装（review-0831 任务
       // bbd175dc 子项 3：手工信封已删，controller 不再写 res.json）
-      const result = await controller.findOne('agent-chamber', undefined as unknown as string, res);
+      const result = await controller.findOne(
+        'agent-chamber',
+        undefined as unknown as string,
+        res,
+      );
 
       expect(service.findOne).toHaveBeenCalledWith('agent-chamber');
       expect(service.getRaw).not.toHaveBeenCalled();
@@ -212,7 +216,12 @@ describe('SkillController', () => {
       } as unknown as Response;
 
       await expect(
-        controller.findSubSkill('agent-chamber', 'missing', undefined as unknown as string, res),
+        controller.findSubSkill(
+          'agent-chamber',
+          'missing',
+          undefined as unknown as string,
+          res,
+        ),
       ).rejects.toThrow(NotFoundException);
     });
   });

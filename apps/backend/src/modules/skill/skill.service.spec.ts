@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/api-definition.md §13. Skill 模块
+ *   - 主文档: docs/api-definition.md §14. Skill 分发 (Skills)
  *   - 补充: ./agents/skills/agent-chamber/SKILL.md
  *
  * [踩坑索引]
@@ -459,6 +459,87 @@ internal: true
       createSkillFile('internal-skill/sub/SKILL.md', '# Sub\n');
 
       await expect(service.getSubRaw('internal-skill', 'sub')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  /**
+   * name/dirname 一致性不变量。
+   *
+   * 列表名取自 frontmatter `name`（缺失时回退目录名，见 toListItem），而**访问键恒为目录名**
+   * （resolveSkillFile）。二者错位时 `GET /skills` 列出的名字点进详情必 404——web 列表页与
+   * install-skill.sh 都按列表名发请求，属静默坏链，故用不变量测试守住。
+   */
+  describe('name/dirname 一致性不变量', () => {
+    it('findAll 的每个 name 都能被 findOne / findSubSkills 解析（正向）', async () => {
+      createSkillFile(
+        'agent-chamber/SKILL.md',
+        `---
+name: agent-chamber
+description: Main skill.
+version: 1.43.0
+---
+# Main
+`,
+      );
+      createSkillFile(
+        'agent-chamber/topics/SKILL.md',
+        `---
+name: topics
+description: Topics sub skill.
+---
+# Topics
+`,
+      );
+      createSkillFile(
+        'solo-skill/SKILL.md',
+        `---
+name: solo-skill
+description: Skill without sub skills.
+---
+# Solo
+`,
+      );
+
+      const list = await service.findAll();
+      expect(list.map((item) => item.name).sort()).toEqual(['agent-chamber', 'solo-skill']);
+
+      for (const item of list) {
+        // 列表名必须可作访问键（详情端点按 name 解析）
+        await expect(service.findOne(item.name)).resolves.toMatchObject({ name: item.name });
+        // 子列表端点同理；父 Skill 无子目录时必须返回空数组而非 404
+        expect(Array.isArray(await service.findSubSkills(item.name))).toBe(true);
+      }
+
+      // 子 Skill 的列表名必须可作 findSubSkill 的 subpath
+      const subs = await service.findSubSkills('agent-chamber');
+      expect(subs.map((item) => item.name)).toEqual(['topics']);
+      for (const sub of subs) {
+        await expect(service.findSubSkill('agent-chamber', sub.name)).resolves.toMatchObject({
+          name: sub.name,
+        });
+      }
+    });
+
+    it('frontmatter name 与目录名错位时可被检测（反例）', async () => {
+      // 目录 y 下写 frontmatter `name: x`：列表报 x，但访问键是目录名 y
+      createSkillFile(
+        'y/SKILL.md',
+        `---
+name: x
+description: Name/dirname mismatch.
+---
+# Mismatched
+`,
+      );
+
+      const list = await service.findAll();
+      expect(list.map((item) => item.name)).toEqual(['x']);
+
+      // 列表名 x 不可访问——这正是本不变量要防的静默坏链
+      await expect(service.findOne('x')).rejects.toThrow(NotFoundException);
+      await expect(service.findSubSkills('x')).rejects.toThrow(NotFoundException);
+      // 目录名 y 虽可访问，但列表里不叫这个名字（错位的事实证据）
+      await expect(service.findOne('y')).resolves.toMatchObject({ name: 'x' });
     });
   });
 });

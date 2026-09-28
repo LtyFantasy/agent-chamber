@@ -27,7 +27,7 @@ updatedAt: 2026-09-26
 | 5 | `GET /doc-spaces/:id/docs` 同时传 `path=` 和 `q=` | 400 | 二者互斥：`path=` 精确匹配（定位用）、`q=` 模糊搜索 |
 | 6 | 创建空间同时传 `topicId` 和 `boardId` | 403/400 | 二选一（或全空 = 独立空间） |
 | 7 | 列表/搜索期望跨空间全量 | 只返回有权限空间 | 权限自治：read = open \| creator \| member；私密空间无权限 read → 404 |
-| 8 | `spaceName` 传空间 slug | 0 候选 `isError` | 三层匹配匹配的是**空间显示名**（如 `Agent Chamber Docs`）不是 slug——6 个 docs MCP 工具皆然 |
+| 8 | `spaceName` 传空间 slug | 0 候选 `isError` | 三层匹配匹配的是**空间显示名**（如 `<your-docspace-name>`，替换为你的空间显示名，见项目 AGENTS.md）不是 slug——6 个 docs MCP 工具皆然 |
 
 ---
 
@@ -48,7 +48,7 @@ get_docs_overview → search_docs        → read_doc(position)
 
 ```bash
 # MCP（推荐）
-get_docs_overview { "spaceName": "Agent Chamber Docs" }
+get_docs_overview { "spaceName": "<your-docspace-name>" }
 
 # REST
 GET /doc-spaces/:id/overview
@@ -148,7 +148,7 @@ upsert_doc {
 | source | 含义 | 可写？ |
 |--------|------|--------|
 | `native`（默认） | API/MCP 生产的文档 | ✅ 可写可删 |
-| `git:*`（如 `git:agent-chamber`） | ingest 适配器同步的仓库镜像 | ❌ 平台只读，写/删 → 409 `DOC_SOURCE_MISMATCH` |
+| `git:*`（如 `git:<your-repo-slug>`） | ingest 适配器同步的仓库镜像 | ❌ 平台只读，写/删 → 409 `DOC_SOURCE_MISMATCH` |
 
 - MCP `upsert_doc`/`delete_doc` 固定 `native`，**不暴露 source 参数**。
 - 要修改 `git:*` 文档：改仓库源文件 → 跑 ingest 同步（§5），ingest 只覆盖同 source 文档、绝不误删 native。
@@ -243,10 +243,10 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs            # 正式同步
 PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 ```
 
-- **source** = `git:agent-chamber`；空间名 `Agent Chamber Docs`（不存在则自建并绑定 topic）。
+- **source** = `git:<your-repo-slug>`；空间名 `<your-docspace-name>`（不存在则自建并绑定 topic）。
 - **扫描范围**：仓库根白名单（`INDEX.md`/`PROJECT.md`/`AGENTS.md`/`README.md`/`DEPLOY.md`/`change-checklists.md`）+ `docs/**/*.md`（排除 `docs/plans/`）；明确排除 `memory/`、`.kimi/`、`.agents/`、`node_modules/`。
 - **行为**：逐文件 `PUT` upsert（contentHash 相同 → unchanged 跳过）；仓库已删文件 → 对比远端后 `DELETE`（仅同 source）；输出 changed/unchanged/deleted 统计，任一失败 exit 1。
-- **环境变量**：`PLATFORM_API_KEY`（必填，不入库不入 git）、`PLATFORM_BASE_URL`（默认 `http://localhost:8743/api/v1`）、`PLATFORM_TOPIC_ID`（绑定 topic 覆盖）。
+- **环境变量**：`PLATFORM_API_KEY`（必填，不入库不入 git）、`PLATFORM_BASE_URL`（默认 `http://localhost:<port>/api/v1`，端口默认 8743）、`PLATFORM_TOPIC_ID`（绑定 topic 覆盖）。
 - **frontmatter 约定**（写入文档头，适配器解析）：`title / summary / type / category / tags`；无 frontmatter 时以文件名推导 title、首段推导 summary。
 - `deploy.sh` 含可选 ingest 步骤：检测到脚本且 env 具备时执行，失败 WARN 不阻断部署。
 

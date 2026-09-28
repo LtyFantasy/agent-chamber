@@ -11,7 +11,7 @@ updatedAt: 2026-08-30
 >
 > 本 skill 是「IR 契约三层投放」的 skill+文档层（Agent 学画图契的主教材）；MCP 四工具的描述只是生存指南，完整契约在本文件与 schema。权威事实源按序：
 >
-> - **IR schema（契约事实源）**：`agent-chamber/packages/diagram/schemas/`（5 类型 + common；与校验器同源，改契约先改这里）
+> - **IR schema（契约事实源）**：`<repo-root>/packages/diagram/schemas/`（5 类型 + common；与校验器同源，改契约先改这里；契约事实源在源码仓，安装版无此目录，改动需回源码仓）
 > - **行为事实源（已实现）**：`apps/backend/src/modules/docspace/diagram.controller.ts`（5 端点）、`diagram.service.ts`、`diagram-renderer.service.ts`（门规则）、`doc.service.ts` `parseDiagramIr`（R3 前置拒绝）；`diagram-patch.ts`（指针语义）；MCP 工具 `packages/platform-mcp/src/tools/{upsert,read,patch,validate}-diagram.ts`
 > - **设计决策**：`.kimi/plans/diagram-ir-v1-plan.md`；线上 `docs/api-definition.md` diagram 小节
 >
@@ -113,7 +113,7 @@ updatedAt: 2026-08-30
 - **共享枚举**（`common.schema.json`）：`componentType` = `frontend | backend | database | cloud | security | messagebus | external`；`variant` = `default | emphasis | security | dashed`（顺序图消息另有 `return`）；`locale` = `en | zh-CN`；`point` = `[x, y]` 两数数组。
 - **可选常用 meta 字段**：`locale`（控制 viewer 固定 UI 语言，不翻译你写的内容）、`animation: "trace"`（动效，默认静态）、`visual_preset`（classic 默认/信号流/蓝图/editorial——只有用户明确要风格才写）、`views`（引导视角，≤5 个）、`legend`（`mode: auto|all|hidden` + `entries.<kind>.label|visible`；省略 = 诚实 auto）。
 - **创作规范**：默认省略 `subtitle`/`legend`/`visual_preset`；`meta.locale` 与正文语言一致（zh-CN 图就写 `"zh-CN"`）；产品名/命令/协议路径保持原文不翻译。
-- 完整字段清单与类型范围：`agent-chamber/packages/diagram/schemas/{common,<型名>}.schema.json`（唯一事实源，本文档不复刻全文）。
+- 完整字段清单与类型范围：`<repo-root>/packages/diagram/schemas/{common,<型名>}.schema.json`（唯一事实源，本文档不复刻全文）。
 
 ---
 

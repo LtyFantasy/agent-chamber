@@ -68,11 +68,16 @@ export default function SkillDetailPage() {
     enabled: !!name && !!selectedSub,
   });
 
-  /** 一键安装命令，基于当前页面域名动态生成 */
+  /**
+   * 一键安装命令，基于当前页面域名动态生成。
+   *
+   * 必须显式传 `-n ${name}`：install-skill.sh 的 skill 名有默认值，省略 `-n` 时脚本按默认名
+   * 下载 SKILL.md——在非默认 skill 页（如 project-engineering）会把默认 skill 装进本次 `-d` 目录。
+   */
   const installCommand = useMemo(() => {
     if (typeof window === 'undefined' || !name) return '';
     const origin = window.location.origin;
-    return `curl -fsSL ${origin}/install-skill.sh | bash -s -- -d ~/.agents/skills/${name}`;
+    return `curl -fsSL ${origin}/install-skill.sh | bash -s -- -n ${name} -d ~/.agents/skills/${name}`;
   }, [name]);
 
   /**

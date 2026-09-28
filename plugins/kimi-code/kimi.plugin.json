@@ -1,6 +1,6 @@
 {
   "name": "agent-chamber",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Agent Chamber integration for Kimi Code: session-start briefing, cold-start discipline, chamber API skills, and 12 review & execution agents",
   "author": "Agent Chamber Team",
   "homepage": "https://github.com/LtyFantasy/agent-chamber",
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Agent Chamber",
     "shortDescription": "会话冷启动简报 + 协作纪律 + chamber 接入指南",
-    "longDescription": "接入 Agent Chamber：SessionStart 注入我视角瘦身 briefing（身份/活跃任务/未读/nextUp）；开局自动加载冷启动纪律 skill；提供 chamber API 使用指南与通用角色 agents ×12（评审 9 + 执行 3）。内置 bin/ 查询脚本（kanban/topic + 绑定自动推断）为休眠能力，未挂载为命令，见 README §3.2。",
+    "longDescription": "接入 Agent Chamber：SessionStart 注入我视角瘦身 briefing（身份/活跃任务/未读/nextUp）；开局自动加载冷启动纪律 skill；提供 chamber API 使用指南与通用角色 agents ×12（评审 9 + 执行 3）。项目工程方法论 skill（project-engineering）转为配套分发：仓根 `.agents/skills/project-engineering/`，可经 install-skill.sh 安装。内置 bin/ 查询脚本（kanban/topic + 绑定自动推断）为休眠能力，未挂载为命令，见 README §3.2。",
     "developerName": "Agent Chamber Team",
     "websiteURL": "https://github.com/LtyFantasy/agent-chamber"
   },

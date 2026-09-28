@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/api-definition.md §13. Skill 模块
+ *   - 主文档: docs/api-definition.md §14. Skill 分发 (Skills)
  *   - 补充: ./agents/skills/agent-chamber/SKILL.md
  *
  * [踩坑索引]

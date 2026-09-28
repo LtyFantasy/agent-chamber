@@ -167,6 +167,6 @@ boardId/topicId 未填时自动推断绑定对象：
 
 ## 8. 开发维护
 
-- **skill 同步**：改 skill 源（仓根 `.agents/skills/` 下的主 skill 目录，单一事实源）后必须跑同步脚本——在 monorepo 内层根执行 `bash scripts/sync-plugin-skills.sh`（生成 chamber 品牌副本，含品牌 / 端口 / UUID 守卫与 manifest version 校验）；
+- **skill 同步**：`.agents/skills/` 下两个公开 skill 是**单一事实源**，插件目录不再各自维护——① `agent-chamber`：改源后在 monorepo 内层根执行 `bash scripts/sync-plugin-skills.sh` 纯拷贝进插件 `skills/agent-chamber/`（含品牌 / 端口 / UUID 守卫与 manifest version 校验）；② `project-engineering`：**已撤出插件**，由 `scripts/oss-export.sh` 随版本进 chamber 仓配套分发，用户经 `install-skill.sh -n project-engineering` 安装。⚠️ `skills/session-start/` 是**插件原生直写**的源文件（plugins/ 全树皆门面产物），直接改插件目录即改源，不要给它建私有侧副本；
 - **测试**：`node --test 'plugins/kimi-code/tests/*.test.mjs'`（注意：node 22 下裸目录形式 `node --test tests/` 不工作，必须用 glob）；
 - **品牌红线**：plugins/ 全树不得出现 platform 系品牌、生产域名、生产 UUID、本地开发端口（`localhost:874x` 模式）。
