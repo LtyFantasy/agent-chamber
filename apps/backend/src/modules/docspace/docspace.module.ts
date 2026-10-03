@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocLinksService } from './doc-links.service';
 import { DocBundleService } from './doc-bundle.service';
 import { DocSpaceController } from './docspace.controller';
 import { DocController } from './doc.controller';
@@ -85,6 +86,9 @@ import { JudgmentModule } from '../judgment/judgment.module';
     DocSpaceService,
     DocService,
     DocMoveService,
+    // 全空间入链反扫内核（v1.90.0-dev backlinks 批次）：DocMoveService 与
+    // DocController(/docs/:id/backlinks) 共用；漏注册 → 启动即抛未解析依赖
+    DocLinksService,
     DocSearchService,
     DocRouteService,
     RouteHealthService,

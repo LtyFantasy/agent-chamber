@@ -7,7 +7,7 @@
 #   dist-assets/roundtable-runner.tar.gz   runner + prod node_modules（vendored，
 #                                         用户机器只需 node，无需 pnpm/git/外网）
 #   dist-assets/install-runner.sh          一键安装脚本（与 tar.gz 同版本）
-#   dist-assets/integrations/*.md          对接指南八份（kimi/codex/opencode/claude-code × EN/zh-CN）
+#   dist-assets/integrations/*.md          对接指南十份（五厂商 × EN/zh-CN）
 #
 # 流程：构建 protocol/runner → pnpm deploy --prod 到临时 staging（workspace 依赖
 # 内联成独立副本）→ 逃逸符号链接替换为实体拷贝（deploy --legacy 的 workspace 依赖

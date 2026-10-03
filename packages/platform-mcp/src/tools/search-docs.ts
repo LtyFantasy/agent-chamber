@@ -25,7 +25,13 @@ import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamb
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 import { projectDocHits } from './project';
-import { DOC_SEARCH_SORT_VALUES } from '@agent-chamber/shared';
+import {
+  DOC_SEARCH_POSITIONAL_ORDER_HINT,
+  DOC_SEARCH_SORT_VALUES,
+  DOC_SEARCH_WEAK_HIT_HINT,
+  DOC_SEARCH_ZERO_HIT_HINT,
+} from '@agent-chamber/shared';
+import type { DocSearchHintCode } from '@agent-chamber/shared';
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -89,10 +95,12 @@ function resolutionFailureBody(err: unknown): Record<string, unknown> {
  *
  * 解析 spaceName → 调用双路检索（v1.86 中文根治：q 先经编译器——CJK 逐字 bigram ts 腿
  * OR 融合 trgm 兜底腿，英文/标识符走 ts 词位腿；融合分 = `ts_rank_cd × 3.0` +
- * `similarity(heading_path) × 0.5` + `similarity(content) × 0.6`，地板 0.08、弱命中线 0.9）
- * → 投影 hits 为紧凑摘要。
- * 响应为信封 `{hits, hint?}`——零命中/弱命中（最高分 < 0.9）/降级位置序时 hint 给消费
- * 指引（Agent 应读并据此调整查询；文案单源 = shared DOC_SEARCH_*_HINT）。
+ * `similarity(heading_path) × 0.5` + `similarity(content) × 0.6`，地板 0.08；活弱命中线
+ * 当前 0.9，随 `SEARCH_TS_W1` 漂移）→ 投影 hits 为紧凑摘要。
+ * 响应为信封 `{hits, hint?, hintCode?}`——三态（零命中 / 弱命中 / 降级位置序）各带一条
+ * 指引；**消费方按 `hintCode` 分支**（hint 文案逐字稳定但为人类可读面，见 shared
+ * `DOC_SEARCH_HINT_CODES`）。文案单源 = shared `DOC_SEARCH_*_HINT`，description 按
+ * search_experiences 先例内联引用原文（禁手抄，防漂移）。
  * 返回 top-k hits：{docId, docPath, docTitle, headingPath, position, snippet, score, boosts?}。
  * boosts 为三路融合加权来源（plan §4-C3）：route = 策展路由命中（primary ×1.5 / secondary ×1.2）、
  * taskLinks = 关联任务数（×1+min(c,5)×0.05 封顶 ×1.25）；无 boost 的命中省略该键。
@@ -106,7 +114,7 @@ export const searchDocsTool: CustomTool = {
       'scoring — CJK is tokenized per character into bigram ts arms OR-fused with a pg_trgm ' +
       'fallback arm, while English/identifiers use the ts term arm. Composite score = ' +
       'ts_rank_cd × 3.0 + similarity(heading_path) × 0.5 + similarity(content) × 0.6, floored ' +
-      'at 0.08; weak-hit line is 0.9. Short CJK terms (2+ chars) now match; a K-gate keeps ' +
+      'at 0.08; the live weak-hit line is currently 0.9. Short CJK terms (2+ chars) now match; a K-gate keeps ' +
       'only rows sharing ≥K distinct bigrams (K=1 for ≤4 CJK chars, K=2 for longer), so a ' +
       'paraphrase sharing no bigram is not recalled. A single CJK ' +
       'character is searchable but scores a constant 0.1 and is ordered by section position, ' +
@@ -125,10 +133,17 @@ export const searchDocsTool: CustomTool = {
       'Example "read diaries of the last 7 days": q="日记", type="memory", ' +
       'sort="createdAt_desc", createdAfter=<now minus 7 days ISO>, limit=20. ' +
       'q is capped at 200 characters (longer input is rejected with 400). ' +
-      'The response is an envelope {hits, hint?}: hint appears on zero hits, weak hits (top ' +
-      'score < 0.9), or degraded positional-order results. READ it and act on it before ' +
-      'retrying — e.g. switch to shorter 2-4 character domain terms closer to the document ' +
-      'wording, or locate the doc by title/path via list_docs instead of full-text q. ' +
+      'The response is an envelope {hits, hint?, hintCode?}: hint appears on zero hits, weak ' +
+      'hits (top score below the live weak-hit line, currently 0.9), or degraded ' +
+      'positional-order results. hintCode is its machine-readable twin — branch on hintCode, ' +
+      'not on the wording. ' +
+      `hintCode="zero_hit" ⇒ the hint reads: "${DOC_SEARCH_ZERO_HIT_HINT}" — rephrase the ` +
+      'query (never retry the same wording). ' +
+      `hintCode="weak_hit" ⇒ the hint reads: "${DOC_SEARCH_WEAK_HIT_HINT}" — USE the returned ` +
+      'hits first: they may be the answer; only rephrase if they look unrelated, and never ' +
+      'discard the page just because this hint is present. ' +
+      `hintCode="positional_order" ⇒ the hint reads: "${DOC_SEARCH_POSITIONAL_ORDER_HINT}" ` +
+      '— use a LONGER query (the opposite direction from zero_hit). ' +
       'Ranking may be model-assisted by the operator ("rerank"): for agent searches with ' +
       'sort="relevance" the page can be reordered by the configured judgment provider, which ' +
       'sends the query text and a byte-bounded excerpt (≈240B) of up to 50 candidate rows ' +
@@ -277,13 +292,14 @@ export const searchDocsTool: CustomTool = {
     if (createdBefore !== undefined) params.createdBefore = createdBefore;
 
     try {
-      // v1.86 起上游为信封 `{ hits, hint? }`（主脑裁决 #1）：取 body.hits 投影，
-      // hint 原样透传（零命中/弱命中引导或降级位置序声明——消费方 Agent 的行为指令）
-      const body = await client.request<{ hits?: unknown[]; hint?: string }>(
-        'GET',
-        `/doc-spaces/${spaceId}/search`,
-        { params },
-      );
+      // v1.86 起上游为信封 `{ hits, hint?, hintCode? }`（主脑裁决 #1）：取 body.hits 投影，
+      // hint / hintCode 原样透传（三态引导文案 + 机器判别码——消费方 Agent 按 hintCode
+      // 分支，勿匹配文案；两个键同生命周期：无 hint 时 hintCode 也不出现）
+      const body = await client.request<{
+        hits?: unknown[];
+        hint?: string;
+        hintCode?: DocSearchHintCode;
+      }>('GET', `/doc-spaces/${spaceId}/search`, { params });
       const projected = projectDocHits(body.hits ?? []);
 
       return {
@@ -293,6 +309,7 @@ export const searchDocsTool: CustomTool = {
             text: JSON.stringify({
               hits: projected,
               ...(typeof body.hint === 'string' ? { hint: body.hint } : {}),
+              ...(typeof body.hintCode === 'string' ? { hintCode: body.hintCode } : {}),
             }),
           },
         ],

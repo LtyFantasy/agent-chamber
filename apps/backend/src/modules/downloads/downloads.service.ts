@@ -37,11 +37,13 @@ export const DOWNLOADS_DIR_TOKEN = 'DOWNLOADS_DIR_TOKEN';
 /**
  * 可下载资产清单（防路径遍历的白名单）：
  * - install-runner.sh / roundtable-runner.tar.gz：安装脚本与其自包含 bundle
- * - integrations/ 下八份对接指南：与 oss-docs/docs/integrations/ 实际文件名一一对应
- *   （kimi / codex / opencode / claude-code × en/zh-CN）
+ * - integrations/ 下十份对接指南：与 oss-docs/docs/integrations/ 实际文件名一一对应
+ *   （五厂商 kimi · codex · opencode · claude-code · dsh × en/zh-CN）
  *
  * 为什么白名单而非黑名单：资产是构建期固化的静态文件集合，白名单天然
  * 排除「未来误放敏感文件」的回归；新增资产必须显式加进这里（铁律 #11 常量 rationale）。
+ * 注意新增指南要**两处同加**：本清单（漏则 404）与 CONTENT_TYPE_BY_FILE
+ * （漏则 contentType 为 undefined → 响应头缺 Content-Type）。
  */
 export const DOWNLOAD_WHITELIST = [
   'install-runner.sh',
@@ -54,6 +56,8 @@ export const DOWNLOAD_WHITELIST = [
   'opencode.zh-CN.md',
   'claude-code.md',
   'claude-code.zh-CN.md',
+  'dsh.md',
+  'dsh.zh-CN.md',
 ] as const;
 
 /** 固定文件名 → Content-Type 映射（StreamableFile 不依赖扩展名猜，显式给全） */
@@ -68,6 +72,8 @@ const CONTENT_TYPE_BY_FILE: Record<string, string> = {
   'opencode.zh-CN.md': 'text/markdown; charset=utf-8',
   'claude-code.md': 'text/markdown; charset=utf-8',
   'claude-code.zh-CN.md': 'text/markdown; charset=utf-8',
+  'dsh.md': 'text/markdown; charset=utf-8',
+  'dsh.zh-CN.md': 'text/markdown; charset=utf-8',
 };
 
 /** 单个下载资产在磁盘上的定位信息（供 controller 组装 StreamableFile） */
@@ -87,7 +93,7 @@ export interface DownloadAsset {
  *
  * 磁盘布局（与 scripts/build-runner-bundle.sh 的产物一一对应）：
  * - dist-assets/install-runner.sh / roundtable-runner.tar.gz（根层）
- * - dist-assets/integrations/*.md（厂商指南在 integrations/ 子目录：kimi/codex/opencode/claude-code × en/zh-CN）
+ * - dist-assets/integrations/*.md（厂商指南在 integrations/ 子目录：五厂商 × en/zh-CN）
  *
  * backend 进程 cwd 因启动方式而异（铁律 #11 必须写清语义）：
  * - dev：`pnpm --filter @agent-chamber/backend dev` 的工作目录是 apps/backend/

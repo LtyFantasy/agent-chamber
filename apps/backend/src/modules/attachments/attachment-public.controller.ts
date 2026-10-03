@@ -4,6 +4,11 @@
  * =============================================================================
  * [功能概念]
  *   - 附件公开读取端点：短时签名 URL 的消费侧（capability URL）
+ *   - **出口头分叉（v1.90.0-dev §1.2）**：`var=original` 时按
+ *     `INLINE_IMAGE_MIME_TYPES` 精确成员判断决定 inline（4 种嗅探图片，
+ *     `Content-Type` 取 DB 字节证据值）还是 attachment（其余一律
+ *     `application/octet-stream` + 强制下载）；`var=thumbnail` 恒 image/webp inline。
+ *     两个分支都带 nosniff + `Content-Security-Policy: sandbox`
  *
  * [代码职责]
  *   - `GET /public/attachments/:id/content?token=` 流式返回对象字节，
@@ -17,9 +22,13 @@
  *   - **类级不得挂任何守卫**（无 JwtOrApiKeyGuard）：这是本端点存在的理由——
  *     要能直接进 `<img src>` / markdown。仅 `@Public()` 让全局 JwtAuthGuard 放行
  *   - 无 `Cache-Control` 的 max-age（或极短）：能力 URL 进共享缓存 = 凭证随缓存扩散，
- *     故恒 `Cache-Control: private`（与 /attachments/:id/content 的 private, max-age=3600 刻意不同）
+ *     故恒 `Cache-Control: private`（与 /attachments/:id/content 的 private, max-age=300 刻意不同）
  *   - 响应头不得泄露存储内部（无 bucket/objectKey；文件名走 RFC 6266 filename*）
- *   - 断言顺序由 service 保证：无效凭证先 401，绝不借 404 探测附件存在性
+ *   - 出口头与全鉴权面**同一套**（§1.2，三条字节出口全量）：inline 判据 =
+ *     isInlineImageMime 精确成员判断；非图片恒 octet-stream + attachment；
+ *     nosniff + `Content-Security-Policy: sandbox`（纯 sandbox，不带 default-src）
+ *   - 断言顺序由 service 保证：无效凭证先 401，绝不借 404 探测附件存在性；
+ *     已过期附件（行仍在，扫前）→ 410·12009，懒判在行加载后、getObject 前
  *
  * [关联代码]
  *   - attachment-signed-url.service.ts — 验签/三断言/取流（本端点唯一业务依赖）
@@ -67,8 +76,10 @@ import { encodeFilenameStar, buildThumbnailFilename } from './filename-sanitize'
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import {
+  ATTACHMENT_FALLBACK_MIME,
   ATTACHMENT_PUBLIC_CONTENT_THROTTLE_LIMIT,
   ATTACHMENT_PUBLIC_CONTENT_THROTTLE_TTL_MS,
+  isInlineImageMime,
 } from './attachment.constants';
 
 /**
@@ -85,8 +96,10 @@ import {
  *   controller 侧另有显式 typeof 复检（校验链被绕过时也不把非字符串喂进验签器）；
  * - 限流 60/min/IP（常量+env 范式）；生产需 `trust proxy` 才能按真实客户端计数
  *   （main.ts 已设，见该文件注释）；
- * - 响应头：Content-Type 按变体（thumbnail 恒 image/webp，original 取 DB mime_type）、
- *   nosniff、inline + RFC 6266 文件名、ETag=对应内容 sha256、`Cache-Control: private`。
+ * - 响应头：Content-Type 按变体 + **inline/attachment 分叉**（thumbnail 恒 image/webp
+ *   inline；original 命中 4 种嗅探图片 mime 才 inline，其余恒 application/octet-stream
+ *   + attachment）、nosniff + `Content-Security-Policy: sandbox`、RFC 6266 文件名、
+ *   ETag=对应内容 sha256、`Cache-Control: private`（无 max-age）。
  */
 @ApiTags('Attachments (public)')
 @Controller('public/attachments')
@@ -118,7 +131,11 @@ export class AttachmentPublicController {
       '401/ATTACHMENT_SIGNATURE_INVALID (12006) on bad signature / wrong scope / id mismatch; ' +
       '401/ATTACHMENT_SIGNATURE_EXPIRED (12007) when expired; ' +
       '404/ATTACHMENT_NOT_FOUND (12000) when the attachment is missing or soft-deleted; ' +
-      '404/ATTACHMENT_THUMBNAIL_UNAVAILABLE (12008) for thumbnail tokens without a thumbnail. ' +
+      '404/ATTACHMENT_THUMBNAIL_UNAVAILABLE (12008) for thumbnail tokens without a thumbnail; ' +
+      '410/ATTACHMENT_EXPIRED (12009) when the attachment itself has expired. ' +
+      'Images are served inline (exact mime match on the sniffed type); every other type is ' +
+      'forced to application/octet-stream with Content-Disposition: attachment. All responses ' +
+      'carry nosniff + Content-Security-Policy: sandbox. ' +
       'Rate limit: 60/min/IP.',
   })
   @ApiParam({ name: 'id', description: 'Attachment UUID', type: String })
@@ -126,10 +143,11 @@ export class AttachmentPublicController {
     name: 'token',
     description: 'Signed URL token from POST /attachments/:id/signed-url',
   })
-  @ApiProduces('image/*')
+  @ApiProduces('image/*', 'application/octet-stream')
   @ApiResponse({
     status: 200,
-    description: 'Image bytes (inline; Cache-Control: private, no shared caching)',
+    description:
+      'Attachment bytes (inline for images, attachment otherwise; Cache-Control: private)',
   })
   @ApiResponse({
     status: 401,
@@ -139,6 +157,7 @@ export class AttachmentPublicController {
     status: 404,
     description: 'Attachment not found / soft-deleted (12000), or thumbnail unavailable (12008)',
   })
+  @ApiResponse({ status: 410, description: 'Attachment expired (12009)' })
   @ApiResponse({ status: 429, description: 'Read rate limit exceeded' })
   async getPublicContent(
     @Param('id', ParseUUIDPipe) id: string,
@@ -162,7 +181,8 @@ export class AttachmentPublicController {
     );
 
     if (variant === 'thumbnail') {
-      // 缩略图变体：格式是规格常量（webp），mime 不从 DB 取（DB 无 thumb mime 列）
+      // 缩略图变体：格式是规格常量（webp），mime 不从 DB 取（DB 无 thumb mime 列）；
+      // 缩略图只对图片附件存在 → 恒可内联
       res.setHeader('Content-Type', 'image/webp');
       res.setHeader(
         'Content-Disposition',
@@ -170,15 +190,21 @@ export class AttachmentPublicController {
       );
       res.setHeader('ETag', `"${attachment.thumbSha256}"`);
     } else {
-      res.setHeader('Content-Type', attachment.mimeType);
+      // 原图变体：与全鉴权 /content 同一 inline 判据（精确成员判断，禁前缀）
+      const inline = isInlineImageMime(attachment.mimeType);
+      res.setHeader('Content-Type', inline ? attachment.mimeType : ATTACHMENT_FALLBACK_MIME);
       res.setHeader(
         'Content-Disposition',
-        `inline; filename*=UTF-8''${encodeFilenameStar(attachment.originalName)}`,
+        `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeFilenameStar(attachment.originalName)}`,
       );
       res.setHeader('ETag', `"${attachment.sha256}"`);
     }
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    // 能力 URL 场景禁共享缓存（凭证随缓存扩散）：恒 private，不设 max-age
+    // 纯 sandbox（不带 default-src 'none'，与全鉴权出口同值）：防 polyglot 顶层渲染
+    res.setHeader('Content-Security-Policy', 'sandbox');
+    // 能力 URL 场景禁共享缓存（凭证随缓存扩散）：恒 private，**刻意不设 max-age**
+    // （与 /attachments/:id/content 的 private, max-age=300 刻意不同——本端点的
+    //  URL 本身即凭证，TTL 已由 token exp 表达，缓存 max-age 只会扩大凭证扩散窗口）
     res.setHeader('Cache-Control', 'private');
     return new StreamableFile(stream);
   }

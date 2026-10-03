@@ -95,7 +95,16 @@ export class OwnerProxyService {
 
     // 注：Agent 实体带 eager actor relation，find 不做 select 限制（避免
     // eager + partial select 的 TypeORM 兼容坑）；owner 的 agent 数量级小，开销可忽略
-    const agents = await this.agentRepo.find({ where: { ownerId: actor.id } });
+    //
+    // 显式确定性排序：无 ORDER BY 时 PG 按物理行序返回，顺序不确定——
+    // audit resolveScope 的 scope 回声数组会因此抖动（v1.89.0 metrics 全量跑实踩
+    // activity-logs e2e 顺序断言 flake）；确定性排序让回声对消费方可预期（创建序）。
+    // ⚠️ agents 表无 created_at 列——createdAt 是 eager actor 关系的 getter 代理，
+    // order 必须走嵌套关系路径（actor.createdAt），写顶层 createdAt 会被当列名解析失败。
+    const agents = await this.agentRepo.find({
+      where: { ownerId: actor.id },
+      order: { actor: { createdAt: 'ASC', id: 'ASC' } },
+    });
     return agents.map((agent) => agent.id);
   }
 

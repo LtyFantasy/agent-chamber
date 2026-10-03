@@ -1384,6 +1384,51 @@ describe('DocService', () => {
         q: '%日记%',
       });
     });
+
+    // ─── v1.89.0-dev updatedAfter + sort（最近变更镜像的读面）────────
+
+    it('updatedAfter 过滤：含边界（>=），不传则不挂条件', async () => {
+      const qb = createMockQueryBuilder([makeDoc()], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const iso = '2026-09-30T00:00:00.000Z';
+      await service.findAll('space-1', { updatedAfter: iso });
+      expect(qb.andWhere).toHaveBeenCalledWith('d.updated_at >= :updatedAfter', {
+        updatedAfter: iso,
+      });
+
+      // 不传：不挂该条件（保持既有查询计划）
+      const plainQb = createMockQueryBuilder([makeDoc()], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(plainQb);
+      await service.findAll('space-1', {});
+      expect(plainQb.andWhere).not.toHaveBeenCalledWith(
+        'd.updated_at >= :updatedAfter',
+        expect.anything(),
+      );
+    });
+
+    it('sort 缺省 = path ASC（既有行为不变）；显式 sort = updatedAt 属性路径 + path 次键', async () => {
+      const plainQb = createMockQueryBuilder([makeDoc()], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(plainQb);
+      await service.findAll('space-1', {});
+      expect(plainQb.orderBy).toHaveBeenCalledWith('d.path', 'ASC');
+      expect(plainQb.addOrderBy).not.toHaveBeenCalled();
+
+      const descQb = createMockQueryBuilder([makeDoc()], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(descQb);
+      await service.findAll('space-1', { sort: 'updatedAt_desc' });
+      // orderBy 必须是实体属性路径（d.updatedAt）而非列名——分页段按属性名查元数据，
+      // 列名会 500（v1.89.0 生产实踩；真 ORM 行为断言在 docspace-bundle e2e）
+      expect(descQb.orderBy).toHaveBeenCalledWith('d.updatedAt', 'DESC');
+      // 次键恒为 path ASC（path = upsert 业务键 ⇒ 全序；缺次键分页会抖）
+      expect(descQb.addOrderBy).toHaveBeenCalledWith('d.path', 'ASC');
+
+      const ascQb = createMockQueryBuilder([makeDoc()], 1);
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(ascQb);
+      await service.findAll('space-1', { sort: 'updatedAt_asc' });
+      expect(ascQb.orderBy).toHaveBeenCalledWith('d.updatedAt', 'ASC');
+      expect(ascQb.addOrderBy).toHaveBeenCalledWith('d.path', 'ASC');
+    });
   });
 
   // ─── findTree（v1.70.0-dev 懒加载目录树）────────────────────

@@ -2,7 +2,9 @@
  * KimiAcpDriver 测试（假 stdio 子进程按录制 NDJSON fixture 应答）
  *
  * 覆盖：initialize/new/resume/prompt 全链路、单飞行 busy、流式 chunk、审批挂起+应答、
- * usage、畸形响应、silent 判定、tool_event、权限模式钉死、不声明 fs caps、cancel/stop。
+ * usage、畸形响应、silent 判定、tool_event（含 tool_call_update 增量）、toolMeta 补全与
+ * 合并写、RT-ID-1 撞键分发、RT-BOOT-1 启动互斥（start 在途 + inject / 并发 assign 单
+ * spawn）、modelConfigValue hook 透传、权限模式钉死、不声明 fs caps、cancel/stop。
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -263,6 +265,18 @@ describe('KimiAcpDriver 全链路（initialize/new/prompt/流式）', () => {
     );
     expect(modelReq!.params!.value).toBe('kimi-k2');
   });
+
+  it('model 钉死走 profile.modelConfigValue hook：kimi 不实现 → 原值原样透传（D3 行为零变化）', async () => {
+    // 刻意用带 `/` 与 `[` 敏感的形态：若基座把 dsh 的包装逻辑写死（或给 hook 兜默认
+    // 实现），这里会被改写成 JSON 两段数组串——断言逐字相等即证四家零行为变化
+    const h = makeHarness();
+    h.setFixture([...startFixture([{ respond: CONFIG_RESPOND }])]); // set_config_option model
+    await h.driver.start({ ...CONFIG, model: 'kimi/kimi-k2' });
+    const modelReq = h
+      .getLog()
+      .find((r) => r.method === 'session/set_config_option' && r.params!.configId === 'model');
+    expect(modelReq!.params).toMatchObject({ configId: 'model', value: 'kimi/kimi-k2' });
+  });
 });
 
 describe('KimiAcpDriver thinking presence 边沿（1.54.0，Board 3c3d9577：thought 内容屏蔽 + 相位信号边沿触发）', () => {
@@ -456,6 +470,69 @@ describe('KimiAcpDriver 单飞行（per-seat）', () => {
     await expect(p1).rejects.toThrow('exited');
     const completes = h.events.filter((e) => e.type === 'message_complete');
     expect(completes).toHaveLength(2); // a 完成 + b 异常终结
+  });
+});
+
+describe('KimiAcpDriver 启动互斥（RT-BOOT-1：启动只走 bootSession 单一入口，绝不双 spawn 抢 resume）', () => {
+  /** spawn 次数探针：每个子进程启动即写一条 env 快照（fake-acp.js 首行，一进程一条） */
+  function spawnCount(h: Harness): number {
+    return h.getLog().filter((r) => r.direction === 'env').length;
+  }
+
+  it('start 在途（initialize 延迟）+ inject 到达 → 只 spawn 一次，inject 正常完成', async () => {
+    const h = makeHarness({ persistedSessionId: 'sess-old' });
+    h.setFixture([
+      { respond: INIT_RESPOND, delayMs: 150 }, // 人为拉长启动在途窗口（真实场景 = resume 往返）
+      { respond: { result: { sessionId: 'sess-old' } } }, // session/resume
+      { respond: CONFIG_RESPOND }, // set_config_option mode
+      {
+        emit: [chunkNotification('在途注入完成')],
+        respond: { result: { stopReason: 'end_turn' } },
+      }, // session/prompt
+    ]);
+    // 不 await start：模拟 runner-core 的并发下发（`void handleAssign` + `void handleInject`）；
+    // 真实触发序 = runner 重启后 assign 在途 + 离线期积压的 inject 立刻补投（dogfood ④）
+    const startP = h.driver.start(CONFIG);
+    const injectP = h.driver.inject('seat-1', { text: '重启后补投的积压消息' });
+    await expect(startP).resolves.toBeUndefined();
+    await expect(injectP).resolves.toBeUndefined();
+
+    const log = h.getLog();
+    // 核心断言：只有一个子进程——旧实现会 spawn 第二个去抢同一 sessionId 的 resume
+    //（dsh 侧表现为 already owned by an active write handle → 降级 session/new → 覆盖
+    // 持久化 sessionId → 记忆分叉；kimi/codex 侧是静默分叉）
+    expect(spawnCount(h)).toBe(1);
+    expect(log.filter((r) => r.method === 'initialize')).toHaveLength(1);
+    expect(log.filter((r) => r.method === 'session/resume')).toHaveLength(1);
+    // online 只上报一次（双 spawn 时两个子进程各自收尾各报一次）
+    const onlineEvents = h.events.filter(
+      (e) =>
+        e.type === 'status' && (e as Extract<SeatEvent, { type: 'status' }>).status === 'online',
+    );
+    expect(onlineEvents).toHaveLength(1);
+    // inject 正常走完 turn（既不是 BusyError 也不是畸形响应）
+    const complete = h.events.find((e) => e.type === 'message_complete') as Extract<
+      SeatEvent,
+      { type: 'message_complete' }
+    >;
+    expect(complete.stopReason).toBe('end_turn');
+    expect(complete.text).toBe('在途注入完成');
+  });
+
+  it('两个并发 assign（同座位）→ 只 spawn 一次（同根因：第二个 start 复用第一个的在途启动）', async () => {
+    const h = makeHarness();
+    h.setFixture([
+      { respond: INIT_RESPOND, delayMs: 150 },
+      { respond: { result: { sessionId: 'sess-1' } } }, // session/new
+      { respond: CONFIG_RESPOND }, // set_config_option mode
+    ]);
+    const p1 = h.driver.start(CONFIG); // 同步返回：launch + 登记 + boot 已发起
+    const p2 = h.driver.start(CONFIG); // 同一 tick 内并发 assign
+    await expect(p1).resolves.toBeUndefined();
+    await expect(p2).resolves.toBeUndefined();
+    expect(spawnCount(h)).toBe(1);
+    expect(h.getLog().filter((r) => r.method === 'initialize')).toHaveLength(1);
+    expect(h.getLog().filter((r) => r.method === 'session/new')).toHaveLength(1);
   });
 });
 
@@ -677,6 +754,38 @@ describe('KimiAcpDriver toolMeta 缓存补全（M4b-1 ②：request_permission �
     expect(perms[1].requestId).toBe('9101');
     expect(perms[1].tool).toMatchObject({ toolCallId: 'tc-100', title: 'tool-100' }); // 最新键在缓存内：补全
   });
+
+  it('tool_call(带 title) → tool_call_update(仅 status) → request_permission：title 仍在（D4 合并写回归）', async () => {
+    const h = makeHarness();
+    h.setFixture([
+      ...startFixture([
+        {
+          emit: [
+            toolCallNotification('tc-1', 'ls'),
+            {
+              method: 'session/update',
+              params: {
+                // ACP patch 语义：只带变更字段；覆盖写会把缓存 title 冲成 undefined
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-1',
+                  status: 'completed',
+                },
+              },
+            },
+            permissionEmit({ toolCallId: 'tc-1', kind: 'bash', status: 'pending' }, 9001),
+          ],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+      ]),
+    ]);
+    await h.driver.start(CONFIG);
+    const permPromise = waitForEvent(h.events, (e) => e.type === 'permission_request');
+    await h.driver.inject('seat-1', { text: '跑一下' });
+    const perm = (await permPromise) as Extract<SeatEvent, { type: 'permission_request' }>;
+    // 合并写保住了 title（覆盖写路径下此处 title 缺失 → 工具名退化为 "unknown tool"）
+    expect(perm.tool).toMatchObject({ toolCallId: 'tc-1', title: 'ls', status: 'pending' });
+  });
 });
 
 describe('KimiAcpDriver usage / tool_event（行为档案 #3）', () => {
@@ -750,6 +859,53 @@ describe('KimiAcpDriver usage / tool_event（行为档案 #3）', () => {
       { type: 'tool_event' }
     >;
     expect(toolEvent.tool).not.toHaveProperty('sessionUpdate');
+  });
+
+  it('tool_call_update 流式块 → tool_event 事件（D4：工具生命周期增量与 tool_call 同路径透传）', async () => {
+    const h = makeHarness();
+    h.setFixture([
+      ...startFixture([
+        {
+          emit: [
+            {
+              method: 'session/update',
+              params: {
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: 'tc-9',
+                  title: 'ls',
+                  kind: 'bash',
+                  status: 'pending',
+                },
+              },
+            },
+            {
+              method: 'session/update',
+              params: {
+                // ACP patch 语义：只带变更字段（无 title/kind）
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc-9',
+                  status: 'completed',
+                },
+              },
+            },
+            chunkNotification('ok'),
+          ],
+          respond: { result: { stopReason: 'end_turn' } },
+        },
+      ]),
+    ]);
+    await h.driver.start(CONFIG);
+    await h.driver.inject('seat-1', { text: 'x' });
+    const toolEvents = h.events.filter((e) => e.type === 'tool_event') as Array<
+      Extract<SeatEvent, { type: 'tool_event' }>
+    >;
+    // 两帧都上行：首帧 tool_call + 增量帧 tool_call_update（白名单此前只有 tool_call/
+    // tool_response，增量帧被静默丢弃 → 工具「开始→完成」过程只有首帧可观测）
+    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents[1]!.tool).toEqual({ toolCallId: 'tc-9', status: 'completed' });
+    expect(toolEvents[1]!.tool).not.toHaveProperty('sessionUpdate');
   });
 });
 
@@ -977,6 +1133,52 @@ describe('KimiAcpDriver 畸形响应 / 异常路径', () => {
     });
     await expect(driver.start(CONFIG)).rejects.toThrow('spawn failed');
     expect(fs.existsSync(dir)).toBe(true); // 仅保证 fixture 目录用法一致（占位断言）
+  });
+});
+
+describe('KimiAcpDriver 分发判定序（RT-ID-1：反向 RPC id 与在飞请求 id 撞键）', () => {
+  it('撞键的反向请求（带 method）不被当响应吞：审批帧照常上行，原 pending 请求仍 resolve', async () => {
+    const h = makeHarness();
+    // id 占位推算：initialize=1、session/new=2、set_config_option(mode)=3 → session/prompt=4；
+    // 反向 RPC 复用 id=4（agent 反向 id 从 0 起、与 runner 在飞 id 同命名空间，真机可撞）
+    h.setFixture([
+      ...startFixture([
+        {
+          emit: [
+            {
+              jsonrpc: '2.0',
+              id: 4,
+              method: 'session/request_permission',
+              params: {
+                toolCall: { toolCallId: 'tc-1', kind: 'bash', status: 'pending' },
+                options: [{ optionId: 'allow-once', kind: 'allow_once', name: 'Allow once' }],
+              },
+            },
+          ],
+          respond: { result: { stopReason: 'end_turn' } }, // session/prompt（同 id=4，无 method）
+        },
+      ]),
+    ]);
+    await h.driver.start(CONFIG);
+    const permPromise = waitForEvent(h.events, (e) => e.type === 'permission_request');
+    // 修复前：撞键帧先被 pending.has(4) 命中 → 当响应吞掉（无 result/error → 畸形响应
+    // 拒绝 prompt），审批永不上行、turn 死亡。修复后 inject 正常 resolve。
+    await expect(h.driver.inject('seat-1', { text: '跑一下' })).resolves.toBeUndefined();
+    const perm = (await permPromise) as Extract<SeatEvent, { type: 'permission_request' }>;
+    expect(perm.requestId).toBe('4');
+    expect(perm.options).toHaveLength(1);
+    // 原 pending 请求（session/prompt, id=4）仍被正确 resolve：end_turn 而非畸形响应
+    const complete = h.events.find((e) => e.type === 'message_complete') as Extract<
+      SeatEvent,
+      { type: 'message_complete' }
+    >;
+    expect(complete.stopReason).toBe('end_turn');
+    // 撞键不影响挂起表：审批应答仍可送达（回 id=4 的反向应答）
+    await h.driver.answerPermission('seat-1', '4', 'allow-once');
+    await waitFor(() => h.getLog().some((r) => r.direction === 'response' && r.id === 4));
+    expect(h.getLog().find((r) => r.direction === 'response' && r.id === 4)!.result).toEqual({
+      outcome: { outcome: 'selected', optionId: 'allow-once' },
+    });
   });
 });
 

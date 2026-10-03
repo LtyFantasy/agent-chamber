@@ -23,6 +23,7 @@ import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { AuditLog } from '../../database/entities/audit-log.entity';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { DocService } from './doc.service';
+import { DocLinksService } from './doc-links.service';
 import { EventService } from '../event/event.service';
 import { ErrorCode, AuditAction, ActorType, EventType } from '@agent-chamber/shared';
 import { NotFoundException, ConflictException } from '@nestjs/common';
@@ -42,6 +43,9 @@ describe('DocMoveService', () => {
     getSpaceEventContext: jest.Mock;
     recalcSpaceLinkHealth: jest.Mock;
   };
+  // 入链内核（v1.90.0-dev 从 DocMoveService 抽出）——本套件注入**真实例**（repo 已被
+  // mock），使入链断言（去重/双匹配/section 定位/调用图）仍在同一套件内被覆盖
+  let docLinksService: DocLinksService;
   let eventService: { create: jest.Mock };
   let mockTransaction: jest.Mock;
 
@@ -97,6 +101,8 @@ describe('DocMoveService', () => {
       andWhere: jest.fn().mockReturnThis(),
       setLock: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
+      // 入链内核候选集用 ORDER BY path ASC + addOrderBy id ASC（确定性契约）
+      addOrderBy: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
       getOne: jest.fn().mockResolvedValue(null),
       getRawMany: jest.fn().mockResolvedValue([]),
@@ -142,6 +148,13 @@ describe('DocMoveService', () => {
       recalcSpaceLinkHealth: jest.fn().mockResolvedValue(undefined),
     };
     eventService = { create: jest.fn().mockResolvedValue({}) };
+    // 入链内核真实例：repo 走本套件的 mock（其调用图被断言覆盖），docService 用 mock
+    // 的 reconstructContent（按 doc.id 索引内容）
+    docLinksService = new DocLinksService(
+      docRepo as never,
+      sectionRepo as never,
+      docService as unknown as DocService,
+    );
 
     service = new DocMoveService(
       docRepo as never,
@@ -151,6 +164,7 @@ describe('DocMoveService', () => {
       auditRepo as never,
       idempotencyRepo as never,
       docService as unknown as DocService,
+      docLinksService,
       eventService as unknown as EventService,
     );
   });
@@ -163,38 +177,50 @@ describe('DocMoveService', () => {
 
   describe('computeMoveImpact', () => {
     const target = makeDoc();
+    /** sections 查询次数（arrangeSpaceDocs 计数：入链批量恒 1 次，N+1 消除守卫） */
+    let sectionQueryCount = 0;
 
-    /** 安排空间文档列表 + 每篇的 sections/content（reconstructContent mock 为第二参）
-     *  outbound（proposedPath 非空）会额外查一次被移文档自身的 sections——queue 尾部
-     *  追加该文档的 sections 备份供其消费（循环入链反扫只消耗前 docs.length 个）。
-     *  默认追加外层 target 的 sections；outbound 场景被移文档非外层 target 时
-     *  必须显式传 outboundDoc（如 outbound 用例的 subTarget——闭包捕获的是
-     *  定义作用域的 target，shadow 后按 id 匹配会落空） */
+    /** 安排空间文档候选集 + 批量 sections + 按 doc.id 索引的正文。
+     *
+     *  v1.90.0-dev（backlinks 批次）：入链 sections 由「逐篇查询」改为一次
+     *  `WHERE doc_id IN (...)` 批量拉取（N+1 消除），因此旧的「下标队列 + 按 sections
+     *  数组身份匹配」策略失效（每篇拿到的是内存新切片，身份不命中）——改为
+     *  ① 批量返回全空间 sections 平铺（position 升序，模拟 SQL ORDER BY）；
+     *  ② reconstructContent 按 **doc.id** 索引内容。
+     *
+     *  期望调用图（本 helper 即契约）：sections 查询 1 次（入链批量）+
+     *  1 次（outbound 自身 sections，仅 proposedPath 非空时）；outbound 场景
+     *  被移文档非外层 target 时必须显式传 outboundDoc（闭包捕获的是定义作用域的
+     *  target，shadow 后按 id 匹配会落空） */
     function arrangeSpaceDocs(
       docs: Doc[],
       sectionContent: Array<{ doc: Doc; sections: DocSection[]; content: string }>,
       outboundDoc?: Doc,
     ) {
+      // 调用图计数器（N+1 消除的回归守卫）：入链批量查询恒 1 次
+      sectionQueryCount = 0;
       docRepo.createQueryBuilder = jest.fn(() =>
         makeQb({ getMany: jest.fn().mockResolvedValue(docs) }),
       );
-      // sections 队列按 docs 顺序（未提供内容的文档 = 空 sections），防止 queue 错位
-      const outboundSections = sectionContent.find(
-        (s) => s.doc.id === (outboundDoc ?? target).id,
-      )?.sections;
-      const queue = docs.map((d) => sectionContent.find((s) => s.doc.id === d.id)?.sections ?? []);
-      // outbound 的额外查询（computeOutboundLinks）消耗队列最后一个元素——与入链
-      // 反扫同口径（同一 target sections）；无内容时为 []，outbound 空跑
-      queue.push(outboundSections ?? []);
-      let i = 0;
-      sectionRepo.createQueryBuilder = jest.fn(() =>
-        makeQb({
-          getMany: jest.fn().mockImplementation(() => Promise.resolve(queue[i++] ?? [])),
-        }),
+      const sectionsByDocId = new Map(
+        docs.map((d) => [d.id, sectionContent.find((s) => s.doc.id === d.id)?.sections ?? []]),
       );
-      docService.reconstructContent.mockImplementation((_doc: Doc, sections: DocSection[]) => {
-        const hit = sectionContent.find((s) => s.sections === sections);
-        return hit ? hit.content : '';
+      // 批量查询 = 全空间平铺；position 升序对应真实 SQL 的 ORDER BY s.position ASC
+      const batchSections = docs
+        .flatMap((d) => sectionsByDocId.get(d.id) ?? [])
+        .sort((a, b) => a.position - b.position);
+      const outboundSections = sectionsByDocId.get((outboundDoc ?? target).id) ?? [];
+      const queue = [batchSections, outboundSections];
+      let i = 0;
+      sectionRepo.createQueryBuilder = jest.fn(() => {
+        sectionQueryCount++;
+        return makeQb({
+          getMany: jest.fn().mockImplementation(() => Promise.resolve(queue[i++] ?? [])),
+        });
+      });
+      const contentByDocId = new Map(sectionContent.map((s) => [s.doc.id, s.content]));
+      docService.reconstructContent.mockImplementation((doc: { id: string }) => {
+        return contentByDocId.get(doc.id) ?? '';
       });
     }
 
@@ -416,6 +442,29 @@ describe('DocMoveService', () => {
       // plannedPath 为空 → outbound 清单不携带（契约：仅 proposedPath 非空时出现）
       expect(impact.outboundPathLinksToRewrite).toBeUndefined();
       expect(impact.path).toBe('docs/target.md');
+    });
+
+    it('调用图：sections 恰 1 次批量查询（入链），proposedPath 非空时 +1（outbound）', async () => {
+      const srcA = makeDoc({ id: 'doc-src-a', path: 'docs/a.md', title: 'A' });
+      const srcB = makeDoc({ id: 'doc-src-b', path: 'docs/b.md', title: 'B' });
+      const entries = [
+        { doc: srcA, sections: [], content: `见 [t](/docs/space-1?doc=${target.id})` },
+        { doc: srcB, sections: [], content: '见 [t](./target.md)' },
+      ];
+
+      // 无 proposedPath：只有入链批量 sections 的 1 次查询
+      arrangeSpaceDocs([target, srcA, srcB], entries);
+      arrangeRoutes([]);
+      arrangeTaskLinks([]);
+      await service.computeMoveImpact('space-1', target);
+      expect(sectionQueryCount).toBe(1);
+
+      // 有 proposedPath：outbound 自身 sections 再 1 次（合计 2；旧逐篇实现为 3+1）
+      arrangeSpaceDocs([target, srcA, srcB], entries);
+      arrangeRoutes([]);
+      arrangeTaskLinks([]);
+      await service.computeMoveImpact('space-1', target, 'docs/moved.md');
+      expect(sectionQueryCount).toBe(2);
     });
 
     // ─── outbound 出链失效面（v1.61.0 f80a04ea；嵌套于 computeMoveImpact 内以复用

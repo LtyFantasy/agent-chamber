@@ -11,6 +11,12 @@
  *              ⑥(RT-PERM-1: kind 命名不可信→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
  *              ⑧(cancel 语义：优雅优先，kill 仅为超时兜底) ⑨(codex 桥 request_permission 不带 title——
  *              toolCallId 缓存补全，只补缺省不覆盖)
+ *              RT-ID-1(分发判定序：带 method 的反向 RPC 判定必须在 pending.has(id) 之前——
+ *              反向 id 与在飞 id 同命名空间撞键时，先判 pending 会把审批帧当响应吞掉)
+ *              RT-BOOT-1(启动竞态：start 与 inject 叫醒不互斥 → 双 spawn 抢 resume，
+ *              记忆分叉 + 旧子进程泄漏。安全方向：启动只走 bootSession 单一入口)
+ *              D4(tool_call_update 是 patch 语义只带变更字段 → toolMeta 必须合并写，
+ *              覆盖写会把 title 冲成 undefined)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #17(测试契约) #20(契约即设计)
  *
@@ -47,7 +53,7 @@
 /**
  * AcpDriver —— ACP 传输基座（厂商差异收口为 AcpVendorProfile 的 SeatDriver 实现）
  *
- * M4a 由 kimi-acp.ts 提取：kimi/codex 共用同一套 ACP stdio 传输层，厂商 quirk
+ * M4a 由 kimi-acp.ts 提取：kimi 与 codex 共用同一套 ACP stdio 传输层，厂商 quirk
  * （spawn 命令 / 权限档位映射 / 日志前缀）经构造注入的 profile 区分。
  *
  * 传输层整体提升自 scripts/acp-poc.mjs 的 AcpConnection：
@@ -117,26 +123,38 @@ const CLIENT_NAME = 'agent-chamber-roundtable-runner';
 const CANCEL_KILL_TIMEOUT_MS = 10_000;
 
 /**
- * 厂商 profile：AcpDriver 与厂商的全部差异收口点（kimi/codex 各一份薄壳构造注入）。
- * 新增厂商 = 新增一个 profile + 薄壳类，传输层零改动。
+ * 厂商 profile：AcpDriver 与厂商的全部差异收口点（SEAT_VENDORS 五家
+ * 各一份薄壳构造注入）。新增厂商 = 新增一个 profile + 薄壳类，传输层零改动。
  */
 export interface AcpVendorProfile {
-  /** 厂商名（日志前缀/错误文案；如 'kimi'/'codex'） */
+  /** 厂商名（日志前缀/错误文案；如 'kimi'/'codex'/'dsh'） */
   vendorName: string;
   /**
    * 构造 ACP 子进程 spawn 命令（每次拉起时调用，带座位配置——opencode 需要按
    * 座位 permissionMode 注入 OPENCODE_CONFIG_CONTENT 权限钉死，见 opencode-acp.ts；
-   * 不需要座位上下文的厂商（kimi/codex）可忽略该参数）。
+   * dsh 需要按档位钉 DSH_PERMISSION_MODE，见 dsh-acp.ts；不需要座位上下文的厂商
+   * （kimi · codex · claude-code）可忽略该参数）。
    * 可抛错——抛错即 start/inject 失败，错误信息直接成为座位 offline 的 detail
-   * （如 codex 探测不到 CLI：R3 不静默兜底）。
+   * （如 opencode/dsh 探测不到 CLI：R3 不静默兜底）。
    */
   spawnCommand(config: SeatConfig): { bin: string; args: string[]; env: NodeJS.ProcessEnv };
   /**
    * 平台权限档位 → set_config_option 钉死序列（档案 #5 泄漏防护的厂商映射）。
    * kimi：单条 mode=permissionMode；codex：mode（read-only/agent/agent-full-access）
-   * + plan 档追加 collaboration_mode=plan（语义近似非等价，见 codex-acp.ts）。
+   * + plan 档追加 collaboration_mode=plan（语义近似非等价，见 codex-acp.ts）；
+   * dsh：无 mode 面 → `[]`（档位全部由 spawn env 承载，见 dsh-acp.ts D2）。
    */
   modeConfigEntries(permissionMode: PermissionMode): Array<{ configId: string; value: string }>;
+  /**
+   * 可选：model 钉死值的厂商包装 hook（`session/set_config_option configId=model` 的
+   * value 变换）。**缺省不实现 = 原样透传**（四家现状）。
+   * 为什么需要：厂商对 model 值的约定可能不是裸名——dsh 的 configOptions model 值是
+   * JSON 两段数组字符串 `["<provider>","<model>"]`，裸名直接下发报 unknown model
+   * （见 dsh-acp.ts D3）。包装语义放在 profile（厂商差异收口点），传输层不感知。
+   * @param model seat.assign 下发的 model 原文
+   * @returns 实际写入 set_config_option 的 value
+   */
+  modelConfigValue?(model: string): string;
 }
 
 /** ACP 反向 RPC 应答结果：审批选中选项 */
@@ -202,6 +220,15 @@ interface AcpSession {
   turnPromise: Promise<void> | null;
   /** initialize + session 建立完成标志 */
   started: boolean;
+  /**
+   * in-flight 启动（initialize + ensureSession）的 promise；未在启动中为 null（RT-BOOT-1）。
+   * 为什么必须存在：`started=false` 有两种截然不同的语义——①「正在启动中」（等它收尾）
+   * 与 ②「从未启动」（需要拉起）。旧代码只判 `started`，把 ① 误判成 ②，于是 start() 与
+   * inject() 叫醒分支并发时各自 launch，第二个 spawn 去 resume 同一 sessionId（厂商侧
+   * 抢占：dsh 报 already owned by an active write handle → 降级 session/new → 覆盖持久化
+   * sessionId → 记忆分叉）。本字段是两条入口共享同一次启动的唯一凭据。
+   */
+  startPromise: Promise<void> | null;
   /** 当前 ACP 会话 id（resume/new 后填充） */
   sessionId: string | null;
   /** 子进程已退出（不可再请求；inject 时按「叫醒」语义重新 spawn+resume） */
@@ -209,10 +236,12 @@ interface AcpSession {
   /** 实际运行配置快照（configOptions 解析 + set_config_option 钉死值合并；seat_info 上行数据源） */
   configSnapshot: ConfigSnapshot;
   /**
-   * 工具元数据缓存（toolCallId → {title,kind}）：tool_call/tool_response 到达时记录；
-   * request_permission 的 toolCall 缺 title 时查表补全（codex 桥 quirk：审批载荷不带
-   * title，DB 实测仅 {kind,status,toolCallId}）。cap 100 FIFO（Map 迭代序=插入序）。
-   * 会话级内存态：重启/resume 后为空 → 优雅降级为现状（缺省不补），非回归
+   * 工具元数据缓存（toolCallId → {title,kind}）：tool_call/tool_call_update/tool_response
+   * 到达时记录；request_permission 的 toolCall 缺 title 时查表补全（codex 桥 quirk：审批
+   * 载荷不带 title，DB 实测仅 {kind,status,toolCallId}）。**合并写**（D4：仅新值非
+   * undefined 才覆盖对应字段）——tool_call_update 是 ACP patch 语义只带变更字段，
+   * 无条件覆盖会把已有 title 冲成 undefined 自毁补缺路径。cap 100 FIFO（Map 迭代序=
+   * 插入序）。会话级内存态：重启/resume 后为空 → 优雅降级为现状（缺省不补），非回归
    */
   toolMeta: Map<string, { title?: unknown; kind?: unknown }>;
   /**
@@ -227,7 +256,7 @@ interface AcpSession {
 
 /** AcpDriver 构造选项 */
 export interface AcpDriverOptions {
-  /** 厂商差异 profile（必填；kimi/codex 薄壳构造时注入各自 quirk） */
+  /** 厂商差异 profile（必填；kimi 与 codex 薄壳构造时注入各自 quirk） */
   profile: AcpVendorProfile;
   /** 会话 id 读取回调（start 时 resume 用；runner-core 接 state-store） */
   getSessionId?: (seatId: string) => string | undefined;
@@ -270,7 +299,7 @@ export class AcpDriver implements SeatDriver {
   // ─────────────────────────── SeatDriver 接口实现 ───────────────────────────
 
   /**
-   * 拉起或复活座位对应的运行时会话（幂等：已活则复用）。
+   * 拉起或复活座位对应的运行时会话（幂等：已活则复用、启动在途则共享同一次启动）。
    * 流程：spawn acp 子进程 → initialize → 有落盘 sessionId 则 session/resume 否则
    * session/new（档案 #1）→ set_config_option 钉死权限档位（档案 #5，profile 映射）→
    * 可选 model 覆盖（档案 #6）。
@@ -278,21 +307,93 @@ export class AcpDriver implements SeatDriver {
    */
   async start(config: SeatConfig): Promise<void> {
     const existing = this.sessions.get(config.seatId);
-    if (existing && !existing.dead && existing.started) {
-      existing.config = config; // 幂等复用（config 更新仅记录，不重启会话）
+    if (existing && !existing.dead) {
+      existing.config = config; // 幂等复用（config 更新仅记录，不重启会话；启动在途时新值会被 boot 的后续读取采纳——ensureSession 分时读 cwd/mode/model，review N3）
+      if (existing.started) {
+        return; // 已活：幂等直接返回（不重复上报 online）
+      }
+      // RT-BOOT-1：会话已登记但启动在途（并发 assign / 积压 inject 的叫醒抢先发起）——
+      // 共享同一次启动，**绝不二次 launch**。online 由真正完成启动的那条路径上报：
+      // 新起会话路径（下方）必报；inject 叫醒路径沿用其「叫醒不补发 online」既有语义
+      await this.bootSession(existing);
       return;
     }
     const session = this.launch(config);
-    this.sessions.set(config.seatId, session);
-    try {
-      await this.initialize(session);
-      await this.ensureSession(session);
-      this.emit({ type: 'status', seatId: config.seatId, status: 'online' });
-    } catch (err) {
-      session.dead = true;
-      this.teardown(session);
-      this.sessions.delete(config.seatId);
-      throw err;
+    this.register(session);
+    await this.bootSession(session);
+    this.emit({ type: 'status', seatId: config.seatId, status: 'online' });
+  }
+
+  /**
+   * 启动会话的**唯一入口**：每个 session 对象单飞 + 幂等（RT-BOOT-1 的修复核心）。
+   *
+   * 状态机语义：
+   * - `started=true` → 启动已完成，直接 resolve（幂等）；
+   * - `startPromise` 非 null → 启动在途，返回**同一个** promise（并发调用者共享结果，
+   *   失败也共享同一个异常——不静默重试/重 spawn，重 spawn 正是本 bug 的形态）；
+   * - 否则真正执行 initialize + ensureSession，并把 promise 登记进 `session.startPromise`。
+   * 失败清理：标死 + 杀子进程 + 摘除登记（只摘自己，防误删继任者），错误原样上抛
+   * （由 start/inject 的调用方上行 offline）。
+   *
+   * 为什么需要单飞（根因）：启动由两条入口驱动——seat.assign→start() 与 inject() 的叫醒
+   * 分支，二者在 runner-core 是并发下发的（`void this.handleXxx()`）；runner 重启后
+   * 「assign 在途 + 离线期积压的 inject 立刻补投」是常态组合。两处各自 launch 会让第二个
+   * spawn 去 resume 同一 sessionId，且旧 session 被覆盖出 sessions map 后子进程无人回收
+   * （进程泄漏 + 一个座位两份事件流）。
+   */
+  private bootSession(session: AcpSession): Promise<void> {
+    if (session.started) return Promise.resolve();
+    if (session.startPromise) return session.startPromise;
+    const boot = (async () => {
+      try {
+        await this.initialize(session);
+        await this.ensureSession(session);
+      } catch (err) {
+        session.dead = true;
+        this.teardown(session);
+        this.unregister(session);
+        throw err;
+      } finally {
+        // 状态机一致性：成功/失败/被 stop 打断，在途标记都必须清干净——残留会让后续
+        // start/inject 永远 await 一个已 settle 的旧 promise（会话再也起不来）
+        session.startPromise = null;
+      }
+    })();
+    session.startPromise = boot;
+    return boot;
+  }
+
+  /**
+   * 登记会话（一个座位一个会话）。若同座位已有前任 session 对象，对前任做**防御性回收**
+   * （RT-BOOT-1 顺带）：被覆盖出 map 的会话其子进程会失去所有者——进程泄漏，且其 stdout
+   * 仍挂在 readline 上继续为一个座位上行两份事件流。
+   * 正常路径下前任必为**已死**会话（子进程退出后 dead=true 但仍留在 map 等叫醒覆盖），
+   * 此处回收是 no-op；一旦真覆盖到活会话，说明并发保护失效——本兜底让损失有界（杀进程）
+   * 而非静默泄漏。
+   */
+  private register(session: AcpSession): void {
+    const seatId = session.config.seatId;
+    const prev = this.sessions.get(seatId);
+    if (prev && prev !== session) {
+      // 日志分级（review N1）：前任已死是正常叫醒路径（debug 留痕即可）；warn 只留给
+      // 「真覆盖到活会话」——那是并发保护失效的事故信号，需在日志里醒目。
+      const replacedMsg = `seat ${seatId} session replaced (prev pid=${String(prev.child.pid ?? '-')} dead=${prev.dead}); tearing down previous`;
+      if (prev.dead) {
+        this.logger.debug(replacedMsg);
+      } else {
+        this.logger.warn(replacedMsg);
+      }
+      prev.dead = true;
+      this.teardown(prev);
+    }
+    this.sessions.set(seatId, session);
+  }
+
+  /** 摘除会话登记（仅当当前登记的就是它——防误删继任会话） */
+  private unregister(session: AcpSession): void {
+    const seatId = session.config.seatId;
+    if (this.sessions.get(seatId) === session) {
+      this.sessions.delete(seatId);
     }
   }
 
@@ -306,15 +407,20 @@ export class AcpDriver implements SeatDriver {
    */
   async inject(seatId: string, prompt: InjectedPrompt): Promise<void> {
     let session = this.sessions.get(seatId);
-    if (!session || session.dead || !session.started) {
+    if (!session || session.dead) {
+      // 叫醒语义：无会话 / 会话已死 → 新起一个会话对象再启动
       const config = session?.config;
       if (!config) {
         throw new Error(`seat ${seatId} has no config (seat.assign not received?)`);
       }
       session = this.launch(config);
-      this.sessions.set(seatId, session);
-      await this.initialize(session);
-      await this.ensureSession(session);
+      this.register(session);
+      await this.bootSession(session);
+    } else if (!session.started) {
+      // RT-BOOT-1：会话已登记但**启动在途**（seat.assign 的 start() 尚未收尾）——
+      // 等它，绝不二次 launch。启动失败时此处原样抛出（交 runner-core 上行 offline），
+      // 不做静默重 spawn（重 spawn 正是本 bug 的形态）
+      await this.bootSession(session);
     }
     if (session.busy) {
       throw new BusyError(seatId);
@@ -506,6 +612,10 @@ export class AcpDriver implements SeatDriver {
   async stop(seatId: string): Promise<void> {
     const session = this.sessions.get(seatId);
     if (session && !session.dead) {
+      // 先置 dead 再 kill（review N2）：SIGTERM 到子进程真正退出有窗口，在途 boot/后续
+      // inject 必须立刻把该会话视为死——否则启动成功收尾会给已 stop 座位补报 online，
+      // 且子进程已摘登记成无人所有的活进程（与 RT-BOOT-1 同类的泄漏形态）。
+      session.dead = true;
       this.kill(session);
       this.emit({ type: 'status', seatId, status: 'offline' });
     }
@@ -537,6 +647,8 @@ export class AcpDriver implements SeatDriver {
       cancelTimer: null,
       turnPromise: null,
       started: false,
+      // RT-BOOT-1：启动在途标记（bootSession 写入；见 AcpSession.startPromise 注释）
+      startPromise: null,
       sessionId: null,
       dead: false,
       configSnapshot: {},
@@ -615,11 +727,21 @@ export class AcpDriver implements SeatDriver {
     this.dispatch(session, msg as Record<string, unknown>);
   }
 
-  /** 三分发：响应 / 反向 RPC / 通知（acp-poc #dispatch 提升） */
+  /** 三分发：反向 RPC / 响应 / 通知（acp-poc #dispatch 提升） */
   private dispatch(session: AcpSession, msg: Record<string, unknown>): void {
     const id = msg.id;
     const method = typeof msg.method === 'string' ? msg.method : undefined;
-    // 1) 响应：有 id 且对应 pending 请求
+    // 1) 反向请求：agent → client（有 id + method），必须应答。
+    //    ⚠️ 判定序不可调换（RT-ID-1，D8）：**带 method 的判定必须在 pending.has(id)
+    //    之前**——JSON-RPC 响应永不带 method，而 agent 反向 RPC id 从 0 起与 runner
+    //    在飞 id 同命名空间（codex/claude/dsh 均如此），先判 pending 会把撞键的审批帧
+    //    当响应吞掉：审批永不上行（turn 挂起）、原 pending 请求被畸形响应拒绝（turn 死）。
+    //    重排语义安全：真实响应（无 method）不受影响，仍走下一分支。
+    if (id !== undefined && method) {
+      void this.handleReverseRequest(session, msg);
+      return;
+    }
+    // 2) 响应：有 id 且对应 pending 请求
     if (id !== undefined && typeof id === 'number' && session.pending.has(id)) {
       const pending = session.pending.get(id)!;
       session.pending.delete(id);
@@ -633,11 +755,6 @@ export class AcpDriver implements SeatDriver {
         // 畸形响应（档案 #4 wire 表现）：无 result 无 error
         pending.reject(new MalformedResponseError(pending.method));
       }
-      return;
-    }
-    // 2) 反向请求：agent → client（有 id + method），必须应答
-    if (id !== undefined && method) {
-      void this.handleReverseRequest(session, msg);
       return;
     }
     // 3) 通知：无 id（session/update 流式块等）
@@ -727,25 +844,43 @@ export class AcpDriver implements SeatDriver {
             );
           }
           return;
-        } else if (kind === 'tool_call' || kind === 'tool_response') {
+        } else if (
+          kind === 'tool_call' ||
+          kind === 'tool_call_update' ||
+          kind === 'tool_response'
+        ) {
           // 工具调用可观测（M2 过程折叠视图数据源；字段未冻结，宽松透传——RT-PERM-2：
           // 工具元数据（toolCallId/title/kind/status/locations/rawInput）挂在 update
           // 本体上，content 是内容块数组或缺失——取 content 当 tool 载荷会被 chamber
           // 校验丢弃）。透传整个 update 对象（浅拷贝后剥离 sessionUpdate 键），
           // 保证 tool 永远是对象。
+          // tool_call_update（D4）：ACP 工具生命周期增量（kind/status 变更），与 tool_call
+          // 同路径透传——否则 dsh/claude 的工具「开始 → 完成」过程只有首帧可观测。
+          // 注：tool_response 在已接入厂商中零实测（无 fixture、无真机样本），保留原
+          // 白名单仅作防御性兼容；不要据此认为该分支有验证覆盖。
           const tool = { ...update };
           delete tool.sessionUpdate;
           // toolMeta 缓存（M4b-1 ②）：按 toolCallId 记录工具元数据，供 request_permission
           // 补缺省 title——codex 桥审批载荷不带 title（DB 实测仅 {kind,status,toolCallId}，
           // 而 7ms 前同 toolCallId 的 tool_event 有 title）。key 兼容 toolCallId/id 双键
           // （真机与 fixture 形状不一）；cap 100 FIFO 防无限增长（Map 迭代序=插入序，
-          // 删最早键）；tool_response 覆盖写（status 更新不影响 title）
+          // 删最早键）。
+          // ⚠️ 合并写不可回退为覆盖写（D4）：tool_call_update 是 ACP patch 语义——只带
+          // **变更字段**（如仅 status），无条件覆盖会把已缓存的 title/kind 冲成 undefined，
+          // 自毁 request_permission 的补缺路径（工具名退化为 "unknown tool"）。
+          // 仅新值非 undefined 才覆盖对应字段；两者皆缺省时保留旧值。
+          // （kind 是跟随 title 的对称防御字段：读侧当前只在 request_permission 补缺
+          // 消费 title，缓存 kind 暂无消费方，保留以备审批/展示面使用。）
           const metaKey = String(tool.toolCallId ?? tool.id ?? '');
           if (metaKey) {
             if (session.toolMeta.size >= 100 && !session.toolMeta.has(metaKey)) {
               session.toolMeta.delete(session.toolMeta.keys().next().value as string);
             }
-            session.toolMeta.set(metaKey, { title: tool.title, kind: tool.kind });
+            const prev = session.toolMeta.get(metaKey);
+            session.toolMeta.set(metaKey, {
+              title: tool.title !== undefined ? tool.title : prev?.title,
+              kind: tool.kind !== undefined ? tool.kind : prev?.kind,
+            });
           }
           this.emit({
             type: 'tool_event',
@@ -890,7 +1025,9 @@ export class AcpDriver implements SeatDriver {
       await this.request(session, 'session/set_config_option', {
         sessionId,
         configId: 'model',
-        value: session.config.model,
+        // D3：厂商可包装 model 值（dsh 需 `["provider","model"]` 两段式数组字符串）；
+        // 四家 profile 不实现 hook = 原样透传（行为零变化）
+        value: this.profile.modelConfigValue?.(session.config.model) ?? session.config.model,
       });
     }
     // M3 阶段 5：解析会话初始化响应里的 configOptions 当前值（宽松读取，防缺省；

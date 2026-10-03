@@ -157,7 +157,7 @@ describe('list_docs', () => {
     expect(body.status).toBe(404);
   });
 
-  it('过滤/分页参数透传：docType 映射为后端 type，其余原样', async () => {
+  it('过滤/分页参数透传：docType 映射为后端 type，其余原样（含 updatedAfter/sort）', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -174,6 +174,8 @@ describe('list_docs', () => {
         q: '部署',
         page: 2,
         pageSize: 50,
+        updatedAfter: '2026-09-30T00:00:00.000Z',
+        sort: 'updatedAt_desc',
       },
       ctx(),
     );
@@ -187,8 +189,56 @@ describe('list_docs', () => {
       q: '部署',
       page: 2,
       pageSize: 50,
+      updatedAfter: '2026-09-30T00:00:00.000Z',
+      sort: 'updatedAt_desc',
       type: 'memory', // docType → type 映射
     });
+  });
+
+  it('新参数缺省时不注入（保持既有调用形态，不污染 query）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce(docListEnvelope());
+
+    await listDocsTool.handler({ spaceName: 'My Docs' }, ctx());
+
+    const params = request.mock.calls[1][2].params as Record<string, unknown>;
+    expect(params).not.toHaveProperty('updatedAfter');
+    expect(params).not.toHaveProperty('sort');
+  });
+
+  it('未知参数硬护栏：白名单外的非空键 → error + failedStep=validate_args，零请求', async () => {
+    // v1.89.0-dev 批次 A：automcp 运行时零参数校验，白名单外的键此前被静默丢弃——
+    // 现在响亮拒绝（"猜错参数却以为生效"是 Agent 侧的高频事故形态）
+    const request = mockRequest();
+
+    const result = await listDocsTool.handler(
+      { spaceName: 'My Docs', updated_at: '2026-09-30' }, // 典型猜错：snake_case 拼法
+      ctx(),
+    );
+
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.error).toBe(true);
+    expect(body.failedStep).toBe('validate_args');
+    expect(body.message).toBe('unknown parameter updated_at');
+    // 关键：护栏在解析空间之前短路 ⇒ 不发任何 HTTP 请求
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('未知参数硬护栏：空值不算传参（空串/null 不触发）', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce(docListEnvelope());
+
+    const result = await listDocsTool.handler({ spaceName: 'My Docs', foo: '', bar: null }, ctx());
+
+    expect(result.isError).toBeFalsy();
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
   it('slim=true → 只保留 path/title/updatedAt，分页元信息保留', async () => {

@@ -31,6 +31,7 @@ import {
   Workflow,
   X,
   FolderTree,
+  Info,
   ListTree,
 } from 'lucide-react';
 import { Api } from '@/lib/api';
@@ -74,6 +75,8 @@ import type { MemberItem, MembersSheetLabels } from '@/components/members/types'
 import { SidebarTree } from './sidebar-tree';
 // 左栏文档树组件（前端债包批次 4 子项 2 commit 6 抽取自本页：DocTreeItem + CategorySection）
 import { DocTreeItem, CategorySection } from '@/components/docs/doc-tree';
+// 右栏「被引用」卡片（v1.90.0-dev 反向引用面板）
+import { DocBacklinksCard } from '@/components/docs/doc-backlinks-card';
 
 /** 左栏视图模式 localStorage key（同 login 页 auth:last-email 先例；SSR 无 localStorage，挂载后校正） */
 const SIDEBAR_MODE_KEY = 'docs:sidebar-mode';
@@ -198,11 +201,20 @@ export default function DocSpaceDetailPage() {
     visibility: Visibility.OPEN,
     binding: 'none',
   });
-  /** 待滚动定位的标题路径（搜索命中直达 section 用） */
+  /** 待滚动定位的标题路径（搜索命中 / 反向引用点击直达 section 用；**末段**文本，见写入点） */
   const pendingHeadingRef = useRef<string | null>(null);
   /** 断链点击解析的会话内缓存（path → docId | null；null = 已确认不存在，避免重复请求） */
   const pathCacheRef = useRef<Map<string, string | null>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
+  /** 中栏滚动容器（切文档滚顶目标）：**不借 `data-scroll-container`**——那个属性是
+   *  附件图片 IntersectionObserver 的语义锚点（attachment-image.tsx 消费），复用会把
+   *  两个不相关语义绑死；元素级 `scrollTo()` 在 jsdom 下不存在，故用 scrollTop 赋值 */
+  const mainRef = useRef<HTMLElement>(null);
+  /** 中栏文档标题（切文档后焦点交回目标，h2 带 tabIndex={-1} 才可编程聚焦） */
+  const docTitleRef = useRef<HTMLHeadingElement>(null);
+  /** 待执行的「焦点交回中栏标题」标记：h2 只在正文就绪后挂载，滚顶 effect 当场
+   *  可能拿不到节点（切到未访问文档时中栏先是 Loading）——故标记 + 就绪 effect 两段式 */
+  const pendingDocFocusRef = useRef(false);
   /** 空间图例对话框开关（v1.43.1-dev）：图例改为头部按钮触发只读弹窗，不再内联占用首屏三栏区 */
   const [legendOpen, setLegendOpen] = useState(false);
 
@@ -490,7 +502,43 @@ export default function DocSpaceDetailPage() {
     return map;
   }, [docContent]);
 
-  /** 全文加载完成后执行待定的标题滚动（搜索命中直达 section） */
+  /** 中栏正文/元数据是否就绪（焦点交回的前置；diagram doc 的 contentLoading 恒 false） */
+  const docReady = !!selectedDocId && !!doc && !contentLoading && !docIsError;
+
+  /**
+   * 切文档滚顶，并预约「焦点交回中栏标题」。
+   *
+   * ⚠️ **声明顺序是载荷**：本 effect 必须排在下面「待定标题滚动」effect **之前**。
+   * 目标文档正文已在 query cache 里时，两个 effect 会在同一拍一起跑——先跑本 effect
+   * 才看得到非空的 pendingHeadingRef 从而让行，section 定位才不会被滚顶吃掉（复核 N2
+   * 的同型陷阱，只是发生在缓存命中路径上）。
+   *
+   * 前置 `pendingHeadingRef.current == null`：搜索命中 / 反向引用点击要求直达 section，
+   * 无条件滚顶会把既有功能吃掉。
+   * 依赖只挂 selectedDocId（**不含 docReady**）：正文就绪那一拍若重跑，pendingHeadingRef
+   * 恰好刚被消费，视口会被从命中的 section 拉回顶部。
+   */
+  useEffect(() => {
+    if (!selectedDocId || pendingHeadingRef.current != null) return;
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+    pendingDocFocusRef.current = true;
+  }, [selectedDocId]);
+
+  /**
+   * 焦点交回中栏标题（键盘/读屏用户跳转后不落在虚空中）。
+   *
+   * 顺序写死：先滚顶（上一个 effect）后聚焦——反序时 focus 会先把视口带到标题、
+   * 再被滚顶 effect 改写，观感抖动；`preventScroll` 保证聚焦本身不再动视口。
+   * h2 只在正文就绪后挂载，故本 effect 挂在 docReady 上消费标记（切到未访问文档时
+   * 中栏先是 Loading，滚顶那一拍拿不到节点）。
+   */
+  useEffect(() => {
+    if (!pendingDocFocusRef.current || !docReady) return;
+    pendingDocFocusRef.current = false;
+    docTitleRef.current?.focus({ preventScroll: true });
+  }, [docReady, selectedDocId]);
+
+  /** 全文加载完成后执行待定的标题滚动（搜索命中 / 反向引用点击直达 section） */
   useEffect(() => {
     if (docContent && pendingHeadingRef.current) {
       scrollToHeading(contentRef.current, pendingHeadingRef.current);
@@ -499,15 +547,26 @@ export default function DocSpaceDetailPage() {
   }, [docContent]);
 
   /**
-   * 切换选中文档并同步 ?doc= 到 URL（replace 不污染历史；刷新/分享可直达同一文档）。
-   * docId 为 null 时清除参数（回到「请选择文档」态）。
+   * 切换选中文档并同步 ?doc= 到 URL（**push**：每次主动换文档压一条历史，Back 回到
+   * 上一篇而不是直接跳出文档页；刷新/分享仍可经 ?doc= 直达同一文档）。
+   *
+   * docId 为 null = **清除选择**（文档已删 / 正文加载失败后的「返回文档列表」）：
+   * 这里刻意用 replace——被放弃的文档不该留在历史里，push 会让 Back 重进刚退出的
+   * 错误态（显式决定，不默认继承上一分支的 push）。
+   *
+   * 目标 URL 与当前 URL 相同时早退：重复点当前文档（左栏目录/分类树）不该压一条
+   * 同址历史，否则 Back 要按两次才离开。
    */
   const selectDoc = (docId: string | null) => {
     const params = new URLSearchParams(searchParams.toString());
     if (docId) params.set('doc', docId);
     else params.delete('doc');
     const qs = params.toString();
-    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    const nextUrl = qs ? `${pathname}?${qs}` : pathname;
+    const currentQs = searchParams.toString();
+    if (nextUrl === (currentQs ? `${pathname}?${currentQs}` : pathname)) return;
+    if (docId === null) router.replace(nextUrl, { scroll: false });
+    else router.push(nextUrl, { scroll: false });
   };
 
   // ── Mutations ────────────────────────────────────
@@ -517,6 +576,9 @@ export default function DocSpaceDetailPage() {
     void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
+    // 反向引用（v1.90.0-dev）：空间级结构变更会让全空间入链反扫结果过期
+    // （路径改名/删除会改变「谁引用我」的命中集）
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'backlinks'] });
   };
 
   /**
@@ -533,6 +595,8 @@ export default function DocSpaceDetailPage() {
     void queryClient.invalidateQueries({ queryKey: ['docs', 'filtered'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'search-docs'] });
     void queryClient.invalidateQueries({ queryKey: ['docs', 'search'] });
+    // 反向引用（v1.90.0-dev）：回导按 path 覆盖任意篇正文 → 全空间入链集合整体可能变化
+    void queryClient.invalidateQueries({ queryKey: ['docs', 'backlinks'] });
   };
 
   /**
@@ -801,6 +865,9 @@ export default function DocSpaceDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content-full', selectedDocId] });
+      // 反向引用（v1.90.0-dev）：本篇正文的链接可能指向别的文档 → 「被引用」是双向的，
+      // 编辑 B 会对 A 的卡片成真，故前缀失效整类（web 端无删除 mutation，这是主要真命中场景）
+      void queryClient.invalidateQueries({ queryKey: ['docs', 'backlinks'] });
       // 懒加载目录树/聚合计数（A4 防脏目录计数）：前缀通配失效覆盖全部 prefix 层
       void queryClient.invalidateQueries({ queryKey: ['docs', 'tree'] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'facets'] });
@@ -850,9 +917,34 @@ export default function DocSpaceDetailPage() {
     setEditing(null);
     // DocSearchHit 只携带 headingPath（搜索索引投影无 heading 字段，见 shared
     // DocSearchHit），此处反解析末段仅作兼容兜底——outline 消费点已改直读 heading
-    pendingHeadingRef.current = hit.headingPath ? extractLastHeadingSegment(hit.headingPath) : null;
+    const heading = hit.headingPath ? extractLastHeadingSegment(hit.headingPath) : null;
+    // 命中**当前文档**：selectDoc 因「同址早退」不动 URL，正文查询 key 也没变 →
+    // 写进 pendingHeadingRef 的标记不会有任何消费者清（正文 effect 不重跑），
+    // 悬空标记会让**下一次**切文档错误地跳过滚顶、甚至去滚新文档里不存在的标题。
+    // 就地滚动即闭环（用户预期本来也就是「跳到这一节」）。
+    if (hit.docId === selectedDocId) {
+      scrollToHeading(contentRef.current, heading);
+      setSearchQuery('');
+      return;
+    }
+    pendingHeadingRef.current = heading;
     selectDoc(hit.docId);
     setSearchQuery('');
+  };
+
+  /**
+   * 反向引用卡片选中来源：关 <xl 抽屉 → 切文档 → 直达该来源的命中 section。
+   *
+   * - `setRightSheetOpen(false)` 必须在最前：<xl 时卡片在抽屉里，抽屉留着会盖住正文，
+   *   用户看不到「跳过去了」这件事（xl 常驻列下该调用无副作用）；
+   * - headingPath 是 DTO 的全路径，喂 pendingHeadingRef 前必须取**末段**——
+   *   `scrollToHeading` 按渲染标题文本匹配，渲染标题 = 末段（doc.service 的
+   *   heading_text 列即末段）；不截断会静默不滚。null（文首段）落顶部。
+   */
+  const handleBacklinkSelect = (docId: string, headingPath?: string | null) => {
+    setRightSheetOpen(false);
+    pendingHeadingRef.current = headingPath ? extractLastHeadingSegment(headingPath) : null;
+    selectDoc(docId);
   };
 
   /**
@@ -1217,6 +1309,10 @@ export default function DocSpaceDetailPage() {
         </div>
       )}
 
+      {/* 被引用卡（v1.90.0-dev 反向引用面板）：diagram doc 也显示——入链来自**别的**
+          markdown 文档，与本篇正文是不是 IR JSON 无关（与 linkHealth 的隐藏理由相反） */}
+      {doc && <DocBacklinksCard docId={selectedDocId} onSelectDoc={handleBacklinkSelect} />}
+
       {/* 图信息卡（Diagram IR v1）：diagram doc 专用，数据源 = DocDetail.diagram
           （GET /docs/:id 摘要携带 render_meta，免二次请求；html 大字段另走 diagram.html） */}
       {doc?.docType === DOC_TYPE_DIAGRAM && doc.diagram && (
@@ -1361,7 +1457,10 @@ export default function DocSpaceDetailPage() {
               {t('detail.browse')}
             </Button>
           )}
-          {/* xl 以下右栏折叠入口（编辑态禁用，R2） */}
+          {/* xl 以下右栏折叠入口（编辑态禁用，R2）。文案/图标随右栏内容改名：
+              右栏早已不只是大纲（链接健康 + 被引用 + 元数据），入口名与 SheetTitle
+              统一为「文档信息」（docs.detail.panelInfo）；doc.outline 键保留给
+              右栏大纲卡自己的 h3（改引用不改 value） */}
           {!editing && (
             <Button
               variant="outline"
@@ -1369,8 +1468,8 @@ export default function DocSpaceDetailPage() {
               className="xl:hidden"
               onClick={() => setRightSheetOpen(true)}
             >
-              <ListTree className="mr-1 h-4 w-4" />
-              {t('doc.outline')}
+              <Info className="mr-1 h-4 w-4" />
+              {t('detail.panelInfo')}
             </Button>
           )}
           {/* 空间图例入口（v1.43.1-dev）：仅在有图例内容时显示，点击打开只读弹窗 */}
@@ -1480,8 +1579,10 @@ export default function DocSpaceDetailPage() {
           {sidebarContent}
         </aside>
         {/* 中栏：文档正文或编辑器（data-scroll-container = 附件图片视口门控的
-            IntersectionObserver root 锚点，见 attachment-image.tsx） */}
+            IntersectionObserver root 锚点，见 attachment-image.tsx；mainRef 另有用途 =
+            切文档滚顶，两者刻意分开，不复用语义属性） */}
         <main
+          ref={mainRef}
           data-scroll-container
           className="min-w-0 flex-1 overflow-y-auto rounded-lg border border-border/40 p-4"
         >
@@ -1573,7 +1674,11 @@ export default function DocSpaceDetailPage() {
               <header className="mb-4 border-b border-border/50 pb-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
-                    <h2 className="text-2xl font-bold">{doc?.title ?? docContent?.title}</h2>
+                    {/* tabIndex=-1 仅为可编程聚焦（切文档后焦点交回，见滚顶/焦点 effect）：
+                        不进入 Tab 序列，键盘用户不会被多一个落点打扰 */}
+                    <h2 ref={docTitleRef} tabIndex={-1} className="text-2xl font-bold">
+                      {doc?.title ?? docContent?.title}
+                    </h2>
                     {doc?.summary && (
                       <p className="mt-1 text-sm text-muted-foreground">{doc.summary}</p>
                     )}
@@ -1676,11 +1781,17 @@ export default function DocSpaceDetailPage() {
         </Sheet>
       )}
 
-      {/* 右栏折叠 Sheet（xl 以下） */}
+      {/* 右栏折叠 Sheet（xl 以下）。ariaLabel 让面板成为可命名对话框（入口按钮的
+          「展开了什么」对读屏软件成立）；完整 pattern（focus trap + inert +
+          aria-labelledby）另立 follow-up，故这里**不声明 aria-modal**（假声明更糟） */}
       {!editing && (
-        <Sheet open={rightSheetOpen} onOpenChange={setRightSheetOpen}>
+        <Sheet
+          open={rightSheetOpen}
+          onOpenChange={setRightSheetOpen}
+          ariaLabel={t('detail.panelInfo')}
+        >
           <SheetHeader>
-            <SheetTitle>{t('doc.outline')}</SheetTitle>
+            <SheetTitle>{t('detail.panelInfo')}</SheetTitle>
           </SheetHeader>
           <div className="mt-4 space-y-4">{rightPanel}</div>
         </Sheet>

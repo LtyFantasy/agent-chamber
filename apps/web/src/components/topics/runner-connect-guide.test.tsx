@@ -1,7 +1,7 @@
 /**
  * runner-connect-guide.test.tsx — 圆桌「最后一公里」连接向导契约测试（v1.51.0，plan §1.3）
  *
- * 覆盖：① vendor 感知（kimi/codex runner 匹配判定；指南 URL 按 vendor + locale
+ * 覆盖：① vendor 感知（厂商 runner 匹配判定；指南 URL 按 vendor + locale
  * 选文件）；② API Key 内插（填入 → 指令/命令含真实 key；未填 → <AGENT_API_KEY>
  * 占位符）；③ 复制反馈（剪贴板内容 + 内联瞬态「已复制」）；④ 收起态（defaultOpen=false
  * → 常驻按钮 + 轮询不启，点击展开）；⑤ 验收环三级迁移（无 runner → runner 上线 →

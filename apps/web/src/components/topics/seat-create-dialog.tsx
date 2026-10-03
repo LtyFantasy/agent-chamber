@@ -45,14 +45,30 @@ import { RunnerConnectGuide } from './runner-connect-guide';
 
 /**
  * 座位厂商（协议值不翻译，与 backend SEAT_VENDORS 同规；新增厂商时同步此处 +
- * i18n 说明文案）。形状：value = 协议值，descKey = 一句语义说明的 i18n 键。
+ * i18n 说明文案）。形状：value = 协议值。
  */
 const VENDOR_OPTIONS = [
   { value: 'kimi' },
   { value: 'codex' },
   { value: 'opencode' },
   { value: 'claude-code' },
+  { value: 'dsh' },
 ] as const;
+
+/**
+ * 档位语义说明的 i18n 键字面量联合（seatCreate 命名空间下）。
+ * 为什么是联合而非 string：global.d.ts 以 en.json 为 Messages 真相源，t() 的 key
+ * 走编译期校验，放宽成 string 会把校验丢掉（铁律 #20 契约即设计）。
+ */
+type PermissionModeDescKey =
+  | 'pmDefaultDesc'
+  | 'pmPlanDesc'
+  | 'pmAutoDesc'
+  | 'pmYoloDesc'
+  | 'pmDefaultDescDsh'
+  | 'pmPlanDescDsh'
+  | 'pmAutoDescDsh'
+  | 'pmYoloDescDsh';
 
 /**
  * 权限模式四档（协议值不翻译；语义说明走 i18n）。映射关系（runner 侧）：
@@ -61,14 +77,57 @@ const VENDOR_OPTIONS = [
  * 权限 ask 钉死，auto/yolo→build + 权限全放行（opencode 无 auto/yolo 原语，
  * 语义近似，见 opencode-acp.ts O1/O2）；claude-code = default→default /
  * plan→plan / auto→acceptEdits / yolo→bypassPermissions（claude 五值原语，
- * dontAsk 不用，语义近似，见 claude-acp.ts C2）。'auto' 是 dogfood 推荐档（默认选中）。
+ * dontAsk 不用，语义近似，见 claude-acp.ts C2）；dsh = default→workspace-write /
+ * plan→read-only（写逐项升级审批）/ auto·yolo→danger-full-access（dsh 的权限旋钮
+ * 是 spawn env DSH_PERMISSION_MODE，协议侧无 mode 面，见 dsh-acp.ts D2）——
+ * **dsh 四档语义与其他四家方向相反，文案走 VENDOR_MODE_DESC_KEYS 覆盖表**。
+ * 'auto' 是 dogfood 推荐档（默认选中）。
+ *
+ * 形状：value = 协议值，descKey = 默认（共享）语义说明的 i18n 键。
  */
-const PERMISSION_MODE_OPTIONS = [
+const PERMISSION_MODE_OPTIONS: ReadonlyArray<{ value: string; descKey: PermissionModeDescKey }> = [
   { value: 'default', descKey: 'pmDefaultDesc' },
   { value: 'plan', descKey: 'pmPlanDesc' },
   { value: 'auto', descKey: 'pmAutoDesc' },
   { value: 'yolo', descKey: 'pmYoloDesc' },
-] as const;
+];
+
+/**
+ * 档位文案 per-vendor 覆盖表（D9）：键 = vendor 协议值，值 = 该厂商档位 → i18n 键。
+ *
+ * 为什么需要：共享四键描述的是「codex/kimi/opencode/claude」家族语义——default =
+ * 只读逐项审批、auto = 自动执行且敏感操作走审批。dsh 在这两档**双双反转**：default
+ * （workspace-write）在座位 cwd 内零审批放行、越界才硬拒+一次性升级审批；plan
+ * （read-only）才是写逐项审批；auto/yolo 塌缩到 danger-full-access（零审批、无沙箱
+ * 边界）。沿用共享键会把权限预期说反（评审 PM blocking-1）。未登记的厂商回退
+ * PERMISSION_MODE_OPTIONS 的 descKey（新增厂商默认无需登记）。
+ */
+const VENDOR_MODE_DESC_KEYS: Record<string, Partial<Record<string, PermissionModeDescKey>>> = {
+  dsh: {
+    default: 'pmDefaultDescDsh',
+    plan: 'pmPlanDescDsh',
+    auto: 'pmAutoDescDsh',
+    yolo: 'pmYoloDescDsh',
+  },
+};
+
+/** 档位默认值（未登记厂商的兜底；'auto' 是 dogfood 推荐档，见 PERMISSION_MODE_OPTIONS 注释） */
+const DEFAULT_PERMISSION_MODE = 'auto';
+
+/**
+ * 建座对话框的 per-vendor 默认档（主脑 review 决策）：切厂商时把档位重置为该厂商的默认值。
+ *
+ * 为什么 dsh 默认落 `default` 而不是 `auto`：dsh 的 `auto`/`yolo` 都映射到
+ * danger-full-access（沙箱无边界、**零审批**），把它作为开箱默认值等于让用户
+ * 在不知情的情况下拿到一个不受限的座位；而 dsh 的 `default`（workspace-write：
+ * 座位 cwd 内零审批、越界写硬拒并给一次性升级审批）才是可用且受限的档位。
+ * 这与对接指南 dsh.md「`default` 是推荐起步档」的结论一致——否则文档推荐与
+ * 对话框默认值自相矛盾（review 质询项）。
+ * 未登记的厂商沿用 DEFAULT_PERMISSION_MODE，行为与本次改动前完全一致。
+ */
+const VENDOR_DEFAULT_MODE: Record<string, string> = {
+  dsh: 'default',
+};
 
 interface SeatCreateDialogProps {
   /** 所属圆桌 topic UUID（提交 payload + seats 查询 invalidate 键） */
@@ -105,7 +164,7 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
   const [vendor, setVendor] = useState<string>('kimi');
   const [bindActorId, setBindActorId] = useState('');
   const [cwd, setCwd] = useState('');
-  const [permissionMode, setPermissionMode] = useState<string>('auto');
+  const [permissionMode, setPermissionMode] = useState<string>(DEFAULT_PERMISSION_MODE);
   // ── 高级折叠区 ──
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [model, setModel] = useState('');
@@ -139,7 +198,7 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
     setVendor('kimi');
     setBindActorId('');
     setCwd('');
-    setPermissionMode('auto');
+    setPermissionMode(DEFAULT_PERMISSION_MODE);
     setAdvancedOpen(false);
     setModel('');
     setCoordinator(false);
@@ -185,6 +244,19 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
     (r) =>
       r.status === RUNNER_STATUS.ONLINE && Array.isArray(r.vendors) && r.vendors.includes(vendor),
   );
+
+  /**
+   * 切换厂商：档位重置为该厂商的默认档（per-vendor 默认值，见 VENDOR_DEFAULT_MODE）。
+   *
+   * 为什么必须重置而不是保留原值：同一档位名在不同厂商的语义可能完全相反
+   * （dsh 的 `auto` = danger-full-access 零审批，其他家的 `auto` = 自动执行 + 敏感
+   * 操作审批）。保留上一个厂商选的档位，等于把上一个厂商的权限预期错误地套到新厂商上。
+   * 重置只发生在切换瞬间——用户切换后仍可显式改档（映射不是锁）。
+   */
+  const handleVendorChange = (next: string) => {
+    setVendor(next);
+    setPermissionMode(VENDOR_DEFAULT_MODE[next] ?? DEFAULT_PERMISSION_MODE);
+  };
 
   const handleSubmit = () => {
     if (!canSubmit || createMutation.isPending) return;
@@ -233,7 +305,7 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
                       name="seat-vendor"
                       value={opt.value}
                       checked={vendor === opt.value}
-                      onChange={() => setVendor(opt.value)}
+                      onChange={() => handleVendorChange(opt.value)}
                     />
                     <span className="text-sm font-mono">{opt.value}</span>
                   </label>
@@ -280,18 +352,22 @@ export function SeatCreateDialog({ topicId, open, onOpenChange, runners }: SeatC
             <div className="space-y-2">
               <label className="text-sm font-medium">{t('seatCreate.permissionMode')}</label>
               <div className="flex flex-col gap-2">
-                {PERMISSION_MODE_OPTIONS.map((opt) => (
-                  <label key={opt.value} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="seat-permission-mode"
-                      value={opt.value}
-                      checked={permissionMode === opt.value}
-                      onChange={() => setPermissionMode(opt.value)}
-                    />
-                    <span className="text-sm">{t(`seatCreate.${opt.descKey}`)}</span>
-                  </label>
-                ))}
+                {PERMISSION_MODE_OPTIONS.map((opt) => {
+                  // 档位文案 per-vendor 覆盖（D9）：dsh 与共享键语义相反；未登记厂商回退共享键
+                  const descKey = VENDOR_MODE_DESC_KEYS[vendor]?.[opt.value] ?? opt.descKey;
+                  return (
+                    <label key={opt.value} className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="seat-permission-mode"
+                        value={opt.value}
+                        checked={permissionMode === opt.value}
+                        onChange={() => setPermissionMode(opt.value)}
+                      />
+                      <span className="text-sm">{t(`seatCreate.${descKey}`)}</span>
+                    </label>
+                  );
+                })}
               </div>
             </div>
 

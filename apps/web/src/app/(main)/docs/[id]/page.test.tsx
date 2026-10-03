@@ -28,6 +28,22 @@ const messages: Record<string, string> = {
   // 右栏 card 标题（diagram doc 隐藏断言需要真实文案）
   'docs.doc.outline': 'Outline',
   'docs.linkHealth.title': 'Link Health',
+  // 右栏「被引用」卡（v1.90.0-dev）+ <xl 右栏入口改名（docs.doc.outline 键保留给大纲卡 h3）
+  // ⚠️ 本文件的 next-intl mock 不做参数插值：带 {param} 的键以模板原文上屏，
+  // 故页面级断言避开计数文案（计数口径由 doc-backlinks-card.test.tsx 专测）
+  'docs.detail.panelInfo': 'Doc info',
+  'docs.backlinks.title': 'Referenced by {docCount} docs · {linkCount} links',
+  'docs.backlinks.titlePlain': 'Backlinks',
+  'docs.backlinks.empty': 'No documents link here yet',
+  'docs.backlinks.error': 'Failed to load backlinks',
+  'docs.backlinks.noHeading': 'Top of doc',
+  'docs.backlinks.expandMore': '{count} more',
+  'docs.backlinks.collapse': 'Show less',
+  'docs.backlinks.hits': '{count} links',
+  'docs.backlinks.rowAria': 'Source {title} ({path}) — {count} links: {targets}',
+  'docs.backlinks.pathBasedBadge': 'Relative path',
+  'docs.backlinks.platformBadge': 'Platform link',
+  'docs.backlinks.pathBasedHint': 'Needs rewriting after a move',
   // Diagram IR v1（图信息卡 + viewer iframe title）
   'docs.diagram.viewerTitle': 'Diagram preview',
   'docs.diagram.infoCard': 'Diagram Info',
@@ -125,6 +141,8 @@ jest.mock('@/lib/api', () => ({
       getDocContent: jest.fn(),
       getDocByPath: jest.fn(),
       getDiagramHtml: jest.fn(),
+      // 反向引用（v1.90.0-dev）：右栏「被引用」卡数据源
+      getBacklinks: jest.fn(),
       exportSpaceBundle: jest.fn(),
     },
     // v1.37 owner 代理：页面新增我的 agent 列表查询（非 admin 只返回自己拥有的 agents）；
@@ -225,6 +243,7 @@ const mockApi = Api.docs as unknown as {
   getDocContent: jest.Mock;
   getDocByPath: jest.Mock;
   getDiagramHtml: jest.Mock;
+  getBacklinks: jest.Mock;
   exportSpaceBundle: jest.Mock;
 };
 
@@ -291,6 +310,14 @@ function mockBase() {
   mockApi.getDoc.mockResolvedValue(docFixture);
   mockApi.getDocContent.mockResolvedValue({ content: '# Doc T\nbody', title: 'Doc T' });
   mockApi.getDocByPath.mockResolvedValue(null);
+  // 反向引用默认空集（右栏卡片空态；需要非空的用例各自覆盖）
+  mockApi.getBacklinks.mockResolvedValue({
+    docId: 'doc-1',
+    path: 'guides/t.md',
+    docCount: 0,
+    linkCount: 0,
+    sources: [],
+  });
 }
 
 describe('DocSpaceDetailPage headingPath 导航', () => {
@@ -904,10 +931,15 @@ describe('DocSpaceDetailPage diagram doc 中栏 iframe 预览（Diagram IR v1）
     expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
 
     // 右栏（第二个 aside）：大纲/链接健康卡隐藏，图信息卡显示渲染元数据
-    // （头部折叠入口按钮固定渲染「Outline」文案，断言必须限定在右栏内）
+    // （断言限定在右栏内的理由：右栏与头部 <xl 折叠入口都叫「文档信息」，且大纲卡
+    //   h3 的「Outline」与头部入口在 v1.90.0-dev 前同文案——scoping 保住断言不被顶部
+    //   按钮/被引用卡串味；头部入口现已改名 docs.detail.panelInfo）
     const rightAside = document.querySelectorAll('aside')[1] as HTMLElement;
     expect(within(rightAside).queryByText('Outline')).not.toBeInTheDocument();
     expect(within(rightAside).queryByText('Link Health')).not.toBeInTheDocument();
+    // 被引用卡对 diagram doc **照常显示**（入链来自别的 markdown 文档，与 linkHealth
+    // 的隐藏理由相反）；mockBase 给空集 → 空态文案
+    expect(within(rightAside).getByText('No documents link here yet')).toBeInTheDocument();
     expect(within(rightAside).getByText('Diagram Info')).toBeInTheDocument();
     expect(within(rightAside).getByText('architecture')).toBeInTheDocument();
     expect(within(rightAside).getByText('standard')).toBeInTheDocument();
@@ -1399,6 +1431,8 @@ describe('DocSpaceDetailPage 回导成功后查询失效清单（D5）', () => {
         ['docs', 'filtered'],
         ['docs', 'search-docs'],
         ['docs', 'search'],
+        // 反向引用（v1.90.0-dev）：前缀失效覆盖全部 docId（回导按 path 覆盖任意篇正文）
+        ['docs', 'backlinks'],
       ]),
     );
   });
@@ -1412,5 +1446,328 @@ describe('DocSpaceDetailPage 回导成功后查询失效清单（D5）', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'mock-bundle-close' }));
     expect(screen.queryByRole('button', { name: 'mock-bundle-imported' })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * 右栏「被引用」卡的**页面接线**与 v1.90.0-dev 全局导航语义收口。
+ *
+ * 卡片自身的渲染契约（三态/分组/两级展开/aria）见 `doc-backlinks-card.test.tsx`；
+ * 此处只验页面侧接线：
+ * ① 来源行点击 → push 到来源文档并**直达其 section**（DTO 全路径 → 末段提取在页面侧）；
+ * ② 无 section 目标的切文档 → 中栏滚顶 + 焦点交回中栏标题（键盘可达性）；
+ * ③ **回归**：搜索命中仍落 section（滚顶不得吃掉既有直达能力，复核 N2）；
+ * ④ 清除选择（文档已删）走 replace——被放弃的文档不留历史；⑤ 重复点当前文档不压同址历史。
+ *
+ * 切文档在 jsdom 里靠 `mockSearchParams.set + rerender` 模拟（router mock 不驱动 URL，
+ * 既有先例见「分类模式选中同步」describe）。滚顶断言用 scrollTop setter 拦截：
+ * jsdom 无 `Element.prototype.scrollTo`（实测 undefined），实现侧刻意写 `scrollTop`。
+ */
+describe('DocSpaceDetailPage 反向引用卡与导航语义（v1.90.0-dev）', () => {
+  /** 一篇来源文档链当前文档两处（一处有 heading、一处无 = 文首） */
+  const backlinksFixture = {
+    docId: 'doc-1',
+    path: 'guides/t.md',
+    docCount: 1,
+    linkCount: 2,
+    sources: [
+      {
+        sourceDocId: 'doc-2',
+        sourcePath: 'guides/source-doc.md',
+        sourceTitle: 'Source Doc',
+        links: [
+          {
+            href: '../source-doc.md',
+            isPathBased: true,
+            sectionPosition: 0,
+            headingPath: 'Root § Section U',
+          },
+          { href: '../source-doc.md#x', isPathBased: true, sectionPosition: 4, headingPath: null },
+        ],
+      },
+    ],
+  };
+
+  /** 来源文档 doc-2 的元数据 + 正文（正文标题与 pendingHeadingRef 末段同名才可命中滚动） */
+  const docTwoFixture = { ...docFixture, id: 'doc-2', title: 'Doc U', path: 'guides/u.md' };
+  const docTwoContent = { content: '# Doc U\n\n## Section U\n\n正文。', title: 'Doc U' };
+
+  /** 渲染并交出 queryClient（rerender 复用同一 client，模拟 SPA 内 ?doc= 变化不卸载组件） */
+  const pageWithClient = () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return { queryClient, view: render(pageElement(queryClient)) };
+  };
+
+  /** 拦截 scrollTop 赋值（滚顶行为唯一可观测点） */
+  const spyScrollTop = () => {
+    const spy = jest.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get: () => 0,
+      set: (value: number) => spy(value),
+    });
+    return spy;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // 视图模式走 localStorage（本文件靠前的 describe 会写入 category，跨用例残留会
+    // 让左栏换成分类视图 → 目录树行不渲染），本 describe 需要 tree 视图
+    localStorage.clear();
+    mockSearchParams.set('doc', 'doc-1');
+    mockBase();
+    mockApi.getBacklinks.mockResolvedValue(backlinksFixture);
+    mockApi.getDoc.mockImplementation((docId: string) =>
+      Promise.resolve(docId === 'doc-2' ? docTwoFixture : docFixture),
+    );
+    mockApi.getDocContent.mockImplementation((docId: string) =>
+      Promise.resolve(
+        docId === 'doc-2' ? docTwoContent : { content: '# Doc T\nbody', title: 'Doc T' },
+      ),
+    );
+  });
+
+  afterEach(() => {
+    mockSearchParams.set('doc', 'doc-1');
+    delete (HTMLElement.prototype as { scrollTop?: unknown }).scrollTop;
+  });
+
+  it('来源行点击 → push 到来源文档并直达其 section（末段提取在页面侧）', async () => {
+    const scrollSpy = Element.prototype.scrollIntoView as unknown as jest.Mock;
+    scrollSpy.mockClear();
+    const { queryClient, view } = pageWithClient();
+    await screen.findByText('body');
+
+    // 卡片组行（文件名主标签 = fileBaseName(sourcePath)），整行即导航入口
+    fireEvent.click((await screen.findByText('source-doc')).closest('button') as HTMLElement);
+    expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-1?doc=doc-2', { scroll: false });
+
+    mockSearchParams.set('doc', 'doc-2');
+    view.rerender(pageElement(queryClient));
+
+    await waitFor(() => {
+      expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    });
+  });
+
+  it('回归：搜索命中直达 section 不被滚顶吃掉（滚顶 effect 对 pendingHeadingRef 让行）', async () => {
+    jest.useFakeTimers();
+    const scrollTopSpy = spyScrollTop();
+    const scrollSpy = Element.prototype.scrollIntoView as unknown as jest.Mock;
+    scrollSpy.mockClear();
+    mockApi.search.mockResolvedValue({
+      hits: [
+        {
+          docId: 'doc-2',
+          docTitle: 'Doc U',
+          headingPath: 'Root § Section U',
+          snippet: '命中片段',
+          position: 2,
+        },
+      ],
+    });
+    const { queryClient, view } = pageWithClient();
+    await screen.findByText('body');
+
+    fireEvent.change(screen.getByPlaceholderText('docs.detail.searchPlaceholder'), {
+      target: { value: 'section' },
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(300);
+    });
+
+    // 命中列表由 debounce 后的 search 查询驱动：等它真正落到 DOM 再点（否则点击落空）
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /命中片段/ })).toBeInTheDocument();
+    });
+
+    // 挂载时的滚顶已发生（深链进页面落正文起点）→ 从命中点击起重新计数
+    scrollTopSpy.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: /命中片段/ }));
+    // handleHitSelect 是异步（先过脏状态守卫）→ 等 push 落定
+    await waitFor(() => {
+      expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-1?doc=doc-2', { scroll: false });
+    });
+
+    mockSearchParams.set('doc', 'doc-2');
+    view.rerender(pageElement(queryClient));
+
+    await waitFor(() => {
+      expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    });
+    // 滚顶必须让行：否则命中的 section 会被立刻拉回顶部（既有功能被打回）
+    expect(scrollTopSpy).not.toHaveBeenCalled();
+    jest.useRealTimers();
+  });
+
+  it('命中当前文档的搜索命中：就地滚动该 section，不留悬空待滚标记、不压历史', async () => {
+    jest.useFakeTimers();
+    const scrollSpy = Element.prototype.scrollIntoView as unknown as jest.Mock;
+    mockApi.search.mockResolvedValue({
+      hits: [
+        {
+          docId: 'doc-1', // 当前选中文档（URL 不会变）
+          docTitle: 'Doc T',
+          headingPath: 'Root § Section T',
+          snippet: '本页命中',
+          position: 1,
+        },
+      ],
+    });
+    mockApi.getDocContent.mockResolvedValue({
+      content: '# Doc T\n\n## Section T\n\nbody',
+      title: 'Doc T',
+    });
+    renderPage();
+    await screen.findByText('body');
+
+    fireEvent.change(screen.getByPlaceholderText('docs.detail.searchPlaceholder'), {
+      target: { value: 'section' },
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(300);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /本页命中/ })).toBeInTheDocument();
+    });
+
+    scrollSpy.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: /本页命中/ }));
+
+    await waitFor(() => {
+      expect(scrollSpy).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    });
+    // 同址 → 不压历史（同 selectDoc 的同址早退），也不写待滚标记（就地滚动已闭环）
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    jest.useRealTimers();
+  });
+
+  it('无 section 目标的切文档 → 中栏滚顶 + 焦点交回中栏标题（tabIndex=-1 的 h2）', async () => {
+    const scrollTopSpy = spyScrollTop();
+    // 树按 prefix 分层：当前文档 path=guides/t.md → 祖先目录 guides/ 自动展开，
+    // 目标行落在 guides/ 层（根层给目录条目，与既有 sidebar 用例同构）
+    mockApi.getTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) =>
+      Promise.resolve(
+        params?.prefix === 'guides/'
+          ? {
+              prefix: 'guides/',
+              folders: { items: [], total: 0, hasMore: false },
+              docs: {
+                items: [{ id: 'doc-2', title: 'Doc U', path: 'guides/u.md' }],
+                total: 1,
+                hasMore: false,
+              },
+            }
+          : {
+              prefix: '',
+              folders: {
+                items: [
+                  {
+                    path: 'guides/',
+                    name: 'guides',
+                    docCount: 1,
+                    latestDocAt: '2026-08-01T00:00:00Z',
+                  },
+                ],
+                total: 1,
+                hasMore: false,
+              },
+              docs: { items: [], total: 0, hasMore: false },
+            },
+      ),
+    );
+    const { queryClient, view } = pageWithClient();
+    await screen.findByText('body');
+
+    scrollTopSpy.mockClear();
+    // 左栏目录行（title = path — title）
+    fireEvent.click(await screen.findByTitle('guides/u.md — Doc U'));
+    await waitFor(() => {
+      expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-1?doc=doc-2', { scroll: false });
+    });
+
+    mockSearchParams.set('doc', 'doc-2');
+    view.rerender(pageElement(queryClient));
+
+    await waitFor(() => {
+      expect(scrollTopSpy).toHaveBeenCalledWith(0);
+    });
+    // 焦点交回：正文就绪后落在中栏标题（先滚顶后聚焦）。
+    // 注意滚顶 effect 只挂 selectedDocId，先于正文就绪触发 → 标题要等挂载
+    const title = await waitFor(() => {
+      const el = document.querySelector('h2[tabindex="-1"]') as HTMLElement | null;
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(title);
+    });
+  });
+
+  it('清除选择（文档已删 → 返回文档列表）走 replace：Back 不重进刚退出的错误态', async () => {
+    mockApi.getDoc.mockRejectedValue(new Error('404'));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Back to doc list' }));
+
+    expect(mockRouter.replace).toHaveBeenCalledWith('/docs/space-1', { scroll: false });
+    expect(mockRouter.push).not.toHaveBeenCalled();
+  });
+
+  it('<xl 右栏入口改名「文档信息」，展开的面板是具名 dialog（且不声明 aria-modal）', async () => {
+    renderPage();
+    await screen.findByText('body');
+
+    // 头部入口按钮（CSS 在 xl 断点隐藏，jsdom 不做媒体查询 → 仍在 DOM 中可断言）
+    fireEvent.click(screen.getByRole('button', { name: 'Doc info' }));
+
+    const panel = await screen.findByRole('dialog', { name: 'Doc info' });
+    expect(panel).toHaveAttribute('aria-label', 'Doc info');
+    // 无 focus trap 就不声明 aria-modal（假声明比不加更糟，完整 pattern 另立 follow-up）
+    expect(panel).not.toHaveAttribute('aria-modal');
+  });
+
+  it('重复点当前文档（左栏目录同一篇）不压同址历史', async () => {
+    // 同「无 section 目标」用例：目标行在自动展开的 guides/ 层
+    mockApi.getTree.mockImplementation((_spaceId: string, params?: { prefix?: string }) =>
+      Promise.resolve(
+        params?.prefix === 'guides/'
+          ? {
+              prefix: 'guides/',
+              folders: { items: [], total: 0, hasMore: false },
+              docs: {
+                items: [{ id: 'doc-1', title: 'Doc T', path: 'guides/t.md' }],
+                total: 1,
+                hasMore: false,
+              },
+            }
+          : {
+              prefix: '',
+              folders: {
+                items: [
+                  {
+                    path: 'guides/',
+                    name: 'guides',
+                    docCount: 1,
+                    latestDocAt: '2026-08-01T00:00:00Z',
+                  },
+                ],
+                total: 1,
+                hasMore: false,
+              },
+              docs: { items: [], total: 0, hasMore: false },
+            },
+      ),
+    );
+    renderPage();
+    await screen.findByText('body');
+
+    fireEvent.click(await screen.findByTitle('guides/t.md — Doc T'));
+    // handleDocSelect 是异步（先过脏状态守卫），等微任务落定再断言
+    await act(async () => {});
+
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 });

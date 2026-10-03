@@ -139,4 +139,42 @@ describe('export_doc_space', () => {
     const body = JSON.parse(result.content[0].text);
     expect(body.failedStep).toBe('list_doc_spaces');
   });
+
+  it('pathPrefix 显式传入时透传 params；缺省不带第三参（既有调用形态不变）', async () => {
+    // v1.89.0-dev 批次 A：部分快照入口。透传证据 = request 第三参 params；
+    // 缺省证据 = 第三参 undefined（不给后端挂多余的 query 面）
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({
+      formatVersion: 2,
+      docs: [],
+      appliedFilters: { pathPrefix: 'tmp/A/', matchedDocs: 0 },
+    });
+
+    const result = await exportDocSpaceTool.handler(
+      { spaceName: 'My Docs', pathPrefix: 'tmp/A/' },
+      ctx(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    const getCall = request.mock.calls[1];
+    expect(getCall[0]).toBe('GET');
+    expect(getCall[1]).toBe('/doc-spaces/sp-1/export');
+    expect(getCall[2]).toEqual({ params: { pathPrefix: 'tmp/A/' } });
+    // 回声随 bundle 整体透传（工具不解释字段）
+    expect(JSON.parse(result.content[0].text).appliedFilters).toEqual({
+      pathPrefix: 'tmp/A/',
+      matchedDocs: 0,
+    });
+
+    const plain = mockRequest();
+    plain.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    plain.mockResolvedValueOnce({ formatVersion: 2, docs: [] });
+    await exportDocSpaceTool.handler({ spaceName: 'My Docs' }, ctx());
+    expect(plain.mock.calls[1][2]).toBeUndefined();
+  });
 });

@@ -13,25 +13,31 @@
  *     输入，可能粘着 API key；落盘前必须过脱敏
  *   - `buildZeroHitLogLine` / `logSearchZeroHit`：结构化对象一律经 `JSON.stringify`
  *     生成（**禁模板拼接**——拼接会让 q 里的引号/换行击穿 JSON 结构）
+ *   - `buildWeakHitLogLine` / `logSearchWeakHit`：**弱命中**可观测（有结果但最高分低于
+ *     活阈值，批次 A）。与零命中同款通道，独立 tag，级别 `debug`（弱命中量级远高于
+ *     零命中，warn 会淹没日志）
  *
  * [权威文档]
  *   - 主文档: 检索中文根治计划终稿 v1.5 §2.6（零命中引导与可观测）
  *   - 补充: 线上 DocSpace `docs/experience-base.md` — 脱敏纪律（同一脱敏族）
  *
  * [关键不变量]
- *   - **日志行只允许一个 JSON 对象**：`buildZeroHitLogLine` 是唯一产线函数，消费方
- *     不得自行拼串；新增字段加进 `ZeroHitLogInput`（标量），**绝不内嵌 q 原文**
- *     （q 只经 truncateForLog + redactForLog 通道出现一次）。
+ *   - **日志行只允许一个 JSON 对象**：`buildZeroHitLogLine` / `buildWeakHitLogLine`
+ *     是仅有的两个产线函数，消费方不得自行拼串；新增字段加进对应 Input 类型（标量），
+ *     **绝不内嵌 q 原文**（q 只经 truncateForLog + redactForLog 通道出现一次）。
+ *   - **两个 tag 不得混用**：`WEAK_HIT_LOG_TAG`（SEARCH_WEAK_HIT）独立于
+ *     `ZERO_HIT_LOG_TAG`（SEARCH_ZERO_HIT）——后者是零命中挖掘任务 d3063de5 的过滤键，
+ *     复用会让弱命中污染零命中统计。
  *   - **脱敏族 = `JUDGMENT_REDACTION_PATTERNS`**（common/utils/redaction-patterns.ts，
  *     吃整个值语义）；`EXPERIENCE_SECRET_PATTERNS` 是"命中即 400"的闸门表，不可混用。
- *   - **jest spy 断言点 = `logSearchZeroHit`**：四消费方零命中分支各调一次；单测
- *     spy 本函数（或 Logger.warn）断言落行，不得在消费方各写一份格式断言。
+ *   - **jest spy 断言点 = `logSearchZeroHit` / `logSearchWeakHit`**：消费方零命中分支各调
+ *     一次；单测 spy 本函数（或 Logger.warn/debug）断言落行，不得在消费方各写一份格式断言。
  *   - **fail-open**：日志失败不得阻断检索（本函数不抛——truncate/redact/stringify
  *     对任意 string 输入全定义；消费方不得在调用点再加 try/catch 包装）。
  *
  * [关联代码]
  *   - common/utils/redaction-patterns.ts — 脱敏族单源
- *   - modules/docspace/doc-search.service.ts / modules/task/task.service.ts /
+ *   - modules/docspace/doc-search.service.ts（零命中 + 弱命中 + 降级三态）/ modules/task/task.service.ts /
  *     modules/experience/experience.service.ts / modules/search/search.service.ts
  *     — 四路零命中分支消费方
  *   - zero-hit-log.spec.ts — 截断/剥离/脱敏/JSONL 形态契约单测
@@ -43,6 +49,7 @@
  *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
  *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  *   □ 新增日志字段必须是标量且不含用户输入原文（q 走唯一通道）
+ *   □ 新增 tag 必须独立（不得复用既有 tag 的过滤键）
  * =============================================================================
  */
 import type { Logger } from '@nestjs/common';
@@ -128,4 +135,45 @@ export function buildZeroHitLogLine(input: ZeroHitLogInput): string {
  */
 export function logSearchZeroHit(logger: Logger, input: ZeroHitLogInput): void {
   logger.warn(buildZeroHitLogLine(input));
+}
+
+// ─── 弱命中可观测（v1.89.0-dev 批次 A）─────────────────────────────────────
+
+/**
+ * 弱命中日志检索锚点 tag——**独立于 `ZERO_HIT_LOG_TAG`，不得复用**：后者是零命中
+ * 挖掘任务（`d3063de5`）的过滤键，混用会让弱命中污染零命中统计。
+ */
+export const WEAK_HIT_LOG_TAG = 'SEARCH_WEAK_HIT';
+
+/**
+ * 弱命中日志输入。surface 恒为 `'doc'`——弱命中线（`DOC_SEARCH_WEAK_HIT_SCORE`）
+ * 只存在于文档检索面，故不开放 surface 参数。
+ */
+export interface WeakHitLogInput {
+  /** 原始查询串（函数内走 truncate+redact 唯一通道） */
+  query: string;
+  /** 本页最高合成分（用于判断活阈值线是否漂移） */
+  topScore: number;
+}
+
+/**
+ * 生成弱命中单行 JSONL（与 `buildZeroHitLogLine` 同款纪律：`JSON.stringify`，禁拼接）。
+ * 字段：`{tag, surface:'doc', q, topScore}`。
+ * @returns 单行 JSON 字符串（不含换行）
+ */
+export function buildWeakHitLogLine(input: WeakHitLogInput): string {
+  return JSON.stringify({
+    tag: WEAK_HIT_LOG_TAG,
+    surface: 'doc',
+    q: redactForLog(truncateForLog(input.query)),
+    topScore: input.topScore,
+  });
+}
+
+/**
+ * 弱命中落行（debug 级）：弱命中是**相关度提示**，量级远高于零命中（正常查询也会触发），
+ * warn 级会淹没有效信号，故降级为 debug。
+ */
+export function logSearchWeakHit(logger: Logger, input: WeakHitLogInput): void {
+  logger.debug(buildWeakHitLogLine(input));
 }

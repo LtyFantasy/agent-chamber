@@ -202,6 +202,11 @@ export type {
   UpsertDocResult,
   // 链接健康巡检结果
   LinkHealth,
+  // 反向引用（GET /docs/:id/backlinks，v1.90.0-dev）：
+  // DocBacklinks = 视图根（docCount 篇 / linkCount 处 / sources 分组）；
+  // DocBacklinksSource = 来源分组（组级三键 + 逐条 links，摊平即 DocInboundLink）
+  DocBacklinks,
+  DocBacklinksSource,
 } from '@agent-chamber/shared';
 
 // ──────────────────────────────────────────────
@@ -283,7 +288,7 @@ import type { Visibility } from '@agent-chamber/shared';
 /**
  * 空间级导出 bundle（`GET /doc-spaces/:id/export`，formatVersion 2）。
  *
- * 形状来源 = `apps/backend/src/modules/docspace/doc-bundle.service.ts:126-177`
+ * 形状来源 = `apps/backend/src/modules/docspace/doc-bundle.service.ts`
  * （导出侧 DocSpaceExportBundle / DocBundleDocItem）。
  * web 只消费 `space.name` / `space.visibility` / `docs[].path` / 各段长度——
  * 其余字段一律原样回传回导端点，不在前端解释（解析后的对象即回导请求体）。
@@ -316,6 +321,19 @@ export interface DocSpaceExportBundle {
   media?: Record<string, unknown>[];
   /** 正文引用但刻意未打包的附件（informational，回导后为断链） */
   mediaOmitted?: Record<string, unknown>[];
+  /**
+   * 导出侧过滤条件回声（v1.89.0-dev 批次 A；只有带 `?pathPrefix=` 导出时才出现）。
+   *
+   * web **行为零改动**：`doc-human-export.ts` 逐字段访问、`parseBundlePreview` 无未知键
+   * 白名单，且回导时整个对象原样透传（import DTO 已声明该键，不会被 400）。类型补上只为
+   * 让类型面与后端 `DocSpaceExportBundle` 对齐。
+   */
+  appliedFilters?: {
+    /** 生效的字面前缀（原样回声，未转义） */
+    pathPrefix: string;
+    /** 入选文档数（0 = 前缀零命中 ⇒ 空 bundle，仍是成功） */
+    matchedDocs: number;
+  };
 }
 
 /** bundle.docs[] 条目（web 只读 path；其余字段原样回传） */

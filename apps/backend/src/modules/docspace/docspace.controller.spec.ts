@@ -595,9 +595,20 @@ describe('DocSpaceController', () => {
       service.findById.mockResolvedValue(space);
       bundleService.exportBundle.mockResolvedValue(bundle);
 
-      expect(await controller.exportBundle('space-1', mockActor)).toBe(bundle);
+      expect(await controller.exportBundle('space-1', mockActor, {})).toBe(bundle);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
-      expect(bundleService.exportBundle).toHaveBeenCalledWith('space-1');
+      expect(bundleService.exportBundle).toHaveBeenCalledWith('space-1', undefined);
+    });
+
+    it('pathPrefix 透传 service（部分快照入口）', async () => {
+      const space = { id: 'space-1', settings: { visibility: Visibility.OPEN } };
+      service.findById.mockResolvedValue(space);
+      bundleService.exportBundle.mockResolvedValue({} as never);
+
+      await controller.exportBundle('space-1', mockActor, { pathPrefix: 'tmp/A/' });
+
+      // 字面前缀原样下发（转义与收窄归 Service）
+      expect(bundleService.exportBundle).toHaveBeenCalledWith('space-1', 'tmp/A/');
     });
   });
 

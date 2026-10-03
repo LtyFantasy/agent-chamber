@@ -30,15 +30,15 @@ const messages: Record<string, string> = {
 
 /** attachments 命名空间英语文案快照（同 en.json） */
 const attachmentMessages: Record<string, string> = {
-  'attachments.upload': 'Upload image',
+  'attachments.upload': 'Upload attachment',
   'attachments.uploading': 'Uploading...',
-  'attachments.uploadFailed': 'Image upload failed, please retry',
-  'attachments.tooLarge': 'Image exceeds the 8MiB size limit',
-  'attachments.typeNotAllowed': 'Only PNG/JPEG/GIF/WebP images are supported',
+  'attachments.uploadFailed': 'Upload failed, please retry',
+  'attachments.tooLarge': 'File exceeds the 10MB size limit',
+  'attachments.tooMany': 'Up to 9 attachments per message',
   'attachments.quotaExceeded': 'Storage quota exceeded, please clean up attachments first',
   'attachments.removeChip': 'Remove attachment',
   'attachments.confirmRemove':
-    'The attachment will be deleted and the image link in the message will be removed. Remove it?',
+    'The attachment will be deleted; any reference to it in the message is removed as well. Remove it?',
   'attachments.removeFailed':
     'Failed to delete the attachment; you can clean it up later in My Attachments',
 };
@@ -55,7 +55,7 @@ const mockToastError = toast.error as jest.Mock;
 const mockToastWarning = toast.warning as jest.Mock;
 
 // Api.attachments mock（附件上传流；既有测试不触达，零影响）。
-// requireActual 保留真实 ATTACHMENT_ALLOWED_TYPES/MAX_BYTES/escapeAttachmentAlt——
+// requireActual 保留真实 ATTACHMENT_MAX_BYTES/escapeAttachmentAlt——
 // 前端拦截与 alt 转义测的是真实实现，不是 mock 副本。
 jest.mock('@/lib/api', () => {
   const actual = jest.requireActual('@/lib/api');
@@ -396,21 +396,33 @@ describe('TopicComposer @all 闸门（M3 阶段 3，r13；全局 confirm 替换 
 
 describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）', () => {
   /** 构造最小上传响应（字段对齐 UploadAttachmentResponse 契约） */
-  const uploadRes = (id: string, originalName: string) => ({
+  const uploadRes = (
+    id: string,
+    originalName: string,
+    overrides: Record<string, unknown> = {},
+  ) => ({
     id,
     contentUrl: `/api/v1/attachments/${id}/content`,
     originalName,
     mimeType: 'image/png',
     sizeBytes: 1024,
+    clientMimeType: 'image/png',
+    expiresAt: null,
+    expired: false,
     sha256: 'a'.repeat(64),
     topicId: 'topic-1',
     docId: null,
     createdAt: '2026-09-09T00:00:00.000Z',
+    ...overrides,
   });
 
   /** 构造图片 File（jsdom 支持 File/Blob） */
   const pngFile = (name = 'photo.png', size = 1024) =>
     new File([new Uint8Array(size)], name, { type: 'image/png' });
+
+  /** 构造非图片 File（类型放开后同样可上传） */
+  const logFile = (name = 'build.log', size = 1024) =>
+    new File([new Uint8Array(size)], name, { type: 'text/plain' });
 
   /** 通过隐藏 file input 选择文件（paperclip 触发同一路径） */
   function pickFile(container: HTMLElement, file: File) {
@@ -474,7 +486,7 @@ describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）'
 
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith(
-        expect.objectContaining({ title: 'Image upload failed, please retry' }),
+        expect.objectContaining({ title: attachmentMessages['attachments.uploadFailed'] }),
       );
     });
     expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
@@ -500,30 +512,75 @@ describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）'
     });
   });
 
-  it('超限前端拦截：>8MiB 不调 upload，直接 toast', async () => {
+  it('超限前端拦截：>10MiB 不调 upload，直接 toast', async () => {
     const user = userEvent.setup();
     const { container } = render(<Harness onSend={jest.fn()} />);
 
     await user.type(textareaOf(container), 'x');
-    pickFile(container, pngFile('big.png', 8 * 1024 * 1024 + 1));
+    pickFile(container, pngFile('big.png', 10 * 1024 * 1024 + 1));
 
     expect(mockUpload).not.toHaveBeenCalled();
     expect(mockToastError).toHaveBeenCalledWith(
-      expect.objectContaining({ title: 'Image exceeds the 8MiB size limit' }),
+      expect.objectContaining({ title: attachmentMessages['attachments.tooLarge'] }),
     );
   });
 
-  it('类型前端拦截：非白名单类型不调 upload，直接 toast', async () => {
+  it('边界：恰好 10MiB 放行（与后端 ATTACHMENT_MAX_BYTES 同口径）', async () => {
     const user = userEvent.setup();
+    mockUpload.mockResolvedValue(uploadRes('att-edge', 'edge.png'));
     const { container } = render(<Harness onSend={jest.fn()} />);
 
     await user.type(textareaOf(container), 'x');
-    pickFile(container, new File(['svg'], 'evil.svg', { type: 'image/svg+xml' }));
+    pickFile(container, pngFile('edge.png', 10 * 1024 * 1024));
 
-    expect(mockUpload).not.toHaveBeenCalled();
-    expect(mockToastError).toHaveBeenCalledWith(
-      expect.objectContaining({ title: 'Only PNG/JPEG/GIF/WebP images are supported' }),
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(1));
+  });
+
+  it('类型放开：非图片（.log）上传成功 → chip + attachmentIds，正文不插裸链接', async () => {
+    const user = userEvent.setup();
+    // 服务端字节证据：非图片 mimeType 恒 octet-stream（M1 不变量）
+    mockUpload.mockResolvedValue(
+      uploadRes('att-log', 'build.log', {
+        mimeType: 'application/octet-stream',
+        clientMimeType: 'text/plain',
+      }),
     );
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, '看日志');
+    pickFile(container, logFile());
+
+    await waitFor(() => {
+      expect(mockUpload).toHaveBeenCalledWith(
+        expect.any(File),
+        expect.objectContaining({ topicId: 'topic-1' }),
+      );
+    });
+    // chip 挂上（文件名可见）
+    await waitFor(() => expect(screen.getByText('build.log')).toBeInTheDocument());
+    // 正文不变：非图片不插 `![]()`（content 是渲染事实，裸链接需凭证=401 死链）
+    expect(ta.value).toBe('看日志');
+
+    // 发送仍携带附件 id（渲染由消息卡片承担）
+    await user.type(ta, '{Enter}');
+    expect(onSend).toHaveBeenCalledWith(['att-log']);
+  });
+
+  it('声明 image/png 但服务端嗅探为非图片 → 不插内联图片链接（M1 展示层镜像）', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(
+      uploadRes('att-polyglot', 'fake.png', { mimeType: 'application/octet-stream' }),
+    );
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    pickFile(container, pngFile('fake.png'));
+
+    await waitFor(() => expect(screen.getByText('fake.png')).toBeInTheDocument());
+    expect(ta.value).toBe('x');
   });
 
   it('chip 移除（已上传）：确认后调 DELETE + 同步剥离 textarea 链接', async () => {
@@ -620,15 +677,31 @@ describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）'
     });
   });
 
-  it('onPaste 非图片（文本/文件）→ 不拦截，不调 upload', async () => {
+  it('onPaste 粘贴非图片文件（v1.90.0-dev 类型放开）：同样拦截 + 上传，不插正文', async () => {
     const user = userEvent.setup();
+    mockUpload.mockResolvedValue(
+      uploadRes('att-paste-log', 'notes.txt', { mimeType: 'application/octet-stream' }),
+    );
     const { container } = render(<Harness onSend={jest.fn()} />);
     const ta = textareaOf(container);
 
     await user.type(ta, 'x');
     fireEvent.paste(ta, {
-      clipboardData: { files: [new File(['txt'], 'note.txt', { type: 'text/plain' })] },
+      clipboardData: { files: [logFile('notes.txt')] },
     });
+
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText('notes.txt')).toBeInTheDocument());
+    expect(ta.value).toBe('x');
+  });
+
+  it('onPaste 纯文本（无文件）→ 不拦截，不调 upload', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    await user.type(ta, 'x');
+    fireEvent.paste(ta, { clipboardData: { files: [] } });
 
     expect(mockUpload).not.toHaveBeenCalled();
   });
@@ -672,5 +745,93 @@ describe('TopicComposer 附件上传流（MinIO 媒体附件 P0，plan §5.3）'
       expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
     });
     expect(mockRemove).not.toHaveBeenCalled(); // 已发送附件不删除
+  });
+
+  it('M1：只传文件不打字 → 发送按钮可用，点击发送且 attachmentIds 携带（附件即消息内容）', async () => {
+    const user = userEvent.setup();
+    mockUpload.mockResolvedValue(
+      uploadRes('att-only', 'only.log', {
+        mimeType: 'application/octet-stream',
+        clientMimeType: 'text/plain',
+      }),
+    );
+    const onSend = jest.fn();
+    const { container } = render(<Harness onSend={onSend} />);
+    const ta = textareaOf(container);
+
+    pickFile(container, logFile('only.log'));
+    await waitFor(() => expect(screen.getByText('only.log')).toBeInTheDocument());
+
+    expect(ta.value).toBe(''); // 正文为空
+    const sendBtn = screen.getByRole('button', { name: 'Send' });
+    expect(sendBtn).not.toBeDisabled(); // M1 修订：有已上传附件即可发
+    await user.click(sendBtn);
+
+    expect(onSend).toHaveBeenCalledWith(['att-only']);
+  });
+
+  it('M1 反向：既无正文也无附件 → 发送按钮禁用（空载荷不发）', async () => {
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    await userEvent.setup().type(textareaOf(container), 'x{Backspace}');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+  });
+
+  it('M1：正文为空但附件上传中 → 仍禁用（上传中发送会丢附件）', async () => {
+    mockUpload.mockReturnValue(new Promise(() => {})); // 挂起
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    pickFile(container, logFile('pending.log'));
+    await waitFor(() => expect(screen.getByText('pending.log')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+  });
+
+  it('n4：附件数上限 9（对齐服务端 @ArrayMaxSize(9)）——逐个选第 10 个被本地拦截', async () => {
+    const user = userEvent.setup();
+    let n = 0;
+    mockUpload.mockImplementation(async () => {
+      n += 1;
+      return uploadRes(`att-${n}`, `f${n}.log`, { mimeType: 'application/octet-stream' });
+    });
+    const { container } = render(<Harness onSend={jest.fn()} />);
+
+    for (let i = 0; i < 9; i++) {
+      pickFile(container, logFile(`f${i + 1}.log`));
+      await waitFor(() =>
+        expect(screen.getAllByRole('button', { name: 'Remove attachment' })).toHaveLength(i + 1),
+      );
+    }
+    await user.type(textareaOf(container), 'x');
+
+    pickFile(container, logFile('f10.log'));
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'Up to 9 attachments per message' }),
+      ),
+    );
+    expect(mockUpload).toHaveBeenCalledTimes(9);
+    expect(screen.getAllByRole('button', { name: 'Remove attachment' })).toHaveLength(9);
+  });
+
+  it('n4：同一 tick 粘贴一批文件（>9）→ 上限同样生效，不超发到服务端', async () => {
+    let n = 0;
+    mockUpload.mockImplementation(async () => {
+      n += 1;
+      return uploadRes(`bulk-${n}`, `p${n}.log`, { mimeType: 'application/octet-stream' });
+    });
+    const { container } = render(<Harness onSend={jest.fn()} />);
+    const ta = textareaOf(container);
+
+    fireEvent.paste(ta, {
+      clipboardData: {
+        files: Array.from({ length: 12 }, (_, i) => logFile(`p${i + 1}.log`)),
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getAllByRole('button', { name: 'Remove attachment' })).toHaveLength(9),
+    );
+    expect(mockUpload).toHaveBeenCalledTimes(9);
+    expect(mockToastError).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Up to 9 attachments per message' }),
+    );
   });
 });

@@ -41,6 +41,7 @@ import { IdempotencyRecord } from '../src/database/entities/idempotency-record.e
 import { DocService } from '../src/modules/docspace/doc.service';
 import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { DocMoveService } from '../src/modules/docspace/doc-move.service';
+import { DocLinksService } from '../src/modules/docspace/doc-links.service';
 import { Doc } from '../src/database/entities/doc.entity';
 import { DocSection } from '../src/database/entities/doc-section.entity';
 import { DocVersion } from '../src/database/entities/doc-version.entity';
@@ -147,6 +148,8 @@ describe('DocSpace 写族 clientRequestId 幂等 — 真实 PG 集成', () => {
       ds.getRepository(AuditLog),
       ds.getRepository(IdempotencyRecord),
       service,
+      // 入链内核（v1.90.0-dev backlinks 批次）：move 的 impact 走同一内核
+      new DocLinksService(ds.getRepository(Doc), ds.getRepository(DocSection), service),
       eventStub,
     );
 

@@ -78,7 +78,13 @@ describe('OwnerProxyService', () => {
       agentRepo.find.mockResolvedValue([{ id: 'agent-1' }, { id: 'agent-2' }] as Agent[]);
       const result = await service.getOwnedAgentIds(makeActor());
       expect(result).toEqual(['agent-1', 'agent-2']);
-      expect(agentRepo.find).toHaveBeenCalledWith({ where: { ownerId: 'human-1' } });
+      // 确定性排序契约（v1.89.0 activity-logs flake 热修）：scope 回声顺序必须稳定——
+      // 无 ORDER BY 时 PG 物理行序会让 audit scope 数组抖动；createdAt 在 actor 关系上，
+      // 嵌套路径是唯一定点（真 ORM 行为由 activity-logs e2e 真 PG 守门）
+      expect(agentRepo.find).toHaveBeenCalledWith({
+        where: { ownerId: 'human-1' },
+        order: { actor: { createdAt: 'ASC', id: 'ASC' } },
+      });
     });
 
     it('returns empty array when human owns no agents', async () => {

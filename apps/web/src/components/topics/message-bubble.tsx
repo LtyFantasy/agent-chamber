@@ -24,6 +24,9 @@
  *     的 Agent 在发言」（M3 验收 P2 bug 修复）；正文默认 truncate 单行，仅内容真溢出
  *     时显示 chevron 折叠控件（scrollWidth > clientWidth 检测，M3 验收第二批升级）。
  *     折叠相关 hook 必须在早返回之前声明（早返回在所有 hook 之后的铁律）
+ *   - 非图片附件卡片（v1.90.0-dev 通用附件批 §2 B2）：渲染在 content **之后**，
+ *     图片条目（4 种嗅探 mime）由 content 的 `![]()` 渲染、卡片必须过滤掉
+ *     （双重呈现）；乐观消息 attachments: [] 天然零卡片
  *
  * [铁律关联] #7（视觉样式先看 ui-design-system） #11（注释强制）
  *
@@ -57,6 +60,10 @@ import { formatRelativeTime } from '@/lib/utils';
 import { MARKDOWN_CHAT_CLASSES } from '@/lib/markdown-classes';
 import { createMarkdownComponents } from '@/lib/markdown-components';
 import { CollapsibleMarkdown } from '@/components/topics/collapsible-markdown';
+import {
+  AttachmentFileCard,
+  isInlineImageAttachment,
+} from '@/components/attachments/attachment-file-card';
 import { Badge } from '@/components/ui/badge';
 import { confirm } from '@/lib/notify';
 
@@ -95,6 +102,17 @@ export function MessageBubble({
   // AttachmentImage（附件鉴权 blob 加载）。system 公告条与 thinking 过程记录
   // 两处 ReactMarkdown 不接本工厂——平台生成内容，无附件场景（plan §5.2 排除项）。
   const markdownComponents = useMemo(() => createMarkdownComponents(), []);
+  /**
+   * 非图片附件条目（v1.90.0-dev 通用附件批 §2 B2）：图片条目由 content 内
+   * `![]()` 渲染（AttachmentImage），卡片再渲染 = 双重呈现 → 此处过滤。
+   * 乐观消息 `attachments: []`（topics/[id]/page.tsx）天然零卡片，不受影响。
+   * `?? []` 防御：历史测试夹具/更早的响应可能缺该键（服务端契约恒存在）。
+   * 必须位于 system 早返回之前（hook 顺序铁律，见文件头注释）。
+   */
+  const fileAttachments = useMemo(
+    () => (msg.attachments ?? []).filter((a) => !isInlineImageAttachment(a)),
+    [msg.attachments],
+  );
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
   // 不防则连点排队两个确认框——确认两次 = 重复删除消息）
   const deleteConfirmPendingRef = useRef(false);
@@ -444,6 +462,17 @@ export function MessageBubble({
             {msg.content}
           </ReactMarkdown>
         </CollapsibleMarkdown>
+      )}
+      {/* 非图片附件卡片（v1.90.0-dev）：渲染在 content **之后**——「content 是渲染事实，
+          metadata.attachments 是索引」契约下，卡片只是索引的可操作投影，不抢正文位。
+          图片条目已被 fileAttachments 过滤（不双重渲染）。列表语义 ul/li（卡片根 = li），
+          读屏按列表播报附件数（a11y 基线：语义先行，不用 div + role 硬凑） */}
+      {fileAttachments.length > 0 && (
+        <ul data-testid="message-attachments" className="mt-2 flex list-none flex-col gap-1.5 p-0">
+          {fileAttachments.map((attachment) => (
+            <AttachmentFileCard key={attachment.id} attachment={attachment} />
+          ))}
+        </ul>
       )}
     </div>
   );

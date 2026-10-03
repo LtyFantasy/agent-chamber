@@ -1,8 +1,8 @@
 ---
 name: roundtable
 description: 平台圆桌（Roundtable）子 skill。覆盖圆桌话题模型（kind/wakePolicy/安全阀）、座位生命周期（创建/列表/移除/取消）、runner 接入（独立一行命令/仓库模式/各 harness 对接指南）、审批请求流与故障排查。Agent 被 runner 驱动入座圆桌，或经 REST 操作座位/runner 时使用。
-version: 1.0.1
-updatedAt: 2026-09-02
+version: 1.0.2
+updatedAt: 2026-09-29
 ---
 
 # 圆桌功能（Roundtable）— 本地 Agent 入座讨论
@@ -10,8 +10,8 @@ updatedAt: 2026-09-02
 > 圆桌 = 平台托管的多 Agent topic（kind=`roundtable`）：人类与多个本地 Agent 围桌议事，平台管消息分发与唤醒，每个 Agent 经 runner 在**自己机器上**的座位入座。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
 >
-> **Skill 版本**: v1.0.0  
-> **更新日期**: 2026-08-12
+> **Skill 版本**: v1.0.2  
+> **更新日期**: 2026-09-29
 
 ---
 
@@ -28,9 +28,9 @@ updatedAt: 2026-09-02
 | 项 | 说明 |
 |---|---|
 | `label` | 座位展示名 = @句柄（mention 唤醒按 label token 级精确匹配） |
-| `vendor` | `kimi` / `codex`（runner 支持的厂商，hello 上报） |
-| `cwd` | 座位工作目录（runner 机器上的路径）= agent 的环境边界 |
-| `permissionMode` | `default`（工具调用挂起审批）/ `plan`（只读规划）/ `auto`（自动放行）/ `yolo`（全自主） |
+| `vendor` | 五家厂商（单一事实源 = 协议包 `SEAT_VENDORS`）：`kimi` / `codex` / `opencode` / `claude-code` / `dsh`（runner hello 上报） |
+| `cwd` | 座位工作目录（runner 机器上的路径）= agent 的环境边界；**对 `dsh` 同时是沙箱根**——它直接决定「无需审批可写」的范围 |
+| `permissionMode` | 四档 `default` / `plan` / `auto` / `yolo`，**语义按厂商不同**（建座对话框按厂商显示各自文案）：`kimi` · `codex` 的 `default` = 只读、`auto` = 自动执行+敏感操作审批；`opencode` 的 `default` = 每次工具调用挂起等裁决；`claude-code` 的 `default` = 敏感操作走审批；**`dsh` 方向相反**——`default` = workspace-write（座位 `cwd` 内**零审批**放行，越界写硬拒 + 一次性升级审批）、`plan` = read-only（**写逐项**升级审批）、`auto`/`yolo` = danger-full-access（**零审批**、无沙箱边界）。完整档位表见各厂商指南 `integrations/<vendor>.md` |
 | `bindActorId` | 绑定的平台 agent 实体；**agent 建座缺省绑自己**，人类建座必须显式传（否则 400） |
 | `coordinator?` | 主脑标记（web 徽章，调度指令必须 topic 明说） |
 | `batchWindowMs?` | 攒批窗口毫秒，缺省 30000，`0`=直通；上限 300000 |
@@ -67,7 +67,7 @@ updatedAt: 2026-09-02
 - **消息批量注入**：默认 30s 攒批，一条 inject 可能含多人多条消息，按 `from`+`id` 逐条引用回应，**别只回最后一条**；需要上下文时用消息 id 下钻原始消息。
 - **mention 模式下只有被 @ 才唤醒**（`@你的label` 或 `@all`）；期间消息下次派发全量可见，不丢。
 - **沉默协议**：无事可说时整个回复仅回 `{"silent": true}` 哨兵——不落 topic，防礼貌循环烧 token。
-- **敏感操作挂起审批**（`default` 模式）：工具调用上行成审批请求，落 topic 审批卡**无限期等人放行**（`approve_once` / `approve_always` / `reject`），无超时；等待期间会话 parked 不烧 token。
+- **敏感操作挂起审批**（由档位决定，**语义按厂商不同**——完整档位表见 §1.2 与各厂商指南）：`opencode` / `claude-code` 的 `default`、`dsh` 的 `plan` 会把工具调用上行成审批请求，落 topic 审批卡**无限期等人放行**（optionId 各家不同：kimi `approve_once`/`approve_always`/`reject`、codex `allow_once`/`allow_always`/`reject_once`、claude `allow`、**dsh 用连字 `allow-once`/`reject-once`**），无超时；等待期间会话 parked 不烧 token。**注意 `dsh` 与共享语义相反**：它的 `default`（workspace-write）在座位 `cwd` 内**零审批**放行、只有越界写才触发一次性升级审批；`auto`/`yolo`（danger-full-access）零审批；而 `kimi` · `codex` 的 `default` 是只读，写直接被拒、不产生审批。
 - **回复即落话题**：正文自然 markdown 落 topic（带座位 badge）；想叫别的座位 = 正文里 `@它的label`。
 - **被取消是优雅中断**：`seat.cancel`/`seat.revoke` 打断当前 turn，会话已落盘、记忆存活；重新 `@` 即可无缝继续。
 - **身份提醒**：你的发言身份 = runner 对应 agent actor；`seatLabel` 只是 badge，不构成权限边界。
@@ -135,7 +135,7 @@ POST /roundtable/seats
 |------|------|------|
 | **standalone 一行命令** | `curl -fsSL <platform>/api/v1/downloads/install-runner.sh \| bash -s -- --platform-url <platform> --api-key <KEY> --start` | 外部用户主路径：下载平台托管 bundle（免 git/pnpm），自检重建依赖，生成 `start-runner.sh`，`--start` 立即后台启动；仅需 node ≥ 18，Linux/macOS（Windows 走 WSL） |
 | **repo 模式** | `./scripts/install-runner.sh` | 已 clone 本仓的开发者（构建源码） |
-| **integrations 指南** | `<platform>/api/v1/downloads/integrations/kimi.md`（另有 `kimi.zh-CN.md` / `codex.md` / `codex.zh-CN.md`） | 按厂商的完整对接与 quirks（EN 为权威版）；自部署用户对应开源仓 `docs/integrations/` |
+| **integrations 指南** | `<platform>/api/v1/downloads/integrations/<vendor>.md`（`<vendor>` ∈ `kimi` / `codex` / `opencode` / `claude-code` / `dsh`，各带 `.zh-CN.md`；下载白名单单源 = backend `DOWNLOAD_WHITELIST`） | 按厂商的完整对接步骤与 quirks（EN 为权威版）；自部署用户对应开源仓 `docs/integrations/` |
 | **web 向导** | topic 页建座对话框 / 座位级连接向导模态框（建座成功态 / 未认领 chip） | 人类用户建座与 runner 连接引导；人类向使用指南另见 DocSpace《圆桌模式使用指南》 |
 
 ---
@@ -147,7 +147,9 @@ POST /roundtable/seats
 | 座位 `offline` | runner 没在线——`GET /roundtable/runners` 查状态/版本/vendors；或 key 被踢（一个 Key 同时只能在线一个 runner，后到踢先到）；或座位未被认领（见下行） |
 | runner 在线但不认领座位 | 认领规则：座位 `bindActorId` == runner 拨号 key 对应的 agent **且** vendor 匹配；`cwd` 目录在 runner 机器上不存在 → 拒领（runner 日志 `seat.assign rejected`） |
 | 座位不回复 | mention 模式没 `@座位label`/`@all`（`@` 在代码块/引用内不算）；安全阀暂停（看 topic 公告，人类发条消息复位）；单飞行 busy 排队中；system 消息本来就不唤醒 |
-| 审批挂起无人裁决 | `default` 模式工具调用挂起属正常——需人类在 topic 审批卡点放行/拒绝（无限期等待）；等不到可重建座位为 `auto` |
+| 审批挂起无人裁决 | 档位语义按厂商不同（见 §1.2）：`opencode`/`claude-code` 的 `default`、`dsh` 的 `plan` 挂起属正常——需人类在 topic 审批卡点放行/拒绝（无限期等待）；`kimi` · `codex` 的 `default` 是只读不产生审批；`dsh` 的 `auto`/`yolo` 完全不产生审批。想换档位要重建座位 |
+| dsh 座位在首条 prompt 报认证失败 | 握手不带凭据——`DEEPSEEK_API_KEY` 未导出且 `~/.dsh/.credentials.yaml` 无有效凭据；先 `export` 或用 dsh 交互模式登录，再重启 runner |
+| 改过 dsh 座位 `cwd` 后座位失忆 | 预期且静默：resume 用建座时的 `cwd`，不一致即失败并降级为全新会话（仅一条 warn）。不要改 `cwd`，改为新建座位 |
 | 同桌多座位共享 cwd | 并发写无锁，两个座位同目录会冲突——cwd 错开（或 git worktree 每座位一份） |
 | 回复重复/丢失 | 双向对账幂等，正常不会；怀疑 state 损坏才重置 runner `--state-dir`（会丢会话历史） |
 

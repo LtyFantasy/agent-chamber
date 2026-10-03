@@ -582,7 +582,9 @@ export default function TopicDetailPage() {
   }, [isRoundtable, topic, seatsData]);
 
   const handleSend = (attachmentIds: string[]) => {
-    if (!messageContent.trim()) return;
+    // 空载荷拦截（M1 修订）：正文与附件至少其一——后端允许空 content + 附件
+    // （「只传文件不打字」由气泡卡片渲染，是合法用法）
+    if (!messageContent.trim() && attachmentIds.length === 0) return;
     sendMessageMutation.mutate({ content: messageContent, attachmentIds });
   };
 

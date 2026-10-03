@@ -2,7 +2,12 @@ import request = require('supertest');
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createTestingApp } from './test-setup';
-import { ErrorCode, TaskStatus, DOC_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
+import {
+  ErrorCode,
+  TaskStatus,
+  DOC_SEARCH_WEAK_HIT_HINT,
+  DOC_SEARCH_ZERO_HIT_HINT,
+} from '@agent-chamber/shared';
 import { JwtOrApiKeyGuard } from '../src/common/guards/jwt-or-api-key.guard';
 
 jest.mock('bcrypt', () => ({
@@ -471,6 +476,20 @@ describe('DocSpaceController (e2e)', () => {
       .expect(400);
   });
 
+  it('GET /doc-spaces/:id/export?foo=1 — 400（query DTO 白名单：未知参数不再被静默忽略）', async () => {
+    // v1.89.0-dev 批次 A 行为变更：export 端点挂上 ExportBundleQueryDto 后，
+    // 全局 ValidationPipe（whitelist + forbidNonWhitelisted，test-setup 与 main.ts 同构）
+    // 会把未知 query 参数从"静默忽略"变 400。守卫先于 pipe 运行 ⇒ 仍需带合法凭据。
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/export?foo=1`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(400);
+  });
+
   // ─── Test 4: GET /doc-spaces/:id/search?q=中文 ────────────────
 
   it('GET /doc-spaces/:id/search — searches with Chinese query', async () => {
@@ -516,14 +535,40 @@ describe('DocSpaceController (e2e)', () => {
       .set('Authorization', `Bearer ${authToken}`)
       .expect(200)
       .expect((res: any) => {
-        // v1.86 信封契约（主脑裁决 #1）：裸数组 → `{ hits, hint? }`；
+        // v1.86 信封契约（主脑裁决 #1）：裸数组 → `{ hits, hint?, hintCode? }`；
         // 本 fixture 最高分 0.09 < DOC_SEARCH_WEAK_HIT_SCORE（基准 0.3 × W1，现构 0.9
-        // ——弱命中家族）⇒ hint 在场
+        // ——弱命中家族）⇒ 弱命中**独立文案** + hintCode='weak_hit' 在场
         expect(Array.isArray(res.body.data.hits)).toBe(true);
         expect(res.body.data.hits.length).toBeGreaterThanOrEqual(1);
         expect(res.body.data.hits[0]).toHaveProperty('docId', docId);
         expect(res.body.data.hits[0]).toHaveProperty('docTitle', '测试文档');
+        expect(res.body.data.hint).toBe(DOC_SEARCH_WEAK_HIT_HINT);
+        expect(res.body.data.hintCode).toBe('weak_hit');
+      });
+  });
+
+  it('GET /doc-spaces/:id/search — 零命中返回 DOC_SEARCH_ZERO_HIT_HINT + hintCode=zero_hit', async () => {
+    // e2e 层零命中此前零覆盖（v1.89.0-dev 批次 A 补）：与弱命中同 fixture 形态，唯一差别是
+    // 主查询返回空集 ⇒ 走 `hits.length === 0` 分支（不落 snippet 查询，mock 打分路径）。
+    const space = makeSpace();
+    mockRepos.DocSpace.findOne.mockResolvedValue(space);
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const searchQb = genericQb({
+      getRawMany: jest.fn().mockResolvedValue([]),
+    });
+    const mgr: any = mockRepos.DocSection.manager;
+    mgr.createQueryBuilder = jest.fn().mockReturnValue(searchQb);
+    mockRepos.DocSection.findOne.mockResolvedValue(null);
+
+    return request(app.getHttpServer())
+      .get(`/doc-spaces/${spaceId}/search?q=不存在的词`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.hits).toEqual([]);
         expect(res.body.data.hint).toBe(DOC_SEARCH_ZERO_HIT_HINT);
+        expect(res.body.data.hintCode).toBe('zero_hit');
       });
   });
 

@@ -45,6 +45,8 @@ function attachmentRow(overrides: Partial<Attachment> = {}): Attachment {
     uploaderId: ACTOR.id,
     topicId: null,
     docId: null,
+    status: 'ready',
+    expiresAt: null,
     ...overrides,
   } as Attachment;
 }
@@ -158,6 +160,36 @@ describe('AttachmentSignedUrlService', () => {
       });
       // fail fast：不签 token、不写审计
       expect(auditService.log).not.toHaveBeenCalled();
+    });
+
+    it('已过期附件 → 400·12009（m3：死了就是死了，不许铸新票；先于变体可行性判定）', async () => {
+      attachmentService.findAccessible.mockResolvedValue(
+        attachmentRow({ expiresAt: new Date(Date.now() - 1000) }),
+      );
+
+      await expect(service.mint(ID, ACTOR, {})).rejects.toMatchObject({
+        status: 400,
+        response: { code: ErrorCode.ATTACHMENT_EXPIRED },
+      });
+      // 不签 token、不写审计
+      expect(auditService.log).not.toHaveBeenCalled();
+    });
+
+    it('已过期 + 无缩略图 + variant=thumbnail → 仍 400·12009（过期判定先于变体判定）', async () => {
+      attachmentService.findAccessible.mockResolvedValue(
+        attachmentRow({ thumbKey: null, expiresAt: new Date(Date.now() - 1) }),
+      );
+      await expect(service.mint(ID, ACTOR, { variant: 'thumbnail' })).rejects.toMatchObject({
+        status: 400,
+        response: { code: ErrorCode.ATTACHMENT_EXPIRED },
+      });
+    });
+
+    it('恰好未过期（expiresAt = now + 1h）→ 正常签发（边界不误伤）', async () => {
+      attachmentService.findAccessible.mockResolvedValue(
+        attachmentRow({ expiresAt: new Date(Date.now() + 3600_000) }),
+      );
+      await expect(service.mint(ID, ACTOR, {})).resolves.toMatchObject({ variant: 'original' });
     });
 
     it('审计 mint_attachment_url：entityType=attachment/actorId/newData 无 token', async () => {
@@ -341,6 +373,30 @@ describe('AttachmentSignedUrlService', () => {
       await service.resolvePublicContent(ID, token);
 
       expect(attachmentService.findAccessible).not.toHaveBeenCalled();
+    });
+
+    it('过期懒判（插入点：行加载后、getObject 前）→ 410·12009，不取流', async () => {
+      attachmentRepo.findOne.mockResolvedValue(
+        attachmentRow({ expiresAt: new Date(Date.now() - 1000) }),
+      );
+      const token = signToken({ aid: ID, var: 'original', scope: ATTACHMENT_SIGNED_URL_SCOPE });
+
+      await expect(service.resolvePublicContent(ID, token)).rejects.toMatchObject({
+        status: 410,
+        response: { code: ErrorCode.ATTACHMENT_EXPIRED },
+      });
+      expect(storage.getObject).not.toHaveBeenCalled();
+    });
+
+    it('非 ready（潜伏态）→ 404·12000（m6 就绪谓词），不取流', async () => {
+      attachmentRepo.findOne.mockResolvedValue(attachmentRow({ status: 'pending' }));
+      const token = signToken({ aid: ID, var: 'original', scope: ATTACHMENT_SIGNED_URL_SCOPE });
+
+      await expect(service.resolvePublicContent(ID, token)).rejects.toMatchObject({
+        status: 404,
+        response: { code: ErrorCode.ATTACHMENT_NOT_FOUND },
+      });
+      expect(storage.getObject).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { DocEditor } from './doc-editor';
 import { Api } from '@/lib/api';
-import { confirm } from '@/lib/notify';
+import { confirm, toast } from '@/lib/notify';
 
 /** docs.editor 命名空间的英语文案快照（同 en.json） */
 const messages: Record<string, string> = {
@@ -50,6 +50,7 @@ jest.mock('@/lib/notify', () => ({
   toast: { error: jest.fn(), warning: jest.fn(), success: jest.fn(), info: jest.fn() },
 }));
 const mockConfirm = confirm as jest.Mock;
+const mockToastError = toast.error as jest.Mock;
 
 // DocPicker 依赖弹层/搜索链路，与本测试无关，stub 掉保持测试轻量
 jest.mock('@/components/docs/doc-picker', () => ({
@@ -349,5 +350,59 @@ describe('DocEditor 图片上传插入（MinIO 媒体附件 P0，plan §5.4）',
       expect(mockUpload).toHaveBeenCalledTimes(1);
     });
     expect(ta.value).toBe('x'); // 未插入链接
+  });
+
+  it('非图片类型被前端拦截（m2 裁决：doc 侧收回仅图片——无非图片消费面，上传即死重）', async () => {
+    const { container } = render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        docId="doc-1"
+        initialContent=""
+        initialPath="docs/a.md"
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+    const ta = screen.getByPlaceholderText('Write Markdown content here...') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: 'x' } });
+
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      target: { files: [new File(['y'], 'build.log', { type: 'text/plain' })] },
+    });
+
+    expect(mockUpload).not.toHaveBeenCalled(); // 不产生死重附件（doc 绑定 = 永久）
+    expect(ta.value).toBe('x'); // 不插 content
+    expect(mockToastError).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'attachments.typeNotAllowed' }),
+    );
+  });
+
+  it('大小拦截仍在：>10MiB 不调 upload，直接 toast', async () => {
+    const { container } = render(
+      <DocEditor
+        mode="edit"
+        spaceId="space-1"
+        docId="doc-1"
+        initialContent=""
+        initialPath="docs/a.md"
+        saving={false}
+        onSave={jest.fn()}
+        onCancel={jest.fn()}
+      />,
+    );
+
+    fireEvent.change(container.querySelector('input[type=file]') as HTMLInputElement, {
+      // 类型走图片（类型门在前，若用 .bin 会先命中 typeNotAllowed，测不到大小门）
+      target: {
+        files: [new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'big.png', { type: 'image/png' })],
+      },
+    });
+
+    expect(mockUpload).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'attachments.tooLarge' }),
+    );
   });
 });

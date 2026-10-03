@@ -825,6 +825,195 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
     expect(tgtNorm).toEqual(srcNorm);
   }, 60000);
 
+  // ─── ①b pathPrefix 部分快照（v1.89.0-dev 批次 A）────────────
+
+  /**
+   * 专用部分快照空间（自包含 fixture，不依赖共享 src 空间）：A/ 与 B/ 两个目录各一篇文档
+   * + 一个被引用分类（甲类）+ 一个无人引用分类（乙类）+ 一条 primary=A/secondary=B 的路由。
+   *
+   * 为什么不用 src 空间的既有文档：plan 的定案用例要求「primary 在 A/、secondary 在 B/」，
+   * 而 src 的三篇文档同在 tmp/ 一层；且新建文档走 upsert 的 create 分支，分类链接一定落库
+   * （既有文档的"补策展元数据" upsert 内容未变 ⇒ 命中 unchanged 短路，分类不会写入——
+   * 这也是本套件 ① 断言只比较 title/summary/docType/tags 的原因）。
+   *
+   * 清理：文档由 afterAll 兜底 A（path LIKE `tmp/${RUN}-%`）、空间由兜底 B
+   * （name LIKE `%${RUN}`）覆盖，无需登记到 tracked 列表。
+   */
+  async function seedPrefixSpace(): Promise<{
+    spaceId: string;
+    pathA: string;
+    pathB: string;
+    intent: string;
+  }> {
+    const spaceId = await makeSpace(`BundlePrefix ${RUN}`);
+    await docspaceService.createCategory(spaceId, { name: '甲类', slug: 'jia', sortOrder: 1 });
+    // 无人引用的分类：带前缀导出必须被丢弃（保留集 = 入选文档引用的分类）
+    await docspaceService.createCategory(spaceId, { name: '乙类', slug: 'yi', sortOrder: 2 });
+
+    const pathA = `tmp/${RUN}-pfx-A/a.md`;
+    const pathB = `tmp/${RUN}-pfx-B/b.md`;
+    await docService.upsert(
+      spaceId,
+      {
+        path: pathA,
+        content: `# 前缀文档 A\n\nA 正文。`,
+        title: '前缀文档 A',
+        category: '甲类',
+        tags: ['pfx'],
+      },
+      testActor,
+    );
+    await docService.upsert(
+      spaceId,
+      { path: pathB, content: `# 前缀文档 B\n\nB 正文。`, title: '前缀文档 B', tags: ['pfx'] },
+      testActor,
+    );
+    await flushImmediates();
+
+    const docA = await ds.getRepository(Doc).findOne({ where: { spaceId, path: pathA } });
+    const docB = await ds.getRepository(Doc).findOne({ where: { spaceId, path: pathB } });
+    expect(docA).toBeTruthy();
+    expect(docB).toBeTruthy();
+    // 前提自证：新建文档确实落到了分类（否则下面的分类收窄断言会退化成"空对空")
+    expect(docA!.categoryId).toBeTruthy();
+
+    const intent = '我要看前缀文档 A';
+    await docRouteService.create(
+      spaceId,
+      { intent, primaryDocId: docA!.id, secondaryDocId: docB!.id, sortOrder: 5 },
+      testActor,
+    );
+    return { spaceId, pathA, pathB, intent };
+  }
+
+  it('pathPrefix 部分快照：docs/categories 收窄、routes 按 primary 筛、secondary 照实输出（不写 null）', async () => {
+    if (!dbAvailable) return;
+
+    const { spaceId, pathA, pathB } = await seedPrefixSpace();
+    const bundle = await bundleService.exportBundle(spaceId, `tmp/${RUN}-pfx-A/`);
+
+    // docs：只有 A/ 下的文档入选
+    expect(bundle.docs.map((d) => d.path)).toEqual([pathA]);
+    // 回声 + 不变量（matchedDocs 与 docs 段同源）
+    expect(bundle.appliedFilters).toEqual({ pathPrefix: `tmp/${RUN}-pfx-A/`, matchedDocs: 1 });
+    expect(bundle.appliedFilters!.matchedDocs).toBe(bundle.docs.length);
+    // categories：入选文档引用「甲类」→ 保留；无人引用的「乙类」→ 丢弃
+    expect(bundle.categories.map((c) => c.name)).toEqual(['甲类']);
+    // routes：primary=A 的路由入选
+    expect(bundle.routes).toHaveLength(1);
+    expect(bundle.routes[0].primaryDocPath).toBe(pathA);
+    // **次级文档在入选集之外 → 仍给真 path**（"照实输出"的真库证据：绝不写 null）
+    expect(bundle.routes[0].secondaryDocPath).toBe(pathB);
+  }, 60000);
+
+  it('pathPrefix 零命中：空 bundle + appliedFilters.matchedDocs=0（200 成功，非错误）', async () => {
+    if (!dbAvailable) return;
+
+    const { spaceId } = await seedPrefixSpace();
+    const missPrefix = `tmp/${RUN}-pfx-none/`;
+    const bundle = await bundleService.exportBundle(spaceId, missPrefix);
+
+    expect(bundle.formatVersion).toBe(2);
+    expect(bundle.docs).toEqual([]);
+    expect(bundle.categories).toEqual([]);
+    expect(bundle.routes).toEqual([]);
+    expect(bundle.media).toEqual([]);
+    // "前缀没命中" 与 "空间本来就空" 都返回空 bundle —— 靠该值区分
+    expect(bundle.appliedFilters).toEqual({ pathPrefix: missPrefix, matchedDocs: 0 });
+  }, 60000);
+
+  it('pathPrefix 部分快照同空间回导：routes 的 secondaryDocId 未被破坏（部分链完整）', async () => {
+    if (!dbAvailable) return;
+
+    const { spaceId, pathA, pathB, intent } = await seedPrefixSpace();
+    const bundle = await bundleService.exportBundle(spaceId, `tmp/${RUN}-pfx-A/`);
+    // 前提自证：次级文档确实在包外（bundle.docs 里没有它），但导出侧照实给了真 path
+    expect(bundle.docs.map((d) => d.path)).toEqual([pathA]);
+    expect(bundle.routes).toHaveLength(1);
+    expect(bundle.routes[0].secondaryDocPath).toBe(pathB);
+
+    // 关键：部分快照导回**同一空间**——次级文档在库内，链路必须完好。
+    // （若导出侧把 secondaryDocPath 写成 null，import 侧会按"显式清空"把它置空）
+    const result = await bundleService.importBundle(spaceId, bundle as never, testActor);
+    await flushImmediates();
+
+    expect(result.routes.summary.total).toBe(1);
+    expect(result.routes.summary.failed).toBe(0);
+
+    const route = await ds.getRepository(DocRoute).findOne({ where: { spaceId, intent } });
+    const docB = await ds.getRepository(Doc).findOne({ where: { spaceId, path: pathB } });
+    expect(route).toBeTruthy();
+    expect(docB).toBeTruthy();
+    expect(route!.secondaryDocId).toBe(docB!.id);
+  }, 60000);
+
+  // ─── ①c findAll sort/updatedAfter（v1.89.0 生产热修守门）────────────
+
+  /**
+   * v1.89.0 生产实踩：sort 的 orderBy 误写数据库列名 `d.updated_at`，skip/take 分页段
+   * （createOrderByCombinedWithSelectExpression）按**实体属性名**查元数据 → undefined →
+   * TypeError 500。mock 单测只能断言调用字符串、测不出真 ORM 行为——本用例打真 PG，
+   * 断言排序真确 + updatedAfter 含边界，是该路径的定案守门。
+   *
+   * fixture：updated_at 由 UPDATE 直改到固定时刻（消除 upsert 应用时钟的同毫秒抖动）；
+   * 清理由 afterAll 兜底 A（path LIKE `tmp/${RUN}-%`）+ 兜底 B（name LIKE `%${RUN}`）覆盖。
+   */
+  it('findAll sort=updatedAt_desc/asc 真排序 + updatedAfter 含边界（真 PG，生产 500 回归）', async () => {
+    if (!dbAvailable) return;
+
+    const spaceId = await makeSpace(`DocListSort ${RUN}`);
+    const paths = [`tmp/${RUN}-lst-a.md`, `tmp/${RUN}-lst-b.md`, `tmp/${RUN}-lst-c.md`];
+    for (const [i, p] of paths.entries()) {
+      await seedDoc(spaceId, p, `# 排序文档 ${i}\n\n正文 ${i}。`);
+    }
+
+    // 固定 updated_at：a=3 小时前，b=2 小时前，c=1 小时前（直改列 = fixture 手段，非被测路径）
+    const now = Date.now();
+    const stamps = paths.map((_, i) => new Date(now - (3 - i) * 3600_000).toISOString());
+    for (const [i, p] of paths.entries()) {
+      await ds
+        .getRepository(Doc)
+        .createQueryBuilder()
+        .update()
+        .set({ updatedAt: new Date(stamps[i]) })
+        .where('space_id = :spaceId AND path = :p', { spaceId, p })
+        .execute();
+    }
+
+    // desc：新 → 旧（生产 500 的 exact 路径：orderBy + skip/take）
+    const desc = await docService.findAll(spaceId, { sort: 'updatedAt_desc' });
+    expect(desc.items.map((d) => d.path)).toEqual([paths[2], paths[1], paths[0]]);
+    expect(desc.total).toBe(3);
+
+    // asc：旧 → 新
+    const asc = await docService.findAll(spaceId, { sort: 'updatedAt_asc' });
+    expect(asc.items.map((d) => d.path)).toEqual(paths);
+
+    // updatedAfter 含边界（>= b 时刻 ⇒ b、c 入选）
+    const filtered = await docService.findAll(spaceId, {
+      sort: 'updatedAt_asc',
+      updatedAfter: stamps[1],
+    });
+    expect(filtered.items.map((d) => d.path)).toEqual([paths[1], paths[2]]);
+
+    // 分页次键稳定性：pageSize=2 翻页无重复无遗漏（同 updated_at 撞票时靠 path 全序）
+    const page1 = await docService.findAll(spaceId, {
+      sort: 'updatedAt_desc',
+      page: 1,
+      pageSize: 2,
+    });
+    const page2 = await docService.findAll(spaceId, {
+      sort: 'updatedAt_desc',
+      page: 2,
+      pageSize: 2,
+    });
+    expect([...page1.items, ...page2.items].map((d) => d.path)).toEqual([
+      paths[2],
+      paths[1],
+      paths[0],
+    ]);
+  }, 60000);
+
   // ─── ② per-doc 失败不中止 ───────────────────────────────────
 
   it('per-doc 失败不中止：source 冲突文档该篇 failed，其余文档照常 created', async () => {

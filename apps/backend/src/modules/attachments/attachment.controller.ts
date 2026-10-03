@@ -1,25 +1,55 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/api-definition.md §Attachments（6 端点契约 + 错误码语义）
- *   - 补充: docs/architecture.md §3.2 (Attachments 模块)
+ * [功能概念]
+ *   - 附件全鉴权端点族（上传 / 元数据 / 字节 / 缩略图 / 铸造 / 删除）
  *
- * [踩坑索引] (无历史踩坑，新建文件；全仓首个 FileInterceptor——multipart
- *            解析实证见 attachment-upload-multipart.spec.ts)
+ * [代码职责]
+ *   - 路由与守卫（类级 JwtOrApiKeyGuard，刻意拒绝 capability URL）
+ *   - multipart 解析配置（memoryStorage + 全维 limits）与拦截器接线
+ *   - **响应头**：inline/attachment 分叉、nosniff、CSP sandbox、Cache-Control、ETag
+ *   - Swagger 契约描述（错误码/上限/410·12009）
+ *
+ * [权威文档]
+ *   - 主文档: docs/api-definition.md §Attachments — 6 端点契约 + 错误码语义
+ *   - 补充: docs/api-definition.md §16a「附件 TTL 与类型放开」— 出口头与 410·12009
+ *   - 补充: docs/architecture.md §3.2 — Attachments 模块
  *
  * [铁律关联] #11(注释) #17(测试契约) #21(双层校验)
  *
- * [详细踩坑]（最多 5 条）
+ * [关键不变量]
+ *   - 路由顺序：`'mine'` 必须声明在 `':id'` 之前（Express 顺序匹配，反序会被
+ *     ParseUUIDPipe 拦成 400）；`content/thumbnail` 的 @SkipTransform() +
+ *     @Res({passthrough:true}) 组合不得改动（StreamableFile 必须绕过响应信封）。
+ *   - **出口头（§1.2）**：inline 判据 = `isInlineImageMime` **精确成员判断**
+ *     （禁前缀/正则——`image/svg+xml` 过闸 = XSS）；非图片恒
+ *     `application/octet-stream` + `attachment`；三出口全量 `nosniff` +
+ *     `Content-Security-Policy: sandbox`（**纯 sandbox**，不带 default-src）。
+ *   - **Cache-Control 范围（N1）**：仅 content/thumbnail 为 `private, max-age=300`；
+ *     public 端点保持 `private` 无 max-age 不动（能力 URL 进共享缓存 = 凭证扩散）。
+ *   - **分码**：无缩略图必须 12008（不得并回 12000）；已过期附件字节面 410·12009；
+ *     铸造端点响应必须 `no-store`（体内含能力凭证），12008 文案逐字钉死。
+ *   - 错误码不许说谎：multipart 超限由 MulterLimitErrorInterceptor 映射 413·12001。
+ *
+ * [关联代码]
+ *   - attachment.service.ts — 业务链（本文件只做路由/头/解析面）
+ *   - attachment.constants.ts — 上限/限流/inline 判据单源
+ *   - attachment-public.controller.ts — 公开面（无守卫，出口头须与本文件同套）
+ *   - attachment-upload-multipart.spec.ts — 全仓首个 FileInterceptor 的 multipart 解析实证
+ *   - test/attachments.e2e-spec.ts — 响应头逐字断言（改头必先看它）
+ *
+ * [持久踩坑]
+ *   - （无历史踩坑，新建文件；全仓首个 FileInterceptor——multipart 解析实证见
+ *     attachment-upload-multipart.spec.ts）
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  *   □ 路由顺序不变量：'mine' 必须声明在 ':id' 之前（Express 顺序匹配）
  *   □ GET content/thumbnail 的 @SkipTransform()/@Res(passthrough) 组合不得改动
- *   □ 缩略图 404 分码不变量：无缩略图必须 12008（不得并回 12000）
- *   □ 铸造端点（:id/signed-url）：响应必须 no-store（体内含能力凭证）；
- *     12008 文案逐字钉死（见 plan §②.6 文案表）
+ *   □ 改响应头后同步：public 端点同套头 + Swagger 描述 + e2e 断言（三处同批）
  * =============================================================================
  */
 import {
@@ -60,11 +90,13 @@ import { QueryMineDto } from './dto/query-mine.dto';
 import { MintSignedUrlDto } from './dto/mint-signed-url.dto';
 import { MintSignedUrlResponse } from './dto/attachment-response.dto';
 import {
+  ATTACHMENT_FALLBACK_MIME,
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MINT_URL_THROTTLE_LIMIT,
   ATTACHMENT_MINT_URL_THROTTLE_TTL_MS,
   ATTACHMENT_UPLOAD_THROTTLE_LIMIT,
   ATTACHMENT_UPLOAD_THROTTLE_TTL_MS,
+  isInlineImageMime,
 } from './attachment.constants';
 import { encodeFilenameStar, buildThumbnailFilename } from './filename-sanitize';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
@@ -79,9 +111,10 @@ import { UnifiedActor } from '../../common/types/actor.types';
  * 读取链路保持全鉴权——刻意拒绝 capability URL（可见性收口哲学，plan §0.2）。
  *
  * multer 配置钉死：memoryStorage（platform-express 默认，buffer 在内存——
- * 8MiB 上限 × 30/min 限流，单实例可承受，plan §10 已评估）+ 全维 limits
- * （fileSize/files/fields/parts/fieldSize，不给 busboy 留无界解析面）。
- * 文件超 8MiB 由 MulterLimitErrorInterceptor 映射 413 + 12001（错误码不许说谎）。
+ * 10MiB 上限 × 30/min 限流，单实例可承受；**多 IP 并发下在途缓冲会叠加**
+ * （限流按 IP 计数不互相削峰），全局在途上传数闸门记 P2（m8））+
+ * 全维 limits（fileSize/files/fields/parts/fieldSize，不给 busboy 留无界解析面）。
+ * 文件超 10MiB 由 MulterLimitErrorInterceptor 映射 413 + 12001（错误码不许说谎）。
  */
 @ApiTags('Attachments')
 @Controller('attachments')
@@ -96,7 +129,9 @@ export class AttachmentController {
    * 上传附件（绑定 topic 或 doc，恰好一值）。
    *
    * 校验链（service 层，顺序钉死）：绑定恰好一值(12005) → 绑定资源存在+写权限(12004)
-   * → 魔数白名单(12002) → 头部尺寸(400) → 配额事务(12003) → 插行。
+   * → 字节证据分类（图片：尺寸校验 400；非图片：直接放行）→ 配额事务(12003) → 插行。
+   * 出口安全模型（v1.90.0-dev）：唯一防线 = 响应头（非图片恒 octet-stream + attachment），
+   * 准入不做类型白名单（详见 api-definition §16a）。
    */
   @Post()
   @Throttle({
@@ -119,7 +154,7 @@ export class AttachmentController {
   )
   @ApiConsumes('multipart/form-data')
   @ApiBody({
-    description: 'Image file (png/jpeg/gif/webp) bound to a topic or doc',
+    description: 'Any file (≤10MB) bound to a topic or doc',
     schema: {
       type: 'object',
       required: ['file'],
@@ -131,17 +166,21 @@ export class AttachmentController {
   @ApiOperation({
     summary: 'Upload attachment',
     description:
-      'Upload an image (png/jpeg/gif/webp, ≤8MiB) bound to exactly one of topicId/docId. ' +
-      'Magic-byte sniffed (client Content-Type not trusted); dimension bomb rejected; ' +
-      'per-uploader quota enforced in the same transaction as the row insert. ' +
+      'Upload a file (≤10MB) bound to exactly one of topicId/docId. ' +
+      'Magic-byte sniffed: image types (png/jpeg/gif/webp) are inline-eligible; every other ' +
+      'byte stream is stored as application/octet-stream and always served as an attachment ' +
+      '(client Content-Type is never trusted; it is kept only as clientMimeType for display). ' +
+      'Image dimension bombs rejected; per-uploader quota enforced in the same transaction ' +
+      'as the row insert. Topic-bound rows get expiresAt = now + topic.settings.attachmentTtl ' +
+      '(default 7d, fail-closed); doc-bound rows never expire. ' +
       'Rate limit: 30/min/IP.',
   })
   @ApiResponse({ status: 201, description: 'Attachment uploaded (returns contentUrl)' })
-  @ApiResponse({ status: 400, description: 'Bind conflict / type not allowed / bad image header' })
+  @ApiResponse({ status: 400, description: 'Bind conflict, or malformed image header' })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
   @ApiResponse({ status: 403, description: 'No write permission on target, or quota exceeded' })
   @ApiResponse({ status: 404, description: 'Target topic/doc not found' })
-  @ApiResponse({ status: 413, description: 'File exceeds 8MiB (ATTACHMENT_TOO_LARGE)' })
+  @ApiResponse({ status: 413, description: 'File exceeds 10MB (ATTACHMENT_TOO_LARGE)' })
   @ApiResponse({ status: 429, description: 'Upload rate limit exceeded' })
   upload(
     @CurrentActor() actor: UnifiedActor,
@@ -190,35 +229,57 @@ export class AttachmentController {
    * @SkipTransform()：StreamableFile 必须绕过 ResponseInterceptor 信封
    * （downloads.controller 先例）；@Res({passthrough:true})：ETag 由 sha256
    * 动态生成，@Header 静态装饰器表达不了，须手动 setHeader（plan §3.1）。
-   * 响应头钉死：Content-Type 用 DB 存值（魔数嗅探单一来源）/ nosniff /
-   * inline + RFC 6266 filename* / private 缓存 1h / ETag=sha256。
+   *
+   * 响应头钉死（v1.90.0-dev 出口收紧，§1.2）：
+   * - **inline 分叉**：`INLINE_IMAGE_MIME_TYPES` **精确相等**成员判断命中 → Content-Type
+   *   取 DB 字节证据值 + `inline`；未命中（含非图片恒 octet-stream）→ Content-Type 恒
+   *   `application/octet-stream` + `attachment`（强制下载，不渲染）；
+   * - `nosniff` + `Content-Security-Policy: sandbox`（**纯 sandbox，不带 default-src**——
+   *   sandbox 已给不透明源 + 禁脚本，是防 polyglot 顶层渲染的全部所需；`default-src 'none'`
+   *   对脚本面零增益且可能掐掉浏览器顶层直开图片时合成的内部 `<img>` 造成裂图）；
+   * - RFC 6266 filename* / `private, max-age=300`（TTL 最短档 1d 与 1h 客户端缓存冲突，
+   *   收到 300s——ETag 兜底重验证）/ ETag=sha256。
    */
   @Get(':id/content')
   @SkipTransform()
   @ApiOperation({
     summary: 'Get attachment content',
     description:
-      'Streams the image with full auth (Bearer/X-API-Key). ETag = sha256; ' +
-      'Cache-Control: private, max-age=3600. 404 both when missing and when access is denied.',
+      'Streams the attachment bytes with full auth (Bearer/X-API-Key). Images ' +
+      '(png/jpeg/gif/webp, exact mime match) are served inline with their sniffed ' +
+      'Content-Type; every other type is forced to application/octet-stream with ' +
+      'Content-Disposition: attachment. All responses carry X-Content-Type-Options: nosniff ' +
+      'and Content-Security-Policy: sandbox. ETag = sha256; Cache-Control: private, max-age=300. ' +
+      '404 both when missing and when access is denied (12000); 410/ATTACHMENT_EXPIRED (12009) ' +
+      'for expired attachments (metadata reads still 200 — the row is purged later by GC, ' +
+      'after which the byte path returns 404).',
   })
   @ApiParam({ name: 'id', description: 'Attachment UUID', type: String })
-  @ApiProduces('image/*')
-  @ApiResponse({ status: 200, description: 'Image bytes (inline)' })
+  @ApiProduces('image/*', 'application/octet-stream')
+  @ApiResponse({
+    status: 200,
+    description: 'Attachment bytes (inline for images, attachment otherwise)',
+  })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
   @ApiResponse({ status: 404, description: 'Attachment not found (or access denied)' })
+  @ApiResponse({ status: 410, description: 'Attachment expired (12009)' })
   async getContent(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentActor() actor: UnifiedActor,
     @Res({ passthrough: true }) res: Response,
   ): Promise<StreamableFile> {
     const { attachment, stream } = await this.attachmentService.getContent(id, actor);
-    res.setHeader('Content-Type', attachment.mimeType);
+    // 精确成员判断（禁止前缀/正则：image/svg+xml 过闸 = XSS 面）
+    const inline = isInlineImageMime(attachment.mimeType);
+    res.setHeader('Content-Type', inline ? attachment.mimeType : ATTACHMENT_FALLBACK_MIME);
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    // 纯 sandbox（不带 default-src 'none'）：见方法注释
+    res.setHeader('Content-Security-Policy', 'sandbox');
     res.setHeader(
       'Content-Disposition',
-      `inline; filename*=UTF-8''${encodeFilenameStar(attachment.originalName)}`,
+      `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeFilenameStar(attachment.originalName)}`,
     );
-    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Cache-Control', 'private, max-age=300');
     // ETag = sha256（内容相等性 oracle；带引号是 RFC 7232 强校验器标准形态）
     res.setHeader('ETag', `"${attachment.sha256}"`);
     return new StreamableFile(stream);
@@ -233,8 +294,8 @@ export class AttachmentController {
    *
    * @SkipTransform()：StreamableFile 绕过响应信封（/content 同款组合）。
    * 响应头钉死：Content-Type 恒 image/webp（DB thumb 列不存 mime——变体格式
-   * 是规格常量不是数据）/ nosniff / inline + `<原stem>_thumb.webp` /
-   * private 缓存 1h / ETag=thumb_sha256。
+   * 是规格常量不是数据）/ nosniff / CSP sandbox / inline + `<原stem>_thumb.webp` /
+   * private 缓存 300s / ETag=thumb_sha256。
    */
   @Get(':id/thumbnail')
   @SkipTransform()
@@ -242,10 +303,11 @@ export class AttachmentController {
     summary: 'Get attachment thumbnail',
     description:
       'Streams the webp thumbnail variant (max edge 512, first frame for animated input) ' +
-      'with full auth. ETag = thumb_sha256; Cache-Control: private, max-age=3600. ' +
+      'with full auth. Images only — non-image attachments have no thumbnail. ' +
+      'ETag = thumb_sha256; Cache-Control: private, max-age=300; nosniff + CSP sandbox. ' +
       '404/ATTACHMENT_NOT_FOUND when missing or access denied; ' +
       '404/ATTACHMENT_THUMBNAIL_UNAVAILABLE (12008) when the attachment has no thumbnail ' +
-      '(use /content for the original).',
+      '(use /content for the original); 410/ATTACHMENT_EXPIRED (12009) when expired.',
   })
   @ApiParam({ name: 'id', description: 'Attachment UUID', type: String })
   @ApiProduces('image/webp')
@@ -256,6 +318,7 @@ export class AttachmentController {
     description:
       'Attachment not found / access denied (12000), or the attachment has no thumbnail (12008)',
   })
+  @ApiResponse({ status: 410, description: 'Attachment expired (12009)' })
   async getThumbnail(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentActor() actor: UnifiedActor,
@@ -264,11 +327,13 @@ export class AttachmentController {
     const { attachment, stream } = await this.attachmentService.getThumbnail(id, actor);
     res.setHeader('Content-Type', 'image/webp');
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    // 纯 sandbox（与 /content 同值）：防 polyglot 顶层渲染的第二道门
+    res.setHeader('Content-Security-Policy', 'sandbox');
     res.setHeader(
       'Content-Disposition',
       `inline; filename*=UTF-8''${encodeFilenameStar(buildThumbnailFilename(attachment.originalName))}`,
     );
-    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Cache-Control', 'private, max-age=300');
     // ETag = thumb_sha256（缩略图内容相等性 oracle，与原图 ETag 同规）
     res.setHeader('ETag', `"${attachment.thumbSha256}"`);
     return new StreamableFile(stream);
@@ -307,13 +372,16 @@ export class AttachmentController {
       'nor X-API-Key — the token IS the credential. Safe to retry: every call mints a new token. ' +
       'Requires read access; 404 both when missing and when access is denied. ' +
       'variant=thumbnail on an attachment without a thumbnail → 404/ATTACHMENT_THUMBNAIL_UNAVAILABLE (12008). ' +
+      'Expired attachments (expiresAt < now) → 400/ATTACHMENT_EXPIRED (12009): a dead attachment ' +
+      'cannot be shared, even though its metadata stays readable at GET /attachments/:id. ' +
       'Rate limit: 30/min/IP.',
   })
   @ApiParam({ name: 'id', description: 'Attachment UUID', type: String })
   @ApiResponse({ status: 200, description: 'Signed URL minted (signedUrl/expiresAt/variant)' })
   @ApiResponse({
     status: 400,
-    description: 'Invalid ttlSeconds (outside 60-3600) or variant value',
+    description:
+      'Invalid ttlSeconds (outside 60-3600) or variant value, or the attachment has expired (12009)',
   })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
   @ApiResponse({

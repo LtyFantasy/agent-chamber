@@ -267,7 +267,7 @@ describe('TopicController', () => {
 
       expect(await controller.remove('topic-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(topic, mockActor, 'delete');
-      expect(service.remove).toHaveBeenCalledWith('topic-1');
+      expect(service.remove).toHaveBeenCalledWith('topic-1', mockActor.id);
       // 审计（Phase 2）：DELETE + topic；newData {topicId, title}
       expect(auditService.log).toHaveBeenCalledWith({
         action: AuditAction.DELETE,

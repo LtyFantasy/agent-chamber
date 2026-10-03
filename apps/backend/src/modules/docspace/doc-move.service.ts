@@ -42,7 +42,6 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ErrorCode, AuditAction, EventType, ResourceType } from '@agent-chamber/shared';
 import type {
-  DocInboundLink,
   DocMoveImpact,
   DocMoveResult,
   DocOutboundLink,
@@ -56,6 +55,8 @@ import { AuditLog } from '../../database/entities/audit-log.entity';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { DocService } from './doc.service';
+import { DocLinksService } from './doc-links.service';
+import type { SpaceDocCandidate } from './doc-links.service';
 import { DOC_IDEMPOTENCY_ENTITY_TYPE, DOC_SOURCE_NATIVE } from './doc-constants';
 import { EventService } from '../event/event.service';
 import { extractDocLinks, resolveHrefToDocPath, matchDocReferenceLink } from './link-health';
@@ -108,6 +109,9 @@ export class DocMoveService {
     @InjectRepository(IdempotencyRecord)
     private readonly idempotencyRepo: Repository<IdempotencyRecord>,
     private readonly docService: DocService,
+    // 全空间入链反扫内核（v1.90.0-dev backlinks 批次：由本类抽取为独立 DocLinksService）：
+    // 本类保留「文档移动唯一写通道」与 outbound/collision/routes/taskLinks 迁移视图
+    private readonly docLinksService: DocLinksService,
     private readonly eventService: EventService,
   ) {}
 
@@ -119,14 +123,17 @@ export class DocMoveService {
    * path 碰撞检测（targetCollision）与 outbound 出链失效清单
    * （outboundPathLinksToRewrite，v1.61.0 f80a04ea）。
    *
-   * 入链反扫：全空间未删 doc 逐篇 sections 还原全文（reconstructContent
-   * skipDuplicateTitle=false，与 recalcSpaceLinkHealth 输入完全同源）→
-   * extractDocLinks 提取 → 反向匹配目标 doc。匹配规则 single-source：
-   * - ?doc= 平台规范链接（matchDocReferenceLink）按 docId 比对，isPathBased=false；
-   * - 相对 .md path 链接（resolveHrefToDocPath(href, sourceDoc.path) 严格源目录
-   *   解析，v1.61.0）与 target.path 等值比对，isPathBased=true。
-   * 去重契约：inboundLinks 按 (sourceDocId, href) 去重；section 定位 = 该 href
-   * 首个命中 section 的 position/headingPath。
+   * 入链反扫自 v1.90.0-dev 起**抽取至 DocLinksService.scanInboundLinks**（全空间
+   * 「入链反扫」的家，与 GET /docs/:id/backlinks 共用同一份实现）：本类只消费其
+   * 返回的 inboundLinks + 候选集。匹配规则 / 去重 / section 定位契约见该 service
+   * 的 AGENT-CODE-HOOK（单源 link-health.ts）。
+   *
+   * ⚠️ 可观测契约变化（v1.90.0-dev，勿当作纯重构）：内核候选集补了
+   * `ORDER BY d.path ASC, d.id ASC`，因此 **inboundLinks（及派生自它的
+   * pathBasedLinksToRewrite）的数组顺序从「PG 返回顺序（任意）」变为「sourcePath
+   * 升序」。既有消费者若非按序读取不受影响；按数组序读取的（MCP get_doc_move_impact
+   * / POST move 的 response.impact）现在拿到确定顺序。另：入链 sections 由逐篇
+   * N+1 查询改为一次 `IN (...)` 批量查询，结果集与顺序不变。
    *
    * @param spaceId - 文档所属 DocSpace ID
    * @param doc - 目标文档实体（须未软删，由调用方 findById 保证）
@@ -138,85 +145,8 @@ export class DocMoveService {
     doc: Doc,
     proposedPath?: string,
   ): Promise<DocMoveImpact> {
-    // 1. 空间全部未删 doc（id + path + title），与 recalcSpaceLinkHealth 候选集同款
-    const docs = await this.docRepo
-      .createQueryBuilder('d')
-      .select(['d.id', 'd.path', 'd.title'])
-      .where('d.space_id = :spaceId', { spaceId })
-      .andWhere('d.deleted_at IS NULL')
-      .getMany();
-
-    // 2. 入链反扫（全空间逐篇 sections 还原 + 正则，262-doc 量级秒级，读操作可接受；
-    //    不做缓存——link_health 不存入链是有意设计）
-    const inboundLinks: DocInboundLink[] = [];
-    const seen = new Set<string>(); // 去重键 (sourceDocId, href)
-
-    for (const sourceDoc of docs) {
-      const sections = await this.sectionRepo
-        .createQueryBuilder('s')
-        .select([
-          's.content',
-          's.headingLevel',
-          's.headingPath',
-          's.headingText',
-          's.isContinuation',
-          's.position',
-        ])
-        .where('s.doc_id = :docId', { docId: sourceDoc.id })
-        .orderBy('s.position', 'ASC')
-        .getMany();
-
-      const content = this.docService.reconstructContent(sourceDoc, sections, false);
-      const hrefs = extractDocLinks(content);
-      if (hrefs.length === 0) continue;
-
-      // section 定位索引：href → 首个命中 section（同一 section 可能链多个 href；
-      // 同一 href 多处链只记首个命中 position——验收契约）
-      const hrefSection = new Map<string, { position: number; headingPath: string | null }>();
-      for (const s of sections) {
-        for (const h of extractDocLinks(s.content)) {
-          if (!hrefSection.has(h)) {
-            hrefSection.set(h, { position: s.position, headingPath: s.headingPath });
-          }
-        }
-      }
-
-      for (const href of hrefs) {
-        const key = `${sourceDoc.id}|${href}`;
-        if (seen.has(key)) continue;
-
-        let hit = false;
-        let isPathBased = false;
-        const refDocId = matchDocReferenceLink(href);
-        if (refDocId) {
-          // ?doc= 规范链接：按 docId 比对（move 不改 docId → 不受影响）
-          hit = refDocId === doc.id;
-          isPathBased = false;
-        } else {
-          // 相对 .md path 链接：严格源目录解析后与目标当前 path 等值比对
-          // （v1.61.0 语义变更：sourcePath 精确解析，无 docs/ 前缀补全候选）
-          const resolved = resolveHrefToDocPath(href, sourceDoc.path);
-          if (resolved === null) continue;
-          hit = resolved === doc.path;
-          isPathBased = true;
-        }
-        if (!hit) continue;
-
-        seen.add(key);
-        const section = hrefSection.get(href);
-        const entry: DocInboundLink = {
-          sourceDocId: sourceDoc.id,
-          sourcePath: sourceDoc.path,
-          sourceTitle: sourceDoc.title,
-          href,
-          isPathBased,
-          ...(section
-            ? { sectionPosition: section.position, headingPath: section.headingPath }
-            : {}),
-        };
-        inboundLinks.push(entry);
-      }
-    }
+    // 1+2. 入链反扫（内核外置）+ 空间候选集（outbound 复用，避免二次全空间查询）
+    const { inboundLinks, docs } = await this.docLinksService.scanInboundLinks(doc);
 
     // 3. doc_routes 引用（裸 docId 无 FK，move 后路由行自动连续；清单仅展示用途）
     const routes = await this.routeRepo
@@ -318,13 +248,15 @@ export class DocMoveService {
    *
    * @param doc - 被移文档实体（承载出链的源）
    * @param proposedPath - 提议的新 path
-   * @param docs - 空间全部未删 doc（id + path，移动前集合 + 移动后集合的原料）
+   * @param docs - 空间全部未删文档候选（id + path + title，来自入链内核的候选集；
+   *   移动前集合 + 移动后集合的原料。只需 path/id，故窄类型 SpaceDocCandidate 而非
+   *   完整 Doc 实体——禁止 `as Doc` 强转把实体不变量带进只读计算）
    * @returns outbound 清单（按文内出现顺序去重，section 定位取首个命中）
    */
   private async computeOutboundLinks(
     doc: Doc,
     proposedPath: string,
-    docs: Doc[],
+    docs: SpaceDocCandidate[],
   ): Promise<DocOutboundLink[]> {
     // 被移文档自身 sections（与入链反扫同款 select/排序，off-by-one 无）
     const sections = await this.sectionRepo

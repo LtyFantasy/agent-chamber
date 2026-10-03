@@ -7,6 +7,9 @@
  *   - 补充: 任务 T2（工具面管理/盘点视角补齐——doc_routes/docs 的 MCP 读通道）
  *   - 补充: v1.62.0（contentHash 读路径透传）——非 slim 条目透传 contentHash（原始写入
  *     payload 的 SHA-256，乐观锁 token）；slim 投影保持 {path,title,updatedAt} 不动
+ *   - 补充: v1.89.0-dev 批次 A——updatedAfter/sort 两参数 + **未知参数硬护栏**
+ *     （failedStep='validate_args'）。硬护栏是本批**仅 list_docs 不推广**的先例：
+ *     automcp 运行时零参数校验，白名单外的键此前会被静默丢弃（"猜错参数静默生效"）。
  *
  * [踩坑索引] -
  *
@@ -25,6 +28,22 @@
 import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamber/automcp';
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
+import { DOC_LIST_SORT_VALUES } from '@agent-chamber/shared';
+
+/** list_docs 的参数白名单（inputSchema 的全部键）——未知参数硬护栏的判据单源 */
+const LIST_DOCS_KNOWN_ARGS = new Set([
+  'spaceName',
+  'pathPrefix',
+  'category',
+  'docType',
+  'tag',
+  'q',
+  'page',
+  'pageSize',
+  'slim',
+  'updatedAfter',
+  'sort',
+]);
 
 // ---------------------------------------------------------------------------
 // 类型定义
@@ -131,9 +150,23 @@ export const listDocsTool: CustomTool = {
       'title/path — for full-text content search use search_docs). ' +
       'Paginated: page (default 1) + pageSize (default 20, max 100); response is ' +
       '{items,total,page,pageSize,totalPages,hasNext,hasPrev} — loop on hasNext to fetch everything. ' +
+      'RECENT-CHANGES GUARDRAILS (updatedAfter / sort, v1.89.0-dev): updatedAfter is a LOWER bound ' +
+      'only (inclusive, ISO 8601) — THERE IS NO updatedBefore in this version. The default order is ' +
+      'PATH ASC, so for "most recently updated first" you MUST pass sort="updatedAt_desc" ' +
+      'explicitly (updatedAt_desc/updatedAt_asc; the tie-breaker is always path ASC, which keeps ' +
+      'pagination stable across pages). Spell it camelCase: updatedAfter / updatedAt_desc. ' +
+      'updatedAfter filters METADATA only (docs.updated_at): there is no content-level increment ' +
+      '(full text still needs read_doc per doc, or export the subtree), DELETIONS ARE INVISIBLE ' +
+      '(soft-deleted docs are filtered out and do not bump updatedAt — mirroring must period-reconcile ' +
+      'or consume doc_deleted events), and updated_at is written by TWO clocks (save() uses the ' +
+      'application clock; metadata patch/move use DB NOW()) — re-read a watermark look-back window ' +
+      '(default ≥ 5 minutes, or your longest write transaction) and de-duplicate by contentHash. ' +
       'Each item carries contentHash (SHA-256 of the original upsert payload — the optimistic-' +
       'lock token used as expectedContentHash on upsert/patch/move; NOT the hash of the returned ' +
       'summary text, never self-compute). ' +
+      'UNKNOWN PARAMETERS ARE REJECTED: any argument outside this schema that carries a value ' +
+      'returns {error:true, failedStep:"validate_args"} instead of being silently dropped — ' +
+      'check the parameter name rather than assuming it took effect. ' +
       'slim=true projects each item to {path,title,updatedAt} only (summaries are the token bulk ' +
       'in inventory scenarios). Use get_docs_overview for the categorized map, read_doc for content.',
     inputSchema: {
@@ -182,12 +215,56 @@ export const listDocsTool: CustomTool = {
             'Optional: project each item to {path,title,updatedAt} only, dropping summary and ' +
             'other metadata to minimize tokens. Default false.',
         },
+        updatedAfter: {
+          type: 'string',
+          description:
+            'Optional: only docs updated at/after this ISO 8601 time (inclusive), e.g. ' +
+            '"2026-09-30T00:00:00.000Z". LOWER bound only — there is NO updatedBefore. Metadata ' +
+            'level only: deletions are invisible and content changes are not implied.',
+        },
+        sort: {
+          type: 'string',
+          // 枚举值从 shared DOC_LIST_SORT_VALUES 单源取值（防 backend DTO 加值后此处漂移）
+          enum: [...DOC_LIST_SORT_VALUES],
+          description:
+            'Optional: sort mode. Omit for the default path ASC. "updatedAt_desc"/"updatedAt_asc" ' +
+            'sort by docs.updated_at with path ASC as the tie-breaker (stable pagination). ' +
+            'For "recently changed first" you MUST pass updatedAt_desc explicitly.',
+        },
       },
       required: ['spaceName'],
     },
   },
 
   async handler(args: Record<string, unknown>, ctx: CustomToolContext): Promise<ToolCallResult> {
+    // ── 未知参数硬护栏（v1.89.0-dev 批次 A；**本批仅 list_docs，不推广**）──
+    // automcp 运行时零参数校验，原始 arguments 直交 handler（mcp-server.ts:552-564）——
+    // 白名单外的键此前会被静默丢弃（"猜错参数却以为生效"）。这里显式响亮拒绝，
+    // failedStep 取 validate_* 同族（对齐 import-docs / get-my-briefing 先例）。
+    // 判定口径与下面的 filterKeys 一致：**非空值**才算传参（undefined/null/'' 视为未传）。
+    const unknownKeys = Object.keys(args).filter(
+      (key) =>
+        !LIST_DOCS_KNOWN_ARGS.has(key) &&
+        args[key] !== undefined &&
+        args[key] !== null &&
+        args[key] !== '',
+    );
+    if (unknownKeys.length > 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: true,
+              failedStep: 'validate_args',
+              message: `unknown parameter ${unknownKeys[0]}`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
     const spaceName = args.spaceName as string;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 
@@ -257,7 +334,18 @@ export const listDocsTool: CustomTool = {
     // 步骤 3：拉取文档清单（过滤/分页参数透传；空值不携带，保持请求干净）
     // 参数名映射：工具面 docType → 后端 type（对齐 QueryDocDto 既有契约）
     const spaceId = matches[0].id;
-    const filterKeys = ['pathPrefix', 'category', 'tag', 'q', 'page', 'pageSize'] as const;
+    // ⚠️ 新增参数必须同时进本列表，否则会被静默丢弃（v1.89.0-dev：updatedAfter/sort 已入列；
+    // 未知键现由 handler 顶部的硬护栏响亮拒绝，不再静默）
+    const filterKeys = [
+      'pathPrefix',
+      'category',
+      'tag',
+      'q',
+      'page',
+      'pageSize',
+      'updatedAfter',
+      'sort',
+    ] as const;
     const params: Record<string, unknown> = {};
     for (const key of filterKeys) {
       const value = args[key];

@@ -576,6 +576,21 @@ export const DOC_TREE_SORT_VALUES = ['recent', 'name'] as const;
 export type DocTreeSort = (typeof DOC_TREE_SORT_VALUES)[number];
 
 /**
+ * 文档列表排序模式（GET /doc-spaces/:id/docs 的 sort 参数，v1.89.0-dev 批次 A）
+ *
+ * - **缺省（不传 sort）**：path ASC（既有行为，逐字节不变）；
+ * - `updatedAt_desc` / `updatedAt_asc`：按 `docs.updated_at` 排序，**次键恒为 path ASC**
+ *   （path 是 upsert 业务键、应用层唯一 ⇒ 全序；批量 upsert 同值常见，缺次键分页会抖）。
+ *
+ * ⚠️ 与搜索面的 `DOC_SEARCH_SORT_VALUES`（`createdAt_*`）是**词表双轨，不可互换**：
+ * 搜索排的是"文档创建时间"，本词表排的是"文档最后更新时间"。
+ */
+export const DOC_LIST_SORT_VALUES = ['updatedAt_desc', 'updatedAt_asc'] as const;
+
+/** DOC_LIST_SORT_VALUES 元素联合（'updatedAt_desc' | 'updatedAt_asc'） */
+export type DocListSort = (typeof DOC_LIST_SORT_VALUES)[number];
+
+/**
  * 文档搜索命中项
  * 按 position 定位（替代不稳定 sectionId）
  */
@@ -634,16 +649,41 @@ export interface DocSearchHit {
  * 消费方三处同改：web `apps/web/src/lib/api.ts` 返回类型 + `docs/[id]/page.tsx` 解构 +
  * platform-mcp `search-docs.ts`（取 body.hits 并透传 hint）。
  */
+/**
+ * 搜索 hint 三态机器判别码（v1.89.0-dev 批次 A 落地；`DocSearchResponse.hintCode` 值域单源）
+ *
+ * rationale：`hint` 是**给人/Agent 读的文案**，逐字稳定但不适合程序分支（文案微调即
+ * 破消费方匹配）。`hintCode` 是同一触发条件的**机器判别面**，与 `hint` 一一对应：
+ * - `zero_hit` → DOC_SEARCH_ZERO_HIT_HINT（零命中，或降级查询零命中——"换词"更可操作）；
+ * - `weak_hit` → DOC_SEARCH_WEAK_HIT_HINT（**有结果**但最高分低于本面活阈值）；
+ * - `positional_order` → DOC_SEARCH_POSITIONAL_ORDER_HINT（降级路径且未按相关度排序）。
+ *
+ * ⚠️ 与 hint 同生命周期：**无 hint 时 `hintCode` 不出现（不是 null）**——消费方三处
+ * jest `toEqual` 严格相等断言钉住这一形态（prefilter ⑦ / invariants ⑪ / search spec）。
+ */
+export const DOC_SEARCH_HINT_CODES = ['zero_hit', 'weak_hit', 'positional_order'] as const;
+
+/** hintCode 取值联合（'zero_hit' | 'weak_hit' | 'positional_order'） */
+export type DocSearchHintCode = (typeof DOC_SEARCH_HINT_CODES)[number];
+
 export interface DocSearchResponse {
   /** 命中列表（排序语义见 DocSearchHit.reranked 与 hint 的位置序声明） */
   hits: DocSearchHit[];
   /**
-   * 零命中/弱命中/降级引导（仅触发时出现）：
-   * - 零命中或最高分低于**本面活阈值** → DOC_SEARCH_ZERO_HIT_HINT；
-   * - 单 CJK 字 / df 降级路径（未按相关度排序）→ DOC_SEARCH_POSITIONAL_ORDER_HINT。
+   * 零命中/弱命中/降级引导（仅触发时出现），与 `hintCode` 一一对应：
+   * - `zero_hit`：零命中（含降级查询零命中）→ DOC_SEARCH_ZERO_HIT_HINT；
+   * - `weak_hit`：**有结果**但最高分低于**本面活阈值** → DOC_SEARCH_WEAK_HIT_HINT；
+   * - `positional_order`：单 CJK 字 / df 降级路径且按位置序（未按相关度）→
+   *   DOC_SEARCH_POSITIONAL_ORDER_HINT。
    * 红线（security ③）：hint 术语来源固定（静态词表/本次已召回结果），**禁提权重查**。
    */
   hint?: string;
+  /**
+   * `hint` 的机器判别码（additive 可选键，MCP `search_docs` 原样透传）：
+   * **无 hint 时不出现该键**（禁 null——消费方 jest `toEqual` 严格相等断言在册），
+   * 消费方分支请读本键而非匹配文案。
+   */
+  hintCode?: DocSearchHintCode;
 }
 
 /**
@@ -677,6 +717,23 @@ export const DOC_SEARCH_ZERO_HIT_HINT =
   'intent via list_doc_routes, or anchor on an exact English identifier (file/symbol name). ' +
   'Paraphrase mismatches (same concept, different wording) are a known v1 boundary — ' +
   'they need v3 semantic retrieval, not more retries.';
+
+/**
+ * 文档检索**弱命中**引导原文（v1.89.0-dev 批次 A 从零命中文案拆出；REST 信封 `hint`
+ * 字段单源，`hintCode = 'weak_hit'`）。
+ *
+ * 为什么必须与零命中文案分家：弱命中 = **本页有结果**，只是最高分低于活阈值（
+ * `DOC_SEARCH_WEAK_HIT_SCORE`）。复用零命中文案（"No sections strongly matched" +
+ * "not more retries"）会让消费方丢掉**已经返回、且可能正是答案**的结果。故本文案的
+ * 第一动作是"先用"，换词是**条件动作**（仅当结果看起来不相关）。
+ *
+ * 措辞不匹配类属 v1 边界的说明仍由零命中文案承担（弱命中场景不适用——已经有召回）。
+ */
+export const DOC_SEARCH_WEAK_HIT_HINT =
+  'Results were returned, but none scored above the strong-hit line: they may still be the ' +
+  'answer, so use them first. Only if they look unrelated, try shorter 2-4 character domain ' +
+  'terms, browse curated intent via list_doc_routes, or anchor on an exact English identifier ' +
+  '(file/symbol name). This is a relevance caveat, not a failure.';
 
 /**
  * 位置序声明引导（单 CJK 字查询 / df 降级路径专用，计划 §2.5）：候选经全文索引精确
@@ -1225,7 +1282,13 @@ export interface DocMoveImpact {
   contentHash: string | null;
   /** 提议的新 path（proposedPath/toPath 非空时返回） */
   proposedPath?: string;
-  /** 入链清单（全空间反扫，按 (sourceDocId, href) 去重） */
+  /**
+   * 入链清单（全空间反扫，按 (sourceDocId, href) 去重）。
+   *
+   * **数组顺序契约（v1.90.0-dev 起确定）**：按来源文档 path 升序（候选集
+   * `ORDER BY d.path ASC, d.id ASC`）。此前无 ORDER BY，顺序 = PG 返回顺序（任意、
+   * 不可复现）；按数组序读取的消费者（agent 面 get_doc_move_impact）现在拿到稳定顺序。
+   */
   inboundLinks: DocInboundLink[];
   /** doc_routes 引用清单 */
   docRoutes: DocRouteRef[];
@@ -1236,7 +1299,8 @@ export interface DocMoveImpact {
   /** proposedPath == 当前 path（no-op，调用方判 409 RESOURCE_CONFLICT） */
   samePath?: boolean;
   /** 需人工改写的入链子集（inboundLinks 中 isPathBased=true 的项）；
-   *  ?doc= 规范链接按 docId 引用，不受 move 影响，不在此清单 */
+   *  ?doc= 规范链接按 docId 引用，不受 move 影响，不在此清单。
+   *  顺序继承 inboundLinks（同数组过滤 → 同为来源 path 升序，v1.90.0-dev 起确定） */
   pathBasedLinksToRewrite: DocInboundLink[];
   /**
    * 被移文档自身的相对 .md 出链失效清单（v1.61.0 批次 1；仅 proposedPath 非空时携带）。
@@ -1320,4 +1384,60 @@ export interface PatchDocMetadataResult {
    * response_snapshot 存的首次成功响应。仅携带幂等键的请求可能出现。
    */
   idempotentReplay?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Backlinks（反向引用面板，v1.90.0-dev）
+// ---------------------------------------------------------------------------
+
+/**
+ * Backlinks 来源分组（GET /docs/:id/backlinks 的 sources 元素）
+ *
+ * 分组口径：同一来源文档（sourceDocId）的多条入链合并为一组；组级携带来源文档
+ * 三键（docId/path/title），组内 links 复用 DocInboundLink 的**逐条**字段。
+ *
+ * ⚠️ Omit 三键是本 DTO 的结构保证：`{...组级三键, ...link}` 恒等于一条完整
+ * `DocInboundLink`——让「摊平后与 move-impact.inboundLinks 语义等价」成为**类型
+ * 保证**而不是结构巧合（后端 e2e 的等价性护栏正是靠这一点做双方对比）。
+ */
+export interface DocBacklinksSource {
+  /** 入链来源文档 ID（出链方） */
+  sourceDocId: string;
+  /** 入链来源文档 path（出链方） */
+  sourcePath: string;
+  /** 入链来源文档 title（出链方） */
+  sourceTitle: string;
+  /**
+   * 该来源文档指向目标文档的入链（已剔除组级三键，避免逐条重复）
+   *
+   * 组内顺序契约：按 `sectionPosition` 升序，`sectionPosition` 缺省（非路径命中
+   * 且无 section 定位）排在最后；同位次按 href 升序（全序，两次请求数组全等）。
+   */
+  links: Array<Omit<DocInboundLink, 'sourceDocId' | 'sourcePath' | 'sourceTitle'>>;
+}
+
+/**
+ * 反向引用视图（GET /docs/:id/backlinks 响应）
+ *
+ * 人类消费面：回答「这篇文档被谁引用了、在哪些 section 引用的」。
+ * 与 move-impact 的三处语义差异（有意设计，勿合并两个端点）：
+ * - **自引用被过滤**（sourceDocId === docId 剔除）——对「谁引用我」是噪音且点击无反应；
+ *   move-impact 保留（迁移方需看到自身引用条目）；
+ * - 只返回入链面（move-impact 还带 routes/taskLinks/collision/outbound 等迁移视图）；
+ * - 按来源文档分组（move-impact 是扁平清单）。
+ */
+export interface DocBacklinks {
+  /** 被查文档 ID */
+  docId: string;
+  /** 被查文档当前 path */
+  path: string;
+  /** 引用该文档的**来源文档**篇数（= sources.length；自引用已剔除） */
+  docCount: number;
+  /** 入链**处数**（所有组 links 长度之和；同篇多 href → linkCount > docCount） */
+  linkCount: number;
+  /**
+   * 来源分组清单，**组级顺序契约**：按 `sourcePath` 升序（两次请求数组全等）。
+   * 不设 total（前端首屏取前 5 组，全量即本数组长度）。
+   */
+  sources: DocBacklinksSource[];
 }

@@ -49,6 +49,8 @@ function attachmentRow(overrides: Partial<Attachment> = {}): Attachment {
     originalName: '链路 图.png',
     sha256: 'a'.repeat(64),
     thumbSha256: 'b'.repeat(64),
+    status: 'ready',
+    expiresAt: null,
     ...overrides,
   } as Attachment;
 }

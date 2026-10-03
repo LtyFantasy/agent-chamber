@@ -1,8 +1,8 @@
 ---
 name: docs
 description: 平台 DocSpace（知识库）子 skill。覆盖三层消费模型（overview → search → read）、文档 upsert/delete、source 写入隔离（native vs git ingest）、任务-文档关联与 ingest 同步约定。Agent 阅读或产出平台文档时使用。
-version: 1.3.6
-updatedAt: 2026-09-26
+version: 1.4.1
+updatedAt: 2026-10-03
 ---
 
 # 文档知识库（DocSpace）— Agent 知识库
@@ -11,8 +11,8 @@ updatedAt: 2026-09-26
 > 文档由 Agent 生产、人类审阅；native 优先（平台 DB 即真相源），git ingest 为可选只读适配器。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
 >
-> **Skill 版本**: v1.3.6
-> **更新日期**: 2026-09-26
+> **Skill 版本**: v1.4.0
+> **更新日期**: 2026-09-30
 
 ---
 
@@ -64,7 +64,11 @@ search_docs { "spaceName": "...", "q": "权限模型", "limit": 5 }
 ```
 
 - **v1.86 起双路打分**：q 先经编译器（CJK 逐字 bigram ts 腿 + trgm 兜底腿 **OR 融合**，英文/标识符走 ts 词位腿），合成分 = `ts_rank_cd × 3.0` + `similarity(headingPath) × 0.5` + `similarity(content) × 0.6`，下限 `0.08` 过滤零相关噪音（弱命中线 `0.9`）。单 CJK 字查询走单字路径（常数分 `0.1`——可搜但低分、按节位而非相关度排序）。
-- **响应是 `{hits, hint?}` 信封**（v1.86 起，不再是裸数组）：零命中**或最高分 < 0.9（弱命中）**时带 `hint` 消费指引——**要读**并据此调整：换更贴近文档原词的 2–4 字术语 / 缩短查询 / 改走 `list_doc_routes` 策展意图 / 锚定英文标识符；单字与高频降级路径另带「未按相关度排序」声明。
+- **响应是 `{hits, hint?, hintCode?}` 信封**（v1.86 起；**v1.89.0-dev 起 hint 拆三态 + 新增机器判别码 `hintCode`**）：**按 `hintCode` 分支，勿匹配文案**——
+  - `zero_hit`（零命中）：换更贴近文档原词的 2–4 字术语 / 缩短查询 / 改走 `list_doc_routes` 策展意图 / 锚定英文标识符；**别用同义改写重试**（同概念异措辞属 v1 已知边界）。
+  - `weak_hit`（**有结果**，只是最高分低于活弱命中线，现构 `0.9`）：**先用手上结果**——它们可能正是答案；仅当明显不相关才换词，**别因这条提示弃页**（相关度提示，不是失败）。
+  - `positional_order`（单 CJK 字 / 高频降级，未按相关度排序）：换**更长**的查询（方向与 `zero_hit` 相反）。
+  - 无 `hint` 时 `hintCode` **不出现**（不是 `null`）。
 - 返回 `hits`：`{docId, docPath, docTitle, headingPath, position, snippet, score}`。**记下 `docId` + `position`** 供下一步精读。
 - **v1.55 起**：`offset`（跳过 N 条，配合 `limit` 穷尽翻页，上限 100000）+ `sort`（`relevance` 缺省｜`createdAt_desc`｜`createdAt_asc`，时间序接管 ORDER BY、跳过 boost 融合、不透出 boosts）+ `createdAfter`/`createdBefore`（ISO 8601，含边界）——「读最近 N 天日记」：`sort="createdAt_desc"&createdAfter=<now-7天>&limit=20`。
 
@@ -98,6 +102,30 @@ read_doc { "docId": "...", "headingQuery": "模块划分" }
 
 > 定位二选一：`(spaceName + path)` 精确路径 或 裸 `docId`。`position` 优先于 `headingPath`。
 > **BYTE-IDENTITY GUARANTEE**：小文档 `mode:'full'` 的 `content` 与 `GET /docs/:id/content?full=true` 匹配面逐字节同形（首 H1 保留）；`position`/`headingPath`、`positions[]`、`headingQuery` 三条 section 通道优先取后端 `markdown`，该字段是 full=true 全文的字节级子串（标题行插回、run-dedup 兄弟续 chunk 不插标题行、空正文节只插标题行）。复制 read_doc 全文或任一 section `markdown` 均可直接作为 `patch_doc` match 模式 `oldString`；旧服务端缺少 `markdown` 时才本地渲染兼容 fallback。
+
+### 2.4 消费模式选择（决策树，v1.89.0-dev 新增）
+
+> 先问自己「我要的是**点查**还是**全集**」——选错模式是 DocSpace 消费侧最常见的浪费：用 top-k 追全集（永远追不齐），或用全量 export 回答一个点查（拉几 MB 只为一句话）。
+
+| 我要… | 用什么 | 关键约束 |
+|------|-------|---------|
+| **点查**：某概念在哪篇 / 哪节 | `search_docs`（§2.2） | **top-k 非穷尽，绝不能当全集**；hint 按 `hintCode` 分叉 |
+| **关键词穷尽命中**：这个词到底出现在哪些文档 | `export_doc_space` 全量 → **本地匹配** | 服务端检索是排序面不是枚举面，全集只能自己算 |
+| **模式 / regex 扫描**：错误码、URL 形态、TODO 标记… | `export_doc_space` 全量 → **本地 grep / regex** | **服务端无 regex 通道**（检索走 tsquery + trgm 相关度，不是行级模式匹配）——别把正则塞进 `q=` |
+| **机审喂料**：批量喂审查 / 统计 | `export_doc_space { pathPrefix }` + `list_docs { updatedAfter, sort:"updatedAt_desc" }` | 三盲区 + 水位写法见下 |
+| **基准对照**：top-k 到底漏没漏 | export 全量作 **ground truth**，拿它质疑 top-k 召回 | 对外承诺（51ff0ea3）的兑现路径：先有全集，才谈得上评测 |
+| **单篇全文** | `read_doc`（小文档直接 full；大文档走 `GET /docs/:id/content?full=true`） | 匹配面与 `full=true` 逐字节同形，可直接作 `patch_doc` oldString |
+| **互链悬空** | link-health（已有基建，勿自建爬链） | — |
+| **最近变更** | `list_docs { updatedAfter, sort }` | **必须显式传 `sort="updatedAt_desc"`**（缺省是 path 序） |
+| **空间 / 目录规模** | `get_docs_overview` / `list_doc_tree` / `GET /doc-spaces/:id/docs/facets` | 规模面走聚合，别拉全量再数 |
+
+**机审喂料的三盲区（`updatedAfter` 增量维护）**：
+
+1. **只筛元数据**：`updated_at` 变化 ≠ 内容变化（元数据 patch / move 也 bump），且**不存在内容级增量**；
+2. **删除不可见**：软删文档被列表过滤且**不 bump** 时间列 ⇒ 镜像必须周期全量对账，或消费 `doc_deleted` 事件；
+3. **两个时钟源写同一列**：`save()` 走应用时钟（`new Date()`），元数据 patch / move 走 DB 时钟（`NOW()`）——水位写法 = `max(updatedAt) − 重叠窗口` 回看（**默认 ≥5 分钟，或你方最长写事务时长**）+ 按 `contentHash` 去重。
+
+⚠️ **部分快照警告**：带 `pathPrefix` 的 bundle **不是备份**——前缀外文档被丢弃，保留下来的路由可能携带指向包外的 `secondaryDocPath`（**同空间**回导该链路完好；导入**新空间**则该路由 per-item failed，响亮不静默）。`pathPrefix` 是**字面、大小写敏感**前缀（目录语义**带尾 `/`**）；零命中返回 200 空 bundle，读 `appliedFilters.matchedDocs === 0` 区分「前缀没命中」与「空间本来就空」。要给新空间播种请**不带 `pathPrefix`** 全量导出。
 
 ---
 
@@ -204,18 +232,21 @@ patch_doc { "spaceName": "...", "path": "docs/api-definition.md", "oldString": "
 
 ```bash
 list_docs { "spaceName": "...", "pathPrefix": "memory/", "slim": true }   # 平铺清单（分页拉全）
+list_docs { "spaceName": "...", "updatedAfter": "2026-09-30T00:00:00.000Z",
+            "sort": "updatedAt_desc" }                                     # 最近变更（v1.89.0-dev；sort 必须显式传）
 list_doc_tree { "spaceName": "...", "prefix": "memory/" }                 # 分层目录（v1.70.0-dev，逐层下钻）
 list_doc_routes { "spaceName": "...", "q": "架构" }                        # 意图路由清单（不传分页=全量数组）
 export_doc_space { "spaceName": "..." }                                    # 空间全量 bundle（formatVersion 2，v1.75.0-dev 起含媒体）
+export_doc_space { "spaceName": "...", "pathPrefix": "memory/" }           # 部分快照（v1.89.0-dev；**不是备份**）
 import_doc_bundle { "spaceName": "...", "bundle": <export_doc_space 输出> } # 回导（吃 v1/v2；默认不动 space meta）
 ```
 
-- `list_docs`：与 overview 分工——overview 是分类树地图，本工具是可翻页的平铺清单；`slim=true` 只回 `{path,title,updatedAt}`。
+- `list_docs`：与 overview 分工——overview 是分类树地图，本工具是可翻页的平铺清单；`slim=true` 只回 `{path,title,updatedAt}`。**v1.89.0-dev 起**新增 `updatedAfter`（ISO 8601，**只有下界**、含边界）与 `sort`（`updatedAt_desc` / `updatedAt_asc`；缺省仍是 **path ASC**，要"最近在前"必须显式传）。⚠️ 与搜索面的 `createdAt_*` 是**词表双轨不可互换**；增量的三盲区与水位写法见 §2.4。**白名单外的参数会被拒**（`failedStep:'validate_args'`），不再静默丢弃——参数没生效先核对拼写（如 `updatedAfter` vs `updated_at`）。
 - `list_doc_tree`（v1.70.0-dev）：**大空间目录发现**——一次调用只返「当前层」直接子目录（递归 `docCount`/`latestDocAt` 聚合）+ 直挂文档 slim 分页；用返回的 `folder.path` 作下一次 `prefix` 逐层下钻（目录不递归展开，免全量拉取）；`sort=recent`（缺省）\|`name`；`docsLimit` 缺省 50 上限 200 / `foldersLimit` 缺省 200 上限 500，folders/docs 独立分页，`total` 不受 limit/offset 影响。**采集空间钻取链路**：`list_doc_tree` 根层看 `folders[].docCount` 找大目录 → 用其 `path` 下钻 → 目标层 `list_docs` 拉全量 → `read_doc` 精读。
 - `list_doc_routes`：不传 `page`/`pageSize` = 全量数组（上限 1000 条兜底）；传 = 分页信封。
-- `export_doc_space`：空间元数据 + categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇全文与策展元数据；**v1.75.0-dev 起 `formatVersion 2` 另含 `media[]`（doc 绑定附件的原始字节 + 缩略图，base64）与 informational `mediaOmitted[]`（正文引用但刻意未打包的 topic 绑定附件）**——媒体受**联合请求体预算**约束（`10MiB − docs 段实际字节 − 64KiB 余量`），未打包项同段落 `{skipped:'too_large'|'budget_exceeded', ...meta}`（可发现优于静默截断）；read 权限即可；快照可落 git 做版本对齐 diff / 离线灾备。
-- `import_doc_bundle`：**六阶段有序回导**（categories 按名幂等 → media stage-1（字节证据校验 + 插入或复用）→ docs 每篇独立事务 + 正文附件 URL 按配对映射重写（**无映射不重写**）→ media stage-2 回绑 docId → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；`formatVersion` 接受 **{1, 2}**（1 = 存量快照格式，整段跳过 media，结果信封 media 段全零值），其余值 400；**同 bundle 重复回导幂等**（附件行数/对象数不变、docs unchanged——复用键 + tie-break 保证收敛）；返回 per-item `created/updated/unchanged/failed` + `media:{created,reused,skipped,failed[]}` 计数；需 space write。
-- **媒体打包边界**（v1.75.0-dev 起，详见 [`../SKILL.md` §3a.3/§3a.4](../SKILL.md)）：只打包 **doc 绑定**附件；**topic 绑定附件仍不打包**（跨环境 topic id 不通用）——它们在 `mediaOmitted[]`（`reason:'topic_bound'`）里可见，回导后该处断链；导出侧 `media[].skipped` 项需另行取件。
+- `export_doc_space`：空间元数据 + categories + routes（含 codeEntryType，文档以 path 引用）+ 每篇全文与策展元数据；**v1.75.0-dev 起 `formatVersion 2` 另含 `media[]`（doc 绑定附件的原始字节 + 缩略图，base64）与 informational `mediaOmitted[]`（正文引用但刻意未打包的 topic 绑定附件）**——媒体受**联合请求体预算**约束（`10MiB − docs 段实际字节 − 64KiB 余量`），未打包项同段落 `{skipped:'too_large'|'budget_exceeded', ...meta}`（可发现优于静默截断）；read 权限即可；快照可落 git 做版本对齐 diff / 离线灾备。**v1.89.0-dev 起**支持 `pathPrefix` **部分快照**：收窄 docs / categories（只留入选文档引用的）/ routes（只按 **primary** 筛）/ media，并回声 `appliedFilters:{pathPrefix, matchedDocs}`（含零命中；200 空 bundle 不是错误）。⚠️ **不是备份**且路由的 `secondaryDocPath` 可能指向包外文档——详见 §2.4。
+- `import_doc_bundle`：**六阶段有序回导**（categories 按名幂等 → media stage-1（字节证据校验 + 插入或复用）→ docs 每篇独立事务 + 正文附件 URL 按配对映射重写（**无映射不重写**）→ media stage-2 回绑 docId → routes 按 intent+primaryDocPath 幂等 → space meta 默认**跳过**，`overwriteSpaceMeta=true` 显式开启）；`formatVersion` 接受 **{1, 2}**（1 = 存量快照格式，整段跳过 media，结果信封 media 段全零值），其余值 400；**同 bundle 重复回导幂等**（附件行数/对象数不变、docs unchanged——复用键 + tie-break 保证收敛）；返回 per-item `created/updated/unchanged/failed` + `media:{created,reused,skipped,failed[]}` 计数；需 space write。bundle 顶层的 `appliedFilters`（v1.89.0-dev）为 informational，**回导显式忽略**（DTO 已声明，带该键可安全回导）。
+- **媒体打包边界**（v1.75.0-dev 起；导出侧过滤 v1.90.0-dev 起，详见 [`../SKILL.md` §3a.3/§3a.4](../SKILL.md)）：只打包 **doc 绑定**附件；**topic 绑定附件仍不打包**（跨环境 topic id 不通用）——它们在 `mediaOmitted[]`（`reason:'topic_bound'`）里可见，回导后该处断链；**v1.90.0-dev 起 doc 导出显式排除非图片附件**（非图片 `mime_type` 恒 `application/octet-stream`，打包无意义）——同样进 `mediaOmitted[]`，`reason:'unsupported_media_type'`（显式报出，不静默丢）；导出侧 `media[].skipped` 项需另行取件。
 
 ---
 
@@ -260,11 +291,11 @@ PLATFORM_API_KEY=asp_xxx node scripts/sync-docs.mjs --dry-run  # 只打印不写
 
 | 分组 | 端点 |
 |------|------|
-| 空间 | `POST/GET /doc-spaces`、`GET/PATCH/DELETE /doc-spaces/:id`、`GET /doc-spaces/:id/overview`（v1.55 起 routes 段截断 + `routesTruncated`/`routesTotal`）、`GET /doc-spaces/:id/export`（v1.55 全量导出 bundle；**v1.75.0-dev 起 `formatVersion 2` 含媒体字节**）、`POST /doc-spaces/:id/import-bundle`（v1.55 回导，吃 v1/v2，`?overwriteSpaceMeta=`） |
+| 空间 | `POST/GET /doc-spaces`、`GET/PATCH/DELETE /doc-spaces/:id`、`GET /doc-spaces/:id/overview`（v1.55 起 routes 段截断 + `routesTruncated`/`routesTotal`）、`GET /doc-spaces/:id/export`（v1.55 全量导出 bundle；**v1.75.0-dev 起 `formatVersion 2` 含媒体字节**；**v1.89.0-dev 起 `?pathPrefix=` 部分快照 + `appliedFilters` 回声**，未知 query 参数由静默忽略变 400）、`POST /doc-spaces/:id/import-bundle`（v1.55 回导，吃 v1/v2，`?overwriteSpaceMeta=`） |
 | 成员（creator-only） | `POST /doc-spaces/:id/{invite-agent,uninvite-agent,add-editor,remove-editor}` |
 | 分类 | `POST /doc-spaces/:id/categories`、`PATCH/DELETE /doc-categories/:id` |
 | 意图路由（v1.43 起） | `GET/POST /doc-spaces/:id/routes`（v1.55 起 GET 双模式：无分页参数=全量数组+1000 兜底，传 page/pageSize=分页信封，q/category 过滤）、`PATCH/DELETE /doc-routes/:id`、`POST /doc-spaces/:id/routes/recheck`（手动重检 health，space write）、`PUT /doc-spaces/:id/repo-manifest`（仓库清单上报，space write） |
-| 文档读 | `GET /doc-spaces/:id/docs`（v1.55 起 `pathPrefix=` 前缀过滤，与 `path=` 互斥）、`GET /doc-spaces/:id/docs/tree`（v1.70.0-dev 懒加载目录树：prefix 分层 + folders/docs 独立分页）、`GET /doc-spaces/:id/docs/facets`（v1.70.0-dev 全空间 type/tag/category 聚合计数）、`GET /doc-spaces/:id/search`（v1.55 起 `offset`/`sort`/`createdAfter`/`createdBefore`）、`GET /docs/:id`（小文档 full 与 `full=true` 匹配面逐字节同形）、`GET /docs/:id/content`（`full=true` 为保真匹配面，默认 `false` web 渲染）、`GET /docs/:id/sections/:position?`（v1.55 起 `positions=1,3,5` 批量 + `headingQuery=` 模糊定位；v1.57.1 起响应新增保真 `markdown` 字段） |
+| 文档读 | `GET /doc-spaces/:id/docs`（v1.55 起 `pathPrefix=` 前缀过滤，与 `path=` 互斥；**v1.89.0-dev 起 `updatedAfter=`（ISO 8601 下界，含边界）+ `sort=`（`updatedAt_desc`/`updatedAt_asc`，缺省 path ASC）**——⚠️ 与搜索面的 `createdAt_*` 词表**双轨不可互换**）、`GET /doc-spaces/:id/docs/tree`（v1.70.0-dev 懒加载目录树：prefix 分层 + folders/docs 独立分页）、`GET /doc-spaces/:id/docs/facets`（v1.70.0-dev 全空间 type/tag/category 聚合计数）、`GET /doc-spaces/:id/search`（v1.55 起 `offset`/`sort`/`createdAfter`/`createdBefore`；**v1.89.0-dev 起响应信封加 `hintCode` 三态判别**）、`GET /docs/:id`（小文档 full 与 `full=true` 匹配面逐字节同形）、`GET /docs/:id/content`（`full=true` 为保真匹配面，默认 `false` web 渲染）、`GET /docs/:id/sections/:position?`（v1.55 起 `positions=1,3,5` 批量 + `headingQuery=` 模糊定位；v1.57.1 起响应新增保真 `markdown` 字段） |
 | 文档写 | `PUT /doc-spaces/:id/docs`（v1.57 起可选 `expectedContentHash`）、`PUT /doc-spaces/:id/docs/batch`（1–50 篇批量，不支持 expectedContentHash）、`PATCH /docs/:id/sections/:position`（v1.55 section 级写，body `{content, expectedSectionHash?}`，`?source=` 可选）、`PATCH /docs/:id/content`（v1.57 match 模式写，body `{oldString, newString}`，操作面=full=true 保真全文）、`DELETE /docs/:id` |
 | 任务关联 | `POST/DELETE /tasks/:id/doc-links[/:docId]` |
 

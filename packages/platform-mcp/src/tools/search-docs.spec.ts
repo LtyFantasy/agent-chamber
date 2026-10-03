@@ -277,9 +277,10 @@ describe('search_docs', () => {
     expect(() => JSON.parse(text)).not.toThrow();
   });
 
-  it('hint 透传：信封带 hint 时原样产出（缺省不产出该键）', async () => {
+  it('hint / hintCode 透传：信封带两键时原样产出（缺省两键都不产出）', async () => {
     // 1-d2 终审补：`search-docs.ts` 的 hint 条件分支此前零覆盖——它是零命中/弱命中/
     // 降级位置序三类引导的**唯一出口**（消费方 Agent 的行为指令），必须钉住两种形态。
+    // v1.89.0-dev 批次 A：hintCode 是同出口的机器判别面（同形白名单展开），同步钉住。
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -287,6 +288,7 @@ describe('search_docs', () => {
     request.mockResolvedValueOnce({
       hits: [],
       hint: 'No sections strongly matched. Try shorter 2-4 character domain terms.',
+      hintCode: 'zero_hit',
     });
 
     const withHint = JSON.parse(
@@ -295,8 +297,9 @@ describe('search_docs', () => {
     );
     expect(withHint.hits).toEqual([]);
     expect(withHint.hint).toContain('No sections strongly matched');
+    expect(withHint.hintCode).toBe('zero_hit');
 
-    // 缺省（信封无 hint 键）⇒ 响应里也不产出 hint 键（additive 契约，老客户端无感）
+    // 缺省（信封无 hint / hintCode 键）⇒ 响应里也不产出两键（additive 契约，老客户端无感）
     const plain = mockRequest();
     plain.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
@@ -307,5 +310,6 @@ describe('search_docs', () => {
       (await searchDocsTool.handler({ spaceName: 'My Docs', q: 'test' }, ctx())).content[0].text,
     );
     expect(withoutHint).not.toHaveProperty('hint');
+    expect(withoutHint).not.toHaveProperty('hintCode');
   });
 });

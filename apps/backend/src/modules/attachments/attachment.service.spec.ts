@@ -12,6 +12,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  GoneException,
   NotFoundException,
   PayloadTooLargeException,
 } from '@nestjs/common';
@@ -312,14 +313,56 @@ describe('AttachmentService', () => {
     });
   });
 
-  describe('upload 校验链：3 魔数 + 4 尺寸', () => {
-    it('魔数不命中白名单 → 400 ATTACHMENT_TYPE_NOT_ALLOWED', async () => {
-      const file = makeFile({ buffer: Buffer.from('<?xml version="1.0"?><svg/>') });
-      await expectError(
-        service.upload(ACTOR, { topicId: 'topic-1' }, file),
-        BadRequestException,
-        ErrorCode.ATTACHMENT_TYPE_NOT_ALLOWED,
+  describe('upload 校验链：3 字节证据分类 + 4 尺寸', () => {
+    it('非图片字节 → 非图片分支：201 + octet-stream + .bin 键 + client_mime_type 展示值（类型放开）', async () => {
+      // 声明 image/png 的 HTML 字节：M1 不变量——声明值绝不影响 mime_type
+      const file = makeFile({
+        buffer: Buffer.from('<!doctype html><html><script>alert(1)</script>'),
+        originalname: 'evil.png',
+        mimetype: 'image/png',
+      });
+      const res = await service.upload(ACTOR, { topicId: 'topic-1' }, file);
+
+      // putObject：uuid.bin 恒定键 + 原 buffer + 恒 octet-stream（声明值不固化）
+      const [key, buf, mime] = storage.putObject.mock.calls[0];
+      expect(key).toMatch(/^[0-9a-f-]{36}\.bin$/);
+      expect(buf).toBe(file.buffer);
+      expect(mime).toBe('application/octet-stream');
+
+      // 插行：mime_type=字节证据（octet-stream），client_mime_type=sanitize 后声明值
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.mimeType).toBe('application/octet-stream');
+      expect(created.clientMimeType).toBe('image/png');
+      expect(created.thumbKey).toBeNull(); // 非图片跳过缩略图（无解码面）
+
+      // 响应：恒出现 clientMimeType（四表面同一口径）
+      expect(res).toMatchObject({
+        mimeType: 'application/octet-stream',
+        clientMimeType: 'image/png',
+      });
+    });
+
+    it('非图片 + 声明值非法 → client_mime_type 落 NULL（sanitize 兜底）', async () => {
+      const file = makeFile({
+        buffer: Buffer.from([0x00, 0x01, 0x02, 0x03]),
+        mimetype: 'not a mime',
+      });
+      await service.upload(ACTOR, { topicId: 'topic-1' }, file);
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.mimeType).toBe('application/octet-stream');
+      expect(created.clientMimeType).toBeNull();
+    });
+
+    it('非图片上传不触发 sharp 解码（无缩略图尝试）：putObject 仅一次', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const file = makeFile({ buffer: Buffer.from('%PDF-1.7 fake'), mimetype: 'application/pdf' });
+      await service.upload(ACTOR, { topicId: 'topic-1' }, file);
+      expect(storage.putObject).toHaveBeenCalledTimes(1);
+      // 非图片分支不进入缩略图 try/catch → 无 fail-open warn
+      expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).not.toContain(
+        'Thumbnail generation failed',
       );
+      warn.mockRestore();
     });
 
     it('魔数命中但头部尺寸不可解析 → 400 VALIDATION_ERROR', async () => {
@@ -429,18 +472,75 @@ describe('AttachmentService', () => {
       });
       expect(created.sha256).toBe(createHash('sha256').update(file.buffer).digest('hex'));
 
-      // 响应形状（plan §3.1 钉死九字段）
+      // 响应形状（plan §3.1 钉死字段 + v1.90.0-dev 两新列；四表面同一口径）
       expect(res).toEqual({
         id: 'att-1',
         contentUrl: '/api/v1/attachments/att-1/content',
         originalName: 'myphoto.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: file.buffer.length, // number，非 string
         sha256: created.sha256,
         topicId: 'topic-1',
         docId: null,
+        expiresAt: (created.expiresAt as Date).toISOString(),
         createdAt: FIXED_DATE,
       });
+      // TTL 冻结：topic.settings 为空 → fail-closed 回退默认 7d
+      expect((created.expiresAt as Date).getTime() - Date.now()).toBeGreaterThan(
+        6 * 24 * 60 * 60 * 1000,
+      );
+    });
+  });
+
+  describe('上传 TTL 冻结（§1.1）+ 配额口径（§1.3 R1）', () => {
+    it('topic 显式 attachmentTtl=1d → expires_at ≈ now+1d', async () => {
+      topicService.findById.mockResolvedValue({
+        ...OPEN_TOPIC,
+        settings: { attachmentTtl: '1d' },
+      });
+      await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      const ms = (created.expiresAt as Date).getTime() - Date.now();
+      expect(ms).toBeGreaterThan(23 * 60 * 60 * 1000);
+      expect(ms).toBeLessThan(25 * 60 * 60 * 1000);
+    });
+
+    it('topic 设置 never → expires_at = NULL（永久）', async () => {
+      topicService.findById.mockResolvedValue({
+        ...OPEN_TOPIC,
+        settings: { attachmentTtl: 'never' },
+      });
+      await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.expiresAt).toBeNull();
+    });
+
+    it('topic 设置脏值 → fail-closed 回退 7d（解析失败 ≠ never）', async () => {
+      topicService.findById.mockResolvedValue({
+        ...OPEN_TOPIC,
+        settings: { attachmentTtl: 'forever' },
+      });
+      await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      const ms = (created.expiresAt as Date).getTime() - Date.now();
+      expect(ms).toBeGreaterThan(6 * 24 * 60 * 60 * 1000);
+      expect(ms).toBeLessThan(8 * 24 * 60 * 60 * 1000);
+    });
+
+    it('doc 绑定 → expires_at 恒 NULL（豁免 TTL，即使声明了 attachmentTtl 也不适用）', async () => {
+      docService.findById.mockResolvedValue({ id: 'doc-1', spaceId: 'space-1' });
+      docSpaceService.findById.mockResolvedValue({ id: 'space-1' });
+      await service.upload(ACTOR, { docId: 'doc-1' }, makeFile());
+      const created = queryRunner.manager.create.mock.calls[0][1] as Record<string, unknown>;
+      expect(created.expiresAt).toBeNull();
+      expect(created.topicId).toBeNull();
+    });
+
+    it('配额 SUM 排除过期行（AND (expires_at IS NULL OR expires_at > now())）', async () => {
+      await service.upload(ACTOR, { topicId: 'topic-1' }, makeFile());
+      const sumSql = queryRunner.query.mock.calls[1][0] as string;
+      expect(sumSql).toContain('expires_at IS NULL OR expires_at > now()');
     });
   });
 
@@ -533,11 +633,13 @@ describe('AttachmentService', () => {
       objectKey: 'k.png',
       originalName: 'a.png',
       mimeType: 'image/png',
+      clientMimeType: 'image/png',
       sizeBytes: '33',
       sha256: 'ab'.repeat(32),
       status: 'ready',
       topicId: 'topic-1',
       docId: null,
+      expiresAt: null,
       createdAt: FIXED_DATE,
     } as unknown as Attachment;
 
@@ -572,13 +674,51 @@ describe('AttachmentService', () => {
         id: 'att-1',
         originalName: 'a.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: 33,
         sha256: 'ab'.repeat(32),
         topicId: 'topic-1',
         docId: null,
+        expiresAt: null,
         createdAt: FIXED_DATE,
       });
       expect(access.assertCanRead).toHaveBeenCalledWith(row, ACTOR);
+    });
+
+    it('过期懒判：getContent 行加载+授权后、getObject 前 → 410 + 12009（不取流）', async () => {
+      const expiredRow = {
+        ...row,
+        expiresAt: new Date(Date.now() - 1000),
+      } as unknown as Attachment;
+      attachmentRepo.findOne.mockResolvedValue(expiredRow);
+      await expect(service.getContent('att-1', ACTOR)).rejects.toBeInstanceOf(GoneException);
+      await expect(service.getContent('att-1', ACTOR)).rejects.toMatchObject({
+        response: { code: ErrorCode.ATTACHMENT_EXPIRED },
+      });
+      expect(storage.getObject).not.toHaveBeenCalled();
+      // 授权先于懒判（判定在 findAccessible 之后）
+      expect(access.assertCanRead).toHaveBeenCalled();
+    });
+
+    it('元数据面**不**判过期：GET :id 仍 200 带 expiresAt（懒判不下沉 findAccessible，m3）', async () => {
+      const expiredRow = {
+        ...row,
+        expiresAt: new Date(Date.now() - 1000),
+      } as unknown as Attachment;
+      attachmentRepo.findOne.mockResolvedValue(expiredRow);
+      const dto = await service.getMetadata('att-1', ACTOR);
+      expect(dto.expiresAt).toBe((expiredRow.expiresAt as Date).toISOString());
+      expect(storage.getObject).not.toHaveBeenCalled();
+    });
+
+    it('非 ready（潜伏态）→ getContent 404·12000（m6 就绪谓词，不取流）', async () => {
+      attachmentRepo.findOne.mockResolvedValue({ ...row, status: 'pending' } as Attachment);
+      await expectError(
+        service.getContent('att-1', ACTOR),
+        NotFoundException,
+        ErrorCode.ATTACHMENT_NOT_FOUND,
+      );
+      expect(storage.getObject).not.toHaveBeenCalled();
     });
 
     it('getContent：授权通过后按 objectKey 取流', async () => {
@@ -604,6 +744,9 @@ describe('AttachmentService', () => {
       thumbSha256: 'cd'.repeat(32),
       originalName: 'a.png',
       mimeType: 'image/png',
+      clientMimeType: null,
+      status: 'ready',
+      expiresAt: null,
     } as unknown as Attachment;
 
     it('无缩略图（thumb_key NULL）→ 404 + 12008，消息指导改用 /content', async () => {
@@ -629,6 +772,20 @@ describe('AttachmentService', () => {
       const res = await service.getThumbnail('att-1', ACTOR);
       expect(storage.getObject).toHaveBeenCalledWith('k.thumb.webp');
       expect(res).toEqual({ attachment: thumbRow, stream });
+    });
+
+    it('过期懒判先于无缩略图判定：过期且无 thumb → 410·12009（不因变体缺失改判语义）', async () => {
+      attachmentRepo.findOne.mockResolvedValue({
+        ...thumbRow,
+        thumbKey: null,
+        expiresAt: new Date(Date.now() - 1000),
+      } as Attachment);
+      await expectError(
+        service.getThumbnail('att-1', ACTOR),
+        GoneException,
+        ErrorCode.ATTACHMENT_EXPIRED,
+      );
+      expect(storage.getObject).not.toHaveBeenCalled();
     });
 
     it('无权限 → access 的 404·12000 透传（先于无缩略图判定，不因变体分码泄露存在性）', async () => {
@@ -659,6 +816,8 @@ describe('AttachmentService', () => {
       sha256: 'ab'.repeat(32),
       topicId: 'topic-1',
       docId: null,
+      status: 'ready',
+      expiresAt: null,
       createdAt: FIXED_DATE,
     } as unknown as Attachment;
     const withThumb = { ...withoutThumb, thumbKey: 'k.thumb.webp' } as unknown as Attachment;

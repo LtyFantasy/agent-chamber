@@ -9,7 +9,11 @@ import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { JudgmentRunnerService } from '../judgment/judgment-runner.service';
 import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
 import { DOC_SEARCH_WEAK_HIT_SCORE } from '../../common/utils/search/search-tuning';
-import { DOC_SEARCH_STRONG_HIT_SCORE, DOC_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
+import {
+  DOC_SEARCH_STRONG_HIT_SCORE,
+  DOC_SEARCH_WEAK_HIT_HINT,
+  DOC_SEARCH_ZERO_HIT_HINT,
+} from '@agent-chamber/shared';
 
 // ─── Mock helpers ──────────────────────────────────────────────
 
@@ -860,17 +864,24 @@ describe('DocSearchService', () => {
       }
     });
 
-    it('弱命中线读**现构** DOC_SEARCH_WEAK_HIT_SCORE（= 基准 0.3 × W1，R4）', async () => {
+    it('弱命中线读**现构** DOC_SEARCH_WEAK_HIT_SCORE（= 基准 0.3 × W1，R4）+ 独立 hint/hintCode', async () => {
       // 旧口径直读基准 0.3：W1=3 时 cd 单点恰好 0.3 ⇒ `0.3 < 0.3` 为假 ⇒ 弱命中分支整体失效
       // （1-d1 实测 3~4 条 → 0 条）。故取现构线的两侧各测一次：线内触发、线外不触发。
-      const below = async (score: number): Promise<string | undefined> => {
+      const atScore = async (score: number) => {
         mockOuterQb.getRawMany.mockResolvedValue([makeRawRow({ score })]);
-        const res = await service.search(['space-1'], { q: '端口映射失效' });
-        return res.hint;
+        return service.search(['space-1'], { q: '端口映射失效' });
       };
 
-      expect(await below(DOC_SEARCH_WEAK_HIT_SCORE * 0.5)).toBe(DOC_SEARCH_ZERO_HIT_HINT);
-      expect(await below(DOC_SEARCH_WEAK_HIT_SCORE * 1.5)).toBeUndefined();
+      // 线内：弱命中 ⇒ **独立文案**（v1.89.0-dev 批次 A：不再复用零命中文案）+ hintCode
+      const weak = await atScore(DOC_SEARCH_WEAK_HIT_SCORE * 0.5);
+      expect(weak.hint).toBe(DOC_SEARCH_WEAK_HIT_HINT);
+      expect(weak.hintCode).toBe('weak_hit');
+      expect(DOC_SEARCH_WEAK_HIT_HINT).not.toBe(DOC_SEARCH_ZERO_HIT_HINT);
+
+      // 线外：强命中 ⇒ hint / hintCode 两个键都不出现（additive 契约，禁 null）
+      const strong = await atScore(DOC_SEARCH_WEAK_HIT_SCORE * 1.5);
+      expect(Object.keys(strong)).toEqual(['hits']);
+
       // 前提自证：现构线必须**高于**基准线（否则本用例退化成旧口径的等价物）
       expect(DOC_SEARCH_WEAK_HIT_SCORE).toBeGreaterThan(DOC_SEARCH_STRONG_HIT_SCORE);
     });

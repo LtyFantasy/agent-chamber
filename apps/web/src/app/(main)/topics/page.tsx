@@ -1,8 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { Visibility, TopicKind, WakePolicy } from '@agent-chamber/shared';
-import type { Topic } from '@agent-chamber/shared';
+import { Visibility, TopicKind, WakePolicy, ATTACHMENT_TTL_VALUES } from '@agent-chamber/shared';
+import type { AttachmentTtl, Topic, TopicConfigInput } from '@agent-chamber/shared';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
@@ -35,6 +35,20 @@ import {
   Globe,
 } from 'lucide-react';
 
+/**
+ * 附件有效期档位 → i18n 词条（表单下拉文案；值域单源 = shared
+ * `ATTACHMENT_TTL_VALUES`，此处只做「值 → 词条」映射，禁止再抄一遍字面量清单）。
+ */
+const TTL_LABEL_KEYS: Record<AttachmentTtl, string> = {
+  '1d': 'form.attachmentTtl1d',
+  '7d': 'form.attachmentTtl7d',
+  '30d': 'form.attachmentTtl30d',
+  never: 'form.attachmentTtlNever',
+};
+
+/** 附件有效期缺省档（与后端 fail-closed 缺省 7d 对齐，plan §1.1） */
+const TTL_DEFAULT: AttachmentTtl = '7d';
+
 export default function TopicsPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('topics');
@@ -50,12 +64,17 @@ export default function TopicsPage() {
   const [newKind, setNewKind] = useState<TopicKind>(TopicKind.NORMAL);
   const [newWakePolicy, setNewWakePolicy] = useState<WakePolicy>(WakePolicy.MENTION);
   const [newMaxRounds, setNewMaxRounds] = useState('');
+  // 附件有效期（v1.90.0-dev 附件 TTL 批）：topic 级设置，写 settings.attachmentTtl，
+  // 上传时冻结（只影响新上传，不追溯既有附件）；缺省 7d 与后端 fail-closed 一致
+  const [newAttachmentTtl, setNewAttachmentTtl] = useState<AttachmentTtl>(TTL_DEFAULT);
 
   const [editTopic, setEditTopic] = useState<{
     id: string;
     title: string;
     description?: string;
     visibility?: Visibility;
+    /** 附件有效期档位（编辑态初值 = 详情 settings.attachmentTtl，缺省回退 7d） */
+    attachmentTtl: AttachmentTtl;
   } | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
@@ -74,6 +93,7 @@ export default function TopicsPage() {
       setNewKind(TopicKind.NORMAL);
       setNewWakePolicy(WakePolicy.MENTION);
       setNewMaxRounds('');
+      setNewAttachmentTtl(TTL_DEFAULT);
     },
   });
 
@@ -83,7 +103,12 @@ export default function TopicsPage() {
       data,
     }: {
       id: string;
-      data: { title: string; description?: string; visibility?: Visibility };
+      data: {
+        title: string;
+        description?: string;
+        visibility?: Visibility;
+        config?: TopicConfigInput;
+      };
     }) => Api.topics.update(id, data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['topics'] });
@@ -112,16 +137,15 @@ export default function TopicsPage() {
 
   const handleCreate = () => {
     if (!newTitle.trim()) return;
-    // 仅圆桌携带 config（普通话题不消费 wakePolicy/maxRounds，保持载荷瘦）；
-    // maxRoundsWithoutHuman 留空 = 后端缺省 8，显式 0 = 关闭安全阀（shared DTO 契约）
-    const config =
-      newKind === TopicKind.ROUNDTABLE
-        ? {
-            kind: TopicKind.ROUNDTABLE,
-            wakePolicy: newWakePolicy,
-            ...(newMaxRounds.trim() ? { maxRoundsWithoutHuman: Number(newMaxRounds) } : {}),
-          }
-        : undefined;
+    // config 现在两个用途都要：① 圆桌专属（kind/wakePolicy/maxRounds）；
+    // ② 附件有效期（所有 topic 通用——普通话题也消费）。maxRoundsWithoutHuman
+    // 留空 = 后端缺省 8，显式 0 = 关闭安全阀（shared DTO 契约）。
+    const config: TopicConfigInput = { attachmentTtl: newAttachmentTtl };
+    if (newKind === TopicKind.ROUNDTABLE) {
+      config.kind = TopicKind.ROUNDTABLE;
+      config.wakePolicy = newWakePolicy;
+      if (newMaxRounds.trim()) config.maxRoundsWithoutHuman = Number(newMaxRounds);
+    }
     createMutation.mutate({
       title: newTitle,
       description: newDesc,
@@ -138,19 +162,24 @@ export default function TopicsPage() {
         title: editTopic.title,
         description: editTopic.description,
         visibility: editTopic.visibility,
+        // 后端 update 把 config 并进 settings（kind 被忽略——创建后不可变），
+        // 只带 attachmentTtl：不覆盖用户历史写入的其他 settings 键
+        config: { attachmentTtl: editTopic.attachmentTtl },
       },
     });
   };
 
   const openEdit = async (topic: Topic) => {
     // 列表项只有 descriptionSnippet（截断值），编辑表单需完整描述，
-    // 通过详情接口拉取避免数据截断风险（spec.md §7.4a）
+    // 通过详情接口拉取避免数据截断风险（spec.md §7.4a）；settings 也只在详情
+    // 响应里透出（列表刻意剔除）——附件有效期初值同源取自 detail.settings
     const detail = await Api.topics.getById(topic.id);
     setEditTopic({
       id: topic.id,
       title: topic.title,
       description: detail.description ?? undefined,
       visibility: topic.visibility,
+      attachmentTtl: detail.settings?.attachmentTtl ?? TTL_DEFAULT,
     });
   };
 
@@ -340,6 +369,26 @@ export default function TopicsPage() {
           {/* 话题类型（v1.49.0 圆桌 web 创建入口）：radio 模式与 visibility 同规；
               kind 创建后不可变（后端契约），选中圆桌时展开圆桌专属配置 */}
           <div className="space-y-2">
+            <label className="text-sm font-medium" htmlFor="create-attachment-ttl">
+              {t('form.attachmentTtl')}
+            </label>
+            <select
+              id="create-attachment-ttl"
+              data-testid="create-attachment-ttl"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              value={newAttachmentTtl}
+              onChange={(e) => setNewAttachmentTtl(e.target.value as AttachmentTtl)}
+            >
+              {ATTACHMENT_TTL_VALUES.map((ttl) => (
+                <option key={ttl} value={ttl}>
+                  {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                  {t(TTL_LABEL_KEYS[ttl] as any)}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-muted-foreground">{t('form.attachmentTtlHint')}</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm font-medium">{t('form.kind')}</label>
             <div className="flex gap-4">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -468,6 +517,29 @@ export default function TopicsPage() {
                   <span className="text-sm">{t('visibility.private')}</span>
                 </label>
               </div>
+            </div>
+            {/* 附件有效期（编辑态）：初值 = detail.settings.attachmentTtl；只影响新上传 */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="edit-attachment-ttl">
+                {t('form.attachmentTtl')}
+              </label>
+              <select
+                id="edit-attachment-ttl"
+                data-testid="edit-attachment-ttl"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={editTopic.attachmentTtl}
+                onChange={(e) =>
+                  setEditTopic({ ...editTopic, attachmentTtl: e.target.value as AttachmentTtl })
+                }
+              >
+                {ATTACHMENT_TTL_VALUES.map((ttl) => (
+                  <option key={ttl} value={ttl}>
+                    {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                    {t(TTL_LABEL_KEYS[ttl] as any)}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">{t('form.attachmentTtlHint')}</p>
             </div>
           </div>
         )}

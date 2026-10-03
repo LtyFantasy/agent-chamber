@@ -10,9 +10,19 @@ interface SheetProps {
   children: React.ReactNode;
   side?: 'left' | 'right' | 'bottom';
   className?: string;
+  /**
+   * 面板可访问名（a11y，v1.90.0-dev 起可选）：传值时面板补 `role="dialog"` +
+   * `aria-label`——无 role 的浮层对读屏软件只是一块普通 div，入口按钮的 aria-expanded
+   * 语义接不上；不传值则 DOM 与历史完全一致（其余调用方的完整 pattern —— focus trap
+   * + inert + aria-labelledby —— 另立 follow-up，本批只做 docs 右栏）。
+   *
+   * **刻意不加 `aria-modal`**：无 focus trap / inert 时就声明 aria-modal 是假声明
+   * （键盘 Tab 仍会跑到浮层背后的内容上），比不加更糟。
+   */
+  ariaLabel?: string;
 }
 
-function Sheet({ open, onOpenChange, children, side = 'right', className }: SheetProps) {
+function Sheet({ open, onOpenChange, children, side = 'right', className, ariaLabel }: SheetProps) {
   const t = useTranslations('common');
   /** Escape 键关闭 */
   React.useEffect(() => {
@@ -39,13 +49,15 @@ function Sheet({ open, onOpenChange, children, side = 'right', className }: Shee
         className="fixed inset-0 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200"
         onClick={() => onOpenChange(false)}
       />
-      {/* Sheet 面板玻璃化（壳层元素允许 backdrop-blur）；glass 自带整圈边框，sideClass 的方向性 border 类被其取代 */}
+      {/* Sheet 面板玻璃化（壳层元素允许 backdrop-blur）；glass 自带整圈边框，sideClass 的方向性 border 类被其取代。
+          面板 a11y（仅传 ariaLabel 时生效）：role/aria-label 用展开属性下发，未传值的调用方 DOM 不变 */}
       <div
         className={cn(
           'glass fixed z-50 p-6 shadow-lg animate-in slide-in-from-right duration-300 flex flex-col',
           sideClass,
           className,
         )}
+        {...(ariaLabel ? { role: 'dialog', 'aria-label': ariaLabel } : {})}
       >
         <button
           onClick={() => onOpenChange(false)}

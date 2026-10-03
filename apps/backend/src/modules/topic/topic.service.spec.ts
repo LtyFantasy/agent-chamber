@@ -186,7 +186,20 @@ describe('TopicService', () => {
   let mockDataSource: jest.Mocked<DataSource>;
   let mockIdempotencyRepo: jest.Mocked<Repository<IdempotencyRecord>>;
   let mockAttachmentRepo: jest.Mocked<Repository<Attachment>>;
-  let mockEntityManager: { getRepository: jest.Mock; query: jest.Mock };
+  let mockEntityManager: {
+    getRepository: jest.Mock;
+    softRemove: jest.Mock;
+    createQueryBuilder: jest.Mock;
+    query: jest.Mock;
+  };
+  /** remove() 连带软删附件的 queryBuilder mock（affected 可逐用例改写） */
+  let mockCascadeQb: {
+    update: jest.Mock;
+    set: jest.Mock;
+    where: jest.Mock;
+    andWhere: jest.Mock;
+    execute: jest.Mock;
+  };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
   let mockAuditService: { log: jest.Mock };
 
@@ -298,7 +311,15 @@ describe('TopicService', () => {
     } as unknown as jest.Mocked<DataSource>;
 
     // EntityManager mock：getRepository 按类型返回对应 mock repo；
-    // query 用于 sendMessage 事务路径的原子条件 upsert（AUTO_JOIN_PARTICIPANT_SQL）
+    // query 用于 sendMessage 事务路径的原子条件 upsert（AUTO_JOIN_PARTICIPANT_SQL）；
+    // softRemove/createQueryBuilder 用于 remove() 的连带软删附件（v1.90.0-dev）
+    mockCascadeQb = {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      execute: jest.fn(async () => ({ affected: 0 })),
+    };
     mockEntityManager = {
       getRepository: jest.fn((entityClass: unknown) => {
         if (entityClass === Topic) return mockTopicRepo;
@@ -307,6 +328,8 @@ describe('TopicService', () => {
         if (entityClass === IdempotencyRecord) return mockIdempotencyRepo;
         return createMockRepo();
       }),
+      softRemove: jest.fn(async (entity: unknown) => entity),
+      createQueryBuilder: jest.fn(() => mockCascadeQb),
       query: jest.fn().mockResolvedValue([]),
     };
 
@@ -580,6 +603,42 @@ describe('TopicService', () => {
   });
 
   describe('create', () => {
+    it('config.attachmentTtl 落 settings（M2 写入面①：create 合并点）', async () => {
+      const createdTopic = createMockTopic({});
+      const savedTopic = createMockTopic({ id: 'topic-new', settings: { attachmentTtl: '30d' } });
+      mockTopicRepo.create.mockReturnValue(createdTopic);
+      mockTopicRepo.save.mockResolvedValue(savedTopic);
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant({}));
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant({}));
+
+      await service.create('user-1', ActorType.HUMAN, {
+        title: 'TTL Topic',
+        config: { attachmentTtl: '30d' },
+      } as never);
+
+      // create 的 settings 组装点（...restConfig 原样铺进 jsonb）
+      expect(mockTopicRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          settings: expect.objectContaining({ attachmentTtl: '30d' }),
+        }),
+      );
+    });
+
+    it('config 缺省 attachmentTtl → settings 不含该键（读取侧 fail-closed 兜底 7d，不显式落库）', async () => {
+      const createdTopic = createMockTopic({});
+      mockTopicRepo.create.mockReturnValue(createdTopic);
+      mockTopicRepo.save.mockResolvedValue(createMockTopic({ id: 'topic-new' }));
+      mockParticipantRepo.create.mockReturnValue(createMockParticipant({}));
+      mockParticipantRepo.save.mockResolvedValue(createMockParticipant({}));
+
+      await service.create('user-1', ActorType.HUMAN, { title: 'No TTL Topic' } as never);
+
+      const settings = (
+        mockTopicRepo.create.mock.calls[0][0] as { settings: Record<string, unknown> }
+      ).settings;
+      expect(Object.hasOwn(settings, 'attachmentTtl')).toBe(false);
+    });
+
     it('should create topic and add creator as participant', async () => {
       const dto = { title: 'New Topic', description: 'Desc', type: 'discussion' };
       const createdTopic = createMockTopic(dto);
@@ -1077,6 +1136,31 @@ describe('TopicService', () => {
       expect(topic.settings).not.toHaveProperty('kind'); // kind 不进 settings
     });
 
+    it('update：config.attachmentTtl 合并进 settings（M2 写入面②：update 合并点）', async () => {
+      const topic = createMockTopic({ settings: { visibility: 'open' } });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+
+      await service.update('topic-1', { config: { attachmentTtl: '1d' } });
+
+      expect(topic.settings).toMatchObject({ visibility: 'open', attachmentTtl: '1d' });
+      expect(mockTopicRepo.save).toHaveBeenCalledWith(topic);
+    });
+
+    it('update：改 attachmentTtl 只改设置本身，不触任何附件行（事后修改不追溯，§1.1）', async () => {
+      const topic = createMockTopic({ settings: {} });
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockTopicRepo.save.mockResolvedValue(topic);
+
+      await service.update('topic-1', { config: { attachmentTtl: 'never' } });
+
+      expect(topic.settings.attachmentTtl).toBe('never');
+      // 不写附件表：TTL 冻结在上传时刻，存量行 expires_at 不受影响
+      expect(mockAttachmentRepo.update).not.toHaveBeenCalled();
+      expect(mockAttachmentRepo.save).not.toHaveBeenCalled();
+      expect(mockDataSource.transaction).not.toHaveBeenCalled();
+    });
+
     it('update：仅改 wakePolicy（无 kind）→ settings 合并，kind 不动', async () => {
       const topic = createMockTopic({ kind: TopicKind.ROUNDTABLE });
       mockTopicRepo.findOne.mockResolvedValue(topic);
@@ -1090,16 +1174,57 @@ describe('TopicService', () => {
   });
 
   describe('remove', () => {
-    it('should soft remove a topic', async () => {
+    it('should soft remove a topic（事务内）+ 连带软删附件（queryBuilder 显式 set deleted_at）', async () => {
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
-      mockTopicRepo.softRemove.mockResolvedValue(topic);
+      mockCascadeQb.execute.mockResolvedValue({ affected: 3 });
 
-      const result = await service.remove('topic-1');
+      const result = await service.remove('topic-1', 'actor-1');
 
       expect(mockTopicRepo.findOne).toHaveBeenCalledWith({ where: { id: 'topic-1' } });
-      expect(mockTopicRepo.softRemove).toHaveBeenCalledWith(topic);
+      // 事务内：topic 软删 + 附件批量软删（DeleteDateColumn 不自动处理，必须显式 set）
+      expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(mockEntityManager.softRemove).toHaveBeenCalledWith(topic);
+      expect(mockCascadeQb.update).toHaveBeenCalledWith(Attachment);
+      expect(mockCascadeQb.set).toHaveBeenCalledWith({ deletedAt: expect.any(Function) });
+      expect(mockCascadeQb.where).toHaveBeenCalledWith('topic_id = :id', { id: 'topic-1' });
+      expect(mockCascadeQb.andWhere).toHaveBeenCalledWith('deleted_at IS NULL');
       expect(result).toBe(true);
+    });
+
+    it('连带软删 count>0 → 写一条汇总 audit（cascade_delete_attachments，含 topicId + count）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockCascadeQb.execute.mockResolvedValue({ affected: 5 });
+
+      await service.remove('topic-1', 'actor-9');
+
+      const entry = mockAuditService.log.mock.calls[0][0] as Record<string, unknown>;
+      expect(entry.action).toBe(AuditAction.CASCADE_DELETE_ATTACHMENTS);
+      expect(entry.action).toBe('cascade_delete_attachments');
+      expect(entry.entityType).toBe('topic');
+      expect(entry.entityId).toBe('topic-1');
+      expect(entry.actorId).toBe('actor-9');
+      expect(entry.newData).toEqual({ topicId: 'topic-1', count: 5 });
+    });
+
+    it('无附件（count=0）→ 不写汇总 audit（无附件事无留痕必要）', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockCascadeQb.execute.mockResolvedValue({ affected: 0 });
+
+      await service.remove('topic-1', 'actor-1');
+
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('重复删除同一话题 → 404（**非幂等**，与 JSDoc 如实描述一致：findById 默认滤软删）', async () => {
+      // 第二次 DELETE：行已软删 → findById 查不到 → 404·2000（不是 200 no-op）
+      mockTopicRepo.findOne.mockResolvedValue(null);
+      await expect(service.remove('topic-1', 'actor-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.TOPIC_NOT_FOUND },
+      });
+      expect(mockDataSource.transaction).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when topic not found', async () => {
@@ -1609,7 +1734,7 @@ describe('TopicService', () => {
       expect(result.messages[0]).not.toHaveProperty('seatLabel');
     });
 
-    it('attachments 投影恒存在（mapToMessageDtos/P1）：有索引→5 字段+contentUrl；无索引→[]；垃圾键→防御过滤', async () => {
+    it('attachments 投影恒存在（mapToMessageDtos/P1）：有索引→全字段+contentUrl；无索引→[]；垃圾键→防御过滤', async () => {
       // 合法索引：sizeBytes 兼容 number 与 bigint-string 双形态（读库实体 jsonb 保真）
       const msgValid = createMockMessage({
         id: 'msg-a',
@@ -1667,20 +1792,27 @@ describe('TopicService', () => {
       const result = await service.getMessages('topic-1', { limit: 20 });
       const byId = new Map(result.messages.map((m) => [m.id, m]));
 
-      // 有索引 → 5 字段全命中，sizeBytes 归一 number，contentUrl 由 buildContentUrl 派生
+      // 有索引 → 全字段命中（含 expiresAt/expired/clientMimeType 三新键），
+      // sizeBytes 归一 number，contentUrl 由 buildContentUrl 派生
       expect(byId.get('msg-a')!.attachments).toEqual([
         {
           id: 'att-1',
           originalName: '图.png',
           mimeType: 'image/png',
+          clientMimeType: null, // 索引缺键（存量）→ null
           sizeBytes: 2048,
+          expiresAt: null, // 索引缺键（存量）→ null = 永久
+          expired: false,
           contentUrl: '/api/v1/attachments/att-1/content',
         },
         {
           id: 'att-2',
           originalName: 'doc.pdf',
           mimeType: 'application/pdf',
+          clientMimeType: null,
           sizeBytes: 5120,
+          expiresAt: null,
+          expired: false,
           contentUrl: '/api/v1/attachments/att-2/content',
         },
       ]);
@@ -1722,12 +1854,22 @@ describe('TopicService', () => {
       const entryOf = (id: string): Record<string, unknown> =>
         (byId.get(id)!.attachments as unknown as Array<Record<string, unknown>>)[0];
 
-      // 唯一出现条件：hasThumbnail === true → 条件第 6 键
+      // 唯一出现条件：hasThumbnail === true → 条件末键
       const withThumb = entryOf('msg-thumb-true');
       expect(withThumb.thumbnailContentUrl).toBe('/api/v1/attachments/att-true/thumbnail');
-      // 同一条目仍是 5 字段 + 条件键（hasThumbnail 自身 strip，不透传——存储态不外泄）
+      // 同一条目仍是全字段 + 条件键（hasThumbnail 自身 strip，不透传——存储态不外泄）
       expect(Object.keys(withThumb).sort()).toEqual(
-        ['contentUrl', 'id', 'mimeType', 'originalName', 'sizeBytes', 'thumbnailContentUrl'].sort(),
+        [
+          'clientMimeType',
+          'contentUrl',
+          'expired',
+          'expiresAt',
+          'id',
+          'mimeType',
+          'originalName',
+          'sizeBytes',
+          'thumbnailContentUrl',
+        ].sort(),
       );
 
       for (const id of ['msg-thumb-false', 'msg-thumb-missing', 'msg-thumb-junk']) {
@@ -1737,6 +1879,51 @@ describe('TopicService', () => {
         expect(entry.thumbnailContentUrl).toBeUndefined();
         expect(Object.hasOwn(entry, 'hasThumbnail')).toBe(false); // strip
       }
+    });
+
+    it('attachments 投影：expiresAt/expired 边界（null / 未来 / 刚过 1s / 索引缺键 / 脏串）', async () => {
+      const mkMsg = (id: string, entry: Record<string, unknown>) =>
+        createMockMessage({
+          id,
+          senderId: 'agent-1',
+          senderType: ActorType.AGENT,
+          metadata: { attachments: [entry] },
+        });
+      const base = { originalName: 'f.bin', mimeType: 'application/octet-stream', sizeBytes: 10 };
+      const past = new Date(Date.now() - 1000).toISOString();
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      const qbMock = createMockQueryBuilder(
+        [
+          mkMsg('msg-null', { id: 'att-null', ...base, expiresAt: null }),
+          mkMsg('msg-future', { id: 'att-future', ...base, expiresAt: future }),
+          mkMsg('msg-past', { id: 'att-past', ...base, expiresAt: past }),
+          mkMsg('msg-missing', { id: 'att-missing', ...base }), // 存量索引缺键
+          mkMsg('msg-junk', { id: 'att-junk', ...base, expiresAt: 'not-a-date' }),
+        ],
+        5,
+      );
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qbMock as unknown as SelectQueryBuilder<Message>,
+      );
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'agent-1', name: 'Bot-1', avatarUrl: null } as Agent,
+      ]);
+
+      const result = await service.getMessages('topic-1', { limit: 20 });
+      const byId = new Map(result.messages.map((m) => [m.id, m]));
+      const attOf = (id: string) => byId.get(id)!.attachments[0];
+
+      // null = 永久
+      expect(attOf('msg-null')).toMatchObject({ expiresAt: null, expired: false });
+      // 未到期
+      expect(attOf('msg-future')).toMatchObject({ expiresAt: future, expired: false });
+      // 刚过 1s → 过期（墓碑）
+      expect(attOf('msg-past')).toMatchObject({ expiresAt: past, expired: true });
+      // 存量索引缺键 → null + 未过期（不追溯）
+      expect(attOf('msg-missing')).toMatchObject({ expiresAt: null, expired: false });
+      // 脏串 → expiresAt 原样透出（展示），但不判过期（宁可可下载，不因脏数据置灰）
+      expect(attOf('msg-junk')).toMatchObject({ expiresAt: 'not-a-date', expired: false });
+      // expired 是响应时纯函数：不入索引（索引内 hasThumbnail 之外的字段不出现）
     });
 
     it('should handle empty results', async () => {
@@ -2831,7 +3018,9 @@ describe('TopicService', () => {
                   id: 'att-1',
                   originalName: 'photo.png',
                   mimeType: 'image/png',
+                  clientMimeType: null, // 行无声明值 → null（四表面同口径）
                   sizeBytes: 2048,
+                  expiresAt: null, // 行无 expiresAt（永久）→ null（静态事实快照）
                   hasThumbnail: false,
                 },
               ],
@@ -2866,6 +3055,76 @@ describe('TopicService', () => {
         // 索引不含投影 URL（URL 是响应层派生物，落库零 URL——防漂移 pin）
         expect(Object.hasOwn(written.metadata.attachments[0], 'contentUrl')).toBe(false);
         expect(Object.hasOwn(written.metadata.attachments[0], 'thumbnailContentUrl')).toBe(false);
+        // expired 也不入索引（响应时纯函数，§1.1）
+        expect(Object.hasOwn(written.metadata.attachments[0], 'expired')).toBe(false);
+      });
+
+      it('绑定成功：expiresAt 静态事实入索引（ISO 字符串）+ clientMimeType 展示值入索引', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const expiresAt = new Date(Date.now() + 3600_000);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({
+            expiresAt,
+            clientMimeType: 'application/pdf',
+          } as Partial<Attachment>),
+        ]);
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+          content: 'see file',
+          attachmentIds: ['att-1'],
+        });
+
+        const written = mockMessageRepo.create.mock.calls[0][0] as {
+          metadata: { attachments: Array<Record<string, unknown>> };
+        };
+        expect(written.metadata.attachments[0].expiresAt).toBe(expiresAt.toISOString());
+        expect(written.metadata.attachments[0].clientMimeType).toBe('application/pdf');
+      });
+
+      it('引用已过期附件 → 400·12009（R2：死资源不得进新消息索引），且不创建消息', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({
+            expiresAt: new Date(Date.now() - 1000),
+          } as Partial<Attachment>),
+        ]);
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'see image',
+            attachmentIds: ['att-1'],
+          }),
+        ).rejects.toMatchObject({
+          response: { code: ErrorCode.ATTACHMENT_EXPIRED },
+        });
+        expect(mockMessageRepo.create).not.toHaveBeenCalled();
+      });
+
+      it('引用恰好未过期附件（expiresAt = now + 1h）→ 正常绑定（边界不误伤）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockAttachmentRepo.find.mockResolvedValue([
+          createMockAttachment({
+            expiresAt: new Date(Date.now() + 3600_000),
+          } as Partial<Attachment>),
+        ]);
+        const createdMessage = createMockMessage({});
+        mockMessageRepo.create.mockReturnValue(createdMessage);
+        mockMessageRepo.save.mockResolvedValue(createdMessage);
+        mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+
+        await expect(
+          service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+            content: 'see image',
+            attachmentIds: ['att-1'],
+          }),
+        ).resolves.toBeDefined();
       });
 
       it('任一附件不存在 → 404 ATTACHMENT_NOT_FOUND（12000），且不创建消息', async () => {
@@ -2949,7 +3208,7 @@ describe('TopicService', () => {
         );
       });
 
-      it('响应投影（正常路径）：sendMessage 返回含服务端索引的消息 → attachments 恒存在且 5 字段 + contentUrl（索引无 hasThumbnail → 无第 6 键）', async () => {
+      it('响应投影（正常路径）：sendMessage 返回含服务端索引的消息 → attachments 恒存在且全字段 + contentUrl（索引无 hasThumbnail → 无条件键）', async () => {
         const topic = createMockTopic();
         mockTopicRepo.findOne.mockResolvedValue(topic);
         mockAttachmentRepo.find.mockResolvedValue([
@@ -2979,7 +3238,10 @@ describe('TopicService', () => {
             id: 'att-1',
             originalName: '图.png',
             mimeType: 'image/png',
+            clientMimeType: null,
             sizeBytes: 2048,
+            expiresAt: null,
+            expired: false,
             contentUrl: '/api/v1/attachments/att-1/content',
           },
         ]);
@@ -3024,7 +3286,7 @@ describe('TopicService', () => {
         expect(result.attachments).toEqual([]);
       });
 
-      it('响应投影（replay 路径）：幂等 23505 重放返回与正常路径同形状（5 字段 + hasThumbnail 命中的第 6 键）', async () => {
+      it('响应投影（replay 路径）：幂等 23505 重放返回与正常路径同形状（全字段 + hasThumbnail 命中的条件键）', async () => {
         const topic = createMockTopic();
         mockTopicRepo.findOne.mockResolvedValue(topic);
         // 事务抛 23505 触发 replay 查找
@@ -3073,7 +3335,10 @@ describe('TopicService', () => {
             id: 'att-1',
             originalName: 'photo.png',
             mimeType: 'image/png',
+            clientMimeType: null,
             sizeBytes: 2048,
+            expiresAt: null,
+            expired: false,
             contentUrl: '/api/v1/attachments/att-1/content',
             thumbnailContentUrl: '/api/v1/attachments/att-1/thumbnail',
           },

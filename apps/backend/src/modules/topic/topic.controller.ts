@@ -283,7 +283,7 @@ export class TopicController {
   async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
     const topic = await this.topicService.findById(id);
     await this.permService.ensureCan(topic, actor, 'delete');
-    await this.topicService.remove(id);
+    await this.topicService.remove(id, actor.id);
     // 审计（Phase 2）：DELETE + topic；controller 层（remove 无 actor 参数，决策 2）；
     // newData 白名单 {topicId, title}
     await this.auditService.log({
@@ -518,7 +518,12 @@ export class TopicController {
     description:
       'List topic messages with pagination, time-range filter, and sender filter.' +
       'Agents reading for the first time should use limit=1~5, then fetch more via before/after cursors as needed;' +
-      'this avoids wasting tokens by pulling large volumes of historical messages at once.',
+      'this avoids wasting tokens by pulling large volumes of historical messages at once.' +
+      ' Each message carries an always-present attachments array (empty when none): per-item ' +
+      'id/originalName/mimeType (byte-sniffed evidence — application/octet-stream for all non-images)/clientMimeType ' +
+      '(display-only)/sizeBytes/expiresAt/expired/contentUrl, plus thumbnailContentUrl when a thumbnail exists. ' +
+      'expired=true means the bytes are permanently unavailable (410/ATTACHMENT_EXPIRED, code 12009) — ' +
+      'ask the sender for a fresh copy instead of retrying.',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiQuery({
@@ -592,7 +597,11 @@ export class TopicController {
   @ApiOperation({
     summary: 'Send message',
     description:
-      'Send a message in the topic. The sender must be a topic participant, or the topic must be publicly visible.',
+      'Send a message in the topic. The sender must be a topic participant, or the topic must be publicly visible. ' +
+      'Attachments: upload files first via POST /attachments?topicId=<id> (multipart field "file", any type, ≤10MiB), ' +
+      'then pass up to 9 returned ids in attachmentIds — every id must exist, be uploaded by you, be bound to this topic, ' +
+      'and be unexpired (expired ids are rejected with 400/ATTACHMENT_EXPIRED, code 12009). ' +
+      'The response message carries an always-present attachments projection (per-item expired/expiresAt included).',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiResponse({ status: 201, description: 'Message sent' })

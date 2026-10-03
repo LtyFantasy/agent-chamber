@@ -48,9 +48,11 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ErrorCode, DOC_SOURCE_NATIVE } from '@agent-chamber/shared';
+import type { DocBacklinks } from '@agent-chamber/shared';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocLinksService } from './doc-links.service';
 import { DocSearchService } from './doc-search.service';
 import { DocSpaceService } from './docspace.service';
 import { PermissionService } from '../../common/services/permission.service';
@@ -87,6 +89,7 @@ export class DocController {
   constructor(
     private readonly docService: DocService,
     private readonly docMoveService: DocMoveService,
+    private readonly docLinksService: DocLinksService,
     private readonly docSearchService: DocSearchService,
     private readonly docSpaceService: DocSpaceService,
     private readonly permService: PermissionService,
@@ -157,8 +160,15 @@ export class DocController {
     summary: 'List documents in a DocSpace',
     description:
       'List documents with optional filters: category (by slug), tag, type, q (ILIKE on title/path), ' +
-      'path (exact match, mutually exclusive with q), pathPrefix (prefix match, mutually exclusive with path). ' +
-      'Returns summary list without body content.',
+      'path (exact match, mutually exclusive with q), pathPrefix (prefix match, mutually exclusive with path), ' +
+      'updatedAfter (ISO 8601 lower bound on docs.updated_at, inclusive). ' +
+      'sort is omitted by default (path ASC); updatedAt_desc/updatedAt_asc order by docs.updated_at ' +
+      'with path ASC as the tie-breaker. ' +
+      'Returns summary list without body content. ' +
+      'NOTE (v1.89.0-dev): updatedAfter filters METADATA only — there is no content-level increment, ' +
+      'deletions are invisible (soft delete does not bump updatedAt), and updated_at is written by ' +
+      'two clocks (application-side new Date() on save; DB-side NOW() on metadata patch/move) — ' +
+      'mirror maintenance must re-read a watermark look-back window (default ≥ 5 minutes).',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiQuery({
@@ -194,8 +204,29 @@ export class DocController {
     description: 'Items per page (max 100, default 20)',
     type: Number,
   })
+  @ApiQuery({
+    name: 'updatedAfter',
+    required: false,
+    description:
+      'Only docs updated at/after this ISO 8601 time (inclusive). Metadata-level only — no ' +
+      'content-level increment; deletions are invisible (soft delete does not bump updatedAt).',
+    type: String,
+  })
+  @ApiQuery({
+    name: 'sort',
+    required: false,
+    description:
+      'List sort: updatedAt_desc | updatedAt_asc (by docs.updated_at, path ASC as tie-breaker). ' +
+      'Omit for the default path ASC.',
+    enum: ['updatedAt_desc', 'updatedAt_asc'],
+  })
   @ApiResponse({ status: 200, description: 'Document list returned successfully' })
-  @ApiResponse({ status: 400, description: 'path= and q= are mutually exclusive' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'path= and q= are mutually exclusive; invalid sort value or non-ISO-8601 updatedAfter ' +
+      '(VALIDATION_ERROR)',
+  })
   async findAll(
     @Param('id', ParseUUIDPipe) spaceId: string,
     @Query() query: QueryDocDto,
@@ -302,9 +333,12 @@ export class DocController {
       'createdAfter/createdBefore (ISO time window, inclusive). ' +
       'sort=relevance (default) ranks by score + intent fusion boosts; ' +
       'sort=createdAt_desc/createdAt_asc orders by doc creation time and skips boost fusion. ' +
-      'Response envelope: { hits: DocSearchHit[], hint?: string } — hint appears only on ' +
-      'zero/weak hits (guidance to rephrase) or on degraded positional-order results ' +
-      '(not relevance-sorted). ' +
+      'Response envelope: { hits: DocSearchHit[], hint?: string, hintCode?: string } — three ' +
+      'hint states, each paired with a machine-readable hintCode: zero_hit (nothing matched — ' +
+      'rephrase), weak_hit (results WERE returned but below the live weak-hit line — use them ' +
+      'first; rephrase only if they look unrelated), positional_order (degraded high-frequency ' +
+      'query, not relevance-sorted — use a longer query). hintCode is absent (never null) when ' +
+      'there is no hint. ' +
       'Model-assisted ranking (rerank): when enabled by the operator, agent (API-key) searches ' +
       'with sort=relevance may have the page reordered by the judgment provider — this sends the ' +
       'query text and a byte-bounded excerpt (≈240B) of up to 50 candidate rows (no docId/path) ' +
@@ -989,6 +1023,8 @@ export class DocController {
       'Scans the whole space for inbound Markdown links (backlinks) pointing at this doc, ' +
       'plus doc_routes references, task_doc_links, and optional target-path collision ' +
       '(pass ?proposedPath= to include no-op detection and collision check). ' +
+      'inboundLinks array order is deterministic since v1.90.0-dev (source path ' +
+      'ascending; it was previously PG-arbitrary) — pathBasedLinksToRewrite inherits it. ' +
       'Requires the same read permission as the document itself.',
   })
   @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
@@ -1011,6 +1047,43 @@ export class DocController {
     const space = await this.docSpaceService.findById(doc.spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
     return this.docMoveService.computeMoveImpact(doc.spaceId, doc, proposedPath);
+  }
+
+  // ─── Backlinks（v1.90.0-dev：人类消费面反向引用面板）────────────────────
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('docs/:id/backlinks')
+  @ApiOperation({
+    summary: 'Get backlinks (which documents link to this one, grouped by source)',
+    description:
+      'Human-facing backlinks view — the same whole-space inbound-link scan kernel as ' +
+      'GET /docs/:id/move-impact, reshaped for reading: results are grouped by source ' +
+      'document, each source carrying its own link entries, and **self-references are ' +
+      'filtered out** (sourceDocId === docId; move-impact keeps them for the rewrite ' +
+      'checklist). docCount = number of distinct source documents, linkCount = total ' +
+      'entries (a source may link the same doc multiple times). Deterministic ordering: ' +
+      'sources by sourcePath ascending, links within a source by sectionPosition ' +
+      'ascending (nulls last, href ascending as the tie-breaker). ' +
+      'Requires the same read permission as the document itself.',
+  })
+  @ApiParam({ name: 'id', description: 'Document ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'DocBacklinks view returned successfully' })
+  @ApiResponse({
+    status: 404,
+    description:
+      'DOC_NOT_FOUND (document missing/soft-deleted); DOC_SPACE_NOT_FOUND (space missing, or read access denied — read denial is 404 by design, never 403)',
+  })
+  async getBacklinks(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor?: UnifiedActor,
+  ): Promise<DocBacklinks> {
+    const doc = await this.docService.findById(id);
+    const space = await this.docSpaceService.findById(doc.spaceId);
+    // 权限三段式照 move-impact：read 拒绝 → 404 DOC_SPACE_NOT_FOUND（不泄露存在性）
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    // 组装层（滤自引用 → 按来源分组 → 确定性排序）落在 DocLinksService.getBacklinks：
+    // 两个消费面的差异（backlinks 滤自引用 / move-impact 保留）因此各自可测
+    return this.docLinksService.getBacklinks(doc);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

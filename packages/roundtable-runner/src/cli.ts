@@ -58,7 +58,7 @@ const program = new Command();
 
 program
   .name('roundtable-runner')
-  .description('圆桌模式 runner：控制面 WebSocket 拨号 + ACP 座位驱动（kimi/codex，SeatDriver）')
+  .description('圆桌模式 runner：控制面 WebSocket 拨号 + ACP 座位驱动（SeatDriver，厂商以 SEAT_VENDORS 为准）')
   .version(VERSION);
 
 program

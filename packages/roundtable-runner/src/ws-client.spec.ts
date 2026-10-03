@@ -10,7 +10,12 @@ import * as path from 'node:path';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
-import { buildEnvelope, type Envelope, type SeatEvent } from '@agent-chamber/roundtable-protocol';
+import {
+  buildEnvelope,
+  SEAT_VENDORS,
+  type Envelope,
+  type SeatEvent,
+} from '@agent-chamber/roundtable-protocol';
 import { StateStore } from './state-store';
 import { RunnerWsClient, nextBackoff } from './ws-client';
 import { NoopLogger } from './logger';
@@ -142,7 +147,8 @@ describe('RunnerWsClient 连接与心跳', () => {
     expect(hello.seq).toBe(0);
     expect(hello.seatId).toBeUndefined();
     expect(hello.payload.version).toBe('1.2.3');
-    expect(hello.payload.vendors).toEqual(['kimi', 'codex', 'opencode', 'claude-code']);
+    // 从 SEAT_VENDORS 派生（不写死枚举）：新增厂商时 hello 上报自动跟随，防断言再次漂移
+    expect(hello.payload.vendors).toEqual([...SEAT_VENDORS]);
     expect(hello.payload.name).toBe('test-runner');
     expect(hello.payload.seats).toEqual({ 'seat-a': { lastSentSeq: 1, lastReceivedSeq: 1 } });
     await client.stop();

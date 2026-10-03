@@ -105,8 +105,17 @@ import { DocSection } from '../../database/entities/doc-section.entity';
 import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
-import type { DocSearchHit, DocSearchSort, DocSearchResponse } from '@agent-chamber/shared';
-import { DOC_SEARCH_POSITIONAL_ORDER_HINT, DOC_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
+import type {
+  DocSearchHit,
+  DocSearchSort,
+  DocSearchResponse,
+  DocSearchHintCode,
+} from '@agent-chamber/shared';
+import {
+  DOC_SEARCH_POSITIONAL_ORDER_HINT,
+  DOC_SEARCH_WEAK_HIT_HINT,
+  DOC_SEARCH_ZERO_HIT_HINT,
+} from '@agent-chamber/shared';
 import type { UnifiedActor } from '../../common/types/actor.types';
 import { JudgmentRunnerService } from '../judgment/judgment-runner.service';
 import { compileQuery, type CompiledQuery } from '../../common/utils/search/tsquery-compiler';
@@ -122,7 +131,7 @@ import {
   SEARCH_TRGM_HEADING_W,
   SEARCH_TS_W1,
 } from '../../common/utils/search/search-tuning';
-import { logSearchZeroHit } from '../../common/utils/search/zero-hit-log';
+import { logSearchWeakHit, logSearchZeroHit } from '../../common/utils/search/zero-hit-log';
 import { cleanupHeadlineSnippet } from '../../common/utils/search/snippet-cleanup';
 import {
   docSearchRerankCapability,
@@ -507,17 +516,19 @@ export class DocSearchService {
   }
 
   /**
-   * @internal 信封组装（主脑裁决 #1：裸数组 → `{ hits, hint? }`，hint 缺省不出现）+
-   * 零命中结构化日志（计划 §2.6：四路搜索零命中分支各调一次）。
+   * @internal 信封组装（主脑裁决 #1：裸数组 → `{ hits, hint?, hintCode? }`，hint 缺省
+   * 不出现）+ 零命中/弱命中结构化日志（计划 §2.6：四路搜索零命中分支各调一次）。
    *
-   * hint 触发规则：
-   * - 零命中 ⇒ `logSearchZeroHit` + DOC_SEARCH_ZERO_HIT_HINT（无论模式——降级查询零命中
-   *   时「换词」比「位置序声明」更可操作）；
-   * - 降级路径（单字/df）且相关度排序 ⇒ DOC_SEARCH_POSITIONAL_ORDER_HINT（注明未按相关度
-   *   排序；时间序是用户显式选择的遍历语义，不附加）；
-   * - normal/trgm-only 最高分 < **`DOC_SEARCH_WEAK_HIT_SCORE`（= 基准 0.3 ×
-   *   `SEARCH_TS_W1` 现构）** ⇒ DOC_SEARCH_ZERO_HIT_HINT（弱命中家族；降级路径常数分
-   *   0.1 恒 < 本线，已在上一分支拦截不参与本判定）。
+   * hint 三态触发规则（`hintCode` 与 hint 一一对应；v1.89.0-dev 批次 A 起弱命中独立文案）：
+   * - **零命中** ⇒ `logSearchZeroHit` + `DOC_SEARCH_ZERO_HIT_HINT` / `'zero_hit'`
+   *   （无论模式——降级查询零命中时「换词」比「位置序声明」更可操作）；
+   * - **降级路径**（单字/df）且相关度排序 ⇒ `DOC_SEARCH_POSITIONAL_ORDER_HINT` /
+   *   `'positional_order'`（注明未按相关度排序；时间序是用户显式选择的遍历语义，不附加）；
+   * - **弱命中**（normal/trgm-only，**有结果**但最高分 < **`DOC_SEARCH_WEAK_HIT_SCORE`**
+   *   = 基准 0.3 × `SEARCH_TS_W1` 现构**）** ⇒ `logSearchWeakHit` +
+   *   `DOC_SEARCH_WEAK_HIT_HINT` / `'weak_hit'`（结果已返回、可能正是答案，第一动作是
+   *   "先用"；**不再复用零命中文案**——复用会让消费方丢掉已召回的结果）。
+   *   降级路径常数分 0.1 恒 < 本线，已在上一分支拦截不参与本判定。
    *
    * ⚠️ 弱命中线必须读**现构**（主脑裁决 R4，批次 1-d2）：基准 0.3 是"cd 单点 0.1 ×
    * W1=1.0"尺度下的刻度，而本模式的合成分含 `ts_rank_cd × SEARCH_TS_W1` 项 ⇒ 尺度随
@@ -528,6 +539,8 @@ export class DocSearchService {
    * trgm-only 无 ts 项 ⇒ 其尺度其实未随 W1 变化，理论上更贴近基准线；判据是"纯标点查询
    * 本就不该有强命中"，故统一线的实际语义更保守（更愿意给引导）而非漏给。若将来实测
    * trgm-only 的 hint 频率失真，**本条就是拆线的落点**（拆法同 task：给 trgm-only 一份基准值）。
+   *
+   * ⚠️ `hintCode` 只在 hint 存在时出现（**禁 null**——消费方 jest `toEqual` 严格相等断言在册）。
    */
   private finalizeResponse(
     hits: DocSearchHit[],
@@ -537,6 +550,7 @@ export class DocSearchService {
     sortByTime: boolean,
   ): DocSearchResponse {
     let hint: string | undefined;
+    let hintCode: DocSearchHintCode | undefined;
     if (hits.length === 0) {
       logSearchZeroHit(this.logger, {
         surface: 'doc',
@@ -545,13 +559,22 @@ export class DocSearchService {
         armTruncatedCount: compiled.armTruncatedCount,
       });
       hint = DOC_SEARCH_ZERO_HIT_HINT;
+      hintCode = 'zero_hit';
     } else if (mode === 'single-char' || mode === 'df-degraded') {
-      if (!sortByTime) hint = DOC_SEARCH_POSITIONAL_ORDER_HINT;
+      if (!sortByTime) {
+        hint = DOC_SEARCH_POSITIONAL_ORDER_HINT;
+        hintCode = 'positional_order';
+      }
     } else {
       const topScore = Math.max(...hits.map((hit) => hit.score));
-      if (topScore < DOC_SEARCH_WEAK_HIT_SCORE) hint = DOC_SEARCH_ZERO_HIT_HINT;
+      if (topScore < DOC_SEARCH_WEAK_HIT_SCORE) {
+        // 弱命中观测：安全相关（阈值漂移靠日志发现），且测试兜不住线上量级——独立 tag + debug
+        logSearchWeakHit(this.logger, { query: q, topScore });
+        hint = DOC_SEARCH_WEAK_HIT_HINT;
+        hintCode = 'weak_hit';
+      }
     }
-    return hint === undefined ? { hits } : { hits, hint };
+    return hint === undefined ? { hits } : { hits, hint, hintCode };
   }
 
   /**

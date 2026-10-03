@@ -6,6 +6,26 @@ import {
   ParticipantStatus,
   WakePolicy,
 } from '../enums';
+import type { AttachmentTtl } from '../constants';
+
+/**
+ * 话题配置（settings jsonb 的**已声明子集**）。
+ *
+ * 为什么显式声明而不是 `Record<string, unknown>`：settings 是 jsonb，实体透传时
+ * 形状不稳定；把消费方真正读取的键收敛成类型，读侧就有编译期保护（web 表单 /
+ * API 文档 / 后端解析点共用）。未列出的键仍可能存在于运行时对象中（历史遗留配置），
+ * 消费方不得依赖本接口的完备性。
+ */
+export interface TopicSettings {
+  /** 可见性（settings 冗余副本；顶层 visibility 是权威出口） */
+  visibility?: Visibility;
+  /** 圆桌唤醒策略（设计 docs/roundtable-design.md §6） */
+  wakePolicy?: WakePolicy;
+  /** 圆桌安全阀阈值（§6） */
+  maxRoundsWithoutHuman?: number;
+  /** 附件有效期档位（附件 TTL 批 v1.90.0-dev）——上传时冻结，见 TopicConfigInput.attachmentTtl */
+  attachmentTtl?: AttachmentTtl;
+}
 
 /**
  * 话题参与者
@@ -73,6 +93,14 @@ export interface Topic {
   createdAt?: string | Date;
   /** 更新时间 */
   updatedAt?: string | Date;
+  /**
+   * 话题配置（settings jsonb）。
+   *
+   * 出现面：`GET /topics/:id`（详情，`...topic` 透传）与 `POST /topics` / `PATCH /topics/:id`
+   * 的写响应；列表 `GET /topics` **刻意剔除**（接口瘦身，web 列表页零消费——见
+   * topic.service findAll 的解构），故本字段可选。
+   */
+  settings?: TopicSettings;
 }
 
 /**
@@ -110,10 +138,35 @@ export interface MessageAttachment {
   id: string;
   /** 原始文件名 */
   originalName: string;
-  /** MIME 类型 */
+  /**
+   * MIME 类型（**字节证据**，非客户端声明值）。
+   *
+   * v1.90.0-dev 起：4 种嗅探图片 mime 之一，或非图片恒 `application/octet-stream`。
+   * ⚠️ 对图标/呈现形态分类**无信息量**（非图片全是 octet-stream）——展示层请用
+   * `clientMimeType` + `originalName` 扩展名（clientMimeType 是纯展示信息，不参与服务决策）。
+   */
   mimeType: string;
   /** 字节数（number，P0 起 sizeBytes 转换点钉死为显式 Number()） */
   sizeBytes: number;
+  /**
+   * 客户端声明的 mime（sanitize 后；非法/缺失 → null）——**纯展示信息**
+   * （卡片图标参考），不参与任何服务决策。索引快照自发送时刻。
+   */
+  clientMimeType: string | null;
+  /**
+   * 过期时刻（ISO 8601）；null = 永久（doc 绑定 / topic 设置 never / 存量迁移行）。
+   *
+   * **静态事实**：发送时刻从附件行取快照写进索引，事后改 topic TTL 不追溯。
+   * 索引缺该键（存量消息）= null（永久）。
+   */
+  expiresAt: string | null;
+  /**
+   * 是否已过期——**响应时纯函数**（`expiresAt < now()`），不入索引快照。
+   *
+   * 墓碑式语义：消息不动，投影带 expired + expiresAt；过期附件的字节面返回 410
+   * （已过期附件被 GC 物理回收后行已硬删，字节面随之 404）。展示层据此置灰禁用下载。
+   */
+  expired: boolean;
   /** 下载/引用直达 URL（相对路径，buildContentUrl 单一拼装点派生） */
   contentUrl: string;
   /**
@@ -159,7 +212,9 @@ export interface Message {
   /**
    * 附件投影：恒存在数组（无附件 = []），机器消费方免判空、免解析 markdown。
    * 快照语义：发送时刻索引，不 join 附件表——附件事后删除则 contentUrl 404
-   * （与 content 里 markdown 链接行为一致）。
+   * （与 content 里 markdown 链接行为一致）；附件**过期**则条目 `expired=true`
+   * （墓碑：消息不动、投影标注、字节面 410），`expiresAt` 是发送时刻的静态快照
+   * （v1.90.0-dev 附件 TTL 批；事后改 topic TTL 不追溯历史消息）。
    *
    * 恒存在是机器契约约定（与 seatLabel? 条件缺省的双契约风格区分）：
    * 展示层 badge 才用 seatLabel 式条件缺省，勿按该先例把本字段"简化"回可选。

@@ -59,6 +59,9 @@ describe('DownloadsController', () => {
     writeFileSync(join(downloadsDir, 'integrations', 'codex.md'), '# Codex Guide\n');
     writeFileSync(join(downloadsDir, 'integrations', 'kimi.zh-CN.md'), '# Kimi 指南\n');
     writeFileSync(join(downloadsDir, 'integrations', 'codex.zh-CN.md'), '# Codex 指南\n');
+    // dsh 指南（v1.89.0 第五家厂商）：白名单 + Content-Type 两表同加，fixture 同步
+    writeFileSync(join(downloadsDir, 'integrations', 'dsh.md'), '# dsh Guide\n');
+    writeFileSync(join(downloadsDir, 'integrations', 'dsh.zh-CN.md'), '# dsh 指南\n');
   });
 
   afterAll(() => {
@@ -115,6 +118,21 @@ describe('DownloadsController', () => {
 
     it('codex.zh-CN.md 命中（zh-CN 变体也在白名单）', async () => {
       const sf = controller.getIntegrationGuide('codex.zh-CN.md');
+      await tick();
+      expect(headersOf(sf).type).toBe('text/markdown; charset=utf-8');
+    });
+
+    it('dsh.md 命中（第五家厂商指南：白名单 + Content-Type 两表同加）', async () => {
+      const sf = controller.getIntegrationGuide('dsh.md');
+      await tick();
+      expect(sf).toBeInstanceOf(StreamableFile);
+      const h = headersOf(sf);
+      expect(h.type).toBe('text/markdown; charset=utf-8');
+      expect(h.disposition).toContain('filename="dsh.md"');
+    });
+
+    it('dsh.zh-CN.md 命中（zh-CN 变体也在白名单）', async () => {
+      const sf = controller.getIntegrationGuide('dsh.zh-CN.md');
       await tick();
       expect(headersOf(sf).type).toBe('text/markdown; charset=utf-8');
     });

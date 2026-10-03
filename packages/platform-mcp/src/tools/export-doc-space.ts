@@ -10,6 +10,8 @@
  *     自算 hash）；import DTO 显式声明该字段防 roundtrip 400
  *   - 补充: v1.75.0（bundle formatVersion 2，P2 批 5）——media 段（附件字节，联合预算 +
  *     skipped 双形态）+ mediaOmitted（topic 绑定断链说明）；描述必须与后端契约同步
+ *   - 补充: v1.89.0-dev 批次 A——?pathPrefix= 部分快照（appliedFilters 回声 + routes 按
+ *     primary 筛选 + secondaryDocPath 照实输出）；PARTIAL SNAPSHOT WARNING 段是契约的一部分
  *
  * [踩坑索引] -
  *
@@ -120,6 +122,18 @@ export const exportDocSpaceTool: CustomTool = {
       'bundles with media can approach the 10MiB request/response limit and a multi-MB tool ' +
       'result risks client-side truncation — for very large spaces prefer transferring the ' +
       'bundle as a file (the HTTP endpoint) instead of through this tool. ' +
+      'PARTIAL SNAPSHOT WARNING: a bundle fetched with pathPrefix is NOT a full space and must ' +
+      'NOT be used as a backup. Docs outside the prefix are dropped, categories no included doc ' +
+      'references are dropped, and media is narrowed to the included docs automatically. Routes ' +
+      'are kept or dropped by their PRIMARY doc only — a kept route may carry a secondaryDocPath ' +
+      'pointing at a doc that is NOT in bundle.docs: re-importing into the SAME space preserves ' +
+      'that link, but importing into a DIFFERENT/new space fails those routes per-item (loud, ' +
+      'never silent). To seed a new space, export WITHOUT pathPrefix. pathPrefix is a literal, ' +
+      'case-sensitive prefix (use a trailing "/" for directory semantics; LIKE wildcards are ' +
+      'escaped). A prefix matching nothing returns 200 with an empty bundle (success; import = ' +
+      'no-op) — read appliedFilters.matchedDocs === 0 to tell "prefix matched nothing" from ' +
+      '"space is empty". appliedFilters is an informational echo; the import side ignores it. ' +
+      "For a single doc's full content use read_doc, not this tool. " +
       'The bundle is directly consumable by import_doc_bundle (roundtrip; formatVersion 1 ' +
       'bundles remain importable). ' +
       'Requires read access to the space.',
@@ -129,6 +143,15 @@ export const exportDocSpaceTool: CustomTool = {
         spaceName: {
           type: 'string',
           description: 'DocSpace name (resolved via three-layer match)',
+        },
+        pathPrefix: {
+          type: 'string',
+          description:
+            'Optional: literal, case-sensitive path prefix (use a trailing "/" for directory ' +
+            'semantics; LIKE wildcards are escaped). Exports a PARTIAL snapshot — only docs ' +
+            'under the prefix, with categories/routes/media narrowed to that closure and ' +
+            'appliedFilters echoed back. NOT a backup; a prefix matching nothing returns 200 ' +
+            'with an empty bundle.',
         },
       },
       required: ['spaceName'],
@@ -203,11 +226,14 @@ export const exportDocSpaceTool: CustomTool = {
     }
 
     // 步骤 3：调用导出端点（bundle 原样透传——调用方落盘/落 git 即得快照）
+    // v1.89.0-dev 批次 A：pathPrefix 显式传入时才带 params（缺省保持既有调用形态）
     const spaceId = matches[0].id;
+    const pathPrefix = args.pathPrefix as string | undefined;
     try {
       const bundle = await client.request<Record<string, unknown>>(
         'GET',
         `/doc-spaces/${spaceId}/export`,
+        pathPrefix ? { params: { pathPrefix } } : undefined,
       );
       return {
         content: [{ type: 'text', text: JSON.stringify(bundle) }],

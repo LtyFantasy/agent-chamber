@@ -12,6 +12,13 @@
  *   - QUOTA-SEED: 配额用例不打 200MiB 真实上传——SQL 插一行 size_bytes=配额-10
  *     的假行（uploader=独立 agent），再传 33B 即越界触发 403·12003；
  *     该假行无对应 MinIO 对象，清理只删行。
+ *   - EXPIRED-FIXTURE(v1.90.0-dev): 过期态一律「直改 DB expires_at」（forceExpire）构造，
+ *     **不依赖时钟流逝、也不依赖 sweep 被关**——模块不注册 AttachmentGcService + 生产侧
+ *     cron 受 isTestEnv 控制（ATTACHMENT_EXPIRED_SWEEP_ENABLED），故"过期但行仍在"的
+ *     中间态全程稳定（410 不会翻 404）。安全方向: 任何新增过期用例都走 forceExpire。
+ *   - PROJ-SNAPSHOT(v1.90.0-dev): 消息附件投影是**发送时刻快照**——直改附件行不影响
+ *     历史消息的 expiresAt/expired；验"投影过期"要改 messages.metadata 快照
+ *     （getMessageById 后 jsonb_set），不是改附件行。
  *
  * [铁律关联] #17(测试契约) #23(jsonb查询集成覆盖) #8(测试绑定)
  *
@@ -19,6 +26,8 @@
  *   □ 已读 [设计文档] 确认修改符合设计意图
  *   □ 新增用例必须登记 created.* 清理队列（FK 逆序 + MinIO 对象）
  *   □ RUN 后缀隔离纪律不破坏（不碰任何既有数据）
+ *   □ 断言响应头时与 attachment.controller / attachment-public.controller 的出口头同批（三出口同套）
+ *   □ 涉及 TTL 的用例：写入面走真实 API（PATCH config），过期态走 forceExpire 直改 DB
  * =============================================================================
  */
 
@@ -378,6 +387,14 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
           [created.messageIds],
         );
       }
+      // topic 删除族的审计行（v1.90.0-dev 连带清理用例：controller 的 DELETE +
+      // service 的 cascade_delete_attachments）——按本运行创建的 topic id 精确清理
+      if (created.topicIds.length > 0) {
+        await ds.query(
+          `DELETE FROM audit_logs WHERE entity_type = 'topic' AND entity_id = ANY($1)`,
+          [created.topicIds],
+        );
+      }
       await ds.destroy();
     }
     if (minioAvailable) {
@@ -642,6 +659,66 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     return getPublicContent(attachmentId, token).buffer(true).parse(collectBytes);
   }
 
+  /** HTTP 上传（Bearer，任意字节/文件名/声明 Content-Type），201 由调用方断言 */
+  function uploadBytes(
+    token: string,
+    buffer: Buffer,
+    query: string,
+    filename: string,
+    contentType: string,
+  ): request.Test {
+    return request(app.getHttpServer())
+      .post(`${API_PREFIX}/attachments?${query}`)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('file', buffer, { filename, contentType });
+  }
+
+  /** 读全鉴权 content（原始字节解析） */
+  function getContentBytes(token: string, attachmentId: string): request.Test {
+    return request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${attachmentId}/content`)
+      .set('Authorization', `Bearer ${token}`)
+      .buffer(true)
+      .parse(collectBytes);
+  }
+
+  /** 读全鉴权 content（JSON 解析——错误体断言用） */
+  function getContentRaw(token: string, attachmentId: string): request.Test {
+    return request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${attachmentId}/content`)
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  /** 读缩略图（JSON 解析——错误体断言用） */
+  function getThumbnailRaw(token: string, attachmentId: string): request.Test {
+    return request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${attachmentId}/thumbnail`)
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  /** 按 id 从 GET messages 投影里取一条消息（投影断言用） */
+  async function getMessageById(
+    topicId: string,
+    token: string,
+    messageId: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    const res = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/topics/${topicId}/messages?limit=50`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    return (res.body.data.messages as Array<Record<string, unknown>>).find(
+      (m) => m.id === messageId,
+    );
+  }
+
+  /** 直接改 DB 构造过期态（N3：不依赖时钟流逝，也不依赖 sweep 被关——见下方 describe 注释） */
+  async function forceExpire(id: string, secondsAgo = 60): Promise<void> {
+    await ds.query(
+      `UPDATE attachments SET expires_at = now() - ($2 || ' seconds')::interval WHERE id = $1`,
+      [id, String(secondsAgo)],
+    );
+  }
+
   // ─── ① 全链路 ────────────────────────────────────────────────
 
   it('全链：上传→元数据→内容（字节一致+五头）→删除→再读 404', async () => {
@@ -690,7 +767,8 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     expect(content.headers['content-type']).toBe('image/png');
     expect(content.headers['x-content-type-options']).toBe('nosniff');
     expect(content.headers['content-disposition']).toContain("inline; filename*=UTF-8''");
-    expect(content.headers['cache-control']).toBe('private, max-age=3600');
+    expect(content.headers['cache-control']).toBe('private, max-age=300');
+    expect(content.headers['content-security-policy']).toBe('sandbox');
     expect(content.headers['etag']).toBe(`"${data.sha256}"`);
 
     // 删除 → 再读 404·12000；MinIO 对象已清（listObjects 验证）
@@ -790,13 +868,17 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
       .send({ content: '看图说话', attachmentIds: [attId] })
       .expect(201);
     expect(sent.body.data.id).toBeDefined();
-    // 响应恒存在结构化 attachments 投影（P1 契约：5 字段 + contentUrl 派生）
+    const boundExpiresAt = (await readAttachmentRow(attId))!.expiresAt!.toISOString();
+    // 响应恒存在结构化 attachments 投影（P1 契约 + v1.90.0-dev TTL 位）
     expect(sent.body.data.attachments).toEqual([
       {
         id: attId,
         originalName: '绑定.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: 33,
+        expiresAt: boundExpiresAt,
+        expired: false,
         contentUrl: `${API_PREFIX}/attachments/${attId}/content`,
       },
     ]);
@@ -814,13 +896,15 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
         id: attId,
         originalName: '绑定.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png', // 展示信息入索引快照（静态事实）
         sizeBytes: 33,
+        expiresAt: boundExpiresAt, // 静态事实入快照；expired 不入（响应时纯函数）
         hasThumbnail: false, // 伪图 → fail-open 无缩略图（P2 批 1 索引 required 布尔）
       },
     ]);
   });
 
-  it('GET messages / unread（P1 真 PG 链路）：带附件消息投影恒存在（5 字段+contentUrl），无附件消息 attachments: []', async () => {
+  it('GET messages / unread（P1 真 PG 链路）：带附件消息投影恒存在（全字段+contentUrl+TTL 位），无附件消息 attachments: []', async () => {
     if (!available()) return;
     const uploader = await createHuman(UserRole.EDITOR, 'projup');
     // reader 无锚点（addParticipant 建行 lastReadMessageId=null）→ GET unread 全量未读
@@ -832,12 +916,16 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     const attId = up.body.data.id as string;
     created.attachmentIds.push(attId);
     created.objectKeys.push((await readAttachmentRow(attId))!.objectKey);
+    const expiresAt = (await readAttachmentRow(attId))!.expiresAt!.toISOString();
     const projection = [
       {
         id: attId,
         originalName: '投影.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: 33,
+        expiresAt, // 静态事实（上传时冻结，四表面同一口径）
+        expired: false, // 响应时纯函数
         contentUrl: `${API_PREFIX}/attachments/${attId}/content`,
       },
     ];
@@ -1162,7 +1250,8 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     expect(thumbRes.headers['x-content-type-options']).toBe('nosniff');
     expect(thumbRes.headers['content-disposition']).toContain("inline; filename*=UTF-8''");
     expect(thumbRes.headers['content-disposition']).toContain('_thumb.webp');
-    expect(thumbRes.headers['cache-control']).toBe('private, max-age=3600');
+    expect(thumbRes.headers['cache-control']).toBe('private, max-age=300');
+    expect(thumbRes.headers['content-security-policy']).toBe('sandbox');
     expect(thumbRes.headers['etag']).toBe(`"${row.thumbSha256}"`);
 
     // 授权 404 一致性：局外人对缩略图端点同样是 404·12000（不是 12008——不泄露存在性）
@@ -1184,7 +1273,10 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
         id: data.id,
         originalName: '链路 图.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: data.sizeBytes,
+        expiresAt: row.expiresAt!.toISOString(),
+        expired: false,
         contentUrl: `${API_PREFIX}/attachments/${data.id}/content`,
         thumbnailContentUrl: `${API_PREFIX}/attachments/${data.id}/thumbnail`,
       },
@@ -1198,7 +1290,9 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
         id: data.id,
         originalName: '链路 图.png',
         mimeType: 'image/png',
+        clientMimeType: 'image/png',
         sizeBytes: data.sizeBytes,
+        expiresAt: row.expiresAt!.toISOString(),
         hasThumbnail: true,
       },
     ]);
@@ -1320,8 +1414,10 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     expect(Buffer.compare(res.body as Buffer, await readObjectBytes(row.objectKey))).toBe(0);
     expect(res.headers['content-type']).toBe('image/png');
     expect(res.headers['x-content-type-options']).toBe('nosniff');
+    // 三出口同一套安全头（§1.2 M2）：公开面 200 也必须带 CSP sandbox
+    expect(res.headers['content-security-policy']).toBe('sandbox');
     expect(res.headers['content-disposition']).toContain("inline; filename*=UTF-8''");
-    // 能力 URL 禁共享缓存：恒 private 且无 max-age（对照 /content 的 private, max-age=3600）
+    // 能力 URL 禁共享缓存：恒 private 且无 max-age（对照 /content 的 private, max-age=300）
     expect(res.headers['cache-control']).toBe('private');
     expect(res.headers['etag']).toBe(`"${row.sha256}"`);
 
@@ -1553,5 +1649,313 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
     // 合法边界值两端均可铸造（60 / 3600）
     await mintSignedUrl(uploader.token, id, { ttlSeconds: 60 }).expect(200);
     await mintSignedUrl(uploader.token, id, { ttlSeconds: 3600 }).expect(200);
+  });
+
+  // ─── ⑪ v1.90.0-dev 附件 TTL 批（类型放开 + 过期语义 + 连带清理）──────────
+  //
+  // 过期态构造纪律（N3）：`sweepExpiredAttachments` 的小时级 cron 受 isTestEnv
+  // 控制（测试环境 disabled，见 attachment.constants.ATTACHMENT_EXPIRED_SWEEP_ENABLED），
+  // 且本套件的最小模块**不注册 AttachmentGcService**——"过期但行仍在"的中间态
+  // 在整个测试期间稳定（410 不会翻成 404）。expires_at 一律直改 DB 构造。
+
+  it('非图片全链（M1 回归）：声明 image/png 的 HTML 字节 → octet-stream + .bin + 强制下载 + nosniff/CSP', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'bin');
+    const topic = await createTopic(uploader.id, 'open');
+    const evil = Buffer.from('<!doctype html><html><script>alert(1)</script></html>', 'utf8');
+
+    const up = await uploadBytes(
+      uploader.token,
+      evil,
+      `topicId=${topic.id}`,
+      'evil.png',
+      'image/png',
+    ).expect(201);
+    const data = up.body.data;
+    created.attachmentIds.push(data.id);
+    // M1：声明值永不进 mime_type；只进 client_mime_type（纯展示）
+    expect(data.mimeType).toBe('application/octet-stream');
+    expect(data.clientMimeType).toBe('image/png');
+    expect(data.thumbnailContentUrl).toBeUndefined(); // 非图片不生成缩略图
+    expect(typeof data.expiresAt).toBe('string'); // topic 默认 7d → 上传时冻结
+
+    const row = (await readAttachmentRow(data.id))!;
+    created.objectKeys.push(row.objectKey);
+    expect(row.objectKey).toMatch(/\.bin$/); // objectKey 恒 .bin（M3）
+    expect(row.mimeType).toBe('application/octet-stream');
+    expect(row.clientMimeType).toBe('image/png');
+    expect(row.thumbKey).toBeNull();
+    // TTL 冻结 ≈ now + 7d（缺省档 fail-closed；毫秒级容差）
+    const ttlMs = row.expiresAt!.getTime() - Date.now();
+    expect(ttlMs).toBeGreaterThan(6 * 24 * 60 * 60 * 1000);
+    expect(ttlMs).toBeLessThan(8 * 24 * 60 * 60 * 1000);
+    // 对象元数据 Content-Type 也必须 octet-stream（声明值不固化到对象元数据，M3）
+    const stat = await minioClient.statObject(MINIO_CONFIG.bucket, row.objectKey);
+    expect(stat.metaData['content-type']).toBe('application/octet-stream');
+
+    // 字节出口：非图片恒 octet-stream + attachment + nosniff + CSP sandbox + 300s 缓存
+    const content = await getContentBytes(uploader.token, data.id).expect(200);
+    expect(Buffer.compare(content.body as Buffer, evil)).toBe(0);
+    expect(content.headers['content-type']).toBe('application/octet-stream');
+    expect(content.headers['content-disposition']).toContain("attachment; filename*=UTF-8''");
+    expect(content.headers['content-disposition']).not.toContain('inline');
+    expect(content.headers['x-content-type-options']).toBe('nosniff');
+    expect(content.headers['content-security-policy']).toBe('sandbox');
+    expect(content.headers['cache-control']).toBe('private, max-age=300');
+
+    // 非图片无缩略图 → 404·12008（而非 12000：附件可达但无该变体）
+    const thumb = await getThumbnailRaw(uploader.token, data.id).expect(404);
+    expect(thumb.body.code).toBe(ErrorCode.ATTACHMENT_THUMBNAIL_UNAVAILABLE);
+
+    // 元数据面（四表面之一）：200 + clientMimeType + expiresAt，不因非图片变化
+    const meta = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${data.id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+    expect(meta.body.data.clientMimeType).toBe('image/png');
+    expect(meta.body.data.expiresAt).toBe(row.expiresAt!.toISOString());
+  });
+
+  it('TTL 档位冻结：1d 生效 / never → NULL / 脏值 fail-closed 回退 7d / doc 绑定恒 NULL', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'ttl');
+
+    /** 建带 attachmentTtl 的 topic */
+    async function topicWithTtl(attachmentTtl: unknown): Promise<Topic> {
+      const topic = await createTopic(uploader.id, 'open');
+      await ds.query(`UPDATE topics SET settings = settings || $2::jsonb WHERE id = $1`, [
+        topic.id,
+        JSON.stringify({ attachmentTtl }),
+      ]);
+      return topic;
+    }
+
+    // 1d
+    const t1 = await topicWithTtl('1d');
+    const u1 = await uploadPng(uploader.token, `topicId=${t1.id}`).expect(201);
+    created.attachmentIds.push(u1.body.data.id);
+    const r1 = (await readAttachmentRow(u1.body.data.id))!;
+    created.objectKeys.push(r1.objectKey);
+    const d1 = r1.expiresAt!.getTime() - Date.now();
+    expect(d1).toBeGreaterThan(23 * 60 * 60 * 1000);
+    expect(d1).toBeLessThan(25 * 60 * 60 * 1000);
+
+    // never → NULL（永久）
+    const t2 = await topicWithTtl('never');
+    const u2 = await uploadPng(uploader.token, `topicId=${t2.id}`).expect(201);
+    created.attachmentIds.push(u2.body.data.id);
+    const r2 = (await readAttachmentRow(u2.body.data.id))!;
+    created.objectKeys.push(r2.objectKey);
+    expect(r2.expiresAt).toBeNull();
+    expect(u2.body.data.expiresAt).toBeNull();
+
+    // 脏值 → fail-closed 回退 7d（绝不回退 never）
+    const t3 = await topicWithTtl('forever');
+    const u3 = await uploadPng(uploader.token, `topicId=${t3.id}`).expect(201);
+    created.attachmentIds.push(u3.body.data.id);
+    const r3 = (await readAttachmentRow(u3.body.data.id))!;
+    created.objectKeys.push(r3.objectKey);
+    const d3 = r3.expiresAt!.getTime() - Date.now();
+    expect(d3).toBeGreaterThan(6 * 24 * 60 * 60 * 1000);
+    expect(d3).toBeLessThan(8 * 24 * 60 * 60 * 1000);
+
+    // doc 绑定 → 恒 NULL（豁免 TTL，即使话题侧有档位也不适用）
+    const { docId } = await createSpaceWithDoc(uploader.id, 'open', '# s\n');
+    const u4 = await uploadPng(uploader.token, `docId=${docId}`).expect(201);
+    created.attachmentIds.push(u4.body.data.id);
+    const r4 = (await readAttachmentRow(u4.body.data.id))!;
+    created.objectKeys.push(r4.objectKey);
+    expect(r4.topicId).toBeNull();
+    expect(r4.expiresAt).toBeNull();
+  });
+
+  it('TTL 写入面（M2）：PATCH /topics/:id config.attachmentTtl 真实 API 生效 → 后续上传 expiresAt ≈ now+1d', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'ttlapi');
+    const topic = await createTopic(uploader.id, 'open');
+
+    // DTO 白名单放行（forbidNonWhitelisted 真实管线：未声明键会 400，本键已声明）
+    await request(app.getHttpServer())
+      .patch(`${API_PREFIX}/topics/${topic.id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .send({ config: { attachmentTtl: '1d' } })
+      .expect(200)
+      .expect((res: any) => {
+        expect(res.body.data.settings.attachmentTtl).toBe('1d');
+      });
+
+    // 落库复核（settings jsonb 合并点，不经直改 SQL）
+    const persisted = await ds.query(
+      `SELECT settings->>'attachmentTtl' AS ttl FROM topics WHERE id = $1`,
+      [topic.id],
+    );
+    expect(persisted[0].ttl).toBe('1d');
+
+    // 新上传按**当时的设置**冻结 TTL
+    const up = await uploadPng(uploader.token, `topicId=${topic.id}`).expect(201);
+    created.attachmentIds.push(up.body.data.id);
+    const row = (await readAttachmentRow(up.body.data.id))!;
+    created.objectKeys.push(row.objectKey);
+    const ttlMs = row.expiresAt!.getTime() - Date.now();
+    expect(ttlMs).toBeGreaterThan(23 * 60 * 60 * 1000);
+    expect(ttlMs).toBeLessThan(25 * 60 * 60 * 1000);
+
+    // 非法档位 → 400（@IsIn 白名单；DTO 层拦，不进合并点）
+    await request(app.getHttpServer())
+      .patch(`${API_PREFIX}/topics/${topic.id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .send({ config: { attachmentTtl: 'forever' } })
+      .expect(400);
+    // 被拒的写入不得改变已落库值
+    const after = await ds.query(
+      `SELECT settings->>'attachmentTtl' AS ttl FROM topics WHERE id = $1`,
+      [topic.id],
+    );
+    expect(after[0].ttl).toBe('1d');
+  });
+
+  it('过期语义（R2/R3/R4）：元数据面 200 带 expiresAt；content/thumbnail 410·12009；mint 与引用 400·12009；投影 expired', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'exp');
+    const topic = await createTopic(uploader.id, 'open');
+    // 真实 PNG（sharp 可解码）→ 该附件**有缩略图**：过期态下 /thumbnail 也必须是
+    // 410·12009（覆盖"过期 + 有缩略图"分支；伪图只有 fail-open 的 12008 路径）
+    const up = await uploadRealPng(
+      uploader.token,
+      await makeRealPngBuffer(32, 32),
+      `topicId=${topic.id}`,
+    ).expect(201);
+    const id = up.body.data.id as string;
+    created.attachmentIds.push(id);
+    const row = (await readAttachmentRow(id))!;
+    expect(row.thumbKey).not.toBeNull(); // 真实 PNG 必然生成缩略图（本用例前提）
+    created.objectKeys.push(row.objectKey, row.thumbKey!);
+
+    // 过期**前**：铸造一枚签名 URL（验证过期后公开端点同样 410，token 本身仍有效）
+    const minted = await mintSignedUrl(uploader.token, id, {}).expect(200);
+    const signedToken = (minted.body.data.signedUrl as string).split('token=')[1];
+
+    // 过期**前**发一条引用消息（验证投影 expired 的墓碑语义）
+    const sendRes = await request(app.getHttpServer())
+      .post(`${API_PREFIX}/topics/${topic.id}/messages`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .send({ content: 'see image', attachmentIds: [id] })
+      .expect(201);
+    created.messageIds.push(sendRes.body.data.id);
+
+    // 直改 DB 构造过期态（N3：不依赖时钟流逝）
+    await forceExpire(id);
+
+    // ① 元数据面：扫前仍 200 + expiresAt（懒判不下沉 findAccessible，m3 —— 墓碑卡片要数据）
+    const meta = await request(app.getHttpServer())
+      .get(`${API_PREFIX}/attachments/${id}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+    expect(meta.body.data.expiresAt).toBeTruthy();
+    expect(new Date(meta.body.data.expiresAt).getTime()).toBeLessThan(Date.now());
+
+    // ② 字节面：410·12009（Gone 语义，与"从未存在"的 404·12000 刻意区分）
+    const content = await getContentRaw(uploader.token, id).expect(410);
+    expect(content.body.code).toBe(ErrorCode.ATTACHMENT_EXPIRED);
+    const thumb = await getThumbnailRaw(uploader.token, id).expect(410);
+    expect(thumb.body.code).toBe(ErrorCode.ATTACHMENT_EXPIRED);
+
+    // ③ 铸造面：400·12009（死了就是死了，不许铸新票）
+    const mint = await mintSignedUrl(uploader.token, id, {}).expect(400);
+    expect(mint.body.code).toBe(ErrorCode.ATTACHMENT_EXPIRED);
+
+    // ④ 公开端点（凭证仍有效）：410·12009
+    const pub = await getPublicContent(id, signedToken).expect(410);
+    expect(pub.body.code).toBe(ErrorCode.ATTACHMENT_EXPIRED);
+
+    // ⑤ 引用面：新消息引用已过期附件 → 400·12009
+    const send = await request(app.getHttpServer())
+      .post(`${API_PREFIX}/topics/${topic.id}/messages`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .send({ content: 'again', attachmentIds: [id] })
+      .expect(400);
+    expect(send.body.code).toBe(ErrorCode.ATTACHMENT_EXPIRED);
+
+    // ⑥ 投影（历史消息不动，**不 join 附件表**）：索引快照 = 发送时刻的静态事实——
+    //    直改 DB 的 expires_at 不改写历史消息快照，故此刻 expired 仍为 false
+    const msg = (await getMessageById(topic.id, uploader.token, sendRes.body.data.id))!;
+    const att = (msg.attachments as Array<Record<string, unknown>>)[0];
+    expect(att.expiresAt).toBe(row.expiresAt!.toISOString());
+    expect(att.expired).toBe(false);
+    expect(att.contentUrl).toBe(`${API_PREFIX}/attachments/${id}/content`);
+    expect(att.clientMimeType).toBe('image/png');
+
+    // ⑦ 时间前进（等价"发送后 TTL 到期"）：把索引快照的 expiresAt 改到过去 →
+    //    投影实时纯函数算出 expired=true（墓碑卡片：消息不动，投影带 expired）
+    const pastIso = new Date(Date.now() - 1000).toISOString();
+    await ds.query(
+      `UPDATE messages
+         SET metadata = jsonb_set(metadata, '{attachments,0,expiresAt}', to_jsonb($2::text))
+       WHERE id = $1`,
+      [sendRes.body.data.id, pastIso],
+    );
+    const msg2 = (await getMessageById(topic.id, uploader.token, sendRes.body.data.id))!;
+    const att2 = (msg2.attachments as Array<Record<string, unknown>>)[0];
+    expect(att2.expiresAt).toBe(pastIso);
+    expect(att2.expired).toBe(true);
+    expect(att2.contentUrl).toBe(`${API_PREFIX}/attachments/${id}/content`); // 墓碑仍可点（下载端 410）
+  });
+
+  it('topic 连带清理（m5）：软删话题 → 附件 404 + 配额即时释放 + 一条汇总 audit', async () => {
+    if (!available()) return;
+    const uploader = await createHuman(UserRole.EDITOR, 'casc');
+    const topic = await createTopic(uploader.id, 'open');
+    const topicId = topic.id;
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const up = await uploadPng(uploader.token, `topicId=${topicId}`).expect(201);
+      ids.push(up.body.data.id as string);
+      created.attachmentIds.push(up.body.data.id as string);
+      const row = (await readAttachmentRow(up.body.data.id as string))!;
+      created.objectKeys.push(row.objectKey);
+    }
+
+    // 删前：配额口径（与 attachment.service 同款谓词）计入这两行
+    const before = await ds.query(
+      `SELECT COALESCE(SUM(size_bytes),0)::text AS total FROM attachments
+       WHERE uploader_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())`,
+      [uploader.id],
+    );
+    expect(Number(before[0].total)).toBeGreaterThan(0);
+
+    // 软删话题（真实 controller 链路：权限判定 + topic 审计 + 连带清理审计）
+    await request(app.getHttpServer())
+      .delete(`${API_PREFIX}/topics/${topicId}`)
+      .set('Authorization', `Bearer ${uploader.token}`)
+      .expect(200);
+
+    // 连带软删：附件行 deleted_at 非空（语义反转：此前成员仍可读 → 现在 404）
+    for (const id of ids) {
+      const row = await readAttachmentRow(id);
+      expect(row).toBeNull(); // findOne 默认滤软删（= 读取面 404）
+      const raw = await ds.query(`SELECT deleted_at FROM attachments WHERE id = $1`, [id]);
+      expect(raw[0].deleted_at).not.toBeNull();
+    }
+    // 字节面 404（连带软删后 = 不存在，m5 有意变更）
+    const gone = await getContentRaw(uploader.token, ids[0]).expect(404);
+    expect(gone.body.code).toBe(ErrorCode.ATTACHMENT_NOT_FOUND);
+
+    // 配额即时释放（软删口径）
+    const after = await ds.query(
+      `SELECT COALESCE(SUM(size_bytes),0)::text AS total FROM attachments
+       WHERE uploader_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())`,
+      [uploader.id],
+    );
+    expect(Number(after[0].total)).toBe(0);
+
+    // 汇总 audit：action=cascade_delete_attachments + {topicId, count}
+    const audits = await ds.query(
+      `SELECT actor_id, new_data FROM audit_logs
+       WHERE action = 'cascade_delete_attachments' AND entity_id = $1`,
+      [topicId],
+    );
+    expect(audits).toHaveLength(1);
+    expect(audits[0].actor_id).toBe(uploader.id);
+    expect(audits[0].new_data).toEqual({ topicId, count: 2 });
   });
 });

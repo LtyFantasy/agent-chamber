@@ -16,7 +16,12 @@ ARG APK_MIRROR=
 ARG NPM_REGISTRY=
 RUN if [ -n "$APK_MIRROR" ]; then sed -i "s|dl-cdn.alpinelinux.org|$APK_MIRROR|g" /etc/apk/repositories; fi \
  && if [ -n "$NPM_REGISTRY" ]; then echo "registry=$NPM_REGISTRY" >> /root/.npmrc; fi
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# pnpm 钉版（禁 @latest 浮动）：pnpm 12 起 --frozen-lockfile 强校验「lockfile 全部
+# importers 的 package.json 必须存在于安装层」，而过滤安装 COPY 集按设计只含本镜像
+# 构建所需包（packages/diagram 等不在内）→ 全新构建必炸（2026-10-03 v1.90.0 发版冒烟
+# 实证，当日 latest=12.8.1；同族漂移史：v1.51.0 第三层 bug）。钉与 lockfile 生成方
+# （宿主开发机）一致的 9.15.9，保证锁文件格式与校验行为同源
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY pnpm-workspace.yaml package.json ./
 COPY pnpm-lock.yaml ./
 COPY apps/backend/package.json ./apps/backend/

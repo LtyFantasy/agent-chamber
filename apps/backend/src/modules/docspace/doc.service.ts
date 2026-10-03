@@ -129,6 +129,7 @@ import type {
   DiagramWriteRenderInfo,
   DiagramDiagnostic,
   UpsertDiagramResult,
+  DocListSort,
 } from '@agent-chamber/shared';
 import { chunkMarkdown, estimateTokens } from './markdown-chunker';
 import type { ChunkResult } from './markdown-chunker';
@@ -144,8 +145,14 @@ import { computeLinkHealth } from './link-health';
 import { computeLineDiff } from './doc-version-diff';
 import { RouteHealthService } from './route-health.service';
 import { DiagramRendererService, type DiagramRenderArtifacts } from './diagram-renderer.service';
+// 类型专用导入（import type，编译期擦除）：避免与 doc-links.service → doc.service 的
+// 运行时依赖形成模块环（reconstructContent 的入参放宽，见该方法注释）
+import type { SpaceDocCandidate } from './doc-links.service';
 import type { UpsertDocDto, BatchUpsertItemDto } from './dto';
 import { UnifiedActor } from '../../common/types/actor.types';
+// LIKE 字面前缀转义单源（findAll pathPrefix 与 findTree prefix 两处共用；headingQuery 的
+// ILIKE 子串转义语义不同，仍就地实现——见 getSectionByHeadingQuery）
+import { escapeLikePrefix } from '../../common/utils/sql-like';
 import { AuditLog } from '../../database/entities/audit-log.entity';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { EventService } from '../event/event.service';
@@ -1315,9 +1322,15 @@ export class DocService {
 
   /**
    * List documents in a space. Supports filters: category, tag, type, q (full-text),
-   * path (exact), pathPrefix (prefix match, v1.55).
+   * path (exact), pathPrefix (prefix match, v1.55), updatedAfter (metadata-level lower bound,
+   * v1.89.0-dev) and sort (path ASC default | updatedAt_desc | updatedAt_asc).
    * path= and q= are mutually exclusive; path= and pathPrefix= are mutually exclusive
    * (both target the path column and exact match subsumes prefix).
+   *
+   * ⚠️ updatedAfter 的能力边界（契约，消费方别误用）：**只筛元数据** `docs.updated_at`
+   * ——无内容级增量；**删除不可见**（硬过滤 deleted_at IS NULL，软删不 bump 时间列）；
+   * 且 `updated_at` 由两个时钟源写入（save() 路径 = 应用时钟 `new Date()`，元数据 patch /
+   * move = DB 时钟 `NOW()`），增量水位必须回看重叠窗口（详见 QueryDocDto 类头注释）。
    */
   async findAll(
     spaceId: string,
@@ -1330,9 +1343,22 @@ export class DocService {
       pathPrefix?: string;
       page?: number;
       pageSize?: number;
+      updatedAfter?: string;
+      sort?: DocListSort;
     },
   ): Promise<PaginatedResponse<DocSummary>> {
-    const { category, tag, type, q, path, pathPrefix, page = 1, pageSize = 20 } = query;
+    const {
+      category,
+      tag,
+      type,
+      q,
+      path,
+      pathPrefix,
+      page = 1,
+      pageSize = 20,
+      updatedAfter,
+      sort,
+    } = query;
 
     // path= and q= are mutually exclusive
     if (path && q) {
@@ -1364,9 +1390,10 @@ export class DocService {
     }
 
     // Path prefix match（v1.55）：LIKE 通配符转义保证字面前缀语义——
-    // 用户输入中的 \ % _ 逐字符转义（ESCAPE '\'），不会被当作 LIKE 元字符解释
+    // 用户输入中的 \ % _ 逐字符转义（ESCAPE '\'），不会被当作 LIKE 元字符解释。
+    // 转义实现单源 = common/utils/sql-like.ts escapeLikePrefix（与 findTree/exportBundle 共用）
     if (pathPrefix) {
-      const escaped = pathPrefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+      const escaped = escapeLikePrefix(pathPrefix);
       qb.andWhere("d.path LIKE :pathPrefix ESCAPE '\\'", { pathPrefix: `${escaped}%` });
     }
 
@@ -1390,8 +1417,29 @@ export class DocService {
       qb.andWhere('d.doc_type = :docType', { docType: type });
     }
 
-    // Default ordering
-    qb.orderBy('d.path', 'ASC');
+    // updatedAfter（v1.89.0-dev）：元数据级下界，**含边界**（>=）。无上界参数（本版无
+    // updatedBefore）——增量消费靠水位回看，见方法注释的三盲区。
+    if (updatedAfter) {
+      qb.andWhere('d.updated_at >= :updatedAfter', { updatedAfter });
+    }
+
+    // 排序：缺省保持 path ASC（逐字节沿用既有行为）；显式 sort 时按 updatedAt，
+    // **次键恒为 path ASC**——path 是 upsert 业务键、应用层唯一 ⇒ 全序（批量 upsert
+    // 同 updated_at 常见，缺次键会让分页结果在页间抖动/重复）
+    //
+    // ⚠️ orderBy 必须写**实体属性路径**（d.updatedAt），不能写数据库列名（d.updated_at）：
+    // skip/take 分页触发 createOrderByCombinedWithSelectExpression，按属性名查实体元数据，
+    // 列名解析不到 → undefined.databaseName 抛 TypeError 500（v1.89.0 生产实踩；mock 单测
+    // 测不出真 ORM 行为，该路径由 docspace-bundle e2e 真 PG 用例守门）。andWhere 不受此限
+    // （裸 SQL 片段，列名/属性名都能过）。
+    if (sort) {
+      qb.orderBy('d.updatedAt', sort === 'updatedAt_desc' ? 'DESC' : 'ASC').addOrderBy(
+        'd.path',
+        'ASC',
+      );
+    } else {
+      qb.orderBy('d.path', 'ASC');
+    }
 
     const [items, total] = await qb
       .skip((page - 1) * pageSize)
@@ -1463,8 +1511,9 @@ export class DocService {
     const prefix = rawPrefix.replace(/^\/+/, '');
     const normalizedPrefix = prefix === '' ? '' : prefix.endsWith('/') ? prefix : `${prefix}/`;
 
-    // LIKE 通配符转义（照抄 findAll 先例）：\ % _ 逐字符转义，保证字面前缀语义
-    const escapedPrefix = normalizedPrefix.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    // LIKE 通配符转义（单源 = common/utils/sql-like.ts escapeLikePrefix）：\ % _ 逐字符
+    // 转义，保证字面前缀语义
+    const escapedPrefix = escapeLikePrefix(normalizedPrefix);
 
     // plen：substring(d.path from :plen) 的起始位置（PG 1-based）。
     // 归一化 prefix 恒以 / 结尾（非空时），plen = prefix.length + 1 跳过 "prefix/"
@@ -1870,7 +1919,10 @@ export class DocService {
    * 禁止在 DocMoveService 复制渲染实现。
    */
   reconstructContent(
-    doc: Doc,
+    // 签名放宽（v1.90.0-dev backlinks 批次）：本方法**只读 doc.title**（下方
+    // renderSectionPart 的 docTitle 实参），故接纳入链内核的窄候选类型
+    // SpaceDocCandidate——调用方无需把候选集 `as Doc` 强转（plan ADR 明令禁止）。
+    doc: Doc | SpaceDocCandidate,
     sections: {
       content: string;
       headingLevel: number;

@@ -1,4 +1,5 @@
 import { MessageType, TopicKind, TopicStatus, Visibility, WakePolicy } from '../enums';
+import type { AttachmentTtl } from '../constants';
 
 /**
  * 议程项状态值域（AgendaItemInput.status 单一事实来源；review-0831 任务 a8a295df
@@ -62,6 +63,13 @@ export interface TopicConfigInput {
    * 「配置原样存储」语义照常写入 settings。
    */
   maxRoundsWithoutHuman?: number;
+  /**
+   * 附件有效期档位（附件 TTL 批，v1.90.0-dev）：'1d' | '7d' | '30d' | 'never'。
+   * 缺省 / 脏值 → **7d**（fail-closed，绝不回退 never）。写 settings jsonb；
+   * 语义 = **上传时冻结**（`expires_at = now() + ttl`），事后修改只影响新上传；
+   * doc 绑定附件豁免（恒 NULL = 永久）。普通话题同样按「配置原样存储」透传。
+   */
+  attachmentTtl?: AttachmentTtl;
 }
 
 /**
@@ -120,8 +128,9 @@ export interface SendMessageInput {
   metadata?: Record<string, unknown>;
   /**
    * 附件 ID 列表（可选，≤9 个 UUID；MinIO 媒体附件 P0）。
-   * 服务端前置校验：全部存在（未软删）+ 上传者=发送者 + 绑定本 topic，
-   * 通过后写 metadata.attachments=[{id,originalName,mimeType,sizeBytes}] 索引。
+   * 服务端前置校验：全部存在（未软删）+ 上传者=发送者 + 绑定本 topic +
+   * **未过期**（`expiresAt < now` → 400·12009，v1.90.0-dev），
+   * 通过后写 metadata.attachments 索引（含 expiresAt/clientMimeType 静态事实）。
    * 一致性规则：content 是渲染事实，metadata.attachments 是索引，允许不一致
    * （不校验 content 是否真引用）。
    */

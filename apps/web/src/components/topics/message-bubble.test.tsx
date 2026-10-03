@@ -43,9 +43,12 @@ jest.mock('next-intl', () => ({
   useTranslations: () => (key: string) => messages[key] ?? key,
 }));
 
-// 全局 confirm mock（删除消息确认用；resolve 值控制「删除/取消」分支）
+// 全局 confirm mock（删除消息确认用；resolve 值控制「删除/取消」分支）；
+// toast 由附件卡片（attachment-file-card）模块级 import 消费，虽本套件不触发下载，
+// 仍补齐导出避免 mock 模块缺键（undefined 属性访问是隐患）
 jest.mock('@/lib/notify', () => ({
   confirm: jest.fn(),
+  toast: { error: jest.fn(), warning: jest.fn(), success: jest.fn(), info: jest.fn() },
 }));
 const mockConfirm = confirm as jest.Mock;
 
@@ -349,6 +352,79 @@ describe('MessageBubble 圆桌扩展', () => {
       expect(name.className).toContain('opacity-80');
       expect(name.className).not.toContain('opacity-60');
       expect(name).not.toHaveAttribute('title');
+    });
+  });
+
+  describe('非图片附件卡片（v1.90.0-dev 通用附件批 §2 B2）', () => {
+    /** 构造消息附件投影条目（字段对齐 shared MessageAttachment） */
+    const fileAtt = (id: string, originalName: string, mimeType: string) => ({
+      id,
+      originalName,
+      mimeType,
+      sizeBytes: 2048,
+      clientMimeType: mimeType,
+      expiresAt: null,
+      expired: false,
+      contentUrl: `/api/v1/attachments/${id}/content`,
+    });
+
+    it('非图片条目渲染卡片；图片条目走 content 的 ![]() 不渲染卡片（防双重呈现）', () => {
+      render(
+        <MessageBubble
+          msg={makeMessage({
+            attachments: [
+              fileAtt('att-img', 'photo.png', 'image/png'),
+              fileAtt('att-log', 'build.log', 'application/octet-stream'),
+            ],
+          })}
+        />,
+      );
+
+      expect(screen.getByTestId('message-attachments')).toBeInTheDocument();
+      // 卡片只渲染非图片条目
+      expect(screen.getByText('build.log')).toBeInTheDocument();
+      expect(screen.queryByText('photo.png')).not.toBeInTheDocument();
+      expect(screen.getAllByTestId('attachment-file-card')).toHaveLength(1);
+    });
+
+    it('无附件（乐观消息 attachments: []）→ 不渲染列表容器（零视觉噪音）', () => {
+      render(<MessageBubble msg={makeMessage()} />);
+      expect(screen.queryByTestId('message-attachments')).not.toBeInTheDocument();
+
+      render(
+        <MessageBubble
+          msg={makeMessage({
+            id: 'msg-2',
+            attachments: [fileAtt('att-img-2', 'only.png', 'image/jpeg')],
+          })}
+        />,
+      );
+      expect(screen.queryByTestId('message-attachments')).not.toBeInTheDocument();
+    });
+
+    it('多条目按原序渲染，过期条目禁用下载', () => {
+      render(
+        <MessageBubble
+          msg={makeMessage({
+            attachments: [
+              fileAtt('att-a', 'a.log', 'application/octet-stream'),
+              {
+                ...fileAtt('att-b', 'b.zip', 'application/octet-stream'),
+                expiresAt: new Date(Date.now() - 1000).toISOString(),
+                expired: true,
+              },
+            ],
+          })}
+        />,
+      );
+
+      const names = screen.getAllByTestId('attachment-file-card').map((el) => el.textContent);
+      expect(names[0]).toContain('a.log');
+      expect(names[1]).toContain('b.zip');
+      // 过期条目禁用下载；未过期条目可下载（i18n mock 未收录 card.* → 回落 key 本身）
+      const cards = screen.getAllByTestId('attachment-file-card');
+      expect(cards[0].querySelector('button')).not.toBeDisabled();
+      expect(cards[1].querySelector('button')).toBeDisabled();
     });
   });
 });

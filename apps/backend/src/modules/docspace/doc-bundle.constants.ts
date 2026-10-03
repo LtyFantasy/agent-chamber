@@ -6,16 +6,19 @@
  * 同一个数字，散落即漂移。
  *
  * 联合预算口径（plan §0 dx M4 / arch M2 / PM B2 行，architect 复核 B-1 修正）：
- * 单请求体上限是**双 10mb**（express `json({limit:'10mb'})` + nginx `client_max_body_size 10m`），
- * 因此媒体额度不能是固定值，必须是"总量减去其它段"的余量：
+ * **JSON 体的绑定约束是 express `json({limit:'10mb'})`**——nginx `client_max_body_size`
+ * 自 v1.90.0-dev 起为 12m（为 10MB 附件 multipart 留余量），对 JSON 面更宽松，
+ * 即 bundle 请求的实际上限仍是 10MiB（更小者胜）。因此媒体额度不能是固定值，
+ * 必须是"总量减去其它段"的余量：
  *   `媒体额度 = DOC_BUNDLE_MAX_BYTES − docs 段实际 JSON 字节 − DOC_BUNDLE_ENVELOPE_MARGIN_BYTES`
  * 64KiB 余量覆盖：媒体段自身的 JSON 键开销（sourceAttachmentId/docPath/originalName/sha256
  * 等每项数百字节）、categories/routes/space 段、以及 JSON 转义的少量膨胀。
  */
 
 /**
- * 单请求体硬上限（10MiB）——与 main.ts body-parser limit 及生产 nginx
- * client_max_body_size 同值（双端任一更小都会先 413，故取同值时本层预判才有效）。
+ * 单请求体硬上限（10MiB）——与 main.ts body-parser limit 同值（**本面的绑定约束**）。
+ * nginx client_max_body_size 12m 对 JSON 面更宽松（它是 multipart 上传的绑定约束），
+ * 故本层预判必须以 10MiB 为准才有效：取 nginx 的 12m 会让预判失效、整包被 express 413。
  */
 export const DOC_BUNDLE_MAX_BYTES = 10 * 1024 * 1024;
 
@@ -28,7 +31,7 @@ export const DOC_BUNDLE_ENVELOPE_MARGIN_BYTES = 64 * 1024;
 
 /**
  * 单项媒体载荷上限（默认 6MiB，指**原图原始字节数**）。
- * 依据：附件上传单文件上限 8MiB，base64 后 10.67MB 已超双 10mb 请求体上限——
+ * 依据：附件上传单文件上限 10MB，base64 后 13.3MB 已超 12m 请求体上限——
  * 即"能上传的图"有一部分天生进不了 bundle，必须在导出侧显式落 `skipped:'too_large'`
  * 而不是让整包被 413 打回（可发现优于静默截断）。
  */

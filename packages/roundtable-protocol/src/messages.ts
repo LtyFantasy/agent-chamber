@@ -320,7 +320,7 @@ function validateSeatConfigPayload(payload: unknown): ValidationResult {
     errors.push('seat.assign payload.label 必须为非空字符串（座位展示名）');
   }
   if (typeof payload.vendor !== 'string' || payload.vendor.length === 0) {
-    errors.push('seat.assign payload.vendor 必须为非空字符串（已接入 kimi/codex，类型层预留后续扩展）');
+    errors.push('seat.assign payload.vendor 必须为非空字符串（取值以 SEAT_VENDORS 为准，类型层预留后续扩展）');
   }
   if (typeof payload.cwd !== 'string' || payload.cwd.length === 0) {
     errors.push('seat.assign payload.cwd 必须为非空字符串（座位工作目录）');

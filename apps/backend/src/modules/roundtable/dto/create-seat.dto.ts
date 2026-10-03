@@ -38,7 +38,7 @@ export class CreateSeatDto {
 
   @IsIn([...SEAT_VENDORS])
   @ApiProperty({
-    description: '厂商（kimi / codex / opencode / claude-code；M4 起扩展）',
+    description: '厂商（取值以 enum 为准——SEAT_VENDORS 单一事实源，接入新厂商自动跟随）',
     enum: [...SEAT_VENDORS],
     example: 'kimi',
   })

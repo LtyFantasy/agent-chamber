@@ -5,7 +5,10 @@
  * ② vendor-runner 联动提示（无支持 runner 在线 → amber 提示，不阻断提交）；
  * ③ 高级折叠区默认收起、展开后可填；④ 提交 payload（高级项空值不落载荷；
  * 填了才带）；⑤ 成功后**不关窗**、切「下一步」成功态内嵌连接向导（v1.51.0），
- * 点「完成」才关闭；X/遮罩关闭重置回表单态。文案断言用 en.json 快照。
+ * 点「完成」才关闭；X/遮罩关闭重置回表单态；⑥ 档位文案 per-vendor 覆盖（D9：
+ * dsh 四档走专属语义词条，未登记厂商沿用共享键）+ 切厂商重置为该厂商默认档
+ * （VENDOR_DEFAULT_MODE：dsh 默认落 default，其余厂商仍 auto；重置是双向的，
+ * 且不锁死——切换后用户仍可显式改档）。文案断言用 en.json 快照。
  */
 
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -31,6 +34,13 @@ const messages: Record<string, string> = {
   'topics.seatCreate.pmPlanDesc': 'plan (read-only + plan collaboration mode)',
   'topics.seatCreate.pmAutoDesc': 'auto (auto-execute, sensitive ops need approval — recommended)',
   'topics.seatCreate.pmYoloDesc': 'yolo (full access, no approvals — use with caution)',
+  'topics.seatCreate.pmDefaultDescDsh':
+    'default (workspace-write: allowed inside the seat working directory)',
+  'topics.seatCreate.pmPlanDescDsh':
+    'plan (read-only: every write is hard-denied and needs approval)',
+  'topics.seatCreate.pmAutoDescDsh': 'auto (danger-full-access: zero approvals — NOT recommended)',
+  'topics.seatCreate.pmYoloDescDsh':
+    'yolo (danger-full-access: zero approvals — disposable environments only)',
   'topics.seatCreate.advanced': 'Advanced options',
   'topics.seatCreate.model': 'Model override (optional)',
   'topics.seatCreate.modelPlaceholder': 'e.g. kimi-k2',
@@ -159,6 +169,94 @@ describe('vendor-runner 联动提示', () => {
   it('有支持所选 vendor 的在线 runner → 不渲染提示', () => {
     renderDialog([ONLINE_KIMI_RUNNER]);
     expect(screen.queryByTestId('seat-create-vendor-warning')).not.toBeInTheDocument();
+  });
+});
+
+describe('档位文案（D9 per-vendor 覆盖表）', () => {
+  it('默认 vendor=kimi：四档沿用共享文案', () => {
+    renderDialog([ONLINE_KIMI_RUNNER]);
+    expect(screen.getByText('default (read-only, writes need approval)')).toBeInTheDocument();
+    expect(
+      screen.getByText('auto (auto-execute, sensitive ops need approval — recommended)'),
+    ).toBeInTheDocument();
+    // 未登记厂商不出现 dsh 专属文案
+    expect(
+      screen.queryByText('default (workspace-write: allowed inside the seat working directory)'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('切到 vendor=dsh：四档换成 dsh 真实语义文案（default 反转语义）', () => {
+    renderDialog([ONLINE_KIMI_RUNNER]);
+    fireEvent.click(screen.getByRole('radio', { name: 'dsh' }));
+
+    expect(
+      screen.getByText('default (workspace-write: allowed inside the seat working directory)'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('plan (read-only: every write is hard-denied and needs approval)'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('auto (danger-full-access: zero approvals — NOT recommended)'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('yolo (danger-full-access: zero approvals — disposable environments only)'),
+    ).toBeInTheDocument();
+    // 共享键对 dsh 是反向语义（default≠只读逐项审批），已让位
+    expect(screen.queryByText('default (read-only, writes need approval)')).not.toBeInTheDocument();
+  });
+
+  it('切到 vendor=dsh 提交：档位重置为 dsh 默认档 default（不是 auto）+ vendor 协议值原样落载荷', async () => {
+    mockCreateSeat.mockResolvedValue(CREATED_SEAT);
+    renderDialog([ONLINE_KIMI_RUNNER]);
+    fireEvent.click(screen.getByRole('radio', { name: 'dsh' }));
+    await fillRequired();
+    fireEvent.click(screen.getByTestId('seat-create-submit'));
+
+    await waitFor(() => expect(mockCreateSeat).toHaveBeenCalledTimes(1));
+    // dsh 默认档 = default（workspace-write）；auto/yolo 对 dsh 是 danger-full-access 零审批，
+    // 不能作为开箱默认值（主脑 review 决策，与 dsh.md 推荐一致）
+    expect(mockCreateSeat.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ vendor: 'dsh', permissionMode: 'default' }),
+    );
+  });
+
+  it('切到 dsh 后仍可显式改档（per-vendor 映射不是锁）：选 yolo → 载荷 permissionMode=yolo', async () => {
+    mockCreateSeat.mockResolvedValue(CREATED_SEAT);
+    renderDialog([ONLINE_KIMI_RUNNER]);
+    fireEvent.click(screen.getByRole('radio', { name: 'dsh' }));
+    // 用户显式选 dsh 的 yolo 档（danger-full-access，零审批）
+    fireEvent.click(
+      screen.getByRole('radio', {
+        name: 'yolo (danger-full-access: zero approvals — disposable environments only)',
+      }),
+    );
+    await fillRequired();
+    fireEvent.click(screen.getByTestId('seat-create-submit'));
+
+    await waitFor(() => expect(mockCreateSeat).toHaveBeenCalledTimes(1));
+    expect(mockCreateSeat.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ vendor: 'dsh', permissionMode: 'yolo' }),
+    );
+  });
+
+  it('切厂商来回：dsh→kimi 档位重置回 auto（重置双向生效，非单向粘滞）', async () => {
+    mockCreateSeat.mockResolvedValue(CREATED_SEAT);
+    renderDialog([ONLINE_KIMI_RUNNER]);
+    fireEvent.click(screen.getByRole('radio', { name: 'dsh' }));
+    // 在 dsh 上选 plan，再切回 kimi —— 不应把 dsh 的 plan 带到 kimi
+    fireEvent.click(
+      screen.getByRole('radio', {
+        name: 'plan (read-only: every write is hard-denied and needs approval)',
+      }),
+    );
+    fireEvent.click(screen.getByRole('radio', { name: 'kimi' }));
+    await fillRequired();
+    fireEvent.click(screen.getByTestId('seat-create-submit'));
+
+    await waitFor(() => expect(mockCreateSeat).toHaveBeenCalledTimes(1));
+    expect(mockCreateSeat.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ vendor: 'kimi', permissionMode: 'auto' }),
+    );
   });
 });
 

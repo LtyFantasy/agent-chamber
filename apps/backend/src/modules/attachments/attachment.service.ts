@@ -19,7 +19,18 @@
  * [关键不变量]
  *   - 上传：配额事务里 SUM 与插行同事务、advisory lock 持有到提交、putObject 在锁外、
  *     插行失败删对象（原图 + 缩略图双删）
- *   - 缩略图 fail-open：生成/上传失败只降级 thumb 5 列为 null；缩略图不计入配额
+ *   - **mime_type 只承载字节证据**（M1）：4 种嗅探图片 mime 或恒 application/octet-stream；
+ *     客户端声明值只进 client_mime_type（sanitize 后纯展示）。对象键后缀同理：
+ *     图片 `{uuid}.{嗅探ext}`、**非图片恒 `{uuid}.bin`**；putObject 的 Content-Type
+ *     非图片恒 octet-stream（M3：外部输入不进键空间/不进对象元数据）
+ *   - **expires_at 上传时冻结**（§1.1）：topic 绑定按当时 settings.attachmentTtl
+ *     （白名单解析，缺省/脏值 fail-closed 回退 7d，**绝不回退 never**）；doc 绑定恒 NULL
+ *   - 配额 SUM 排除过期行：`AND (expires_at IS NULL OR expires_at > now())`（R1）
+ *   - **字节读取面**（getContent/getThumbnail）过期 → 410·12009、非 ready → 404·12000；
+ *     懒判插入点 = 行加载 + 授权之后、getObject 之前；**绝不**下沉 findAccessible
+ *     （元数据面必须继续 200 + expiresAt——墓碑卡片要数据，m3）
+ *   - 缩略图 fail-open：生成/上传失败只降级 thumb 5 列为 null；缩略图不计入配额；
+ *     **仅图片分支**生成（非图片无解码面，直接跳过）
  *   - bundle 导入：**解码字节的嗅探结果才是 mime 的事实来源**（声明值只作对照，
  *     不符即 failed 不落行——存储型 XSS 防线）；复用行属性以库内为准（不更新文件名）；
  *     复用/插行的候选集 = (uploaderId=importer, sha256, topicId NULL, status='ready',
@@ -36,6 +47,10 @@
  *   - BUNDLE-XSS(B2): bundle 的 mimeType/originalName 都是声明值，只信声明 = 允许把
  *     脚本字节以 image/png 存进平台并同源回吐（存储型 XSS）。安全方向：解码字节魔数
  *     嗅探必须与声明一致，不符即 failed 不落行（与上传同一套 sniffImageMime）。
+ *   - ATTEST-SNIFF-ONLY(M1): mime_type 列被当作"可信类型"直出即 XSS 面
+ *     （声明 image/png 的 HTML 若内联回吐 = 直接执行）。安全方向：出口恒按
+ *     INLINE_IMAGE_MIME_TYPES 精确成员判断分叉 + octet-stream/attachment 兜底 +
+ *     nosniff + CSP sandbox；任何新通道（presign 等）不得把本列当可信类型依据。
  *
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
@@ -46,6 +61,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  GoneException,
   Injectable,
   Logger,
   NotFoundException,
@@ -57,6 +73,7 @@ import { createHash, randomUUID } from 'crypto';
 import type { Readable } from 'stream';
 import { ActorType, AuditAction, ErrorCode, UserRole, Visibility } from '@agent-chamber/shared';
 import { Attachment } from '../../database/entities/attachment.entity';
+import { Topic } from '../../database/entities/topic.entity';
 import { TopicParticipant } from '../../database/entities/topic-participant.entity';
 import { ParticipantStatus } from '@agent-chamber/shared';
 import { TopicService } from '../topic/topic.service';
@@ -70,12 +87,18 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { AttachmentStorageService } from './storage.service';
 import { AttachmentAccessService } from './attachment-access.service';
 import {
+  ATTACHMENT_FALLBACK_MIME,
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_DIMENSION_PX,
   ATTACHMENT_MAX_TOTAL_PIXELS,
   ATTACHMENT_QUOTA_BYTES,
+  NON_IMAGE_OBJECT_EXT,
+  computeAttachmentExpiresAt,
+  isAttachmentExpired,
+  isAttachmentReadable,
 } from './attachment.constants';
 import { exceedsDimensionLimits, readImageDimensions, sniffImageMime } from './image-sniffer';
+import { sanitizeClientMimeType } from './client-mime';
 import { sanitizeOriginalName } from './filename-sanitize';
 import { UploadAttachmentQueryDto } from './dto/upload-attachment-query.dto';
 import { QueryMineDto } from './dto/query-mine.dto';
@@ -214,43 +237,57 @@ export class AttachmentService {
     }
 
     // ── 2. 绑定资源存在 + 写权限 ─────────────────────────────────
+    // topic 绑定额外取回 settings（TTL 冻结用）；doc 绑定恒 NULL（永久豁免）
+    let topicSettings: Record<string, unknown> | undefined;
     if (topicId != null) {
-      await this.assertTopicWritable(topicId, actor);
+      const topic = await this.assertTopicWritable(topicId, actor);
+      topicSettings = topic.settings ?? {};
     } else {
       // docId != null（恰好一值已保证）
       await this.assertDocWritable(docId as string, actor);
     }
 
-    // ── 3. 魔数嗅探（12002）──────────────────────────────────────
+    // ── 3. 字节证据分类（M1 不变量，v1.90.0-dev）───────────────────
+    // 嗅探命中 4 种图片 → 图片分支（头部尺寸校验 + 缩略图 + `{uuid}.{ext}` 键）；
+    // 未命中 → 非图片分支（类型直接放开：mime_type 恒 octet-stream、objectKey 恒 .bin、
+    // 跳过尺寸/缩略图）。两条分支的键后缀与 putObject Content-Type **只来自字节证据**；
+    // 客户端声明的 Content-Type 经 sanitize 后只进 client_mime_type（纯展示）。
     const sniffed = sniffImageMime(file.buffer);
-    if (!sniffed) {
-      throw new BadRequestException({
-        message: 'File content is not an allowed image type (png/jpeg/gif/webp)',
-        code: ErrorCode.ATTACHMENT_TYPE_NOT_ALLOWED,
-      });
-    }
 
-    // ── 4. 头部尺寸校验（防解码炸弹；头部不可解析 = 不可信文件）───
-    const dim = readImageDimensions(file.buffer, sniffed.mime);
-    if (!dim) {
-      throw new BadRequestException({
-        message: 'Image header is malformed or truncated; dimensions unreadable',
-        code: ErrorCode.VALIDATION_ERROR,
-      });
-    }
-    if (exceedsDimensionLimits(dim, ATTACHMENT_MAX_DIMENSION_PX, ATTACHMENT_MAX_TOTAL_PIXELS)) {
-      throw new BadRequestException({
-        message:
-          `Image dimensions ${dim.width}x${dim.height} exceed limits ` +
-          `(max side ${ATTACHMENT_MAX_DIMENSION_PX}px, max total ${ATTACHMENT_MAX_TOTAL_PIXELS} pixels)`,
-        code: ErrorCode.VALIDATION_ERROR,
-      });
+    // ── 4. 头部尺寸校验（防解码炸弹；仅图片分支——非图片无解码面）──
+    if (sniffed) {
+      const dim = readImageDimensions(file.buffer, sniffed.mime);
+      if (!dim) {
+        throw new BadRequestException({
+          message: 'Image header is malformed or truncated; dimensions unreadable',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
+      if (exceedsDimensionLimits(dim, ATTACHMENT_MAX_DIMENSION_PX, ATTACHMENT_MAX_TOTAL_PIXELS)) {
+        throw new BadRequestException({
+          message:
+            `Image dimensions ${dim.width}x${dim.height} exceed limits ` +
+            `(max side ${ATTACHMENT_MAX_DIMENSION_PX}px, max total ${ATTACHMENT_MAX_TOTAL_PIXELS} pixels)`,
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+      }
     }
 
     // ── 5. 哈希 → putObject（锁外）→ 配额事务 ────────────────────
     const sha256 = createHash('sha256').update(file.buffer).digest('hex');
-    const objectKey = `${randomUUID()}.${sniffed.ext}`;
+    // 键后缀闭合值域（M3）：图片 = 嗅探 ext；非图片恒 'bin'——外部输入（文件名/声明 mime）
+    // 永不进键空间（防路径/扩展名注入与未来 presign 的类型混淆）
+    const objectKey = `${randomUUID()}.${sniffed ? sniffed.ext : NON_IMAGE_OBJECT_EXT}`;
     const originalName = sanitizeOriginalName(file.originalname);
+    // mime_type 列 = 字节证据唯一来源：图片=嗅探值，非图片=恒 octet-stream
+    const mimeType = sniffed ? sniffed.mime : ATTACHMENT_FALLBACK_MIME;
+    const clientMimeType = sanitizeClientMimeType(file.mimetype);
+    // TTL 冻结（§1.1）：doc 绑定恒 NULL；topic 绑定按当时 settings 解析（脏值 fail-closed 回退 7d）
+    const expiresAt = computeAttachmentExpiresAt(
+      topicSettings?.attachmentTtl,
+      new Date(),
+      docId != null,
+    );
     const bucket = this.storage.getBucket();
     // 行 id 提前生成（而非交给 DB gen_random_uuid）：缩略图步骤在插行之前，
     // 失败日志要带 attachmentId 做关联——同一 id 随后插行使用，日志与数据行对齐。
@@ -258,11 +295,14 @@ export class AttachmentService {
 
     // putObject 在 advisory 锁外先做（§3.1：锁内只留 SUM+插行，缩短锁持有窗口）；
     // 后续任何失败必须删对象（下方 catch 统一兜底，不留孤儿对象）。
-    await this.storage.putObject(objectKey, file.buffer, sniffed.mime);
+    // Content-Type 传 mimeType（= 字节证据）：非图片恒 octet-stream——声明值不固化到
+    // 对象元数据（这是未来 presign 直传的前置安全条件，M3）
+    await this.storage.putObject(objectKey, file.buffer, mimeType);
 
     // ── 5.5 缩略图变体（P2 批 1）：fail-open —— 失败只降级，不阻断上传 ────
     // 插入点钉死（plan §0 arch M8）：原图 putObject 后、配额事务前——
     // 原图已落对象存储，缩略图失败不影响主链路事务；缩略图是增强不是契约。
+    // 仅图片分支生成：非图片（未命中嗅探）无解码面，直接跳过（thumb 5 列全 null）。
     let thumb: {
       objectKey: string;
       width: number;
@@ -270,27 +310,29 @@ export class AttachmentService {
       sizeBytes: string;
       sha256: string;
     } | null = null;
-    try {
-      const generated = await generateWebpThumbnail(file.buffer);
-      const thumbKey = `${randomUUID()}.thumb.webp`; // 独立 uuid，不与原图共享键
-      await this.storage.putObject(thumbKey, generated.data, 'image/webp');
-      thumb = {
-        objectKey: thumbKey,
-        width: generated.width,
-        height: generated.height,
-        sizeBytes: String(generated.data.length),
-        sha256: createHash('sha256').update(generated.data).digest('hex'),
-      };
-    } catch (err) {
-      // fail-open：结构化 warn（attachmentId/uploaderId/sniffed mime/error 类）
-      // + 累计失败计数；thumb 5 列全 null，原图对象与上传流程不受影响
-      const error = err as Error;
-      this.thumbFailureCount += 1;
-      this.logger.warn(
-        `Thumbnail generation failed (fail-open, upload continues): attachmentId=${attachmentId}, ` +
-          `uploaderId=${actor.id}, mime=${sniffed.mime}, errorClass=${error.constructor?.name ?? 'Error'}, ` +
-          `failuresSinceStartup=${this.thumbFailureCount}, error=${error.message}`,
-      );
+    if (sniffed) {
+      try {
+        const generated = await generateWebpThumbnail(file.buffer);
+        const thumbKey = `${randomUUID()}.thumb.webp`; // 独立 uuid，不与原图共享键
+        await this.storage.putObject(thumbKey, generated.data, 'image/webp');
+        thumb = {
+          objectKey: thumbKey,
+          width: generated.width,
+          height: generated.height,
+          sizeBytes: String(generated.data.length),
+          sha256: createHash('sha256').update(generated.data).digest('hex'),
+        };
+      } catch (err) {
+        // fail-open：结构化 warn（attachmentId/uploaderId/sniffed mime/error 类）
+        // + 累计失败计数；thumb 5 列全 null，原图对象与上传流程不受影响
+        const error = err as Error;
+        this.thumbFailureCount += 1;
+        this.logger.warn(
+          `Thumbnail generation failed (fail-open, upload continues): attachmentId=${attachmentId}, ` +
+            `uploaderId=${actor.id}, mime=${sniffed.mime}, errorClass=${error.constructor?.name ?? 'Error'}, ` +
+            `failuresSinceStartup=${this.thumbFailureCount}, error=${error.message}`,
+        );
+      }
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -305,7 +347,9 @@ export class AttachmentService {
       ]);
       const rows: Array<{ total: string }> = await queryRunner.query(
         `SELECT COALESCE(SUM(size_bytes), 0)::text AS total
-         FROM attachments WHERE uploader_id = $1 AND deleted_at IS NULL`,
+         FROM attachments
+         WHERE uploader_id = $1 AND deleted_at IS NULL
+           AND (expires_at IS NULL OR expires_at > now())`,
         [actor.id],
       );
       // SUM(bigint) 经 ::text 显式转型后 Number()（§2 转换点钉死；规模远小于 2^53）
@@ -326,7 +370,9 @@ export class AttachmentService {
           bucket,
           objectKey,
           originalName,
-          mimeType: sniffed.mime,
+          mimeType,
+          clientMimeType,
+          expiresAt,
           sizeBytes: String(file.buffer.length),
           sha256,
           status: 'ready',
@@ -372,10 +418,15 @@ export class AttachmentService {
   }
 
   /**
-   * 内容读取（GET /attachments/:id/content）。授权通过 → getObject 流。
+   * 内容读取（GET /attachments/:id/content）。授权通过 → 过期懒判 + 就绪谓词 → getObject 流。
+   *
+   * 懒判插入点（§1.3 m3 钉死）：**行加载 + 授权通过之后、getObject 之前**——
+   * 不得下沉进 findAccessible（元数据面必须继续 200 + expiresAt，否则墓碑卡片断数据）。
+   * 扫前 410（行还在）/ 扫后 404（行已被小时级 GC 硬删，走 findAccessible 的 12000）。
    */
   async getContent(id: string, actor: UnifiedActor): Promise<AttachmentContent> {
     const attachment = await this.findAccessible(id, actor);
+    this.assertByteReadable(attachment);
     const stream = await this.storage.getObject(attachment.objectKey);
     return { attachment, stream };
   }
@@ -384,14 +435,19 @@ export class AttachmentService {
    * 缩略图读取（GET /attachments/:id/thumbnail）：授权与 /content 同一入口
    * （findAccessible：不存在/无权一律 404 · 12000，不泄露存在性）。
    *
-   * 无缩略图（thumb_key IS NULL：存量行未回溯生成 / 上传时 fail-open 失败）→
-   * **404 · 12008**（与 12000 刻意分码：附件存在且有权读，只是没有缩略图——
+   * 无缩略图（thumb_key IS NULL：存量行未回溯生成 / 上传时 fail-open 失败，
+   * 或**非图片附件**——非图片分支跳过缩略图生成）→ **404 · 12008**
+   * （与 12000 刻意分码：附件存在且有权读，只是没有缩略图——
    * 消息指导消费方改用 /content 取原图）。
+   *
+   * 过期懒判与 /content 同点位（授权后、取流前）：已过期附件的缩略图同样 410·12009，
+   * 判定先于"无缩略图"分支（死了就是死了，不因变体缺失改判语义）。
    *
    * @returns 行（ETag/文件名用）+ 缩略图对象流（Content-Type 恒 image/webp）
    */
   async getThumbnail(id: string, actor: UnifiedActor): Promise<AttachmentContent> {
     const attachment = await this.findAccessible(id, actor);
+    this.assertByteReadable(attachment);
     if (!attachment.thumbKey) {
       throw new NotFoundException({
         message:
@@ -401,6 +457,35 @@ export class AttachmentService {
     }
     const stream = await this.storage.getObject(attachment.thumbKey);
     return { attachment, stream };
+  }
+
+  /**
+   * 字节读取面的共同前置（m3 + m6，单一事实源）：
+   * 1. 过期 → **410 Gone + 12009**（墓碑式语义；判据 = isAttachmentExpired 单源）；
+   * 2. 非 'ready' → **404 + 12000**（潜伏态，全仓无 pending 写入方，详见
+   *    attachment.constants.isAttachmentReadable 注释）。
+   *
+   * 顺序刻意固定：过期（410）先于就绪（404）——已过期即"曾存在且已终结"，
+   * 比"资源不可达"更精确，且与 mint 侧 400·12009 的先后保持一致。
+   *
+   * 注意：**不得**把本检查下沉进 findAccessible（那会连元数据面一起 410，
+   * 破坏"GET /attachments/:id 扫前仍 200 带 expiresAt"的四表面口径）。
+   */
+  private assertByteReadable(attachment: Attachment): void {
+    if (isAttachmentExpired(attachment.expiresAt)) {
+      throw new GoneException({
+        message:
+          'Attachment has expired and is no longer downloadable; upload or request a new copy ' +
+          '(expired attachments are purged automatically)',
+        code: ErrorCode.ATTACHMENT_EXPIRED,
+      });
+    }
+    if (!isAttachmentReadable(attachment.status)) {
+      throw new NotFoundException({
+        message: 'Attachment not found',
+        code: ErrorCode.ATTACHMENT_NOT_FOUND,
+      });
+    }
   }
 
   /**
@@ -724,7 +809,9 @@ export class AttachmentService {
 
               const rows: Array<{ total: string }> = await em.query(
                 `SELECT COALESCE(SUM(size_bytes), 0)::text AS total
-               FROM attachments WHERE uploader_id = $1 AND deleted_at IS NULL`,
+               FROM attachments
+               WHERE uploader_id = $1 AND deleted_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > now())`,
                 [input.importerId],
               );
               const used = Number(rows[0]?.total ?? '0');
@@ -847,16 +934,19 @@ export class AttachmentService {
    * OPEN topic 非 participant 可发；PRIVATE 需 active participant/admin/ownerProxy。
    * topic 不存在 → 404 TOPIC_NOT_FOUND（findById 已抛）；无权 → 403 12004。
    * 注：plan 只镜像 visibility 段——topic 状态（closed/paused/archived）不拦截上传。
+   *
+   * @returns topic 实体（调用方 upload 需要 settings.attachmentTtl 冻结 TTL——
+   *          与权限判定复用同一次 findById，不额外查库）
    */
-  private async assertTopicWritable(topicId: string, actor: UnifiedActor): Promise<void> {
+  private async assertTopicWritable(topicId: string, actor: UnifiedActor): Promise<Topic> {
     const topic = await this.topicService.findById(topicId);
     const settings = topic.settings || {};
-    if (settings.visibility !== Visibility.PRIVATE) return;
+    if (settings.visibility !== Visibility.PRIVATE) return topic;
 
     const participant = await this.participantRepo.findOne({
       where: { topicId, participantId: actor.id, status: ParticipantStatus.ACTIVE },
     });
-    if (participant) return;
+    if (participant) return topic;
 
     // admin 短路（性能短路铁律：不触发 owner 代理查询）；
     // owner 代理判定仅对 human 有效（sendMessage 同款显式 type 前置判断）
@@ -871,6 +961,7 @@ export class AttachmentService {
         code: ErrorCode.ATTACHMENT_FORBIDDEN,
       });
     }
+    return topic;
   }
 
   /**
@@ -991,16 +1082,22 @@ export class AttachmentService {
    *
    * thumbnailContentUrl **条件展开**（P2 批 1 四表面同一口径）：有缩略图
    * （thumb_key 非空）才出现该键，无缩略图时字面缺键——绝不落 null/空串。
+   *
+   * expiresAt / clientMimeType（v1.90.0-dev 四表面同一口径 R3）：四表面
+   * （上传响应 / GET :id / GET mine / 消息投影）同形状同语义产出——
+   * expiresAt 恒出现（null = 永久），clientMimeType 恒出现（null = 无声明/非法）。
    */
   private toMetadataDto(attachment: Attachment): AttachmentMetadataDto {
     return {
       id: attachment.id,
       originalName: attachment.originalName,
       mimeType: attachment.mimeType,
+      clientMimeType: attachment.clientMimeType ?? null,
       sizeBytes: Number(attachment.sizeBytes),
       sha256: attachment.sha256,
       topicId: attachment.topicId,
       docId: attachment.docId,
+      expiresAt: attachment.expiresAt ? attachment.expiresAt.toISOString() : null,
       createdAt: attachment.createdAt,
       ...(attachment.thumbKey ? { thumbnailContentUrl: buildThumbnailUrl(attachment.id) } : {}),
     };

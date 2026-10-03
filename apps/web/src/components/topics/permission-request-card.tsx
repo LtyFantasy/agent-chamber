@@ -10,11 +10,12 @@
  *
  * [踩坑索引]
  *   - tool/options 是 jsonb 原样透传，**形状未冻结**：tool 宽松读 name/title 兜底
- *     JSON 截断；options 真机形状 `{ optionId, kind, name }`（kimi/codex 实测均无
- *     label），按钮文案 = 已知 optionId 映射 i18n 词条（OPTION_I18N_KEYS 展示层
+ *     JSON 截断；options 真机形状 `{ optionId, kind, name }`（kimi · codex · dsh 实测
+ *     均无 label），按钮文案 = 已知 optionId 映射 i18n 词条（OPTION_I18N_KEYS 展示层
  *     词典），未知回退 label ?? name ?? optionId——不假设形状。optionId 裁决按
  *     optionId/id 双键取（后端同规）。禁止把 kind 硬编码成仅三种——kind 只用于
- *     配色分类（含 'reject' 子串 → 危险色，其余主色）
+ *     配色分类（含 'reject' 子串 → 危险色，其余主色）；kind 缺失时按 optionId 兜底
+ *     同判（dsh 的 optionId 是连字 'reject-once'，kind 才是下划线）
  *   - avatar 来源 = seatId → seats → config.bindActorId → topic.participants 的
  *     avatarUrl（照 seat-presence-bar 同款数据通路，页面数据零重复请求）；
  *     participants 缺省空数组向后兼容，无参与者数据退化为 seat label 首字母色块
@@ -61,8 +62,14 @@ type PermissionOptionI18nKey =
  *
  * 为什么按 optionId 做键：optionId 是裁决稳定键（后端 optionId/id 双键同规），
  * name/label 是厂商自由文本（真机实测 kimi 用 'Approve once'，codex 用
- * 'Allow Once'，两侧都无 label）——词典把两家等价选项收敛到 3 个语义词条，
- * 未知 optionId 回退透传（label ?? name ?? optionId），不假设形状、不穷举厂商
+ * 'Allow Once'，dsh 用 'Allow once'/'Reject'，各家都无 label）——词典把各厂商
+ * 等价选项收敛到 3 个语义词条，未知 optionId 回退透传（label ?? name ?? optionId），
+ * 不假设形状、不穷举厂商。
+ *
+ * 分隔符注意：optionId 与 kind 的命名风格各家不同——kimi · codex 用下划线
+ * （`approve_once`/`allow_once`），dsh 的 **optionId 用连字**（`allow-once` /
+ * `reject-once`，对应 kind 仍是下划线 `allow_once`/`reject_once`）。两个连字形
+ * 必须各立一条，不能靠下划线形态推断。
  */
 const OPTION_I18N_KEYS: Record<string, PermissionOptionI18nKey> = {
   approve_once: 'permissionRequest.option.approveOnce', // kimi
@@ -72,6 +79,8 @@ const OPTION_I18N_KEYS: Record<string, PermissionOptionI18nKey> = {
   allow_always: 'permissionRequest.option.approveAlways',
   reject_once: 'permissionRequest.option.reject',
   allow: 'permissionRequest.option.approveOnce', // claude-code：allow_once kind 对应 optionId=allow（optionId 直透，见 claude-acp.ts §8e）
+  'allow-once': 'permissionRequest.option.approveOnce', // dsh（optionId 连字 / kind 下划线 allow_once）
+  'reject-once': 'permissionRequest.option.reject', // dsh（optionId 连字 / kind 下划线 reject_once）
 };
 
 interface PermissionRequestCardProps {
@@ -100,8 +109,9 @@ interface PermissionRequestCardProps {
  * pending-count 角标、topic 消息列表——后端裁决会落 topic 公告系统消息）。
  * 空态（无 pending）不渲染任何容器；人类（web 会话恒为人类 JWT）见裁决按钮组，
  * 按钮文案 = 已知 optionId 的 i18n 词条（OPTION_I18N_KEYS 展示层词典），未知
- * optionId 回退 label ?? name ?? optionId；reject 类（kind 含 'reject' 子串）
- * 用危险色。每行 seat label 徽章前渲染参与者头像（bindActorId → participants）。
+ * optionId 回退 label ?? name ?? optionId；reject 类（kind 含 'reject' 子串，
+ * kind 缺失时按 optionId 同判）用危险色。每行 seat label 徽章前渲染参与者头像
+ * （bindActorId → participants）。
  */
 export function PermissionRequestCard({
   topicId,
@@ -251,8 +261,8 @@ export function PermissionRequestCard({
               </span>
               {/* 选项按钮组：文案 = 已知 optionId 的 i18n 词条（展示层词典），未知回退
                   label ?? name ?? optionId（真机形状无 label，name 兜底）；kind 仅配色
-                  分类——含 'reject' 子串危险色，其余主色。仅人类会话显示（agent 体验层
-                  闸，后端本来就 403）；裁决中整组禁用防重复点击 */}
+                  分类——含 'reject' 子串危险色，其余主色（kind 缺失按 optionId 同判）。
+                  仅人类会话显示（agent 体验层闸，后端本来就 403）；裁决中整组禁用防重复点击 */}
               {isHuman && (
                 <span className="flex shrink-0 items-center gap-1.5">
                   {item.options.map((option) => {
@@ -260,7 +270,10 @@ export function PermissionRequestCard({
                     if (!optionId) return null;
                     const key = OPTION_I18N_KEYS[optionId];
                     const label = key ? t(key) : (option.label ?? option.name ?? optionId);
-                    const dangerous = (option.kind ?? '').includes('reject');
+                    // 配色分类：kind 优先（厂商原文，含 'reject' 子串 → 危险色）；
+                    // kind 缺失（历史/瘦身载荷）时按 optionId 兜底——dsh 的 optionId
+                    // 是连字 'reject-once'，不看 optionId 会把拒绝键渲染成普通主色
+                    const dangerous = (option.kind || optionId).includes('reject');
                     const pendingThis =
                       verdictMutation.isPending &&
                       verdictMutation.variables?.requestId === item.id &&

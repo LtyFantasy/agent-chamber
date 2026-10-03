@@ -1,19 +1,42 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2 (Attachments 模块)
- *   - 补充: docs/api-definition.md §Attachments
+ * [功能概念]
+ *   - Attachments 模块装配（依赖方向 / 导出面 / 定时调度挂载）
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [代码职责]
+ *   - TypeORM 实体注册、守卫所需仓储、模块依赖与导出面
+ *   - `ScheduleModule.forRoot()` 挂载点（全应用唯一；GC 三轨 cron 归属本模块，内聚）
+ *
+ * [权威文档]
+ *   - 主文档: docs/architecture.md §3.2 (Attachments 模块)
+ *   - 补充: docs/api-definition.md §Attachments（端点归属）
  *
  * [铁律关联] #4(文档优先) #17(测试契约)
  *
- * [详细踩坑]（最多 5 条）
+ * [关键不变量]
+ *   - **依赖方向**：import TopicModule / forwardRef(DocSpaceModule)，
+ *     **禁止 import DocSpacePolicy**（读取授权走全局 PermissionService duck-typing）。
+ *   - **导出面**：只导出 `AttachmentService`（bundle 媒体门面）；
+ *     `AttachmentStorageService` 刻意不导出（对象层只在本模块内使用，docspace 必须走门面）。
+ *   - `ScheduleModule.forRoot()` 全应用只注册一次，挂在**本模块**内聚（GC 三轨
+ *     cron 与 GC 归属同域）；后续模块需要 cron 时**不得**重复 forRoot。
+ *   - 两个 controller 刻意分文件：`AttachmentPublicController` 类级无守卫
+ *     （签名 URL 的凭证在 query），与全鉴权控制器合并会招来"顺手加类级守卫"类回归。
+ *
+ * [关联代码]
+ *   - attachment-gc.service.ts — 三轨 GC（本模块 providers，cron 经 ScheduleModule 注册）
+ *   - attachment-public.controller.ts — 无守卫公开面（与全鉴权控制器分文件）
+ *   - docspace/docspace.module.ts — 双向 forwardRef（bundle 媒体段）
+ *
+ * [持久踩坑]
+ *   - （无历史踩坑，新建文件）
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  *   □ 依赖方向不变量：import TopicModule/DocSpaceModule，禁止 import DocSpacePolicy
  * =============================================================================
  */

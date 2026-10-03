@@ -70,6 +70,7 @@ import { KimiAcpDriver } from './drivers/kimi-acp';
 import { CodexAcpDriver } from './drivers/codex-acp';
 import { OpencodeAcpDriver } from './drivers/opencode-acp';
 import { ClaudeAcpDriver } from './drivers/claude-acp';
+import { DshAcpDriver } from './drivers/dsh-acp';
 import { StateStore } from './state-store';
 import { RunnerWsClient } from './ws-client';
 import { ConsoleLogger } from './logger';
@@ -97,7 +98,7 @@ export interface RunnerCoreOptions {
   /**
    * 座位驱动注入口（按 vendor 注入；测试注入 fake 用。缺省按 vendor 懒加载默认工厂：
    * kimi → KimiAcpDriver、codex → CodexAcpDriver、opencode → OpencodeAcpDriver、
-   * claude-code → ClaudeAcpDriver，一个 vendor 一个实例）
+   * claude-code → ClaudeAcpDriver、dsh → DshAcpDriver，一个 vendor 一个实例）
    */
   drivers?: Partial<Record<string, SeatDriver>>;
   /** 日志器（默认 ConsoleLogger info） */
@@ -141,7 +142,7 @@ export class RunnerCore {
   }
 
   /**
-   * vendor → 默认驱动工厂（懒加载时构造）。仅 kimi/codex/opencode/claude-code 生产；
+   * vendor → 默认驱动工厂（懒加载时构造）。仅 SEAT_VENDORS 五家生产；
    * 未知 vendor 返回 null（handleAssign 据此回 status offline，不 crash）。
    */
   private defaultDriverFor(vendor: string): SeatDriver | null {
@@ -173,6 +174,15 @@ export class RunnerCore {
     }
     if (vendor === 'claude-code') {
       return new ClaudeAcpDriver({
+        logger: this.logger,
+        getSessionId: (seatId: string) => this.state.getSessionId(seatId),
+        onSessionId: (seatId: string, sessionId: string) =>
+          this.state.setSessionId(seatId, sessionId),
+      });
+    }
+    if (vendor === 'dsh') {
+      // dsh ACP（`dsh acp`）：bin 由 DshAcpDriver 内部三级解析（构造选项 > DSH_BIN > PATH）
+      return new DshAcpDriver({
         logger: this.logger,
         getSessionId: (seatId: string) => this.state.getSessionId(seatId),
         onSessionId: (seatId: string, sessionId: string) =>

@@ -171,9 +171,9 @@ Platform mode to Codex configuration. **Semantically approximate, not equivalent
 | `auto` | `agent` | default |
 | `yolo` | `agent-full-access` | default |
 
-## One runner, both vendors
+## One runner, every vendor
 
-A single runner can host Kimi and Codex seats at the same time — its `hello` reports both vendors and the chamber binds each seat by vendor. The pitfalls below apply to both.
+A single runner can host seats of any vendor it supports at the same time — its `hello` reports the vendor list it was built with, and the chamber binds each seat by vendor. So one runner can carry an OpenCode seat next to a Codex seat, and the `dsh` guide's setup works alongside this one on the same machine. The pitfalls below apply to every vendor, not just Codex.
 
 ## Pitfalls
 

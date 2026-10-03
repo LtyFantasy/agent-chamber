@@ -18,9 +18,11 @@
 #     --platform-url https://platform.example.com --api-key <KEY> --start   # standalone
 #
 # 行为（两种模式公共）:
-#   1. 按 --vendor 预检 kimi/codex/opencode CLI（codex 侧检测 chatgpt.com 连通性，
-#      不通则打印代理设置指引——国内 DNS 污染是第一大坑）与 claude-code 认证态
-#      （ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env 或 ~/.claude 登录态目录）
+#   1. 按 --vendor 预检各厂商 CLI（codex 侧检测 chatgpt.com 连通性，
+#      不通则打印代理设置指引——国内 DNS 污染是第一大坑）；claude-code 认证态
+#      （ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN env 或 ~/.claude 登录态目录）；
+#      dsh 认证态（DEEPSEEK_API_KEY env 或 ~/.dsh/.credentials.yaml 有非空凭据块）
+#      + dsh 版本 warn（需 major.minor ≥ 0.2，D7 钉版）
 #   2. 生成 start-runner.sh（含 platform-url / api-key / runner-name / state-dir）
 #   3. state-dir 默认派生 ~/.roundtable-runner-<runner-name>（R3：消灭共享状态
 #      目录假死事故的默认路径；显式 --state-dir 仍优先，两种模式统一）
@@ -35,8 +37,9 @@
 #
 # 不做：不装 systemd/pm2、不创建 agent/座位（需要人类 JWT，属于平台侧操作）。
 #
-# 前置要求：node（>=18；repo 模式还需 pnpm），kimi / codex / opencode CLI 至少一个
-# 已登录，或 claude-code 已配置 ANTHROPIC_API_KEY（兼容端点 + ANTHROPIC_BASE_URL）
+# 前置要求：node（>=18；repo 模式还需 pnpm），五个厂商的 CLI 至少一个已登录
+# （kimi · codex · opencode · claude-code · dsh），或 claude-code 已配置
+# ANTHROPIC_API_KEY（兼容端点 + ANTHROPIC_BASE_URL）
 # =============================================================================
 set -euo pipefail
 
@@ -46,7 +49,7 @@ PLATFORM_URL="${PLATFORM_URL:-http://localhost:8743}" # chamber 后端地址，�
 API_KEY="${API_KEY:-}"                                # 座位 agent 的 API Key（可留空，之后手填 start-runner.sh）
 RUNNER_NAME="${RUNNER_NAME:-roundtable-runner}"       # runner 名称（hello 上报，web 展示）
 STATE_DIR="${STATE_DIR:-}"                            # 状态目录（空 → 下方按 R3 派生）
-VENDOR="${VENDOR:-all}"                               # kimi | codex | opencode | claude-code | all（预检范围；both 为 all 的兼容别名）
+VENDOR="${VENDOR:-all}"                               # kimi | codex | opencode | claude-code | dsh | all（预检范围；both 为 all 的兼容别名）
 DRY_RUN="${DRY_RUN:-0}"                               # 1 = 只打印动作不执行
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/share/agent-chamber/runner}"  # standalone 解压目录
 START="${START:-0}"                                   # 1 = 生成 start-runner.sh 后立即启动（仅 standalone）
@@ -64,6 +67,37 @@ run() {
   else
     "$@"
   fi
+}
+
+# dsh_credentials_present <file> —— dsh 凭据文件是否含可用凭据（D10 判据）
+#
+# 判据（二者其一即算有凭据）：① `refs` / `records` 块存在且**块内**有真实内容行；
+# ② 无顶层 `version:` 键的旧扁平布局（凭据直接写在顶层，无 refs/records 容器），
+# 且文件里存在**缩进层内容行**（值行）。
+# 为什么不用窄判据（只认 refs）：旧扁平布局会被误报成「无凭据」（评审 dx 新-1）。
+# 为什么必须要求「真实内容行」（review M1 修正）：只要文件存在就算有凭据会**假阳性**——
+# 0 字节空文件、纯注释文件、只有裸键没有值的空块文件都会被判成 PRESENT，让安装器
+# 静默跳过认证引导（比没有引导更危险）。故：
+#   - 空行 / 注释行不算内容（`found` 与 `nested` 都不置位）；
+#   - 顶格行 = 顶层键：命中 `refs`/`records` 才进入块内（want=1）；遇到**同级新键**
+#     必须复位 want，否则块外任意后续行都会被算成「块内内容」；
+#   - 只有缩进行（= 真实值）才置 nested；块内缩进行额外置 found；
+#   - 顶层键带内联值（`key: value`）不计入凭据——旧扁平布局的凭据是嵌套值，而顶层
+#     内联值多见于 `version: 1` 这类元数据。
+# 返回 0 = 有凭据，1 = 无凭据。
+dsh_credentials_present() {
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ { next }
+    /^[^[:space:]]/ {
+      if ($0 ~ /^(refs|records):[[:space:]]*$/) { want = 1; next }
+      want = 0
+      if ($0 ~ /^version:/) has_version = 1
+      next
+    }
+    { nested = 1; if (want) found = 1 }
+    END { exit !(found || (!has_version && nested)) }
+  ' "$1"
 }
 
 usage() {
@@ -84,7 +118,7 @@ Options:
                             (optional; edit start-runner.sh later if omitted)
   -n, --runner-name <name>  runner name (default: roundtable-runner)
       --state-dir <dir>     runner state dir (default: ~/.roundtable-runner-<runner-name>)
-      --vendor <v>          preflight scope: kimi | codex | opencode | claude-code | all
+      --vendor <v>          preflight scope: kimi | codex | opencode | claude-code | dsh | all
                             (default: all; "both" kept as a legacy alias of "all")
       --install-dir <dir>   standalone install dir
                             (default: ~/.local/share/agent-chamber/runner)
@@ -93,7 +127,7 @@ Options:
   -h, --help                show this help message and exit
 
 Next steps after this script: create an agent + seat, then ./start-runner.sh
-See docs/integrations/kimi.md, codex.md, opencode.md and claude-code.md.
+See docs/integrations/kimi.md, codex.md, opencode.md, claude-code.md and dsh.md.
 EOF
 }
 
@@ -133,9 +167,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$VENDOR" in
-  kimi|codex|opencode|claude-code|all) ;;
+  kimi|codex|opencode|claude-code|dsh|all) ;;
   both) VENDOR=all ;;  # 兼容别名：both（kimi+codex 时代默认值）→ all
-  *) fail "--vendor 只能是 kimi | codex | opencode | claude-code | all，收到: $VENDOR" ;;
+  *) fail "--vendor 只能是 kimi | codex | opencode | claude-code | dsh | all，收到: $VENDOR" ;;
 esac
 
 # ---------- state-dir 默认派生（R3，两种模式统一） ----------
@@ -207,9 +241,59 @@ preflight_clis() {
       fi
     fi
   fi
+  if [[ "$VENDOR" == "dsh" || "$VENDOR" == "all" ]]; then
+    # dsh 座位预检（D10/D7）：CLI 探测 → 版本 warn → 凭据 warn。
+    # 与 claude-code 同规：**认证缺失只 warn 不 fail**（不参与 CLI_MISSING 判定，
+    # 用户可稍后 export key 或用 dsh 交互模式登录）；CLI 缺失计入 CLI_MISSING。
+    if command -v dsh >/dev/null 2>&1; then
+      # `dsh --version` 输出**裸版本号**（无前缀），逐字对比见 dsh.md。
+      # 末尾 `|| true` 是必需的防御（review B1）：管道任一环失败都会让命令替换非零退出，
+      # 而 `VAR="$(...)"` 的赋值会继承该退出码 → 在 set -euo pipefail 下**静默中止整个
+      # 安装器**（无任何后续输出，用户只看到预检半途而废）。两条真机可复现路径：
+      # ① `dsh --version` 非零退出 → 赋值继承退出码；② 多行输出时 head -1 提前关管道 →
+      # 上游 SIGPIPE → pipefail 把管道状态放大成 141。防御必须加在**整条管道外层**
+      # （管道内层的 `|| true` 兜不住 pipefail 放大的信号失败）。
+      # `|| true` 而不用 `|| echo 'found'`：版本原值还要参与下面的数值比较，空值走
+      # 「探测为空 → 跳过版本检查」分支，由 ${DSH_VERSION:-found} 负责展示兜底。
+      DSH_VERSION="$(dsh --version 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+      info "dsh CLI: ${DSH_VERSION:-found}"
+      # 版本预检（D7）：只比 major.minor 的**数值**，prerelease 段不字典序比——
+      # 禁止 `sort -V`：它把 0.2.0 排在 0.2.0-rc.1 之前（prerelease 字典序），
+      # 会把实测通过的新版误判成旧版。锚点 = 0.2.0-rc.1（本机实测四环 PASS）。
+      # 解析不出来的形态（`v0.1.0` / `dsh version 0.1.0` / 空输出）一律**显式告知后
+      # 跳过**，不 warn 也不 fail——静默通过等于让用户以为版本被检查过了（review M1 附带）。
+      if [[ -z "$DSH_VERSION" ]]; then
+        info "dsh 版本探测为空（--version 无输出）——跳过版本检查，不阻断"
+      elif [[ "$DSH_VERSION" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        if (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < 2 )); then
+          warn "dsh 版本 ${DSH_VERSION} 低于本仓实测锚点 0.2.0-rc.1（座位链要求 0.2.x）——升级："
+          warn "  npm i -g @deepseek-ai/dsh@0.2.0-rc.1"
+          warn "  （勿用 npm latest：latest 比实测锚点旧；@next 是流动 tag）"
+        fi
+      else
+        info "dsh 版本 '${DSH_VERSION}' 无法解析成 <major>.<minor>——跳过版本检查，不阻断"
+      fi
+    else
+      warn "未找到 dsh CLI（dsh 座位将无法启动）。安装（勿用 npm latest，latest 比实测锚点旧）："
+      warn "  npm i -g @deepseek-ai/dsh@0.2.0-rc.1"
+      CLI_MISSING=1
+    fi
+    # 凭据判据（D10）见 dsh_credentials_present：env 层是 credentials 最高优先级层，
+    # 存在即就绪；$DSH_HOME 非默认时路径派生
+    DSH_CRED_FILE="${DSH_HOME:-$HOME/.dsh}/.credentials.yaml"
+    if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
+      info "dsh 认证: DEEPSEEK_API_KEY env"
+    elif [[ -f "$DSH_CRED_FILE" ]] && dsh_credentials_present "$DSH_CRED_FILE"; then
+      info "dsh 认证: $DSH_CRED_FILE"
+    else
+      warn "未检测到 dsh 认证（DEEPSEEK_API_KEY env 与 $DSH_CRED_FILE 均无有效凭据）——dsh 座位会在首个 prompt 时报认证失败："
+      warn "  export DEEPSEEK_API_KEY=<key>，或用 dsh 交互模式完成登录（凭据写入 $DSH_CRED_FILE）"
+      warn "  详见 dsh.md 集成指南"
+    fi
+  fi
   if [[ "$CLI_MISSING" == "1" && "$VENDOR" == "all" ]]; then
-    command -v kimi >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || command -v opencode >/dev/null 2>&1 || \
-      fail "kimi、codex 与 opencode CLI 都未找到——至少安装并登录其中一个（详见 docs/integrations/ 下对应指南）"
+    command -v kimi >/dev/null 2>&1 || command -v codex >/dev/null 2>&1 || command -v opencode >/dev/null 2>&1 || command -v dsh >/dev/null 2>&1 || \
+      fail "kimi · codex · opencode · dsh 四个 CLI 都未找到——至少安装并登录其中一个（详见 docs/integrations/ 下对应指南）"
   fi
 }
 
@@ -234,7 +318,7 @@ if [[ "$MISSING_TOOLCHAIN" == "1" ]]; then
 [install-runner] runner 需要宿主机安装 node（>=18）与 pnpm：
   - node: https://nodejs.org/ （或 nvm: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash）
   - pnpm: corepack enable && corepack prepare pnpm@latest --activate（或 npm i -g pnpm）
-为什么不能用 docker 里的 node？runner 要驱动你本机已登录的 kimi/codex/opencode CLI
+为什么不能用 docker 里的 node？runner 要驱动你本机已登录的厂商 CLI
 （含登录态）或 claude-code 的 ANTHROPIC_* env 认证，必须在宿主机直接运行。
 EOF
   exit 1
@@ -283,7 +367,7 @@ echo -e "${GREEN}  runner 安装完成（repo 模式）${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════${NC}"
 info "下一步："
 info "  1. 创建 agent 拿 API Key、创建圆桌话题与座位（座位要绑定该 agent）"
-info "     指南: docs/integrations/kimi.md · codex.md · opencode.md · claude-code.md"
+info "     指南: docs/integrations/kimi.md · codex.md · opencode.md · claude-code.md · dsh.md"
 info "  2. $([ -z "$API_KEY" ] && echo "把 API Key 填入 $START_SCRIPT 后，" || echo "")运行: $START_SCRIPT"
 info "提示：多个 runner 必须各自独立 --state-dir（默认已按 runner-name 派生，无需手动指定）"
 
@@ -401,7 +485,7 @@ echo -e "${GREEN}  runner 安装完成（standalone 模式）${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════${NC}"
 info "下一步："
 info "  1. 创建 agent 拿 API Key、创建圆桌话题与座位（座位要绑定该 agent）"
-info "     指南: $PLATFORM_URL/api/v1/downloads/integrations/kimi.md · codex.md · opencode.md · claude-code.md"
+info "     指南: $PLATFORM_URL/api/v1/downloads/integrations/kimi.md · codex.md · opencode.md · claude-code.md · dsh.md"
 info "  2. $([ -z "$API_KEY" ] && echo "把 API Key 填入 $START_SCRIPT 后，" || echo "")运行: $START_SCRIPT"
 info "提示：多个 runner 必须各自独立 --state-dir（默认已按 runner-name 派生，无需手动指定）"
 info "提示：升级 runner 时重跑本脚本即可（--install-dir 保持一致）"

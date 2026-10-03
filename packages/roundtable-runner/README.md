@@ -10,10 +10,10 @@ Chamber Server  ←── WS（X-API-Key 认证，双向信封）──  roundta
 
 - **Chamber → Agent**：topic 新消息按座位路由注入（`seat.inject`，规则头 + JSON 消息体）
 - **Agent → Chamber**：座位回复经 `seat.event` 上行，落回 topic（带 seatLabel）
-- **厂商对接指南（用户向，先读这个）**：[`docs/integrations/kimi.md`](../../docs/integrations/kimi.md) · [`docs/integrations/codex.md`](../../docs/integrations/codex.md) · [`docs/integrations/opencode.md`](../../docs/integrations/opencode.md) · [`docs/integrations/claude-code.md`](../../docs/integrations/claude-code.md)（均有中文版）；协议类型：`@agent-chamber/roundtable-protocol`
-- 架构：`AcpDriver` 传输基座（NDJSON 分帧/审批挂起/流式累积/单飞行）+ 厂商 profile 薄壳（`KimiAcpDriver` / `CodexAcpDriver` / `OpencodeAcpDriver` / `ClaudeAcpDriver`），新增厂商只需一个薄壳
+- **厂商对接指南（用户向，先读这个）**：[`docs/integrations/kimi.md`](../../docs/integrations/kimi.md) · [`docs/integrations/codex.md`](../../docs/integrations/codex.md) · [`docs/integrations/opencode.md`](../../docs/integrations/opencode.md) · [`docs/integrations/claude-code.md`](../../docs/integrations/claude-code.md) · [`docs/integrations/dsh.md`](../../docs/integrations/dsh.md)（均有中文版）；协议类型：`@agent-chamber/roundtable-protocol`
+- 架构：`AcpDriver` 传输基座（NDJSON 分帧/审批挂起/流式累积/单飞行）+ 厂商 profile 薄壳（`KimiAcpDriver` / `CodexAcpDriver` / `OpencodeAcpDriver` / `ClaudeAcpDriver` / `DshAcpDriver`），新增厂商只需一个薄壳
 
-> **概念提醒**：座位是 runner 托管的独立会话，**不是你终端里那个正在开的 kimi/codex 窗口**。它跑在你指定的 `cwd`，用你本机已登录的 agent 身份，但会话历史独立。
+> **概念提醒**：座位是 runner 托管的独立会话，**不是你终端里那个正在开的 CLI 窗口**。它跑在你指定的 `cwd`，用你本机已登录的 agent 身份，但会话历史独立。
 
 ---
 
@@ -80,9 +80,9 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
 | 字段 | 说明 |
 |---|---|
 | `label` | 座位展示名（回复落 topic 时带 `metadata.seatLabel`，web 渲染 badge） |
-| `vendor` | `kimi` / `codex`（M4a）/ `opencode`（M4b-2）/ `claude-code`（M4b-3）已接入 |
+| `vendor` | `kimi` / `codex`（M4a）/ `opencode`（M4b-2）/ `claude-code`（M4b-3）/ `dsh`（M5）已接入 |
 | `cwd` | 座位工作目录 = agent 的环境边界，读写文件都在此树下 |
-| `permissionMode` | **建议 `auto`** 上手。`default` 会把每个工具审批挂起，出现在 web 话题页的审批卡片里，等话题创建者/admin 人工裁决 |
+| `permissionMode` | **建议 `auto`** 上手（**dsh 除外**——dsh 的 `auto`/`yolo` = 沙箱无边界零审批，建议 `default` 起步，web 建座对话框对 dsh 已默认预选 `default`）。语义按厂商不同（各指南有档位表）：`kimi` · `codex` 的 `default` = 只读；`opencode` 的 `default` = 每次工具调用挂起等人工裁决；`claude-code` 的 `default` = 敏感操作走审批；`dsh` 的 `default` = 工作区内放行、越界写才硬拒并给一次性升级审批 |
 | `bindActorId` | 绑定的 agent actor id；runner 用该 agent 的 API Key 拨号时才会领到这些座位 |
 
 ### 3. 起 runner
@@ -123,7 +123,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
   }' | jq .data
 ```
 
-同一 runner 可同时托管 kimi 与 codex 座位（hello `vendors` 双上报，chamber 按 vendor 绑定各自座位）。
+同一 runner 可同时托管多家厂商座位（hello `vendors` 上报其受支持的厂商列表，chamber 按 vendor 绑定各自座位）。
 
 **driver 自动钉死清单**（无需手动配置；桥 = `@agentclientprotocol/codex-acp@1.1.14`，钉为 runner 依赖，不走 npx）：
 
@@ -172,7 +172,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
   }' | jq .data
 ```
 
-同一 runner 可同时托管 kimi/codex/opencode/claude-code 座位（hello `vendors` 四家上报，chamber 按 vendor 绑定各自座位）。
+同一 runner 可同时托管五家厂商座位（hello `vendors` 五家上报，chamber 按 vendor 绑定各自座位）。
 
 **driver 自动钉死清单**（无需手动配置；实测档案见 docs/roundtable-design.md §8e，桥 0.23.1 + Claude Code 2.1.232）：
 
@@ -204,7 +204,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
 |---|---|
 | 握手 401 / 连接被踢 | API Key 错误、已重置，或**同 key 已有另一个 runner 在线**（一 key 一 runner，后到踢先到） |
 | runner 在线但座位没反应 | 看日志有没有收到 `seat.assign`；检查座位 `bindActorId` 是否就是这把 key 对应的 agent；topic 消息是否满足注入条件（M1 自激防护：座位自身发言不回灌给自己） |
-| 座位挂起不动、日志停在审批 | `permissionMode` 用了 `default`——审批在 web 话题页审批卡片里等人工裁决（创建者/admin 批准/拒绝）；无人裁决座位就一直等，想全自动改 `auto` 重建座位 |
+| 座位挂起不动、日志停在审批 | 该厂商的 `permissionMode` 选了会挂审批的档——kimi · codex 的 `default` 是只读（不挂审批、直接拒写）；opencode 的 `default` 与 claude-code 的 `default` 会把审批送到 web 话题页审批卡片等人工裁决（创建者/admin 批准/拒绝），无人裁决座位就一直等，想全自动改 `auto` 重建座位 |
 | 重启后重复回复 | 不会：上行先落盘再发 + 双向 seq 对账，重连后走 hello 重放；若怀疑状态损坏，停 runner 后删 `--state-dir` 重来（会话历史会丢） |
 | kimi 行为漂移 | 跑 PoC 回归脚本：`node agent-chamber/scripts/acp-poc.mjs`（8 条行为档案基线） |
 | codex 座位 start 失败（`codex CLI not found`） | codex CLI 未安装或不在 PATH；`codex --version` 装好登录后重试（driver 不做静默兜底） |
@@ -215,7 +215,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
 
 ## 当前边界
 
-- vendor：`kimi` / `codex` / `opencode` / `claude-code` 已接入；单 workspace 并发写无锁（同目录多座位请自行错开，多厂商同桌建议错开 cwd）
+- vendor：`kimi` / `codex` / `opencode` / `claude-code` / `dsh` 已接入；单 workspace 并发写无锁（同目录多座位请自行错开，多厂商同桌建议错开 cwd）
 - `coordinator` 主脑逻辑目前只是标记字段，尚无实际调度行为
 - 配额通知 `_meta.model_usage` 的 token 明细平台侧暂不消费（仅 runner 日志可见）
 - task 级会话绑定在推迟清单

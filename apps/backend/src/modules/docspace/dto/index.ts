@@ -17,6 +17,7 @@ export { QueryDocDto } from './query-doc.dto';
 export { QueryDocTreeDto, DOC_TREE_SORT_VALUES, DocTreeSort } from './query-doc-tree.dto';
 export { DocOverviewQueryDto } from './doc-overview.dto';
 export { DocSearchDto } from './doc-search.dto';
+export { ExportBundleQueryDto } from './export-bundle-query.dto';
 export { AddDocLinkDto } from './doc-link.dto';
 export { BatchUpsertDocsDto, BatchUpsertItemDto } from './batch-upsert-docs.dto';
 export { DocDetailQueryDto } from './doc-detail-query.dto';

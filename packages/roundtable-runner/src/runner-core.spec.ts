@@ -529,7 +529,7 @@ describe('RunnerCore cancel / revoke', () => {
 });
 
 describe('RunnerCore 默认驱动工厂（vendor → 懒加载）', () => {
-  it('kimi/codex 座位 → 各自默认驱动实例；getSessionId/onSessionId 接到 state-store（接线断言）', async () => {
+  it('kimi 与 codex 座位 → 各自默认驱动实例；getSessionId/onSessionId 接到 state-store（接线断言）', async () => {
     const server = new WebSocketServer({ port: 0 });
     await new Promise<void>((resolve) => server.once('listening', () => resolve()));
     const port = (server.address() as AddressInfo).port;

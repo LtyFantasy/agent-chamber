@@ -158,8 +158,9 @@ export const SEARCH_DF_DEGRADE_THRESHOLD = parsePositiveIntEnv(
 /**
  * doc-search 弱命中线（现构）= `DOC_SEARCH_STRONG_HIT_SCORE × SEARCH_TS_W1`。
  *
- * 语义：normal/trgm-only 模式本页最高分低于本线 ⇒ 附带 `DOC_SEARCH_ZERO_HIT_HINT`
- * （弱命中家族，与零命中同一触发）。
+ * 语义：normal/trgm-only 模式本页最高分低于本线 ⇒ 附带 `DOC_SEARCH_WEAK_HIT_HINT`
+ * （`hintCode = 'weak_hit'`；v1.89.0-dev 批次 A 起弱命中独立文案——此前复用零命中文案
+ * 会让消费方丢掉**已经返回、且可能正是答案**的结果）。
  *
  * rationale（计划 v1.5 §2.6 + 主脑裁决 R4，批次 1-d2 落地）：基准线 0.3 是
  * "cd 单点 0.1 × W1=1.0" 尺度下定的**刻度**；doc-search 的合成分含

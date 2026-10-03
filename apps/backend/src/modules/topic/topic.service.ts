@@ -1,7 +1,18 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
+ * [功能概念]
+ *   - 话题生命周期（创建/更新/状态流转/参与者/议程）+ 消息读写与响应投影
+ *   - 附件与消息的绑定关系：attachmentIds 前置校验 → metadata.attachments **索引快照**
+ *     （含静态 expiresAt/clientMimeType）→ 响应层投影（expired 实时纯函数，不 join 附件表）
+ *   - 删除话题的连带清理（同一事务软删附件 + 一条汇总 audit）
+ *
+ * [代码职责]
+ *   - TopicService：话题 CRUD 与状态机、参与者管理、消息发送/分页/未读、
+ *     附件引用校验（validateAttachmentsForMessage）、投影（projectAttachments）、
+ *     remove（连带软删附件）
+ *
  * [设计文档]
  *   - 主文档: docs/api-definition.md §6.11
  *   - 补充: docs/architecture.md §3.2.2 (Topic / Message), docs/spec.md §3.2 MessageType
@@ -20,13 +31,19 @@
  *     P2 批 1：索引条目增 required `hasThumbnail` 布尔，投影按 `=== true`
  *     追加条件第 6 键 thumbnailContentUrl（buildThumbnailUrl 派生；缺席 =
  *     无缩略图回退 contentUrl，永不为 null/空串）。
+ *     v1.90.0-dev 附件 TTL 批（R2/R3）：索引条目再增静态事实 `expiresAt`（ISO 串/
+ *     null=永久）与展示信息 `clientMimeType`；`expired` **不入索引**——它是
+ *     `expiresAt < now()` 的响应时纯函数（过期与否随时间变化，入索引即失真），
+ *     projectAttachments 实时计算。引用**已过期**附件发消息 → 400·12009。
+ *     topic 软删 → remove() 同事务连带软删其全部附件 + 一条汇总 audit
+ *     （cascade_delete_attachments；语义反转：此前成员仍可读附件，现在 404）。
  *   D5: canAccess() 已从 Service 删除，权限检查迁移到 Controller + TopicPolicy。
  *         Service 只做业务逻辑。见 memory/2026-06-05.md
  *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyTopicIds
  *         （creator+participant 去 open 源，participant 口径 = status IN invited/active
  *         对齐 unread SQL，admin 不短路）。缓存键 topic:mine:<actorKey> 前缀隔离。
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(发送即已读+join/邀请游标初始化)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(发送即已读+join/邀请游标初始化) ATT-PROJ-SNAPSHOT(附件投影是发送时刻快照：直改附件行的 expires_at 不改写历史消息，expired 只在响应时按快照算) ATT-CASCADE(m5：删话题连带软删附件，删除入口的语义反转——成员不再可读)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
@@ -119,6 +136,7 @@ import {
 } from '@agent-chamber/shared';
 import type { TopicDetail, MessageAttachment } from '@agent-chamber/shared';
 import { buildContentUrl, buildThumbnailUrl } from '../attachments/dto/attachment-response.dto';
+import { isAttachmentExpired } from '../attachments/attachment.constants';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -749,9 +767,63 @@ export class TopicService {
     return this.topicRepo.save(topic);
   }
 
-  async remove(id: string) {
+  /**
+   * 删除话题（软删）+ **连带软删其全部附件**（v1.90.0-dev §1.4 m5）。
+   *
+   * 语义变更注记（有意反转）：此前 topic 软删后其附件仍可被资源成员读取
+   * （attachment-access.service.ts 的 withDeleted + Policy 语义）；本批起**连带软删**
+   * → 附件读取/字节面一律 404·12000（findOne 默认滤软删）。附件对象走每日轨道一
+   * 的 30 天管道物理回收，配额在软删瞬间释放（SUM 口径含 deleted_at IS NULL）。
+   *
+   * 事务边界：topic 软删 + 附件批量软删必须在**同一事务**——否则中途失败会留下
+   * "话题已删、附件仍可读"的窗口（与"先软删行后删对象"同一条纪律）。
+   * 附件行显式 set deleted_at（DeleteDateColumn 在批量 update 里不会被自动处理，
+   * softRemove 逐行开销大；queryBuilder.update + set deletedAt 是批量软删的正确形态）。
+   *
+   * 审计：**一条汇总**（action=cascade_delete_attachments，newData={topicId, count}）
+   * ——逐行写太噪，一条足够追溯"谁删了哪些"；count=0 时不写（无附件事无留痕必要）。
+   * actorId 取自调用方（controller 已做权限判定）；缺省 null = 系统/内部调用
+   * （actor_id 列可空）。单附件 DELETE 的既有 audit（action=delete）不变。
+   *
+   * **非幂等（如实描述，m4 评审修正）**：id 不存在**或已软删**时 `findById` 抛
+   * 404·2000——重复 DELETE 同一话题得到 404 而不是 200。原 JSDoc 写的"重复删除仍
+   * 为成功"与实现不符（findById 默认滤软删），已改正；如需幂等语义应改为
+   * `withDeleted` 查询 + 命中即返回 true（当前不做：显式删除后重放 = 目标不存在，
+   * 404 更诚实）。
+   *
+   * @param id 话题 ID
+   * @param actorId 操作者 actor ID（controller 透传；内部调用可省 → null）
+   * @returns true（**仅首次调用**；对已软删/不存在的话题抛 404·TOPIC_NOT_FOUND）
+   */
+  async remove(id: string, actorId?: string) {
     const topic = await this.findById(id);
-    await this.topicRepo.softRemove(topic);
+
+    let cascadedCount = 0;
+    await this.dataSource.transaction(async (em) => {
+      await em.softRemove(topic);
+      const result = await em
+        .createQueryBuilder()
+        .update(Attachment)
+        .set({ deletedAt: () => 'now()' })
+        .where('topic_id = :id', { id })
+        .andWhere('deleted_at IS NULL')
+        .execute();
+      cascadedCount = result.affected ?? 0;
+    });
+
+    if (cascadedCount > 0) {
+      // fail-open（AuditService.log 内部兜底）；系统/用户动作留痕边界：topic 删除是
+      // 显式动作，连带清理是其副作用——汇总一条即可追溯
+      await this.auditService.log({
+        action: AuditAction.CASCADE_DELETE_ATTACHMENTS,
+        entityType: AUDIT_ENTITY_TYPE.TOPIC,
+        entityId: id,
+        actorId: actorId ?? null,
+        newData: { topicId: id, count: cascadedCount },
+        source: 'api',
+      });
+    }
+
     return true;
   }
 
@@ -1412,19 +1484,28 @@ export class TopicService {
    *
    * 返回按输入顺序（含重复，与 ≤9 上限语义一致）映射的 metadata.attachments
    * 索引条目；sizeBytes 显式 Number()（bigint string → number，批 1 钉死的转换点）。
-   * 返回类型钉为 Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl'>
+   * 返回类型钉为 Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl' | 'expired'>
    * & { hasThumbnail: boolean }：索引落库**不含**任何投影 URL（contentUrl /
-   * thumbnailContentUrl 都是响应层经 buildContentUrl / buildThumbnailUrl 派生的）；
+   * thumbnailContentUrl 都是响应层经 buildContentUrl / buildThumbnailUrl 派生的），
+   * 也**不含** `expired`（那是响应时纯函数，见 §1.1——过期与否随时间变化，入索引即失真）；
    * 索引只存布尔 `hasThumbnail`（**required**，写路径恒产出——optional 会弱化
-   * 缺席语义的 pin），响应层据此条件展开 thumbnailContentUrl。防索引形状与投影
-   * 条目漂移（P1 钉钉、P2 批 1 扩展）。
+   * 缺席语义的 pin）与静态事实 expiresAt/clientMimeType。响应层据此条件展开
+   * thumbnailContentUrl 并实时计算 expired。防索引形状与投影条目漂移
+   * （P1 钉钉、P2 批 1 扩展、TTL 批扩展）。
+   *
+   * 过期拒绝（R2 定案，v1.90.0-dev）：引用**已过期**附件 → 400·12009
+   * （死了就是死了：不许把过期 id 写进新消息索引）。
    */
   private async validateAttachmentsForMessage(
     topicId: string,
     senderId: string,
     attachmentIds: string[],
   ): Promise<
-    Array<Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl'> & { hasThumbnail: boolean }>
+    Array<
+      Omit<MessageAttachment, 'contentUrl' | 'thumbnailContentUrl' | 'expired'> & {
+        hasThumbnail: boolean;
+      }
+    >
   > {
     const rows = await this.attachmentRepo.find({ where: { id: In(attachmentIds) } });
     const byId = new Map(rows.map((row) => [row.id, row]));
@@ -1448,11 +1529,27 @@ export class TopicService {
           code: ErrorCode.ATTACHMENT_FORBIDDEN,
         });
       }
+      // 过期拒绝（R2）：死资源不得进新消息的索引快照（投影侧的 expired 只服务
+      // 历史消息的墓碑呈现，不是"可以继续引用"的许可）
+      if (isAttachmentExpired(attachment.expiresAt)) {
+        throw new BadRequestException({
+          message:
+            `Attachment ${id} has expired and cannot be referenced in a new message; ` +
+            `upload or request a new copy`,
+          code: ErrorCode.ATTACHMENT_EXPIRED,
+        });
+      }
       return {
         id: attachment.id,
         originalName: attachment.originalName,
         mimeType: attachment.mimeType,
+        // 展示信息入索引快照（静态事实；卡片图标分类用——非图片 mimeType 恒
+        // octet-stream 无信息量）。非法/缺失 → null，与上传响应同口径
+        clientMimeType: attachment.clientMimeType ?? null,
         sizeBytes: Number(attachment.sizeBytes),
+        // 静态事实入快照（§1.1）：事后改 topic TTL 不追溯，索引无需 join 附件表即可
+        // 供投影计算 expired；null = 永久
+        expiresAt: attachment.expiresAt ? attachment.expiresAt.toISOString() : null,
         // 索引只存布尔（URL 是响应层派生物）：发送时刻的缩略图有无快照，
         // 之后缩略图生成/丢失都不改写历史索引（投影按索引走，见 projectAttachments）
         hasThumbnail: !!attachment.thumbKey,
@@ -1534,12 +1631,19 @@ export class TopicService {
    * 防御过滤（存量为脏的兜底，plan §1 快照语义）：非数组 → []；条目非对象 /
    * id/originalName/mimeType 非 string / sizeBytes 无法转有限 number → 丢弃
    * （NaN 经 JSON.stringify 序列化成 null 会破坏 number 契约——评审 N1）。
-   * 输出恒 5 字段 + **条件第 6 键**（P2 批 1）：contentUrl 由 buildContentUrl
+   * 输出恒 8 字段 + **条件第 9 键**（P2 批 1）：contentUrl 由 buildContentUrl
    * 单一拼装点派生（相对路径，下载需拼 base + 携带凭证）；索引 `hasThumbnail`
    * **严格 `=== true`** 才追加 thumbnailContentUrl（buildThumbnailUrl 派生），
    * 其余情形（false / 缺键 / 非布尔垃圾值）字面缺键——绝不落 null/空串；
    * hasThumbnail 自身是存储态、不透传（strip，不出现在响应）。
    * 不验证归属——归属/权限由 /content、/thumbnail 端点鉴权兜底。
+   *
+   * TTL 字段（v1.90.0-dev §1.1，**四表面同一口径**）：
+   * - `expiresAt`：从索引快照取（**静态事实**）；索引缺键/非字符串（存量消息）→ null；
+   * - `expired`：**响应时纯函数** `expiresAt < now()`（不入索引——过期与否随时间变化，
+   *   入索引即失真）；非法日期串 → false（宁可显示可下载，也不因脏数据置灰）；
+   * - `clientMimeType`：展示信息（索引缺键 → null）。
+   * 全程**不 join 附件表**（投影设计不变量：索引即事实，附件行删除/过期都不改写历史消息）。
    *
    * @param metadata 消息实体的 metadata（jsonb，可能为 undefined/null）
    * @returns 恒存在数组（无附件 = []）
@@ -1549,6 +1653,7 @@ export class TopicService {
   ): MessageAttachment[] {
     const raw = metadata?.attachments;
     if (!Array.isArray(raw)) return [];
+    const now = new Date();
     return raw
       .filter(
         (entry): entry is Record<string, unknown> =>
@@ -1561,13 +1666,21 @@ export class TopicService {
       )
       .map((entry) => {
         const id = entry.id as string;
+        const expiresAt = typeof entry.expiresAt === 'string' ? entry.expiresAt : null;
+        // 判据走单一事实源（与 GC 谓词 expires_at < now() 同义；非法串 → false）
+        const expired = isAttachmentExpired(expiresAt, now);
+        const clientMimeType =
+          typeof entry.clientMimeType === 'string' ? entry.clientMimeType : null;
         // 缺席语义：hasThumbnail 严格 === true 才出现 thumbnailContentUrl 键；
         // 无缩略图时字面缺键（不回退 null/''）——四表面同一口径（P2 批 1）
         return {
           id,
           originalName: entry.originalName as string,
           mimeType: entry.mimeType as string,
+          clientMimeType,
           sizeBytes: Number(entry.sizeBytes),
+          expiresAt,
+          expired,
           contentUrl: buildContentUrl(id),
           ...(entry.hasThumbnail === true ? { thumbnailContentUrl: buildThumbnailUrl(id) } : {}),
         };

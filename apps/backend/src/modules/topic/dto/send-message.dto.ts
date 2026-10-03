@@ -45,7 +45,9 @@ export class SendMessageDto implements SendMessageInput {
   @ArrayMaxSize(9)
   @ApiPropertyOptional({
     description:
-      'Attachment IDs (max 9, UUID v4). All must exist, be uploaded by the sender, and be bound to this topic.',
+      'Attachment IDs (max 9, UUID v4). All must exist, be uploaded by the sender, and be bound to this topic. ' +
+      'Expired attachments (expiresAt < now) are rejected with 400/ATTACHMENT_EXPIRED (code 12009). ' +
+      'Upload first via POST /attachments?topicId=<id>.',
     example: ['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'],
   })
   attachmentIds?: string[];

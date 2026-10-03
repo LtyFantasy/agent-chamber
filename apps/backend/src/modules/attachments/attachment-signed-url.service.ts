@@ -21,10 +21,15 @@
  *     借 404 探测附件是否存在；篡改 token + 不存在 id 必须是 401 而非 404）
  *   - 审计 `mint_attachment_url` 的 newData **禁含 token**（能力凭证不进审计面）
  *   - 铸造可安全重试：每次签发新 token，除审计行外无副作用（无状态，不落库）
+ *   - **过期 fail-fast（m3）**：为已过期附件铸造 → 400·12009（死了就是死了，不许铸新票）；
+ *     判定先于变体可行性（语义不因变体缺失改判）。**mint 侧刻意不加 status='ready'
+ *     谓词**（N5：全仓无 pending 写入方，presign 落地时统一收口）
+ *   - 公开取流：过期懒判 410·12009 + 就绪谓词 404·12000，插入点 = 行加载后、getObject 前
  *
  * [关联代码]
  *   - config/attachment-url.config.ts — 密钥与默认 TTL 单一事实源
- *   - attachment.constants.ts — issuer/scope/变体值域/限流与 TTL 边界
+ *   - attachment.constants.ts — issuer/scope/变体值域/限流与 TTL 边界 + 过期/就绪判据单源
+ *   - ../database/entities/attachment.entity.ts — expires_at/status 列语义（本服务两个新判据的输入）
  *   - dto/attachment-response.dto.ts — signedUrl 与响应形状拼装点
  *   - attachment-public.controller.ts — 公开端点（唯一消费 resolvePublicContent 的入口）
  *   - common/utils/redact-url.ts — 日志侧 token 脱敏（本能力的凭证不出现在日志）
@@ -41,7 +46,14 @@
  *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
-import { Injectable, Logger, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  GoneException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
@@ -61,6 +73,8 @@ import {
   ATTACHMENT_SIGNED_URL_ISSUER,
   ATTACHMENT_SIGNED_URL_SCOPE,
   AttachmentSignedUrlVariant,
+  isAttachmentExpired,
+  isAttachmentReadable,
 } from './attachment.constants';
 
 /**
@@ -154,7 +168,19 @@ export class AttachmentSignedUrlService {
     // 1. 读授权 + 软删 fail-fast（findOne 默认滤软删 → 已软删行等同不存在）
     const attachment = await this.attachmentService.findAccessible(id, actor);
 
-    // 2. 变体可行性：无缩略图（存量行/生成失败）时不签缩略图 URL
+    // 2. 过期 fail-fast（m3，v1.90.0-dev）：死了就是死了——不为已过期附件铸造新凭证
+    //    （400 而非 410：铸造是写语义的派生动作；字节面才是 410）。
+    //    判定先于变体可行性：语义不因变体缺失改判。
+    if (isAttachmentExpired(attachment.expiresAt)) {
+      throw new BadRequestException({
+        message:
+          'Attachment has expired and can no longer be shared; upload or request a new copy ' +
+          '(expired attachments are purged automatically)',
+        code: ErrorCode.ATTACHMENT_EXPIRED,
+      });
+    }
+
+    // 3. 变体可行性：无缩略图（存量行/生成失败/非图片附件）时不签缩略图 URL
     const variant = dto.variant ?? ATTACHMENT_SIGNED_URL_DEFAULT_VARIANT;
     if (variant === 'thumbnail' && !attachment.thumbKey) {
       throw new NotFoundException({
@@ -163,7 +189,7 @@ export class AttachmentSignedUrlService {
       });
     }
 
-    // 3. 生效 TTL：请求显式值优先，否则 config 默认（两值都已落在 DTO/文档区间内）
+    // 4. 生效 TTL：请求显式值优先，否则 config 默认（两值都已落在 DTO/文档区间内）
     const ttlSeconds = dto.ttlSeconds ?? this.ttlDefaultSeconds;
 
     const token = this.jwtService.sign(
@@ -213,17 +239,37 @@ export class AttachmentSignedUrlService {
   /**
    * 公开端点取流（`GET /public/attachments/:id/content?token=`）。
    *
-   * 顺序钉死（**先 401 后 404**）：验签三断言 → 行存活（404·12000）→ 变体取流。
+   * 顺序钉死（**先 401 后 404**）：验签三断言 → 行存活（404·12000）→ 过期懒判（410·12009）
+   * → 就绪谓词（404·12000）→ 变体取流。
    * 若反序，篡改 token + 不存在 id 就会先暴露 404，把公开端点变成附件 ID 探测面。
    *
    * 授权检查刻意**不做**：token 即凭证（capability URL 语义）；行已软删等同不存在
    * （404·12000），这是能力 URL 的唯一失效手段（无撤销列表，TTL 是天然窗口）。
+   * 过期懒判插入点（§1.3 钉死）：行加载之后、`getObject` 之前——与全鉴权读取面同点位、
+   * 同判据（isAttachmentExpired 单源），只是本路径没有"授权"这一步。
    */
   async resolvePublicContent(id: string, token: string): Promise<PublicAttachmentContent> {
     const variant = this.verifySignedUrlToken(id, token);
 
     const attachment = await this.attachmentRepo.findOne({ where: { id } });
     if (!attachment) {
+      throw new NotFoundException({
+        message: 'Attachment not found',
+        code: ErrorCode.ATTACHMENT_NOT_FOUND,
+      });
+    }
+
+    // 过期懒判（墓碑式语义）：扫前 410（行还在）/ 扫后 404（行已被小时级 GC 硬删）
+    if (isAttachmentExpired(attachment.expiresAt)) {
+      throw new GoneException({
+        message:
+          'Attachment has expired and is no longer downloadable; upload or request a new copy ' +
+          '(expired attachments are purged automatically)',
+        code: ErrorCode.ATTACHMENT_EXPIRED,
+      });
+    }
+    // 就绪谓词（m6）：非 'ready' 行视同不存在（潜伏态，presign 落地时统一收口）
+    if (!isAttachmentReadable(attachment.status)) {
       throw new NotFoundException({
         message: 'Attachment not found',
         code: ErrorCode.ATTACHMENT_NOT_FOUND,

@@ -522,4 +522,23 @@ export class ImportDocBundleDto {
   @ValidateNested({ each: true })
   @Type(() => BundleMediaOmittedItemDto)
   mediaOmitted?: BundleMediaOmittedItemDto[];
+
+  /**
+   * 导出侧生效的过滤条件回声（v1.89.0-dev 批次 A；带 `?pathPrefix=` 导出时才有）。
+   *
+   * **纯 informational，import 时忽略不参与写**（照 docId/contentHash 先例）——显式声明
+   * 是为让新版 bundle（带 appliedFilters）可安全回导：`forbidNonWhitelisted` 下未声明字段
+   * 会被 400 拒。
+   *
+   * ⚠️ **只挂 `@IsObject()`，禁用 `@ValidateNested`**：嵌套校验会递归 strip/400 内部字段
+   * （`pathPrefix`/`matchedDocs` 未在本文件声明），把"纯回声"变成强形状约束。
+   */
+  @ApiPropertyOptional({
+    description:
+      'Export-side filter echo (informational, ignored on import): ' +
+      '{pathPrefix, matchedDocs} — present only when the bundle was fetched with ?pathPrefix=',
+  })
+  @IsOptional()
+  @IsObject()
+  appliedFilters?: Record<string, unknown>;
 }

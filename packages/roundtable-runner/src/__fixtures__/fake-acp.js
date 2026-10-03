@@ -46,8 +46,8 @@ if (!fs.existsSync(logPath)) {
 
 // 环境快照（codex 规格断言 CODEX_CONFIG/CODEX_PATH；opencode 规格断言
 // OPENCODE_CONFIG_CONTENT 权限钉死；claude 规格断言 ANTHROPIC_MODEL 模型注册保险；
-// kimi 用例不受影响——条目无 method 且 direction='env'，现有 find/filter 断言均按
-// method 过滤，宽松跳过）
+// dsh 规格断言 DSH_PERMISSION_MODE 档位钉死；kimi 用例不受影响——条目无 method 且
+// direction='env'，现有 find/filter 断言均按 method 过滤，宽松跳过）
 log({
   direction: 'env',
   env: {
@@ -55,6 +55,7 @@ log({
     CODEX_PATH: process.env.CODEX_PATH ?? null,
     OPENCODE_CONFIG_CONTENT: process.env.OPENCODE_CONFIG_CONTENT ?? null,
     ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL ?? null,
+    DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE ?? null,
   },
 });
 

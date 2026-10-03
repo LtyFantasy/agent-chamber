@@ -42,4 +42,42 @@ describe('QueryDocDto', () => {
     expect(errors).toHaveLength(0);
     expect(dto.pageSize).toBe(20);
   });
+
+  // ─── v1.89.0-dev：updatedAfter / sort（最近变更镜像的读面）────────
+
+  it('updatedAfter：ISO 8601 通过（含带偏移与毫秒形态）', async () => {
+    for (const value of [
+      '2026-09-30T00:00:00.000Z',
+      '2026-09-30T08:00:00+08:00',
+      '2026-09-30T08:00:00',
+    ]) {
+      const dto = plainToInstance(QueryDocDto, { updatedAfter: value });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+      expect(dto.updatedAfter).toBe(value);
+    }
+  });
+
+  it('updatedAfter：非 ISO 8601 → 400（@IsISO8601，禁透传 PG）', async () => {
+    for (const value of ['yesterday', '2026-13-45', '1759190400000']) {
+      const dto = plainToInstance(QueryDocDto, { updatedAfter: value });
+      const errors = await validate(dto);
+      expect(errors.some((e) => e.property === 'updatedAfter' && e.constraints?.isIso8601)).toBe(
+        true,
+      );
+    }
+  });
+
+  it('sort：只接受 updatedAt_desc / updatedAt_asc（共享词表单源）', async () => {
+    for (const value of ['updatedAt_desc', 'updatedAt_asc']) {
+      const dto = plainToInstance(QueryDocDto, { sort: value });
+      expect(await validate(dto)).toHaveLength(0);
+    }
+    // 搜索面的 createdAt_* 词表**不可互换**（双轨词表）
+    for (const value of ['createdAt_desc', 'createdAt_asc', 'relevance', 'updated_at_desc']) {
+      const dto = plainToInstance(QueryDocDto, { sort: value });
+      const errors = await validate(dto);
+      expect(errors.some((e) => e.property === 'sort' && e.constraints?.isIn)).toBe(true);
+    }
+  });
 });

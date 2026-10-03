@@ -10,7 +10,14 @@ import {
   Min,
   Max,
 } from 'class-validator';
-import { Visibility, TopicConfigInput, TopicKind, WakePolicy } from '@agent-chamber/shared';
+import {
+  Visibility,
+  TopicConfigInput,
+  TopicKind,
+  WakePolicy,
+  ATTACHMENT_TTL_VALUES,
+} from '@agent-chamber/shared';
+import type { AttachmentTtl } from '@agent-chamber/shared';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class TopicConfigDto implements TopicConfigInput {
@@ -100,4 +107,25 @@ export class TopicConfigDto implements TopicConfigInput {
     maximum: 1000,
   })
   maxRoundsWithoutHuman?: number;
+
+  /**
+   * 附件有效期档位（附件 TTL 批 v1.90.0-dev）：'1d' | '7d' | '30d' | 'never'。
+   *
+   * 语义（api-definition §16a）：**上传时冻结**——附件行 `expires_at = now() + ttl`，
+   * 事后修改本设置**只影响新上传**（不追溯既有附件）。写 settings jsonb
+   * （`topic.service.update` 的 configRest 合并点自然携带）。
+   * 缺省 / 脏值 → **7d**（fail-closed，解析失败 ≠ never）。
+   * 值域单源 = shared `ATTACHMENT_TTL_VALUES`（web 下拉同源，禁止在 DTO 再抄字面量）。
+   */
+  @IsOptional()
+  @IsIn(ATTACHMENT_TTL_VALUES)
+  @ApiPropertyOptional({
+    enum: ATTACHMENT_TTL_VALUES,
+    description:
+      'Attachment time-to-live bucket: 1d | 7d | 30d | never (default 7d). ' +
+      'Freezes at upload time — changing it does not affect existing attachments. ' +
+      'Doc-bound attachments never expire.',
+    example: '7d',
+  })
+  attachmentTtl?: AttachmentTtl;
 }

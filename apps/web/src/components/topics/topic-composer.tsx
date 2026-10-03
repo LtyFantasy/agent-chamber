@@ -10,6 +10,9 @@
  *   - 附件: docs/api-definition.md §Attachments（上传绑定 topicId；chip 移除 = DELETE + 链接剥离）
  *
  * [踩坑索引] ①(玻璃壳糊掉 backdrop 文字) ②(附件 chips 不得进玻璃壳容器)
+ *   ③(非图片附件不插 content：v1.90.0-dev 类型放开后，图片仍插 `![]()`；非图片
+ *     **只挂 chip + attachmentIds**——content 是渲染事实，裸链接需凭证（点击 401），
+ *     渲染由消息气泡卡片承担。移除 chip 时非图片无 markdownLink 可剥离，跳过即可)
  *
  * [铁律关联] #7(退化态零差异) #11(注释) #17(测试契约) #20(契约即设计)
  *
@@ -36,12 +39,8 @@ import { Loader2, Paperclip, Send, X } from 'lucide-react';
 import { ErrorCode } from '@agent-chamber/shared';
 import { Button } from '@/components/ui/button';
 import { confirm, toast } from '@/lib/notify';
-import {
-  Api,
-  ATTACHMENT_ALLOWED_TYPES,
-  ATTACHMENT_MAX_BYTES,
-  escapeAttachmentAlt,
-} from '@/lib/api';
+import { Api, ATTACHMENT_MAX_BYTES, escapeAttachmentAlt } from '@/lib/api';
+import { isInlineImageAttachment } from '@/lib/attachment-mime';
 import {
   detectMentionQuery,
   filterMentionTargets,
@@ -51,6 +50,12 @@ import {
 
 /** textarea 自动增高上限（px；对齐原 page 输入框 max-h-32） */
 const MAX_HEIGHT_PX = 128;
+
+/**
+ * 单条消息附件数上限（与后端 `@ArrayMaxSize(9)` 对齐，plan §0.3 钉死）。
+ * 到顶后在本地拦截 + 提示，省一次注定 400 的请求。
+ */
+const MAX_ATTACHMENT_CHIPS = 9;
 
 /** 广播令牌候选（置顶；协议符号不翻译，见 roundtable-design §6/@all） */
 const ALL_CANDIDATE = '@all';
@@ -89,7 +94,12 @@ interface UploadChip {
   name: string;
   /** 上传中 */
   uploading: boolean;
-  /** 插入 textarea 的 markdown 链接（移除 chip 时按此剥离） */
+  /**
+   * 插入 textarea 的 `![alt](contentUrl)` 链接（移除 chip 时按此精确剥离）。
+   * **仅图片附件有值**（v1.90.0-dev）：非图片附件不插 content（content 是渲染事实，
+   * 裸链接需凭证、粘贴进正文只会得到 401 死链），仅挂 chip + attachmentIds 走
+   * `metadata.attachments` 索引 → 消息气泡卡片渲染。
+   */
   markdownLink?: string;
 }
 
@@ -132,6 +142,15 @@ export function TopicComposer({
   const cancelledUploadsRef = useRef<Set<string>>(new Set());
   // 附件 chips（上传中/已上传；发送成功后随 value 清空重置）
   const [chips, setChips] = useState<UploadChip[]>([]);
+  /**
+   * 本渲染批次内已收下、但 state 尚未回填的 chip 数（n4）：
+   * `chips.length` 是渲染快照，粘贴多文件会在同一 tick 内连续建 chip → 只按
+   * chips.length 判上限会超发（服务端 @ArrayMaxSize(9) 直接 400）。每次建 chip
+   * 同步 +1，chips 真正更新后（effect）归零。 */
+  const pendingChipsRef = useRef(0);
+  useEffect(() => {
+    pendingChipsRef.current = 0;
+  }, [chips]);
   // caret 用 state（受控组件无原生事件流）；方向键/点击移动 caret 经 onSelect 同步
   const [caretPos, setCaretPos] = useState(value.length);
   // 当前高亮候选下标（↑↓ 循环导航）
@@ -223,7 +242,11 @@ export function TopicComposer({
    * 排队两个确认框，确认两次 = 重复发消息（@all 发送非幂等）。
    */
   const handleSend = useCallback(async () => {
-    if (!value.trim()) return;
+    // 收集已上传附件 id（上传中已被下方守卫拦截，此处全为已上传）
+    const attachmentIds = chips.filter((c) => c.id).map((c) => c.id as string);
+    // 空载荷不发（M1 修订）：正文与附件**至少其一**——后端允许空 content + 附件
+    // （「只传文件不打字」是合法用法，附件本身就是消息内容，由气泡卡片渲染）。
+    if (!value.trim() && attachmentIds.length === 0) return;
     // 上传中阻塞发送：图片链接尚未插入 content，此刻发送会丢图（附件成孤儿）
     if (chips.some((c) => c.uploading)) return;
     const seatCount = mentionEnabled ? (mentionTargets?.length ?? 0) : 0;
@@ -242,8 +265,7 @@ export function TopicComposer({
         confirmPendingRef.current = false;
       }
     }
-    // 收集已上传附件 id（上传中已被上方守卫拦截，此处全为已上传）
-    onSend(chips.filter((c) => c.id).map((c) => c.id as string));
+    onSend(attachmentIds);
   }, [value, chips, mentionEnabled, mentionTargets, onSend, t, tGlobal]);
 
   /** 选中候选：把 [@, caret) 替换为 `@label `，caret 移到空格后，关闭补全框 */
@@ -296,20 +318,27 @@ export function TopicComposer({
   };
 
   /**
-   * 上传单个图片文件（paperclip 选择 / onPaste 共用）：
-   * 前端拦截（类型/大小，与后端校验对齐，提前失败省一次请求）→ 建 chip →
-   * Api.attachments.upload（绑定 topicId）→ 成功插 `![alt](contentUrl)` 到光标
-   * （alt 转义 `[ ] ( )`，plan §3.6）→ chip 回填 id；失败 toast + 移除 chip。
+   * 上传单个文件（paperclip 选择 / onPaste 共用）：
+   * 前端只做**大小**拦截（10MB，与后端校验对齐，提前失败省一次请求）——v1.90.0-dev
+   * 起类型直接放开（后端非图片走 octet-stream + 强制下载），不再维护 mime 白名单 →
+   * 建 chip → Api.attachments.upload（绑定 topicId）→
+   * · 图片（4 种嗅探 mime）：把 `![alt](contentUrl)` 插到光标（alt 转义 `[ ] ( )`，plan §3.6）
+   * · 非图片：**不插 content**（裸链接需凭证=401 死链；渲染由消息卡片承担），
+   *   仅挂 chip + attachmentIds
+   * → chip 回填 id；失败 toast + 移除 chip。
    */
   const uploadFile = async (file: File) => {
-    if (!ATTACHMENT_ALLOWED_TYPES.includes(file.type)) {
-      toast.error({ title: tGlobal('attachments.typeNotAllowed') });
-      return;
-    }
     if (file.size > ATTACHMENT_MAX_BYTES) {
       toast.error({ title: tGlobal('attachments.tooLarge') });
       return;
     }
+    // 数量上限守卫（n4）：state 快照 + 本批已收下未回填的 chip 数合并判定
+    // （粘贴多文件会在同一 tick 连建 chip，只看 chips.length 会超发到服务端 400）
+    if (chips.length + pendingChipsRef.current >= MAX_ATTACHMENT_CHIPS) {
+      toast.error({ title: tGlobal('attachments.tooMany') });
+      return;
+    }
+    pendingChipsRef.current += 1;
     const localKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     setChips((prev) => [...prev, { localKey, id: null, name: file.name, uploading: true }]);
     try {
@@ -319,8 +348,14 @@ export function TopicComposer({
         cancelledUploadsRef.current.delete(localKey);
         return;
       }
-      const markdownLink = `![${escapeAttachmentAlt(res.originalName)}](${res.contentUrl})`;
-      insertAtCursor(markdownLink);
+      // 仅图片插 `![]()`；非图片不碰正文（见 UploadChip.markdownLink 注释）。
+      // mimeType 是服务端字节证据（嗅探值），不是客户端声明的 file.type——
+      // 声明 image/png 的 HTML 文件不会被误插成内联图片（M1 不变量在展示层的镜像）。
+      const isImage = isInlineImageAttachment(res);
+      const markdownLink = isImage
+        ? `![${escapeAttachmentAlt(res.originalName)}](${res.contentUrl})`
+        : undefined;
+      if (markdownLink) insertAtCursor(markdownLink);
       setChips((prev) =>
         prev.map((c) =>
           c.localKey === localKey ? { ...c, id: res.id, uploading: false, markdownLink } : c,
@@ -339,7 +374,7 @@ export function TopicComposer({
     }
   };
 
-  /** paperclip 文件选择（accept 已限图片白名单；清空 value 允许重复选同一文件） */
+  /** paperclip 文件选择（accept 已放开 = 任意类型；清空 value 允许重复选同一文件） */
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = '';
@@ -347,16 +382,15 @@ export function TopicComposer({
   };
 
   /**
-   * textarea 粘贴（全仓首例，plan §5.3）：clipboardData.files 命中图片白名单 →
-   * 拦截默认粘贴（防文件路径文本）→ 走上传；非图片粘贴保持默认行为（文本）。
+   * textarea 粘贴（全仓首例，plan §5.3）：clipboardData.files 非空 → 拦截默认粘贴
+   * （防文件路径文本）→ 走上传。v1.90.0-dev 起类型放开：任意文件都接管（此前只接
+   * 图片白名单，非图片粘贴回落成文件路径文本）。无文件（纯文本）保持默认行为。
    */
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData?.files ?? []);
     if (files.length === 0) return;
-    const imageFiles = files.filter((f) => ATTACHMENT_ALLOWED_TYPES.includes(f.type));
-    if (imageFiles.length === 0) return;
     e.preventDefault();
-    for (const f of imageFiles) void uploadFile(f);
+    for (const f of files) void uploadFile(f);
   };
 
   /**
@@ -364,7 +398,8 @@ export function TopicComposer({
    * - 上传中：登记取消（成功回调不再插入链接），附件成为孤儿（plan §1）
    * - 已上传：确认后调 Api.attachments.remove + 同步从 textarea 剥离对应
    *   markdown 链接（先剥离后删除——本地剥离可靠，防「已删附件仍被引用」死链；
-   *   删除失败仅提示，链接已剥离消息安全，残留附件为孤儿）
+   *   删除失败仅提示，链接已剥离消息安全，残留附件为孤儿）。
+   *   非图片 chip 无 markdownLink（从未插入正文）→ 跳过剥离，其余流程一致。
    */
   const removeChip = async (localKey: string) => {
     const chip = chips.find((c) => c.localKey === localKey);
@@ -478,8 +513,8 @@ export function TopicComposer({
         </div>
       )}
       <div className="flex items-center gap-2 border-t border-border/60 pt-2 md:pt-4">
-        {/* paperclip：触发隐藏 file input（accept 限图片白名单）；上传中不禁用——
-            可继续选图排队上传（发送按钮在上传中禁用，见 handleSend 守卫） */}
+        {/* paperclip：触发隐藏 file input（v1.90.0-dev 起 accept 放开 = 任意类型；
+            上传中不禁用——可继续选文件排队上传（发送按钮在上传中禁用，见 handleSend 守卫）） */}
         <Button
           type="button"
           variant="ghost"
@@ -492,13 +527,7 @@ export function TopicComposer({
         >
           <Paperclip className="h-4 w-4" />
         </Button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
-          className="hidden"
-          onChange={handleFileChange}
-        />
+        <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
         <div
           className={
             mentionEnabled
@@ -587,7 +616,9 @@ export function TopicComposer({
         <Button
           onClick={handleSend}
           isLoading={isSending}
-          disabled={!value.trim() || chips.some((c) => c.uploading)}
+          // M1 修订：正文空但已有已上传附件 → 允许发送（后端允许空 content + 附件）；
+          // 上传中一律禁用（图片链接尚未插入 content，此刻发送会丢图）
+          disabled={(!value.trim() && !chips.some((c) => c.id)) || chips.some((c) => c.uploading)}
           aria-label={t('message.send')}
           className="shrink-0"
         >

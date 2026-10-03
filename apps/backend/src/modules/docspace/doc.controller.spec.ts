@@ -2,13 +2,14 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { DocController } from './doc.controller';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocLinksService } from './doc-links.service';
 import { DocSpaceService } from './docspace.service';
 import { DocSearchService } from './doc-search.service';
 import { PermissionService } from '../../common/services/permission.service';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 
 describe('DocController', () => {
   let controller: DocController;
@@ -51,6 +52,12 @@ describe('DocController', () => {
     findById: jest.fn(),
   };
 
+  // 入链内核（v1.90.0-dev backlinks 批次）：backlinks 端点消费 getBacklinks
+  const mockDocLinksService = {
+    scanInboundLinks: jest.fn(),
+    getBacklinks: jest.fn(),
+  };
+
   const mockPermService = {
     ensureCan: jest.fn().mockResolvedValue(undefined),
   };
@@ -68,6 +75,7 @@ describe('DocController', () => {
       providers: [
         { provide: DocService, useValue: mockDocService },
         { provide: DocMoveService, useValue: mockDocMoveService },
+        { provide: DocLinksService, useValue: mockDocLinksService },
         { provide: DocSearchService, useValue: mockDocSearchService },
         { provide: DocSpaceService, useValue: mockDocSpaceService },
         { provide: PermissionService, useValue: mockPermService },
@@ -820,6 +828,58 @@ describe('DocController', () => {
         }),
       );
       expect(mockDocMoveService.computeMoveImpact).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── getBacklinks（v1.90.0-dev：GET /docs/:id/backlinks）────────────
+
+  describe('getBacklinks', () => {
+    const doc = { id: 'doc-1', spaceId: 'space-1', path: 'docs/a.md', title: 'A' };
+
+    it('calls docLinksService.getBacklinks after resolving doc + read permission', async () => {
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      const view = { docId: 'doc-1', path: 'docs/a.md', docCount: 0, linkCount: 0, sources: [] };
+      mockDocLinksService.getBacklinks.mockResolvedValue(view);
+
+      expect(await controller.getBacklinks('doc-1')).toBe(view);
+      expect(docService.findById).toHaveBeenCalledWith('doc-1');
+      expect(docSpaceService.findById).toHaveBeenCalledWith('space-1');
+      expect(permService.ensureCan).toHaveBeenCalledWith(space, null, 'read');
+      expect(mockDocLinksService.getBacklinks).toHaveBeenCalledWith(doc);
+    });
+
+    it('read denial propagates as 404 DOC_SPACE_NOT_FOUND (service not called)', async () => {
+      // 权限服务对 read 拒绝抛 404（security through obscurity）——**不是** 403；
+      // 端点不得吞掉或改写该错误（真实语义由 e2e 断，此处只验透传）
+      docService.findById.mockResolvedValue(doc);
+      docSpaceService.findById.mockResolvedValue(space);
+      permService.ensureCan.mockRejectedValue(
+        new NotFoundException({
+          message: 'DocSpace not found',
+          code: ErrorCode.DOC_SPACE_NOT_FOUND,
+        }),
+      );
+
+      await expect(controller.getBacklinks('doc-1', nonAdminActor)).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.DOC_SPACE_NOT_FOUND }),
+        }),
+      );
+      expect(mockDocLinksService.getBacklinks).not.toHaveBeenCalled();
+    });
+
+    it('document missing → 404 propagates from findById (service not called)', async () => {
+      docService.findById.mockRejectedValue(
+        new NotFoundException({ message: 'Document not found', code: ErrorCode.DOC_NOT_FOUND }),
+      );
+
+      await expect(controller.getBacklinks('doc-missing')).rejects.toThrow(
+        expect.objectContaining({
+          response: expect.objectContaining({ code: ErrorCode.DOC_NOT_FOUND }),
+        }),
+      );
+      expect(mockDocLinksService.getBacklinks).not.toHaveBeenCalled();
     });
   });
 

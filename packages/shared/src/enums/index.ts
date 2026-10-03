@@ -159,6 +159,18 @@ export enum AuditAction {
    * 铸造可安全重试（每次新 token，无副作用），审计行随之逐次留痕。
    */
   MINT_ATTACHMENT_URL = 'mint_attachment_url',
+  /**
+   * v1.90.0-dev：topic 删除连带软删其全部附件（附件 TTL 批，verb_noun 同款）——
+   * `TopicService.remove()` 在同一事务里批量软删 `topic_id = :id` 的附件行后，
+   * 写**一条汇总** audit（逐行写太噪）：newData = {topicId, count}。
+   *
+   * ⚠️ `audit_logs.action` 是 PG 原生枚举，补值需 migration
+   * `AddAuditCascadeDeleteAttachmentsAction1791500000001`（与 MINT_ATTACHMENT_URL
+   * 同款先例；缺值写入报 `invalid input value for enum audit_action` 500）。
+   *
+   * 单附件 DELETE 端点的既有 audit（action='delete'）不变；本动作只覆盖连带路径。
+   */
+  CASCADE_DELETE_ATTACHMENTS = 'cascade_delete_attachments',
 }
 
 export enum WebhookStatus {
@@ -328,9 +340,20 @@ export enum ErrorCode {
   // Attachments (12000-12099)
   /** 404 — 附件不存在；对"存在但无权限"的读取/删除访问也返回本码（不泄露存在性） */
   ATTACHMENT_NOT_FOUND = 12000,
-  /** 413 — 单文件超过 ATTACHMENT_MAX_BYTES（默认 8MiB）；注意配额超限是 12003(403) 不是本码 */
+  /** 413 — 单文件超过 ATTACHMENT_MAX_BYTES（默认 10MB）；注意配额超限是 12003(403) 不是本码 */
   ATTACHMENT_TOO_LARGE = 12001,
-  /** 400 — 魔数嗅探不命中图片白名单（png/jpeg/gif/webp），不信任客户端声明的 Content-Type */
+  /**
+   * 400 — **上传路径自 v1.90.0-dev 起不再触发（退役触发器，编号保留不复用）**。
+   *
+   * 历史语义：魔数嗅探不命中图片白名单（png/jpeg/gif/webp）即拒收，不信任客户端
+   * 声明的 Content-Type。附件 TTL 批起类型直接放开——非图片字节走
+   * `mime_type='application/octet-stream'` + 强制下载出口（安全模型改为"唯一防线=响应头"，
+   * 见 api-definition §16a）；上传侧唯一残留的 400 是"嗅探命中图片但头部不可解析"
+   * （VALIDATION_ERROR），不是本码。
+   *
+   * 保留原因：契约编号永不复用（存量消费方/文档仍可能按 12002 分支）；且未来若
+   * 重新引入准入策略，值域语义仍然成立。
+   */
   ATTACHMENT_TYPE_NOT_ALLOWED = 12002,
   /** 403 — 上传者累计存储配额（ATTACHMENT_QUOTA_BYTES，默认 200MiB）超限；刻意用 403 而非 413（非单请求载荷问题） */
   ATTACHMENT_QUOTA_EXCEEDED = 12003,
@@ -367,6 +390,28 @@ export enum ErrorCode {
    *    （变体取自 token 载荷 `var`，var=thumbnail 时该路径适用，批 2）。
    */
   ATTACHMENT_THUMBNAIL_UNAVAILABLE = 12008,
+  /**
+   * 410 / 400 — 附件已过期（v1.90.0-dev 附件 TTL 批，墓碑式过期语义）。
+   *
+   * **同一业务码，两种 HTTP 状态**（按路径语义分工，调用方可据此分支）：
+   * - 410 Gone：**字节面**（`GET /attachments/:id/content` / `:id/thumbnail` /
+   *   公开端点 `GET /public/attachments/:id/content`）——资源曾经存在、语义上已终结，
+   *   与"从未存在"（404·12000）刻意区分；消息指导下一步（重新上传 / 让上传者重发）。
+   * - 400 Bad Request：**引用/铸造面**（`POST /topics/:id/messages` 引用已过期附件、
+   *   `POST /attachments/:id/signed-url` 为已过期附件铸造凭证）——死了就是死了，
+   *   不许铸新票，也不许把过期 id 写进新消息索引。
+   *
+   * 过期判据 = `expires_at IS NOT NULL AND expires_at < now()`：
+   * - `expires_at` 在上传时刻按 topic 当时的 `settings.attachmentTtl` **冻结**写入
+   *   （doc 绑定恒 NULL = 永久；`never` → NULL；存量迁移行 NULL = 永久）；
+   * - 小时级 GC（`sweepExpiredAttachments`）物理回收后行被硬删，读取面随之从 410 变
+   *   404·12000（扫前 410 / 扫后 404，UI 消费投影的 `expired` 字段无感）。
+   *
+   * 元数据面**不**判过期：`GET /attachments/:id`、`GET /attachments/mine`、消息投影
+   * 继续 200 + `expiresAt`（墓碑卡片需要数据；四表面同一口径——上传响应 / GET :id /
+   * GET mine / 消息投影）。
+   */
+  ATTACHMENT_EXPIRED = 12009,
 
   // Experience (13000-13099)
   /**

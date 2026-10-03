@@ -45,7 +45,15 @@ const messages: Record<string, string> = {
   'topics.form.wakeBroadcast': 'Broadcast (every new message goes to all seats)',
   'topics.form.maxRounds': 'Safety-valve round limit (optional)',
   'topics.form.maxRoundsPlaceholder': 'Default 8; 0 = disabled',
+  'topics.form.attachmentTtl': 'Attachment retention',
+  'topics.form.attachmentTtlHint':
+    'Applies to newly uploaded attachments only; existing attachments keep their original expiry.',
+  'topics.form.attachmentTtl1d': '1 day',
+  'topics.form.attachmentTtl7d': '7 days (default)',
+  'topics.form.attachmentTtl30d': '30 days',
+  'topics.form.attachmentTtlNever': 'Never expire',
   'common.cancel': 'Cancel',
+  'common.save': 'Save',
 };
 
 jest.mock('next-intl', () => ({
@@ -93,6 +101,8 @@ jest.mock('@/stores/auth.store', () => ({
 const mockList = Api.topics.list as jest.Mock;
 const mockGetUnread = Api.topics.getUnread as jest.Mock;
 const mockCreate = Api.topics.create as jest.Mock;
+const mockUpdate = Api.topics.update as jest.Mock;
+const mockGetById = Api.topics.getById as jest.Mock;
 
 const NORMAL_TOPIC = {
   id: 't-normal',
@@ -145,7 +155,7 @@ describe('列表卡片圆桌 badge（v1.49.0）', () => {
 });
 
 describe('创建 dialog kind 分支（v1.49.0）', () => {
-  it('默认普通：不展开圆桌配置；提交不携带 config', async () => {
+  it('默认普通：不展开圆桌配置；提交 config 只带附件有效期（缺省 7d）', async () => {
     mockCreate.mockResolvedValue({ id: 't-new' });
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'Create Topic' }));
@@ -163,7 +173,7 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     // mutationFn 第一参数是表单 payload（第二参数是 react-query 内部选项，不断言）
     expect(mockCreate.mock.calls[0][0]).toEqual(
-      expect.objectContaining({ title: '新话题', config: undefined }),
+      expect.objectContaining({ title: '新话题', config: { attachmentTtl: '7d' } }),
     );
   });
 
@@ -196,7 +206,7 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
     expect(mockCreate.mock.calls[0][0]).toEqual(
       expect.objectContaining({
         title: '圆桌测试',
-        config: { kind: 'roundtable', wakePolicy: 'broadcast' },
+        config: { kind: 'roundtable', wakePolicy: 'broadcast', attachmentTtl: '7d' },
       }),
     );
   });
@@ -219,8 +229,87 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     expect(mockCreate.mock.calls[0][0]).toEqual(
       expect.objectContaining({
-        config: { kind: 'roundtable', wakePolicy: 'mention', maxRoundsWithoutHuman: 20 },
+        config: {
+          kind: 'roundtable',
+          wakePolicy: 'mention',
+          maxRoundsWithoutHuman: 20,
+          attachmentTtl: '7d',
+        },
       }),
     );
+  });
+});
+
+describe('附件有效期下拉（v1.90.0-dev 附件 TTL 批 §2 B3.5）', () => {
+  it('创建 dialog：4 档选项 + 默认 7 天 + hint 文案；改档后随 config 提交', async () => {
+    mockCreate.mockResolvedValue({ id: 't-new' });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Topic' }));
+
+    const select = screen.getByTestId('create-attachment-ttl') as HTMLSelectElement;
+    expect(select).toHaveValue('7d');
+    expect(Array.from(select.options).map((o) => [o.value, o.textContent])).toEqual([
+      ['1d', '1 day'],
+      ['7d', '7 days (default)'],
+      ['30d', '30 days'],
+      ['never', 'Never expire'],
+    ]);
+    // hint 明确「仅影响新上传」
+    expect(
+      screen.getByText(
+        'Applies to newly uploaded attachments only; existing attachments keep their original expiry.',
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: 'never' } });
+    fireEvent.change(screen.getByPlaceholderText('Topic title'), {
+      target: { value: '永久附件桌' },
+    });
+    const buttons = screen.getAllByRole('button', { name: 'Create Topic' });
+    fireEvent.click(buttons[buttons.length - 1]);
+
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
+    expect(mockCreate.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ config: { attachmentTtl: 'never' } }),
+    );
+  });
+
+  it('编辑 dialog：初值取 detail.settings.attachmentTtl（缺省回退 7d）；保存回写 config', async () => {
+    mockGetById.mockResolvedValue({
+      id: 't-normal',
+      title: '普通话题',
+      description: 'desc',
+      settings: { attachmentTtl: '30d' },
+    });
+    mockUpdate.mockResolvedValue({ id: 't-normal' });
+    renderPage();
+    await screen.findByText('圆桌会议');
+
+    // 第一张卡片的铅笔（卡片操作区第一个按钮）
+    const allButtons = screen.getAllByRole('button');
+    fireEvent.click(allButtons[1]);
+
+    const select = (await screen.findByTestId('edit-attachment-ttl')) as HTMLSelectElement;
+    await waitFor(() => expect(select).toHaveValue('30d'));
+
+    fireEvent.change(select, { target: { value: 'never' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(mockUpdate).toHaveBeenCalledTimes(1));
+    expect(mockUpdate.mock.calls[0][0]).toBe('t-normal');
+    expect(mockUpdate.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ title: '普通话题', config: { attachmentTtl: 'never' } }),
+    );
+  });
+
+  it('编辑 dialog：detail.settings 缺 attachmentTtl → 回退 7d（与后端 fail-closed 缺省一致）', async () => {
+    mockGetById.mockResolvedValue({ id: 't-normal', title: '普通话题', description: 'desc' });
+    renderPage();
+    await screen.findByText('圆桌会议');
+
+    fireEvent.click(screen.getAllByRole('button')[1]);
+
+    const select = (await screen.findByTestId('edit-attachment-ttl')) as HTMLSelectElement;
+    await waitFor(() => expect(select).toHaveValue('7d'));
   });
 });

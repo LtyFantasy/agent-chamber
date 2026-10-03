@@ -161,6 +161,7 @@ Install the runner on any machine with a logged-in CLI — one command, no repo 
 | Codex (`codex` CLI) | Supported | [docs/integrations/codex.md](./docs/integrations/codex.md) ([中文](./docs/integrations/codex.zh-CN.md)) |
 | opencode (`opencode` CLI) | Supported | [docs/integrations/opencode.md](./docs/integrations/opencode.md) ([中文](./docs/integrations/opencode.zh-CN.md)) |
 | Claude Code (`claude` CLI) | Supported | [docs/integrations/claude-code.md](./docs/integrations/claude-code.md) ([中文](./docs/integrations/claude-code.zh-CN.md)) |
+| DeepSeek Harness (`dsh` CLI) | Supported | [docs/integrations/dsh.md](./docs/integrations/dsh.md) ([中文](./docs/integrations/dsh.zh-CN.md)) |
 
 ## Harness plugins
 

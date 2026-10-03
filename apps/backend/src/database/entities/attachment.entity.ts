@@ -1,19 +1,49 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2 (Attachments 模块 / MinIO 媒体附件)
- *   - 补充: docs/database.md (attachments 表), docs/api-definition.md §Attachments
+ * [功能概念]
+ *   - attachments 表：MinIO 对象存储的元数据行（媒体附件 + TTL 过期治理）
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [代码职责]
+ *   - 列定义与列级语义（绑定模型 / 键 / mime 双列 / 过期时刻 / 缩略图五列 / 软删）
+ *   - 索引声明：与 migrations 手写索引**同名同列同 where**（防 generate 噪声）
+ *
+ * [权威文档]
+ *   - 主文档: docs/database.md — attachments 表结构与三轨 GC
+ *   - 补充: docs/api-definition.md §16a「附件 TTL 与类型放开」— mime 不变量 / expiresAt 语义
+ *   - 补充: docs/architecture.md §3.2 — Attachments 模块
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释)
  *
+ * [关键不变量]
+ *   - `mime_type` **只承载字节证据**：4 种嗅探图片 mime 之一，或非图片恒
+ *     `application/octet-stream`。客户端声明值**永不进本列**（进 `client_mime_type`，
+ *     纯展示）；任何以对象元数据直出的新通道（如未来 presign）不得复用本列当"可信类型"。
+ *   - `client_mime_type` 是展示信息，非法/缺失 → NULL（sanitize 见 client-mime.ts）；
+ *     任何服务决策**不得**读它。
+ *   - `expires_at` 上传时**冻结**（topic TTL / doc 绑定恒 NULL / 存量迁移 NULL = 永久）；
+ *     判据 = 非空且 < now()，小时级 GC 按
+ *     `expires_at < now() AND deleted_at IS NULL` 物理回收——与
+ *     `idx_attachments_expires_gc` 的 partial 谓词精确匹配（多/少一个条件即全表扫）。
+ *   - 索引全部 partial 且与 migration 同名同 where；缩略图五列**同生共死**
+ *     （全 NULL 或全非 NULL），`thumb_key` 是"有无缩略图"的唯一判据。
+ *   - `deleted_at` 是 DeleteDateColumn({select:false})：GC/批量写需显式 addSelect 或
+ *     显式 set（批量 update 不会自动维护软删列）。
+ *
+ * [关联代码]
+ *   - migrations/1788932054730-AddAttachments.ts / 1789204500000-AddAttachmentThumbnail.ts /
+ *     1791500000000-AddAttachmentTtlAndClientMime.ts — 建表/缩略图/TTL 双列 + GC partial index
+ *   - attachment.constants.ts — INLINE_IMAGE_MIME_TYPES / isAttachmentExpired 判据单源
+ *   - attachment.service.ts — 列的写入点（分类分支 / TTL 冻结 / 配额 SUM 谓词）
+ *   - attachment-gc.service.ts — 按 expires_at / deleted_at 三轨回收
+ *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 新增/改名列必须同时手写 migration（禁 generate）并跑 migration-drift 门禁
+ *   □ 新增索引必须与 GC/查询谓词逐字对齐，否则退化为全表扫
  * =============================================================================
  */
 import {
@@ -50,6 +80,9 @@ import {
 @Index('idx_attachments_doc', ['docId'], { where: 'deleted_at IS NULL' })
 @Index('idx_attachments_sha256', ['sha256'], { where: 'deleted_at IS NULL' })
 @Index('idx_attachments_deleted_gc', ['deletedAt'], { where: 'deleted_at IS NOT NULL' })
+@Index('idx_attachments_expires_gc', ['expiresAt'], {
+  where: 'deleted_at IS NULL AND expires_at IS NOT NULL',
+})
 @Unique('uq_attachments_object_key', ['objectKey'])
 @Index('uq_attachments_thumb_key', ['thumbKey'], { unique: true, where: 'thumb_key IS NOT NULL' })
 export class Attachment {
@@ -83,15 +116,31 @@ export class Attachment {
   originalName: string;
 
   /**
-   * MIME 类型——魔数嗅探值（不信任客户端声明的 Content-Type），
-   * 同时是 GET /content 响应 Content-Type 的单一来源。
+   * MIME 类型——**只承载字节证据**，是 GET /content 响应 Content-Type 的单一来源。
+   *
+   * v1.90.0-dev 不变量（M1）：本列只有两种可能——
+   * ① 4 种嗅探图片 mime 之一（png/jpeg/gif/webp，来自 `sniffImageMime` 的字节证据）；
+   * ② 非图片行恒 `application/octet-stream`（`ATTACHMENT_FALLBACK_MIME`）。
+   * **客户端声明的 Content-Type 永不进本列**（进 {@link clientMimeType}，纯展示）。
+   * 任何以对象元数据直出的新通道（如未来 presign）不得复用本列作为"可信类型"依据；
+   * 出口呈现形态由 `INLINE_IMAGE_MIME_TYPES` 精确成员判断决定（见 attachment.constants.ts）。
    */
   @Column({ type: 'varchar', length: 100, nullable: false, name: 'mime_type' })
   mimeType: string;
 
   /**
+   * 客户端声明的 mime（sanitize 后；非法/缺失 → NULL）——**纯展示信息**
+   * （附件卡片图标参考），不参与任何服务决策、不进响应 Content-Type。
+   *
+   * sanitize 规则见 client-mime.ts：剥控制字符 / 取分号前的 media type / 形状校验
+   * （`type/subtype`）/ 截断 ≤100 字符。存量行 NULL。
+   */
+  @Column({ type: 'varchar', length: 100, nullable: true, name: 'client_mime_type' })
+  clientMimeType: string | null;
+
+  /**
    * 字节数（PG bigint）。TypeORM int8 读出为 string——DTO 出口必须显式 Number()
-   * （8MiB 单文件 / 200MiB 配额规模远低于 2^53，安全；刻意偏离平台 string 先例，
+   * （10MiB 单文件 / 200MiB 配额规模远低于 2^53，安全；刻意偏离平台 string 先例，
    * 转换点钉死在 attachment.service.ts toDto）。
    */
   @Column({ type: 'bigint', nullable: false, name: 'size_bytes' })
@@ -100,6 +149,22 @@ export class Attachment {
   /** 内容 SHA-256（hex 64 字符），兼作 GET /content 的 ETag */
   @Column({ type: 'char', length: 64, nullable: false })
   sha256: string;
+
+  /**
+   * 过期时刻（v1.90.0-dev 附件 TTL 批）。**上传时冻结**：`now() + topic.settings.attachmentTtl`。
+   *
+   * - NULL = 永久，三种来源：doc 绑定附件（豁免 TTL）/ topic 设置 `never` /
+   *   存量行迁移后（迁移补列 NULL，存量一律永久，不追溯）；
+   * - `never` 与"解析失败"**不同义**：settings 脏值走 fail-closed 回退 7d
+   *   （见 attachment.constants.resolveAttachmentTtlMs），绝不回退 NULL；
+   * - 事后修改 topic TTL **只影响新上传**，本列不追溯（契约简单可预测）；
+   * - 过期判据 = 本列非 NULL 且 < now()：字节面 410·12009，元数据面照常 200 带本值；
+   * - 小时级 GC（`sweepExpiredAttachments`）按本列物理回收行与对象，
+   *   谓词 `expires_at < now() AND deleted_at IS NULL`——与
+   *   `idx_attachments_expires_gc` 的 partial 谓词精确匹配（否则退化为全表扫）。
+   */
+  @Column({ type: 'timestamptz', nullable: true, name: 'expires_at' })
+  expiresAt: Date | null;
 
   /**
    * 状态值域：'ready'（P0 唯一写入值，上传完成即可读）/ 'pending'（P2 presign 预留）。

@@ -11,6 +11,10 @@
  *     弹确认「将覆盖已有文档」，确认才放行（旧两级预检 existingPaths 本地列表已删——
  *     全量列表不再拉取）；预检与 PUT 之间无锁（TOCTOU），并发覆盖属已知残余风险
  *     （后端 create-only 记入 P2 债）
+ *   - 附件类型（v1.90.0-dev 通用附件批，m2 裁决）：**doc 侧保持仅图片**（accept +
+ *     类型拦截双门）。docs 正文无附件卡片渲染面，非图片上传即死重（bundle 排除非图片、
+ *     /content 需凭证裸链接 401），且 doc 附件永久（无 TTL）= 永久占配额。
+ *     放开任意类型只发生在 topic composer —— 两处策略有意不同
  *
  * [铁律关联] #1（每次 session 必读 AGENTS.md/INDEX.md） #12（写/改文件分批、匹配现有风格）
  *
@@ -34,11 +38,11 @@ import { ErrorCode } from '@agent-chamber/shared';
 
 import {
   Api,
-  ATTACHMENT_ALLOWED_TYPES,
   ATTACHMENT_MAX_BYTES,
   escapeAttachmentAlt,
   type UploadAttachmentResponse,
 } from '@/lib/api';
+import { INLINE_IMAGE_MIME_TYPES } from '@/lib/attachment-mime';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { DocPicker, type DocPick } from '@/components/docs/doc-picker';
@@ -256,12 +260,21 @@ export function DocEditor({
     [content],
   );
 
-  /** 图片文件选择：前端拦截（类型/大小，与后端校验对齐）→ 上传（绑定 docId）→ 插入 */
+  /**
+   * 图片文件选择（m2 裁决：**doc 侧收回仅图片**，与 topic-composer 的放开策略不同）。
+   *
+   * 为什么 doc 不放开：docs 正文没有附件卡片渲染面，非图片附件传上去就只是一条
+   * 无人可消费的记录（bundle 明确排除非图片、`/content` 需凭证裸链接点击 401），
+   * 而 doc 绑定附件**永久**（`expires_at = NULL`）→ 上传即死重 + 永久占配额。
+   * 故此处保留客户端类型拦截（与 `accept` 同口径），topic composer 才放开任意类型。
+   *
+   * 前端拦截（类型/大小，与后端校验对齐）→ 上传（绑定 docId）→ 插入 `![alt](url)`。
+   */
   const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = ''; // 清空 value：允许重复选择同一文件（change 不触发）
     if (!file) return;
-    if (!ATTACHMENT_ALLOWED_TYPES.includes(file.type)) {
+    if (!INLINE_IMAGE_MIME_TYPES.includes(file.type)) {
       toast.error({ title: tGlobal('attachments.typeNotAllowed') });
       return;
     }
@@ -318,7 +331,9 @@ export function DocEditor({
           buttonClassName="h-8 text-xs"
         />
 
-        {/* 插入图片（plan §5.4）：绑定 docId 上传；create 模式文档未创建无 id → 禁用 */}
+        {/* 插入图片（plan §5.4）：绑定 docId 上传；create 模式文档未创建无 id → 禁用。
+            m2 裁决：doc 侧收回仅图片（accept + 类型拦截双门）——docs 无非图片消费面，
+            doc 附件永久 = 上传即死重 */}
         <Button
           type="button"
           variant="outline"

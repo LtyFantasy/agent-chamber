@@ -203,7 +203,13 @@
       "wakeMention": "@ 提及唤醒（默认，仅 @座位 或 @all 时注入）",
       "wakeBroadcast": "广播唤醒（每条新消息注入全部座位）",
       "maxRounds": "安全阀轮数上限（可选）",
-      "maxRoundsPlaceholder": "缺省 8；0 = 关闭"
+      "maxRoundsPlaceholder": "缺省 8；0 = 关闭",
+      "attachmentTtl": "附件有效期",
+      "attachmentTtlHint": "仅影响新上传的附件，已有附件保持原有效期。",
+      "attachmentTtl1d": "1 天",
+      "attachmentTtl7d": "7 天（默认）",
+      "attachmentTtl30d": "30 天",
+      "attachmentTtlNever": "永久"
     },
     "kind": {
       "normal": "普通",
@@ -322,6 +328,10 @@
       "pmPlanDesc": "plan（只读 + 计划协作模式）",
       "pmAutoDesc": "auto（自动执行，敏感操作走审批，推荐）",
       "pmYoloDesc": "yolo（完全放权不审批，谨慎使用）",
+      "pmDefaultDescDsh": "default（workspace-write：工作区内放行；越界写被沙箱硬拒，可走一次性升级审批）",
+      "pmPlanDescDsh": "plan（read-only：写操作被沙箱硬拒，需逐项一次性升级审批后才落盘）",
+      "pmAutoDescDsh": "auto（danger-full-access：沙箱无边界、零审批——不推荐）",
+      "pmYoloDescDsh": "yolo（danger-full-access：全程零审批，座位 Agent 可触达任意路径——仅限一次性/可抛弃环境）",
       "advanced": "高级选项",
       "model": "模型覆盖（可选）",
       "modelPlaceholder": "如 kimi-k2",
@@ -696,7 +706,22 @@
       "loadMoreFolders": "加载更多目录",
       "copyMarkdown": "复制 Markdown",
       "copied": "已复制",
-      "copyMarkdownError": "复制失败，请重试"
+      "copyMarkdownError": "复制失败，请重试",
+      "panelInfo": "文档信息"
+    },
+    "backlinks": {
+      "title": "被引用 {docCount} 篇 · {linkCount} 处",
+      "titlePlain": "被引用",
+      "empty": "暂无文档引用本篇",
+      "error": "引用信息加载失败",
+      "noHeading": "文首",
+      "expandMore": "还有 {count} 篇",
+      "collapse": "收起",
+      "hits": "{count} 处",
+      "rowAria": "引用来源 {title}（{path}）｜命中 {count} 处：{targets}",
+      "pathBasedBadge": "相对路径",
+      "platformBadge": "平台链接",
+      "pathBasedHint": "移动后需改写"
     },
     "doc": {
       "readOnlyMirror": "只读镜像",
@@ -1326,20 +1351,31 @@
     "noSearchResults": "未找到匹配的成员"
   },
   "attachments": {
-    "upload": "上传图片",
+    "upload": "上传附件",
     "uploading": "上传中...",
-    "uploadFailed": "图片上传失败，请重试",
-    "tooLarge": "图片超过 8MiB 大小上限",
+    "uploadFailed": "上传失败，请重试",
+    "tooLarge": "文件超过 10MB 大小上限",
     "typeNotAllowed": "仅支持 PNG/JPEG/GIF/WebP 图片",
     "quotaExceeded": "存储配额已满，请先清理附件",
+    "tooMany": "单条消息最多 9 个附件",
     "brokenImage": "图片加载失败",
     "removeChip": "移除附件",
-    "confirmRemove": "移除后附件将被删除，消息中的图片链接也会同步移除。确定移除？",
+    "confirmRemove": "移除后附件将被删除，消息中的引用也会同步移除。确定移除？",
     "removeFailed": "附件删除失败，可稍后在「我的附件」中清理",
     "preview": "图片预览",
     "zoomActual": "原始尺寸",
     "zoomFit": "适应窗口",
-    "closePreview": "关闭预览"
+    "closePreview": "关闭预览",
+    "card": {
+      "download": "下载",
+      "downloadFailed": "下载失败，请重试",
+      "expired": "已过期",
+      "expiresInDays": "{days}天后过期",
+      "expiresInHours": "{hours}小时后过期",
+      "executableBadge": "可执行文件",
+      "executableTitle": "可执行文件",
+      "executableConfirm": "「{name}」可能是可执行文件，确认下载？"
+    }
   },
   "experiences": {
     "title": "经验库",

@@ -70,6 +70,7 @@ import {
   DocOverviewQueryDto,
   RepoManifestDto,
   ImportDocBundleDto,
+  ExportBundleQueryDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { DocSpace } from '../../database/entities/doc-space.entity';
@@ -608,6 +609,17 @@ export class DocSpaceController {
       '`{skipped: "too_large"|"budget_exceeded"}` markers in the same segment (fetch those ' +
       'separately), and attachments referenced by doc content but bound to a topic are listed ' +
       'in the informational `mediaOmitted` array (their links stay broken after import). ' +
+      'Optional ?pathPrefix= exports a PARTIAL snapshot: a literal, case-sensitive prefix (use a ' +
+      'trailing "/" for directory semantics; LIKE wildcards are escaped) keeps only docs under ' +
+      'the prefix and narrows categories/routes/media to that closure, echoing ' +
+      '`appliedFilters: {pathPrefix, matchedDocs}`. A prefix matching nothing returns 200 with an ' +
+      'empty bundle (success, NOT an error; re-importing it is a no-op) — read ' +
+      'appliedFilters.matchedDocs === 0 to tell "prefix matched nothing" from "space is empty". ' +
+      'Routes are kept or dropped by their PRIMARY doc only, so a kept route may carry a ' +
+      'secondaryDocPath pointing at a doc NOT in bundle.docs (same-space re-import preserves that ' +
+      'link; importing into a new space fails that route per-item, loudly). A bundle fetched WITH ' +
+      'pathPrefix is NOT a backup — export without pathPrefix to seed a new space; for a single ' +
+      'doc use read_doc. ' +
       'Purpose: version-alignment snapshots + offline backup (pull into git, diff across releases). ' +
       'Permission: same as overview (space read). ' +
       'NOTE: large spaces produce large responses (docs carry full content, no pagination) — ' +
@@ -615,11 +627,31 @@ export class DocSpaceController {
       'by POST /doc-spaces/:id/import-bundle (roundtrip; formatVersion 1 bundles are still accepted).',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiQuery({
+    name: 'pathPrefix',
+    required: false,
+    type: String,
+    description:
+      'Literal, case-sensitive path prefix (use a trailing "/" for directory semantics; LIKE ' +
+      'wildcards are escaped). Keeps only docs under the prefix AND narrows categories/routes/' +
+      'media to that closure — a PARTIAL snapshot, not a backup; use read_doc for a single doc. ' +
+      'A prefix matching nothing returns 200 with an empty bundle (not an error; import = no-op).',
+  })
   @ApiResponse({ status: 200, description: 'Export bundle returned successfully' })
-  async exportBundle(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+  @ApiResponse({
+    status: 400,
+    description:
+      'VALIDATION_ERROR — query params rejected. BEHAVIOR CHANGE: with the query DTO attached, ' +
+      'unknown query params (e.g. ?foo=1) are now rejected instead of being silently ignored.',
+  })
+  async exportBundle(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+    @Query() query: ExportBundleQueryDto,
+  ) {
     const space = await this.docSpaceService.findById(id);
     await this.permService.ensureCan(space, actor, 'read');
-    return this.docBundleService.exportBundle(id);
+    return this.docBundleService.exportBundle(id, query.pathPrefix);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

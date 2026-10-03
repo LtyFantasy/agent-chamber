@@ -65,4 +65,28 @@ describe('TopicConfigDto', () => {
     const errors = await validate(dto);
     expect(errors).toHaveLength(0);
   });
+
+  // ── attachmentTtl 校验矩阵（附件 TTL 批 v1.90.0-dev：白名单 1d/7d/30d/never） ──
+
+  it('attachmentTtl 四档合法值通过', async () => {
+    for (const v of ['1d', '7d', '30d', 'never']) {
+      const dto = plainToInstance(TopicConfigDto, { attachmentTtl: v });
+      const errors = await validate(dto);
+      expect(errors).toHaveLength(0);
+    }
+  });
+
+  it('attachmentTtl 非法值拒绝（大小写变体/未知档位/数字/空串）', async () => {
+    for (const v of ['1D', 'forever', '0', 7, '', 'd7', 'never ']) {
+      const dto = plainToInstance(TopicConfigDto, { attachmentTtl: v });
+      const errors = await validate(dto);
+      expect(errors.some((e) => e.property === 'attachmentTtl' && e.constraints?.isIn)).toBe(true);
+    }
+  });
+
+  it('attachmentTtl 缺省不报错（可选项；上传时 service fail-closed 兜底 7d）', async () => {
+    const dto = plainToInstance(TopicConfigDto, {});
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+  });
 });

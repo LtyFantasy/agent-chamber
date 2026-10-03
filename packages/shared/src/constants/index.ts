@@ -41,3 +41,21 @@ export const HEADING_PATH_SEPARATOR = ' § ';
 export function extractLastHeadingSegment(headingPath: string): string {
   return headingPath.split(HEADING_PATH_SEPARATOR).pop()?.trim() ?? '';
 }
+
+/**
+ * 附件有效期档位值域（v1.90.0-dev 附件 TTL 批，**单一事实源**）。
+ *
+ * 语义（docs/api-definition.md §16a）：
+ * - 写侧：`topic.settings.attachmentTtl`（`POST/PATCH /topics` 的 `config.attachmentTtl`）；
+ * - 读侧：上传附件时按 topic 当时的设置把 `expires_at = now() + ttl` **冻结**写入附件行，
+ *   事后改设置只影响新上传（不追溯）；`never` → `expires_at = NULL`（永久）；
+ * - 缺省 / 脏值：**回退 `7d`**（fail-closed，绝不回退 `never`——否则治理目标被静默关掉）。
+ *
+ * 提升到 shared 的 rationale：后端 DTO 校验（`@IsIn`）与 web 表单下拉必须同源；
+ * 后端 `attachment.constants.ts` 的 ms 映射表以本值域为键（`Record<AttachmentTtl, number|null>`，
+ * 漏搬档位即编译期报错）。
+ */
+export const ATTACHMENT_TTL_VALUES = ['1d', '7d', '30d', 'never'] as const;
+
+/** 附件有效期档位（'1d' | '7d' | '30d' | 'never'） */
+export type AttachmentTtl = (typeof ATTACHMENT_TTL_VALUES)[number];

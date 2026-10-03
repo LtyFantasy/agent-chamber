@@ -45,7 +45,7 @@ describe('CreateSeatDto', () => {
     expect(errors.some((e) => e.property === 'topicId')).toBe(true);
   });
 
-  it('vendor 非已知厂商 → 拒绝（已知 kimi/codex）', async () => {
+  it('vendor 非已知厂商 → 拒绝（已知厂商集合见 SEAT_VENDORS）', async () => {
     const dto = plainToInstance(CreateSeatDto, { ...validInput, vendor: 'gpt' });
     const errors = await validate(dto);
     expect(errors.some((e) => e.property === 'vendor')).toBe(true);

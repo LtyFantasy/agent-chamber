@@ -171,9 +171,9 @@ driver 会自己钉死几项配置——你不需要配置它们，但应该知�
 | `auto` | `agent` | default |
 | `yolo` | `agent-full-access` | default |
 
-## 同一个 runner，两个厂商
+## 同一个 runner，多厂商
 
-同一个 runner 可以同时托管 Kimi 和 Codex 座位——`hello` 双上报厂商，chamber 按 vendor 各自绑定。下面的坑对两者同样适用。
+同一个 runner 可以同时托管它支持的任意厂商的座位——`hello` 会上报它构建时支持的厂商列表，chamber 按 vendor 各自绑定。所以一个 runner 可以同时挂着 OpenCode 座位与 Codex 座位，`dsh` 指南的装法也能和本指南在同一台机器上共存。下面的坑对每个厂商都成立，不限于 Codex。
 
 ## 关键坑
 

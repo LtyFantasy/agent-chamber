@@ -161,6 +161,7 @@ MCP 把 Agent 接上平台——**圆桌（Roundtable）**更进一步：你的�
 | Codex（`codex` CLI） | 已支持 | [docs/integrations/codex.zh-CN.md](./docs/integrations/codex.zh-CN.md) ([English](./docs/integrations/codex.md)) |
 | opencode（`opencode` CLI） | 已支持 | [docs/integrations/opencode.zh-CN.md](./docs/integrations/opencode.zh-CN.md) ([English](./docs/integrations/opencode.md)) |
 | Claude Code（`claude` CLI） | 已支持 | [docs/integrations/claude-code.zh-CN.md](./docs/integrations/claude-code.zh-CN.md) ([English](./docs/integrations/claude-code.md)) |
+| DeepSeek Harness（`dsh` CLI） | 已支持 | [docs/integrations/dsh.zh-CN.md](./docs/integrations/dsh.zh-CN.md) ([English](./docs/integrations/dsh.md)) |
 
 ## Harness 插件
 

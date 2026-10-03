@@ -55,6 +55,7 @@ import type {
   DocCategoryDto,
   DocSummary,
   DocDetail,
+  DocBacklinks,
   DocSectionContent,
   DocFullContent,
   DocSearchResponse,
@@ -298,7 +299,7 @@ export interface RoundtableSeatItem {
   label: string;
   /** 生命周期状态：active / paused / parked / offline（已移除座位不出现在列表；类型 = shared SeatLifecycleStatus） */
   status: SeatLifecycleStatus;
-  /** 厂商（'kimi'，M4a 起扩展至 codex/opencode/claude-code；类型 = 协议包 SeatVendor） */
+  /** 厂商（协议值，单一事实源 = 协议包 `SeatVendor`（含 dsh）；类型层已收口） */
   vendor: SeatVendor;
   /**
    * 认领 runner UUID（backend 实体字段原样透出；null = 未被任何 runner 认领）。
@@ -342,7 +343,7 @@ export interface RoundtableSeatItem {
  * 圆桌审批请求（web 侧投影，字段对齐 backend RoundtablePermissionRequest entity +
  * api-definition.md §7a；tool/options 是 jsonb 原样透传——**形状未冻结**：
  * tool = ToolBrief（宽松 `{ name?/title?/kind? }`），options 实测 ACP 形状
- * `{ optionId, kind, name }`（kimi/codex 真机两侧均无 label；kind ∈
+ * `{ optionId, kind, name }`（kimi · codex 真机两侧均无 label；kind ∈
  * allow_once/allow_always/reject 之类），裁决 optionId 按 optionId/id 双键匹配
  * （后端同规，铁律 #20 契约即设计）
  */
@@ -573,7 +574,7 @@ export interface RoundtableRunnerItem {
   status: string;
   /** runner 软件版本（排障用，可空） */
   version: string | null;
-  /** 支持的厂商列表（如 ["kimi","codex","opencode","claude-code"]；建座 vendor 提示的数据源） */
+  /** 支持的厂商列表（如 ["kimi","codex","opencode","claude-code","dsh"]；建座 vendor 提示的数据源） */
   vendors: string[];
   /** 最近心跳/连接时间（ISO 8601，可空；web 渲染相对时间） */
   lastSeenAt: string | null;
@@ -589,7 +590,7 @@ export interface CreateSeatRequest {
   topicId: string;
   /** 座位展示名（seatLabel 身份模型，@ 补全候选） */
   label: string;
-  /** 厂商（kimi / codex / opencode / claude-code——协议值，SEAT_VENDORS） */
+  /** 厂商（协议值，单一事实源 = 协议包 SEAT_VENDORS） */
   vendor: string;
   /** 座位工作目录（runner 所在机器上的路径，agent 环境边界） */
   cwd: string;
@@ -945,6 +946,15 @@ const docs = {
       .then((res) => res.data),
   getSection: (docId: string, position: number) =>
     apiRequest<DocSectionContent>('GET', `/docs/${docId}/sections/${position}`),
+  /**
+   * 反向引用（GET /docs/:id/backlinks，v1.90.0-dev）：谁引用了本篇、在哪些 section。
+   *
+   * 服务端语义（与 move-impact 的三处差异，DTO 注释为准）：结果**按来源文档分组**
+   * （sources）、**自引用已剔除**（sourceDocId === docId）、只返回入链面；
+   * 组级顺序按 sourcePath 升序、组内按 sectionPosition 升序（两次请求数组全等，
+   * 前端首屏取前 5 组依赖该确定性）。read 权限：不可读 → 404（非 403）。
+   */
+  getBacklinks: (docId: string) => apiRequest<DocBacklinks>('GET', `/docs/${docId}/backlinks`),
   upsertDoc: (spaceId: string, data: UpsertDocInput) =>
     apiRequest<UpsertDocResult>('PUT', `/doc-spaces/${spaceId}/docs`, data),
   deleteDoc: (docId: string) => apiRequest<void>('DELETE', `/docs/${docId}`),
@@ -1239,14 +1249,39 @@ const logs = {
 // ──────────────────────────────────────────────
 
 /**
- * 附件元数据（GET /attachments/:id 与 mine 分页项；字段对齐 backend
- * AttachmentMetadataDto——sizeBytes 为 number，8MiB 规模远低于 2^53 安全）。
+ * 附件元数据（GET /attachments/:id 与 mine 分页项；字段镜像 backend
+ * AttachmentMetadataDto——sizeBytes 为 number，10MB 规模远低于 2^53 安全）。
+ *
+ * v1.90.0-dev 附件 TTL 批：新增 `clientMimeType` / `expiresAt`（三个元数据面
+ * ——上传响应 / `GET :id` / `GET mine` 同口径）；`expired` **不在本形状**——它是
+ * 消息投影层（shared `MessageAttachment`）的响应时纯函数，三个元数据面只回
+ * `expiresAt`，消费方需本地推导 `expiresAt < now()`（展示层用
+ * `attachment-file-card` 的 `expiryStateOf`，与服务端同定义）。
  */
 export interface AttachmentMetadata {
   id: string;
   originalName: string;
+  /**
+   * MIME 类型（**字节证据**）：4 种嗅探图片 mime 之一，或非图片恒
+   * `application/octet-stream`。⚠️ 非图片恒 octet-stream，对图标分类无信息量——
+   * 展示层请用 `clientMimeType` + `originalName` 扩展名（见 attachment-file-card）。
+   */
   mimeType: string;
+  /** 字节数（number，P0 起 sizeBytes 转换点钉死为显式 Number()） */
   sizeBytes: number;
+  /** 客户端声明的 mime（sanitize 后；非法/缺失 → null）——纯展示信息，不参与服务决策 */
+  clientMimeType: string | null;
+  /** 过期时刻（ISO 8601）；null = 永久（doc 绑定 / topic 设置 never / 存量迁移行） */
+  expiresAt: string | null;
+  /**
+   * 缩略图 URL（相对路径，`buildThumbnailUrl` 单一拼装点派生）。
+   *
+   * **四表面同一口径**（服务端 `toMetadataDto` 共用）：上传响应 / `GET :id` /
+   * `GET mine` / 消息投影**同样条件展开**——Present ⇔ 该附件当前有缩略图
+   * （判定在服务端，非图片恒无）；absent = 无缩略图，回退 contentUrl；
+   * 永不为 null/空串。
+   */
+  thumbnailContentUrl?: string;
   sha256: string;
   topicId: string | null;
   docId: string | null;
@@ -1262,16 +1297,13 @@ export interface UploadAttachmentResponse extends AttachmentMetadata {
   contentUrl: string;
 }
 
-/** 图片附件白名单（与后端魔数嗅探白名单对齐：png/jpeg/gif/webp；前端提前拦截省一次请求） */
-export const ATTACHMENT_ALLOWED_TYPES: readonly string[] = [
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-];
-
-/** 单文件上限（与后端 ATTACHMENT_MAX_BYTES 对齐，默认 8MiB） */
-export const ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * 单文件上限（与后端 ATTACHMENT_MAX_BYTES 对齐，默认 10MiB，业务口径 10MB）。
+ *
+ * v1.90.0-dev 起后端类型直接放开（非图片走 octet-stream + 强制下载），前端不再
+ * 维护类型白名单——上传侧只做大小这一条提前拦截（省一次注定失败的请求）。
+ */
+export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 
 /**
  * alt 文本转义（plan §3.6 钉死：original_name 含 `](` 可破 markdown 语法，
@@ -1283,7 +1315,9 @@ export function escapeAttachmentAlt(name: string): string {
 
 const attachments = {
   /**
-   * 上传图片附件（绑定 topic 或 doc，恰好一值——应用层强制互斥，plan §0.3）。
+   * 上传附件（绑定 topic 或 doc，恰好一值——应用层强制互斥，plan §0.3）。
+   * 类型策略：topic 绑定放开任意类型；doc 绑定仍限 4 种图片（前端 `accept` +
+   * 类型拦截双门，见 doc-editor —— docs 无非图片消费面且 doc 附件永久）。
    * FormData 必须覆盖实例默认 Content-Type: application/json——显式声明
    * multipart/form-data 后 axios 自动追加 boundary（浏览器端由 fetch 兜底）。
    */

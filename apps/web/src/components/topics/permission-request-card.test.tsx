@@ -3,7 +3,8 @@
  *
  * 覆盖：pending 列表渲染（座位 label 映射 / tool 摘要 name→title→JSON 兜底截断 /
  * options 按钮组文案 = 已知 optionId 的 i18n 词条、未知回退 label ?? name ?? optionId，
- * 且 reject 类危险色）；行内参与者头像（bindActorId→participants，缺失退化 label
+ * 且 reject 类危险色——含 dsh 连字 optionId 词典命中、kind 缺失按 optionId 兜底
+ * 两种形态）；行内参与者头像（bindActorId→participants，缺失退化 label
  * 首字母色块）；裁决交互（点击→调 verdict API→invalidate 三件套：本列表+全局
  * pending-count+topic 消息）；409 提示+失效重取；空态零渲染；enabled=false
  * （非圆桌）不发请求；agent 会话（user null）按钮隐藏。文案断言用 en.json 快照。
@@ -96,7 +97,7 @@ const REQ_APPROVE = {
   seatId: 'seat-1',
   topicId: TOPIC_ID,
   tool: { name: 'Bash' },
-  // 真机形状（kimi/codex 实测）：{ optionId, kind, name }，无 label
+  // 真机形状（kimi · codex 实测）：{ optionId, kind, name }，无 label
   options: [
     { optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' },
     { optionId: 'reject', kind: 'reject', name: 'Reject' },
@@ -362,6 +363,54 @@ describe('PermissionRequestCard 审批裁决卡片', () => {
 
     // 词典外 optionId：不假设形状，透传厂商原文 name
     expect(await screen.findByRole('button', { name: 'Custom Vendor Label' })).toBeInTheDocument();
+  });
+
+  it('dsh 连字 optionId（allow-once/reject-once）：命中词典 + reject 危险色', async () => {
+    mockList.mockResolvedValue(
+      paged([
+        {
+          ...REQ_APPROVE,
+          id: 'req-dsh',
+          // dsh 真机形状：optionId 连字 / kind 下划线 / 带 name（name 与词条同义但不相同，
+          // 用作「走词典而非透传原文」的可判据）
+          options: [
+            { optionId: 'allow-once', kind: 'allow_once', name: 'Allow once (dsh)' },
+            { optionId: 'reject-once', kind: 'reject_once', name: 'Reject (dsh)' },
+          ],
+        },
+      ]),
+    );
+    renderCard({ seats: SEATS });
+
+    const allowBtn = await screen.findByRole('button', { name: 'Allow once' });
+    const rejectBtn = screen.getByRole('button', { name: 'Reject' });
+    // 词典命中：厂商 name 原文不再出现
+    expect(screen.queryByText('Allow once (dsh)')).not.toBeInTheDocument();
+    expect(screen.queryByText('Reject (dsh)')).not.toBeInTheDocument();
+    // kind='reject_once' 含 'reject' → 危险色
+    expect(rejectBtn.className).toContain('bg-destructive');
+    expect(allowBtn.className).not.toContain('bg-destructive');
+  });
+
+  it('kind 缺失：按 optionId 兜底判危险色（连字 reject-once 仍走 destructive）', async () => {
+    mockList.mockResolvedValue(
+      paged([
+        {
+          ...REQ_APPROVE,
+          id: 'req-nokind',
+          // kind 缺失（历史/瘦身载荷）：配色与裁决键都只能靠 optionId
+          options: [{ optionId: 'reject-once', name: 'Reject (dsh)' }],
+        },
+      ]),
+    );
+    mockVerdict.mockResolvedValue({ ...REQ_APPROVE, id: 'req-nokind', status: 'rejected' });
+    renderCard({ seats: SEATS });
+
+    const rejectBtn = await screen.findByRole('button', { name: 'Reject' });
+    expect(rejectBtn.className).toContain('bg-destructive');
+    // 裁决携带连字 optionId（后端按 optionId/id 双键取，不得被规范化改写）
+    fireEvent.click(rejectBtn);
+    await waitFor(() => expect(mockVerdict).toHaveBeenCalledWith('req-nokind', 'reject-once'));
   });
 
   it('participants 传入：行内出现参与者头像（Avatar fallback 首字母）', async () => {

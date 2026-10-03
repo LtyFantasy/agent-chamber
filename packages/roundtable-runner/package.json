@@ -2,7 +2,7 @@
   "name": "@agent-chamber/roundtable-runner",
   "version": "0.4.0",
   "private": true,
-  "description": "圆桌模式 runner：SeatDriver 接口 + AcpDriver 传输基座（kimi/codex ACP stdio）+ WebSocket 控制面拨号 + JSON 状态持久化",
+  "description": "圆桌模式 runner：SeatDriver 接口 + AcpDriver 传输基座（五厂商 ACP stdio，含 dsh）+ WebSocket 控制面拨号 + JSON 状态持久化",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {

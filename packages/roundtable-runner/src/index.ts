@@ -8,6 +8,8 @@
  * - CodexAcpDriver（ACP stdio 驱动 codex-acp 桥，quirk 薄壳 §8）
  * - OpencodeAcpDriver（ACP stdio 直连 `opencode acp`，profile 薄壳 §8；M4b-2）
  * - ClaudeAcpDriver（ACP stdio 驱动 claude-agent-acp 桥，profile 薄壳 §8e；M4b-3）
+ * - DshAcpDriver（ACP stdio 直连 `dsh acp`，profile 薄壳 §8f；档位经 spawn env
+ *   DSH_PERMISSION_MODE 钉死 + model 值 JSON 两段包装）
  * - RunnerWsClient（控制面 WS 拨号：退避重连/心跳/幂等去重/未确认队列重放，§4）
  * - StateStore（JSON 状态持久化：会话映射/对账游标/未确认队列，原子写+损坏恢复）
  * - RunnerCore（编排：座位生命周期 + 下行分发 + prompt 装配）
@@ -24,6 +26,8 @@ export { OpencodeAcpDriver } from './drivers/opencode-acp';
 export type { OpencodeAcpDriverOptions } from './drivers/opencode-acp';
 export { ClaudeAcpDriver } from './drivers/claude-acp';
 export type { ClaudeAcpDriverOptions } from './drivers/claude-acp';
+export { DshAcpDriver } from './drivers/dsh-acp';
+export type { DshAcpDriverOptions } from './drivers/dsh-acp';
 export { RunnerWsClient, nextBackoff } from './ws-client';
 export type { RunnerWsClientOptions } from './ws-client';
 export { StateStore } from './state-store';

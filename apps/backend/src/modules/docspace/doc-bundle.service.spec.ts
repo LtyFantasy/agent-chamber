@@ -396,6 +396,135 @@ describe('DocBundleService', () => {
     });
   });
 
+  // ─── export：pathPrefix 部分快照（v1.89.0-dev 批次 A）─────────
+
+  describe('exportBundle pathPrefix（部分快照）', () => {
+    /** 造一条分类行（导出侧的 name 映射与顺序断言用） */
+    function cat(id: string, name: string, sortOrder: number): DocCategory {
+      return {
+        id,
+        spaceId: 'space-1',
+        name,
+        slug: name,
+        description: null,
+        sortOrder,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        deletedAt: null,
+      } as DocCategory;
+    }
+
+    /**
+     * 带前缀导出时的 docRepo.find 桩：**第一次 = 前缀入选集，第二次 = 全量在册**
+     * （只查 id/path——服务正是这个调用序，见 exportBundle 注释）。
+     */
+    function docFindIncludedThenRegistry(all: Doc[], included: Doc[]): jest.Mock {
+      const mock = jest.fn();
+      mock.mockResolvedValueOnce(included);
+      mock.mockResolvedValueOnce(all);
+      return mock;
+    }
+
+    it('前缀收窄：docs 只留入选；categories 只留被引用；routes 按 primary 筛 + secondary 照实输出', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([
+        cat('cat-used', '架构', 5),
+        cat('cat-unused', '空分类', 9),
+      ]);
+      const docA = makeDoc({ id: 'doc-a', path: 'tmp/A/a.md', categoryId: 'cat-used' });
+      const docB = makeDoc({ id: 'doc-b', path: 'tmp/B/b.md', categoryId: 'cat-unused' });
+      docRepo.find = docFindIncludedThenRegistry([docB, docA], [docA]);
+      routeRepo.find = findFrom<DocRoute>([
+        makeRoute({ id: 'r-a', primaryDocId: 'doc-a', secondaryDocId: 'doc-b' }),
+        makeRoute({ id: 'r-b', intent: '我要看 B', primaryDocId: 'doc-b' }),
+      ]);
+
+      const bundle = await service.exportBundle('space-1', 'tmp/A/');
+
+      expect(bundle.docs.map((d) => d.path)).toEqual(['tmp/A/a.md']);
+      // categories 收窄为入选文档引用的分类（无人引用的「空分类」被丢弃）
+      expect(bundle.categories.map((c) => c.name)).toEqual(['架构']);
+      // routes 只按 primaryDocId ∈ 入选集 筛（r-b 的 primary 是 docB → 丢）
+      expect(bundle.routes).toHaveLength(1);
+      expect(bundle.routes[0].primaryDocPath).toBe('tmp/A/a.md');
+      // **secondary 照实输出**：docB 在空间内存在（只是没入选）→ 真 path，绝不写 null
+      // （null 在 import 侧是"显式清空"，写 null = 静默损坏该链路）
+      expect(bundle.routes[0].secondaryDocPath).toBe('tmp/B/b.md');
+      // 回声：带参即出现（含零命中）
+      expect(bundle.appliedFilters).toEqual({ pathPrefix: 'tmp/A/', matchedDocs: 1 });
+      // 不变量：回声计数与 docs 段长度同源
+      expect(bundle.appliedFilters!.matchedDocs).toBe(bundle.docs.length);
+    });
+
+    it('零命中：200 空 bundle + appliedFilters.matchedDocs=0（成功，非错误）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([cat('cat-used', '架构', 5)]);
+      docRepo.find = docFindIncludedThenRegistry([makeDoc()], []);
+      routeRepo.find = findFrom<DocRoute>([makeRoute()]);
+
+      const bundle = await service.exportBundle('space-1', 'nope/');
+
+      expect(bundle.formatVersion).toBe(DOC_BUNDLE_FORMAT_VERSION);
+      expect(bundle.docs).toEqual([]);
+      expect(bundle.categories).toEqual([]);
+      expect(bundle.routes).toEqual([]);
+      expect(bundle.media).toEqual([]);
+      // 前缀没命中 ⇒ 0；与"空间本来就空"靠该值区分（都返回空 bundle）
+      expect(bundle.appliedFilters).toEqual({ pathPrefix: 'nope/', matchedDocs: 0 });
+    });
+
+    it('前缀转义接线：where.path 挂 Raw，SQL 带 ESCAPE 且参数 = escapeLikePrefix 产物', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = docFindIncludedThenRegistry([], []);
+      routeRepo.find = findFrom<DocRoute>([]);
+
+      await service.exportBundle('space-1', 'a%b_c\\d/');
+
+      const arg = (docRepo.find as jest.Mock).mock.calls[0][0] as {
+        where: {
+          path: {
+            type: string;
+            getSql: (alias: string) => string;
+            objectLiteralParameters: Record<string, unknown>;
+          };
+        };
+      };
+      expect(arg.where.path.type).toBe('raw');
+      expect(arg.where.path.getSql('d.path')).toBe("d.path LIKE :likePrefix ESCAPE '\\'");
+      // `%` `_` `\` 逐字符转义后补 `%`——字面前缀语义（与 findAll/findTree 同款转义单源）
+      expect(arg.where.path.objectLiteralParameters).toEqual({ likePrefix: 'a\\%b\\_c\\\\d/%' });
+    });
+
+    it('回归护栏：不传 pathPrefix → 不挂 path 条件、无 appliedFilters 键、空分类与孤儿路由照旧', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([
+        cat('cat-used', '架构', 5),
+        cat('cat-unused', '空分类', 9),
+      ]);
+      routeRepo.find = findFrom<DocRoute>([
+        makeRoute({ id: 'r-orphan', primaryDocId: 'doc-gone' }),
+      ]);
+      docRepo.find = findFrom<Doc>([]);
+
+      const bundle = await service.exportBundle('space-1');
+
+      // where 形状与改动前一致（无 path 键）且**不追加第二次在册查询**（docs 本身即全量）
+      expect(docRepo.find).toHaveBeenCalledTimes(1);
+      const arg = (docRepo.find as jest.Mock).mock.calls[0][0] as {
+        where: Record<string, unknown>;
+      };
+      expect(Object.keys(arg.where).sort()).toEqual(['deletedAt', 'spaceId']);
+      // 全部分类（含无人引用的空分类）
+      expect(bundle.categories.map((c) => c.name)).toEqual(['架构', '空分类']);
+      // 全部路由（含孤儿：primaryDocPath=null 保真）
+      expect(bundle.routes).toHaveLength(1);
+      expect(bundle.routes[0].primaryDocPath).toBeNull();
+      // appliedFilters 是 additive 键：不带参数时**不出现**（老客户端无感）
+      expect(bundle).not.toHaveProperty('appliedFilters');
+    });
+  });
+
   // ─── export：media 段（P2 批 5）─────────────────────────────
 
   describe('exportBundle 媒体段', () => {
@@ -598,6 +727,48 @@ describe('DocBundleService', () => {
         { docPath: 'docs/a.md', attachmentId: topicAttId, reason: 'topic_bound' },
       ]);
       expect(attachmentService.listByIds).toHaveBeenCalledWith([topicAttId, docAttId]);
+    });
+
+    it('mediaOmitted：非图片 doc 绑定附件被显式排除（unsupported_media_type，§1.6）', async () => {
+      docspaceService.findById.mockResolvedValue(makeSpace());
+      categoryRepo.find = findFrom<DocCategory>([]);
+      docRepo.find = findFrom<Doc>([makeDoc({ id: 'doc-1', path: 'docs/a.md' })]);
+      routeRepo.find = findFrom<DocRoute>([]);
+      (docService.getContent as jest.Mock).mockResolvedValue({
+        docId: 'doc-1',
+        docPath: 'docs/a.md',
+        title: 'Doc A',
+        content: '# Doc A\n',
+      });
+      attachmentService.listByIds.mockResolvedValue([]);
+      // 两行 doc 绑定：图片（可打包）+ 非图片（octet-stream，M1 后恒为非图片的 mime 值）
+      const imgBytes = Buffer.from('data');
+      attachmentService.listByDocIds.mockResolvedValue([
+        makeAttachment({
+          id: 'att-img',
+          mimeType: 'image/png',
+          objectKey: 'obj-img.png',
+          sizeBytes: String(imgBytes.length),
+          sha256: sha256(imgBytes),
+        }),
+        makeAttachment({
+          id: 'att-bin',
+          originalName: 'log.txt',
+          mimeType: 'application/octet-stream',
+          objectKey: 'obj-bin.bin',
+        }),
+      ]);
+      attachmentService.readObjectBytes.mockResolvedValue(imgBytes);
+
+      const bundle = await service.exportBundle('space-1');
+
+      // 非图片显式报出（可发现优于静默）；只对图片读对象
+      expect(bundle.mediaOmitted).toEqual([
+        { docPath: 'docs/a.md', attachmentId: 'att-bin', reason: 'unsupported_media_type' },
+      ]);
+      expect(bundle.media.map((m) => m.sourceAttachmentId)).toEqual(['att-img']);
+      expect(attachmentService.readObjectBytes).toHaveBeenCalledTimes(1);
+      expect(attachmentService.readObjectBytes).toHaveBeenCalledWith('obj-img.png');
     });
 
     it('对象读失败 / 字节与行元数据不符 → 该项不入 media（bundle 自洽优先）', async () => {

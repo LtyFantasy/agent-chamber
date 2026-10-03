@@ -76,7 +76,10 @@ export class RoundtableSeat {
   @Column({ type: 'varchar', length: 100, nullable: false })
   label: string;
 
-  /** 厂商（'kimi' | 'codex'（M4a 已接入），后续扩展 'claude-code' | 'opencode'，契约① SeatConfig） */
+  /**
+   * 厂商（值域单源 = 协议包 SEAT_VENDORS（五家，含 dsh）；
+   * 本列无 DB 约束——新厂商接入不改本列，契约① SeatConfig）
+   */
   @Column({ type: 'varchar', length: 30, nullable: false })
   vendor: string;
 

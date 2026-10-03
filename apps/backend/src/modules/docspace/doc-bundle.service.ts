@@ -23,31 +23,46 @@
  *     AttachmentService.findReusableBundleRow）
  *   - 无映射不重写：正文里没有映射的附件 URL 原样保留（断链可见优于错链）
  *   - docspace 不得 import AttachmentStorageService：媒体读写一律走 AttachmentService 门面
+ *   - **pathPrefix 部分快照（v1.89.0-dev 批次 A）：两个集合并存**——`pathById` 必须由
+ *     **未过滤的全量在册 docs**（只查 id+path）构建，入选集仅用于 primary 筛选。
+ *     若从筛选后集合构建，secondaryDocPath 会退化成 null，而 import 侧 **null = 显式清空**
+ *     （doc-route.service.ts:259）⇒ 静默损坏链路。同理 categories 只收窄到"入选文档引用"
+ *     （`routes.category` 是自由文本无 FK，**不**并入保留集——并入反造幽灵分类）。
+ *   - **不带 pathPrefix ⇒ 输出与改动前逐字节一致**（全部分类含空分类、全部路由含孤儿、
+ *     不出现 appliedFilters 键）；这是回归护栏（doc-bundle.service.spec 钉死）。
  *
  * [关联代码]
  *   - attachment.service.ts — 媒体门面（listByDocIds/listByIds/readObjectBytes/importFromBundle/bindBundleMedia）
  *   - doc-bundle-url.ts — 正文附件 URL 两形态识别与重写（相对 + 同源绝对；纯函数）
  *   - doc-bundle.constants.ts — 预算/上限常量单一事实源（DTO 与两侧复检同源）
  *   - import-doc-bundle.dto.ts — bundle 形状契约（forbidNonWhitelisted：新增导出字段必须声明）
+ *   - common/utils/sql-like.ts — escapeLikePrefix 转义单源（与 doc.service findAll/findTree 共用）
  *
  * [持久踩坑]
- *   - BUNDLE-BUDGET(10mb): 媒体额度不是固定值——单文件 8MiB 图 base64 后 10.67MB 直接超
- *     express/nginx 双 10mb。安全方向：媒体额度 = 10MiB − docs 段实际字节 − 64KiB 余量，
+ *   - BUNDLE-BUDGET(10mb): 媒体额度不是固定值——单文件 10MB 图 base64 后 13.3MB 直接超
+ *     express json 10mb（JSON 面的绑定约束；nginx 自 v1.90.0-dev 起 12m 只约束
+ *     multipart 上传）。安全方向：媒体额度 = 10MiB − docs 段实际字节 − 64KiB 余量，
  *     且按 DB 列"读对象前"预判（§⑤.3）。
  *   - BUNDLE-MEDIA-IDEMPOTENT: 导入侧的复用判定必须带 `status='ready'` + 确定性 tie-break
  *     (createdAt,id) + 本轮未配对语义，否则重导会双插行或配错行（§0 dx B1/arch M3/PM B1）。
+ *   - BUNDLE-EXPORT-PREFIX-NULL(部分快照): 带 pathPrefix 导出时若用筛选后的 docs 建 pathById，
+ *     会写出 `secondaryDocPath: null`——回导把它当"显式清空"写库，链路静默损坏。
+ *     安全方向: pathById 恒取全量在册映射（见 [关键不变量]）。
  *
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
  *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
  *   □ 新增导出字段/段必须同时在 import-doc-bundle.dto.ts 声明（否则 roundtrip 400）
  *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 改 exportBundle 的过滤面时，先确认"不带 pathPrefix 输出逐字节一致"的回归断言仍绿
  * =============================================================================
  */
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, IsNull } from 'typeorm';
+import { Repository, IsNull, Raw } from 'typeorm';
 import { createHash } from 'crypto';
+// LIKE 字面前缀转义单源（与 doc.service findAll/findTree 共用；见 sql-like.ts 的不变量）
+import { escapeLikePrefix } from '../../common/utils/sql-like';
 import {
   DocRouteCodeEntryType,
   ErrorCode,
@@ -84,6 +99,7 @@ import {
   base64EncodedLength,
 } from './doc-bundle.constants';
 import { extractAttachmentContentIds, rewriteAttachmentContentUrls } from './doc-bundle-url';
+import { isInlineImageMime } from '../attachments/attachment.constants';
 
 // ─── Bundle 形状（formatVersion 2，任务 T6 + P2 批 5）─────────────────
 //
@@ -174,6 +190,18 @@ export interface DocSpaceExportBundle {
    * 用途：让"回导后这段断链"可被发现（PM Q4/m4）。
    */
   mediaOmitted: DocBundleMediaOmittedItem[];
+  /**
+   * 生效的过滤条件回声（v1.89.0-dev 批次 A）——**带 `?pathPrefix=` 即出现（含零命中）**，
+   * 不带则不出现该键（additive，老客户端读不到也不受影响）。
+   *
+   * informational：import 侧**忽略**它（DTO 已显式声明该键，仅为让 roundtrip 不 400）。
+   */
+  appliedFilters?: {
+    /** 生效的字面前缀（原样回声，未经 LIKE 转义） */
+    pathPrefix: string;
+    /** 入选文档数（恒 = docs.length；0 = 前缀零命中 ⇒ 空 bundle 但仍是 200 成功） */
+    matchedDocs: number;
+  };
 }
 
 /** bundle.media[] 的缩略图载荷（导出形状；字段与 DTO 同名同义） */
@@ -219,7 +247,14 @@ export type DocBundleMediaEntry = DocBundleMediaItem | DocBundleMediaSkippedItem
 export interface DocBundleMediaOmittedItem {
   docPath: string;
   attachmentId: string;
-  reason: 'topic_bound';
+  /**
+   * 未打包原因（值域）：
+   * - `topic_bound`：正文引用的 topic 绑定附件（跨空间/跨环境不可用，informational）；
+   * - `unsupported_media_type`（v1.90.0-dev）：doc 绑定但**非图片**的附件——bundle 的
+   *   media 段只承载 4 种嗅探图片（导入侧 DTO 同值域），非图片显式排除并报出
+   *   （可发现优于静默；非图片由附件模块的正常读取路径服务）。
+   */
+  reason: 'topic_bound' | 'unsupported_media_type';
 }
 
 /** 回导 per-item 结果（categories/routes 段通用） */
@@ -333,11 +368,27 @@ export class DocBundleService {
   ) {}
 
   /**
-   * 导出空间全量 bundle（formatVersion 2）。
+   * 导出空间 bundle（formatVersion 2）。带 `pathPrefix` 时导出**部分快照**。
    *
    * 输出确定性（git diff 友好）：categories 按 sortOrder+createdAt ASC、
    * routes 按 sortOrder+createdAt ASC（与 GET /doc-spaces/:id/routes 同序）、
    * docs 按 path ASC、media 按 docPath→originalName→attachmentId ASC。
+   *
+   * pathPrefix 收窄语义（v1.89.0-dev 批次 A）：
+   * - **字面前缀、大小写敏感**（目录语义请带尾 `/`）；LIKE 通配符经
+   *   `escapeLikePrefix()` 转义（单源见 common/utils/sql-like.ts）。
+   * - docs = 前缀命中集；categories = **入选文档引用的分类**（未引用分类含空分类不导出）；
+   *   routes = **primaryDocId ∈ 入选集**（secondary 是否入选不影响该条）；media 以
+   *   docItems 为输入自动收窄。
+   * - **pathById 取未过滤的全量在册 docs**（只查 id+path 两列）：孤儿判定与
+   *   secondaryDocPath「照实输出」都需要全量视角——从筛选后集合构建会把 secondary 写成
+   *   null，而 import 侧 null = 显式清空（静默损坏链路，见文件头 [持久踩坑]）。
+   * - 带参即回声 `appliedFilters: {pathPrefix, matchedDocs}`（**含零命中**）：零命中 =
+   *   200 + 空 bundle（成功，回导 = no-op），`matchedDocs: 0` 用于区分「前缀没命中」与
+   *   「空间本来就空」。
+   * - **诚实代价**：LIKE 前缀在本库（en_US.utf8、无 varchar_pattern_ops）是空间内扫描 +
+   *   Filter；当前量级（百篇级）可接受。用 LIKE 形态是为将来可加 `varchar_pattern_ops`
+   *   索引留位，**不是当下的索引友好**。
    *
    * ⚠️ 大空间响应体积大是正常的：docs 段含每篇完整原文（reconstructContent full=true
    * 语义，含首标题行——与 web 编辑器回写保真口径一致），最重租户量级可达数 MB；
@@ -346,8 +397,9 @@ export class DocBundleService {
    * `{skipped}` 标记，消费方据此另行取件（见 doc-bundle.constants.ts 预算口径）。
    *
    * @param spaceId 目标空间（Controller 层已判空 + read 权限检查）
+   * @param pathPrefix 可选字面前缀：只导出该前缀下的文档（部分快照，非备份）
    */
-  async exportBundle(spaceId: string): Promise<DocSpaceExportBundle> {
+  async exportBundle(spaceId: string, pathPrefix?: string): Promise<DocSpaceExportBundle> {
     const space = await this.docspaceService.findById(spaceId);
 
     // ── categories（非软删，策展序）──
@@ -358,8 +410,20 @@ export class DocBundleService {
     const categoryNameById = new Map(categories.map((c) => [c.id, c.name]));
 
     // ── docs（非软删，path 序）+ 每篇完整原文 ──
+    // 前缀条件**只在带参时挂**：不传 pathPrefix 的 where 形状与改动前逐字节一致
+    // （输出一致性回归护栏的一部分）。ESCAPE '\' 显式声明与 findAll/findTree 同款字面形态。
     const docs = await this.docRepo.find({
-      where: { spaceId, deletedAt: IsNull() },
+      where: {
+        spaceId,
+        deletedAt: IsNull(),
+        ...(pathPrefix
+          ? {
+              path: Raw((alias) => `${alias} LIKE :likePrefix ESCAPE '\\'`, {
+                likePrefix: `${escapeLikePrefix(pathPrefix)}%`,
+              }),
+            }
+          : {}),
+      },
       order: { path: 'ASC' },
     });
     const docItems: DocBundleDocItem[] = [];
@@ -383,13 +447,30 @@ export class DocBundleService {
       });
     }
 
+    // ── 全量在册映射（id → path）──
+    // 孤儿判定 + secondaryDocPath 照实解析都依赖**未过滤**的全量视角；不带前缀时 docs
+    // 本身即全量，免一次查询。只取 id/path 两列，代价可忽略。
+    const registryDocs = pathPrefix
+      ? await this.docRepo.find({
+          where: { spaceId, deletedAt: IsNull() },
+          select: ['id', 'path'],
+          order: { path: 'ASC' },
+        })
+      : docs;
+    const pathById = new Map(registryDocs.map((d) => [d.id, d.path]));
+
     // ── routes（全部路由，含指向软删文档的孤儿路由）──
     const routes = await this.routeRepo.find({
       where: { spaceId },
       order: { sortOrder: 'ASC', createdAt: 'ASC' },
     });
-    const pathById = new Map(docs.map((d) => [d.id, d.path]));
-    const routeItems: DocBundleRouteItem[] = routes.map((r) => ({
+    // 带前缀：只按 primaryDocId ∈ 入选集 筛；secondaryDocPath **照实输出**（全量 pathById），
+    // 不因 secondary 不在包内而写 null——null 在 import 侧是"显式清空"的语义
+    const includedDocIds = new Set(docs.map((d) => d.id));
+    const selectedRoutes = pathPrefix
+      ? routes.filter((r) => includedDocIds.has(r.primaryDocId))
+      : routes;
+    const routeItems: DocBundleRouteItem[] = selectedRoutes.map((r) => ({
       intent: r.intent,
       category: r.category,
       // 孤儿路由（doc 软删后路由保留是 doc_routes 设计语义）：导出 null 保真，
@@ -402,6 +483,16 @@ export class DocBundleService {
       codeEntryType: r.codeEntryType,
       sortOrder: r.sortOrder,
     }));
+
+    // ── categories 保留集：带前缀时只留入选文档引用的分类（含排序与映射收窄）──
+    // ⚠️ routes.category 是自由文本无 FK（doc-route.entity.ts:55），与 doc_categories
+    // 不同源——原样透传，**不**并入保留集（并入会反造幽灵分类）。
+    const referencedCategoryIds = new Set(
+      docs.map((d) => d.categoryId).filter((id): id is string => id !== null),
+    );
+    const exportedCategories = pathPrefix
+      ? categories.filter((c) => referencedCategoryIds.has(c.id))
+      : categories;
 
     // ── media 段（联合预算口径见 doc-bundle.constants.ts）──
     // 先装 docs 段测字节，再按剩余额度逐项填充（plan §⑤.3 导出内存策略：
@@ -418,7 +509,7 @@ export class DocBundleService {
         visibility: (space.settings?.visibility || Visibility.OPEN) as Visibility,
         settings: space.settings ?? {},
       },
-      categories: categories.map((c) => ({
+      categories: exportedCategories.map((c) => ({
         name: c.name,
         slug: c.slug,
         description: c.description,
@@ -428,6 +519,8 @@ export class DocBundleService {
       docs: docItems,
       media: media.items,
       mediaOmitted: media.omitted,
+      // 带参即回声（含零命中）；不带则不出现该键（additive）
+      ...(pathPrefix ? { appliedFilters: { pathPrefix, matchedDocs: docItems.length } } : {}),
     };
   }
 
@@ -506,6 +599,21 @@ export class DocBundleService {
         originalName: row.originalName,
         sizeBytes: declaredSize,
       };
+
+      // ── 类型闸门（v1.90.0-dev，§1.6）：bundle 不扩展到非图片 ──
+      // M1 定案后非图片行 mime_type 恒 octet-stream，导入侧（attachment-bundle-media）
+      // 的 DTO @IsIn(DOC_BUNDLE_MEDIA_MIME_TYPES) 会直接拒收——与其让包内出现
+      // "注定 failed 的媒体项"，不如导出侧显式排除并报出（可发现优于静默）。
+      // 判据 = INLINE_IMAGE_MIME_TYPES 精确成员判断（与出口 inline 判据同源，
+      // 与 DOC_BUNDLE_MEDIA_MIME_TYPES 逐字同值）；排除项进 mediaOmitted。
+      if (!isInlineImageMime(row.mimeType)) {
+        omitted.push({
+          docPath: candidate.docPath,
+          attachmentId: row.id,
+          reason: 'unsupported_media_type',
+        });
+        continue;
+      }
 
       if (declaredSize > DOC_BUNDLE_MEDIA_ITEM_MAX_BYTES) {
         items.push({ skipped: 'too_large', ...meta });

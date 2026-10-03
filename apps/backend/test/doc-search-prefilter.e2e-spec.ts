@@ -1060,11 +1060,12 @@ describe('DocSpace 检索预过滤 — 真实 PG（迁移链临时库 + 真编�
     const expected = await mirrorKeys('degraded', 'prefilter', q);
     expect(expected.length).toBeGreaterThan(0); // 防两侧都空而假绿
 
-    const { hits, hint } = await service.search([SPACE_ID], { q, limit: COMPARE_LIMIT });
+    const { hits, hint, hintCode } = await service.search([SPACE_ID], { q, limit: COMPARE_LIMIT });
     expect(hits.map((h) => `${h.docId}#${h.position}`).sort()).toEqual(expected);
     // 常数分（全行同分：绕开逐行打分的可读刻度）+ 位置序声明 hint
     for (const hit of hits) expect(hit.score).toBe(SINGLE_CHAR_CONST_SCORE);
     expect(hint).toBe(DOC_SEARCH_POSITIONAL_ORDER_HINT);
+    expect(hintCode).toBe('positional_order');
 
     const sqls = await captureSqls(q);
     const main = pickMainSql(sqls, 'degraded');
@@ -1091,10 +1092,14 @@ describe('DocSpace 检索预过滤 — 真实 PG（迁移链临时库 + 真编�
       const expected = await mirrorKeys('degraded', 'prefilter', q);
       expect(expected.length).toBeGreaterThan(0);
 
-      const { hits, hint } = await service.search([SPACE_ID], { q, limit: COMPARE_LIMIT });
+      const { hits, hint, hintCode } = await service.search([SPACE_ID], {
+        q,
+        limit: COMPARE_LIMIT,
+      });
       expect(hits.map((h) => `${h.docId}#${h.position}`).sort()).toEqual(expected);
       for (const hit of hits) expect(hit.score).toBe(SINGLE_CHAR_CONST_SCORE);
       expect(hint).toBe(DOC_SEARCH_POSITIONAL_ORDER_HINT);
+      expect(hintCode).toBe('positional_order');
 
       const sqls = await captureSqls(q);
       // 预检结果已被 mock ⇒ 不再发 count 查询；降级主查询占第 0 位（pickMainSql 口径）

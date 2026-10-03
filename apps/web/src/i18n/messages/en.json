@@ -203,7 +203,13 @@
       "wakeMention": "Mention to wake (default; seats only receive @seat or @all)",
       "wakeBroadcast": "Broadcast (every new message goes to all seats)",
       "maxRounds": "Safety-valve round limit (optional)",
-      "maxRoundsPlaceholder": "Default 8; 0 = disabled"
+      "maxRoundsPlaceholder": "Default 8; 0 = disabled",
+      "attachmentTtl": "Attachment retention",
+      "attachmentTtlHint": "Applies to newly uploaded attachments only; existing attachments keep their original expiry.",
+      "attachmentTtl1d": "1 day",
+      "attachmentTtl7d": "7 days (default)",
+      "attachmentTtl30d": "30 days",
+      "attachmentTtlNever": "Never expire"
     },
     "kind": {
       "normal": "Normal",
@@ -322,6 +328,10 @@
       "pmPlanDesc": "plan (read-only + plan collaboration mode)",
       "pmAutoDesc": "auto (auto-execute, sensitive ops need approval — recommended)",
       "pmYoloDesc": "yolo (full access, no approvals — use with caution)",
+      "pmDefaultDescDsh": "default (workspace-write: allowed inside the seat working directory; anything outside is hard-denied, with a one-time escalation approval)",
+      "pmPlanDescDsh": "plan (read-only: every write is hard-denied by the sandbox and needs a one-time escalation approval before it lands)",
+      "pmAutoDescDsh": "auto (danger-full-access: no sandbox boundary, zero approvals — NOT recommended)",
+      "pmYoloDescDsh": "yolo (danger-full-access: zero approvals, the seat agent can reach anything — disposable environments only)",
       "advanced": "Advanced options",
       "model": "Model override (optional)",
       "modelPlaceholder": "e.g. kimi-k2",
@@ -696,7 +706,22 @@
       "loadMoreFolders": "Load more folders",
       "copyMarkdown": "Copy Markdown",
       "copied": "Copied",
-      "copyMarkdownError": "Copy failed, please retry"
+      "copyMarkdownError": "Copy failed, please retry",
+      "panelInfo": "Doc info"
+    },
+    "backlinks": {
+      "title": "Referenced by {docCount, plural, one {# doc} other {# docs}} · {linkCount, plural, one {# link} other {# links}}",
+      "titlePlain": "Backlinks",
+      "empty": "No documents link here yet",
+      "error": "Failed to load backlinks",
+      "noHeading": "Top of doc",
+      "expandMore": "{count, plural, one {# more doc} other {# more docs}}",
+      "collapse": "Show less",
+      "hits": "{count, plural, one {# link} other {# links}}",
+      "rowAria": "Source {title} ({path}) — {count, plural, one {# link} other {# links}}: {targets}",
+      "pathBasedBadge": "Relative path",
+      "platformBadge": "Platform link",
+      "pathBasedHint": "Needs rewriting after a move"
     },
     "doc": {
       "readOnlyMirror": "Read-only mirror",
@@ -1326,20 +1351,31 @@
     "noSearchResults": "No matching members"
   },
   "attachments": {
-    "upload": "Upload image",
+    "upload": "Upload attachment",
     "uploading": "Uploading...",
-    "uploadFailed": "Image upload failed, please retry",
-    "tooLarge": "Image exceeds the 8MiB size limit",
+    "uploadFailed": "Upload failed, please retry",
+    "tooLarge": "File exceeds the 10MB size limit",
     "typeNotAllowed": "Only PNG/JPEG/GIF/WebP images are supported",
     "quotaExceeded": "Storage quota exceeded, please clean up attachments first",
+    "tooMany": "Up to 9 attachments per message",
     "brokenImage": "Image failed to load",
     "removeChip": "Remove attachment",
-    "confirmRemove": "The attachment will be deleted and the image link in the message will be removed. Remove it?",
+    "confirmRemove": "The attachment will be deleted; any reference to it in the message is removed as well. Remove it?",
     "removeFailed": "Failed to delete the attachment; you can clean it up later in My Attachments",
     "preview": "Image preview",
     "zoomActual": "Actual size",
     "zoomFit": "Fit to window",
-    "closePreview": "Close preview"
+    "closePreview": "Close preview",
+    "card": {
+      "download": "Download",
+      "downloadFailed": "Download failed, please retry",
+      "expired": "Expired",
+      "expiresInDays": "Expires in {days}d",
+      "expiresInHours": "Expires in {hours}h",
+      "executableBadge": "Executable",
+      "executableTitle": "Executable file",
+      "executableConfirm": "\"{name}\" may be executable. Download anyway?"
+    }
   },
   "experiences": {
     "title": "Experience Base",

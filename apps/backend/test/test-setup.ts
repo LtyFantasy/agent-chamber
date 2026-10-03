@@ -137,6 +137,32 @@ export async function createTestingApp(): Promise<{
 
   const mockRepos: Record<string, jest.Mocked<Repository<any>>> = {};
 
+  /**
+   * 链式 queryBuilder 桩（EntityManager 版）。
+   *
+   * 为什么必须有默认实现：`em.createQueryBuilder().update(X).set(...).where(...)`
+   * 是 service 层"事务内批量写"的通用形态（如 TopicService.remove 连带软删附件），
+   * 裸 `jest.fn()`（无返回值）会让此类端点整条 500——那是 mock 缺口被误报成产品缺陷。
+   * 默认 `execute()` 返回 `{affected: 0}`（"无行命中"），需要计数断言的用例自行
+   * `mockReturnValue` 覆盖（agent.e2e-spec 先例）。
+   */
+  function createMockManagerQueryBuilder(): any {
+    const qb: any = {
+      update: jest.fn(() => qb),
+      set: jest.fn(() => qb),
+      where: jest.fn(() => qb),
+      andWhere: jest.fn(() => qb),
+      orderBy: jest.fn(() => qb),
+      delete: jest.fn(() => qb),
+      from: jest.fn(() => qb),
+      execute: jest.fn(async () => ({ affected: 0, raw: [] })),
+      getMany: jest.fn(async () => []),
+      getOne: jest.fn(async () => null),
+      getCount: jest.fn(async () => 0),
+    };
+    return qb;
+  }
+
   const managerMock: any = {
     save: jest.fn((entity: any) => {
       if (entity && typeof entity === 'object' && !entity.id) {
@@ -146,8 +172,13 @@ export async function createTestingApp(): Promise<{
     }),
     create: jest.fn((EntityClass: any, entity: any) => entity),
     transaction: jest.fn(async (cb: any) => cb(managerMock)),
-    createQueryBuilder: jest.fn(),
+    createQueryBuilder: jest.fn(() => createMockManagerQueryBuilder()),
     getRepository: jest.fn(),
+    // 事务内实体级写（TopicService.remove 的 em.softRemove(topic) 等）
+    softRemove: jest.fn(async (entity: any) => entity),
+    remove: jest.fn(async (entity: any) => entity),
+    softDelete: jest.fn(async () => ({ affected: 1 })),
+    delete: jest.fn(async () => ({ affected: 1 })),
   };
 
   const dataSourceMock = {
