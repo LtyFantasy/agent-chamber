@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——TopicComposer 圆桌 @ 补全）
- *   - 补充: docs/roundtable-design.md §6（mention 唤醒） + §12 r11（纯文本打字辅助）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——TopicComposer 圆桌 @ 补全）
+ *   - 补充: docs/modules/roundtable-design.md §6（mention 唤醒） + §12 r11（纯文本打字辅助）
  *   - 附件: docs/api-definition.md §Attachments（上传绑定 topicId；chip 移除 = DELETE + 链接剥离）
  *
  * [踩坑索引] ①(玻璃壳糊掉 backdrop 文字) ②(附件 chips 不得进玻璃壳容器)

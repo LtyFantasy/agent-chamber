@@ -26,6 +26,10 @@
  *   - validate 恒零副作用；渲染门 422 转 {ok:false, stage, diagnostics...} 响应，
  *     500 基础设施错误照常上抛（Agent 必须能区分 IR 错了 vs 平台坏了）
  *   - docType 守卫先于内容读取：非 diagram 不得进入 patch/validate 的 IR 解析路径
+ *   - **validate 的 path / docId 两条 locator 通道都受 path spaceId 约束**：path 走
+ *     findDocByPath(spaceId+path)，docId 走 DocService.findByIdInSpace(spaceId, docId)
+ *     ——单条 SQL，跨空间 docId 一律 404 DOC_NOT_FOUND，与"不存在"逐字节同文同码
+ *     （不得改回 findById + 事后比对 spaceId：那会引入时延/内容侧信道）
  *
  * [关联代码]
  *   - doc.service.ts upsertCore — diagram 分支（唯一渲染门位/三列写入）
@@ -336,7 +340,7 @@ export class DiagramService {
       irInput = dto.ir as Record<string, unknown>;
     } else {
       const doc = hasDocId
-        ? await this.docService.findById(dto.docId as string)
+        ? await this.docService.findByIdInSpace(spaceId, dto.docId as string)
         : await this.findDocByPath(spaceId, dto.path as string);
       // nit#5：非 diagram → 400 指路（不得把 markdown 当 IR 解析报 422）
       this.ensureDiagramDoc(doc, 'validate_diagram');

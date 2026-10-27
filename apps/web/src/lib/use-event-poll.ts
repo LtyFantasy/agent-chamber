@@ -39,7 +39,8 @@ const DEFAULT_INTERVAL_MS = 5000;
  * useEventPoll — 通用事件轮询 hook（GET /events/poll 的 react-query 封装）。
  *
  * 行为契约：
- * - 首轮请求固定用 cursor='now'：跳过全部历史事件，仅锚定当前时刻并记录服务端
+ * - 首轮请求固定用 cursor='now'：跳过全部历史事件，锚定**服务端当前的最新位点**
+ *   （全局 MAX(cursor)，不是本地时钟——游标与墙钟刻意解耦），并记录服务端
  *   返回的 nextCursor（历史数据由各页面自身查询兜底，重放事件会与既有数据重复）；
  * - 之后每 intervalMs 用「最近一次返回的 nextCursor」轮询（cursor 单调递增），
  *   有事件则按序逐条回调 onEvent 并推进游标——多轮之间不重不漏；

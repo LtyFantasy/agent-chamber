@@ -31,6 +31,7 @@ function configOf(overrides: Partial<JudgmentConfig> = {}): JudgmentConfig {
     baseUrl: 'https://api.typesafe.ai',
     apiKey: 'k',
     typesafeModel: 'jev-latest',
+    proxyUrl: null,
     timeoutMs: 5000,
     rateLimitPerHour: 1000,
     globalRateLimitPerHour: 1000,

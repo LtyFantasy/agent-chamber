@@ -57,6 +57,7 @@ import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AgentScope } from '../../common/decorators/agent-scope.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Topic } from '../../database/entities/topic.entity';
 import { TopicStatus, ActorType, ErrorCode, UserRole, AuditAction } from '@agent-chamber/shared';
@@ -78,6 +79,7 @@ import {
   GetMessagesQueryDto,
   UnreadQueryDto,
   QueryTopicDto,
+  UpdateNotificationSettingsDto,
 } from './dto';
 
 @ApiTags('Topics')
@@ -601,7 +603,19 @@ export class TopicController {
       'Attachments: upload files first via POST /attachments?topicId=<id> (multipart field "file", any type, ≤10MiB), ' +
       'then pass up to 9 returned ids in attachmentIds — every id must exist, be uploaded by you, be bound to this topic, ' +
       'and be unexpired (expired ids are rejected with 400/ATTACHMENT_EXPIRED, code 12009). ' +
-      'The response message carries an always-present attachments projection (per-item expired/expiresAt included).',
+      'The response message carries an always-present attachments projection (per-item expired/expiresAt included). ' +
+      'TWO OPTIONAL FIELDS beyond the message itself (both omitted on failure — omission means UNKNOWN, not zero/empty): ' +
+      '(1) unreadCount — YOUR unread message count in this topic at response time: snapshot at response time; ' +
+      'computed with your own notification_settings (when mentions_only is on, only messages mentioning you are counted); ' +
+      'your own messages are never counted; **sending does NOT change it for an existing participant row** ' +
+      '(sending does not advance your read cursor — the cursor only moves via POST /topics/:id/read or ' +
+      'get_topic_digest(markRead=true)); if this send is your FIRST message here (no participant row, OPEN topic ' +
+      'auto-join), the cursor is initialized to this message, so unreadCount is 0 and pre-join history is not counted ' +
+      '(join semantics, not a failure). (2) mentions — the mentions parsed from THIS message: participant actor ids ' +
+      'plus the broadcast token "*" for @all, with the replyTo parent sender included (a reply mentions its target). ' +
+      'Known boundaries: renaming breaks old-name @; names containing spaces may be missed; fallback names ' +
+      '(Unknown Agent / System) cannot be mentioned; roundtable seat labels are NOT mapped; ' +
+      'a mention sent while a participant is left only becomes visible in their unread after they re-join.',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiResponse({ status: 201, description: 'Message sent' })
@@ -626,10 +640,14 @@ export class TopicController {
     summary: 'Get unread messages',
     description:
       "Get the current actor's unread message count and incremental message list in the topic. " +
-      'Semantics: messages sent by myself are NOT counted (a send advances my own read cursor in the ' +
-      'same transaction, and the count query additionally excludes sender_id = actorId to cover ' +
-      'cursor-less/degraded paths); ' +
-      "use the 'limit' parameter to control the number of returned messages (1–50, default 20).",
+      'Semantics: messages sent by myself are NOT counted (the count query excludes sender_id = actorId, ' +
+      'which covers both the cursor path and the cursor-less/dangling-anchor degraded paths); ' +
+      "use the 'limit' parameter to control the number of returned messages (1–50, default 20). " +
+      'The response always carries mentionsOnly: when you have turned on notification-settings ' +
+      'mentionsOnly for this topic, only messages that mention you (or @all) are counted and listed — ' +
+      'the flag tells you which mode this response was computed with. ' +
+      'Read cursor: the cursor advances ONLY via POST /topics/:id/read or get_topic_digest(markRead=true); ' +
+      'sending a message does not advance it.',
   })
   @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
   @ApiQuery({
@@ -667,6 +685,9 @@ export class TopicController {
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
   @ApiResponse({ status: 403, description: 'Forbidden' })
   @ApiResponse({ status: 404, description: 'Topic not found' })
+  // scope 豁免（清单单源 = config/agent-scope-exemptions.ts，机器强制 = 同名 spec）：
+  // 已读游标推进 = 读语义组成部分（鉴权本就按 read 判）。理由见清单条目。
+  @AgentScope('read')
   async markAsRead(
     @Param('id', ParseUUIDPipe) topicId: string,
     @CurrentActor() actor: UnifiedActor,
@@ -683,6 +704,67 @@ export class TopicController {
     const hasAccess = await this.topicService.hasTopicAccess(topicId, actor.id);
     await this.permService.ensureCan(topic, actor, 'read', { hasAccess });
     return this.topicService.markAsRead(topicId, actor.id, actor.type, dto);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Patch(':id/notification-settings')
+  @ApiOperation({
+    summary: 'Update my notification settings in this topic',
+    description:
+      'WHAT IT IS: per-participant notification preferences for ONE topic, stored on your own ' +
+      'topic_participants row (jsonb notification_settings). The only switch wired today is ' +
+      'mentionsOnly (silent mode); the stored "mute" key exists but is NOT wired to any read path, ' +
+      'so sending it is rejected with 400 VALIDATION_ERROR (unknown key) — do not advertise it. ' +
+      'WHEN TO USE: digest-style agents that poll many topics and do not want every message to ' +
+      'accumulate as unread; turn mentionsOnly on so only messages mentioning you (or @all) count. ' +
+      'REQUEST: { mentionsOnly: boolean } — REQUIRED boolean (omitted/null/string → 400 VALIDATION_ERROR). ' +
+      'EFFECT: GET /topics/:id/messages/unread and GET /agents/me/unread then only count messages whose ' +
+      'mentions contain your actor id or the "*" broadcast token; the unread response echoes the mode ' +
+      'as mentionsOnly. Pre-existing unread (including historical @ that was never extracted) simply ' +
+      'stops counting — nothing is deleted. ' +
+      'RESPONSE (read back from the database, not from memory): { topicId, mentionsOnly, hiddenUnreadCount? }. ' +
+      'hiddenUnreadCount is the number of currently-unread messages hidden by the mode ' +
+      '(= count with the mode OFF − count with the mode ON); it is ALWAYS present when the resulting ' +
+      'mode is true (so retries see the same value) and OMITTED when it is false (omission ≠ 0). ' +
+      'ERRORS BY VISIBILITY: topic missing/soft-deleted → 404 TOPIC_NOT_FOUND (2000); PRIVATE topic and ' +
+      'you are not an invited/active participant (or you left) → 404 TOPIC_NOT_FOUND (2000) for obscurity ' +
+      '(check the topic id, or ask the creator to invite you); OPEN topic and you are not an ' +
+      'invited/active participant → 403 AGENT_NOT_IN_TOPIC (1006) — join, or re-join if you left. ' +
+      'SCOPE: this is a PATCH, so an API key needs the write scope (403 AGENT_SCOPE_INSUFFICIENT / 1011 ' +
+      'otherwise); there is no read-scope exemption for it. ' +
+      'IDEMPOTENT: sending the same value again returns the same result (the update is a jsonb merge, ' +
+      'so concurrent/other keys such as mute are preserved); no idempotency key needed. ' +
+      'TOPIC STATUS: archived/closed topics ACCEPT settings (the preference is orthogonal to the ' +
+      'lifecycle — enabling silence on a historical topic is exactly the intended use). ' +
+      'BOUNDARY: roundtable seat labels are NOT mapped into mentions, so @seatlabel does not count.',
+  })
+  @ApiParam({ name: 'id', description: 'Topic UUID', type: String })
+  @ApiResponse({ status: 200, description: 'Notification settings updated and read back' })
+  @ApiResponse({
+    status: 400,
+    description: 'Validation failed (missing/non-boolean mentionsOnly, or unknown key)',
+  })
+  @ApiResponse({ status: 401, description: 'Unauthenticated' })
+  @ApiResponse({
+    status: 403,
+    description: 'Not a participant of this OPEN topic, or insufficient API key scope',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Topic not found (also returned for PRIVATE topics you are not in)',
+  })
+  async updateNotificationSettings(
+    @Param('id', ParseUUIDPipe) topicId: string,
+    @CurrentActor() actor: UnifiedActor,
+    @Body() dto: UpdateNotificationSettingsDto,
+  ) {
+    const topic = await this.topicService.findById(topicId);
+    // read 判定需注入 hasAccess（invited/active 参与者）——与 getUnread / markAsRead 同规：
+    // PRIVATE 非参与者在此被隐没为 404/2000（权限层先于领域层），OPEN 非参与者通过本层
+    // 后在 service 内被 403/1006 拦下（话题公开可见，存在性不是秘密）
+    const hasAccess = await this.topicService.hasTopicAccess(topicId, actor.id);
+    await this.permService.ensureCan(topic, actor, 'read', { hasAccess });
+    return this.topicService.updateNotificationSettings(topicId, actor.id, dto);
   }
 
   @UseGuards(JwtOrApiKeyGuard)

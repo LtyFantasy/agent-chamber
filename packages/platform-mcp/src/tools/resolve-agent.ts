@@ -4,7 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: .kimi/plan-mcp-experience-topic-board.md §5 Batch E1 ⑦
- *   - 补充: docs/platform-mcp.md §2.7 + 看板任务 fdc1851b（Batch F：candidates 剔除 avatarUrl）
+ *   - 补充: docs/integrations/platform-mcp.md §2.7 + 看板任务 fdc1851b（Batch F：candidates 剔除 avatarUrl）
  *
  * [踩坑索引] -
  *

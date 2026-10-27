@@ -16,7 +16,7 @@
  * [设计文档]
  *   - 主文档: docs/api-definition.md §6.11
  *   - 补充: docs/architecture.md §3.2.2 (Topic / Message), docs/spec.md §3.2 MessageType
- *   - 圆桌: docs/roundtable-design.md §6/§7（seatLabel 单键透传 / wakePolicy effective 派生）
+ *   - 圆桌: docs/modules/roundtable-design.md §6/§7（seatLabel 单键透传 / wakePolicy effective 派生）
  *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（sendMessageInternal 是
  *     全仓唯一 messageRepo.create 点，roundtable 经它写系统消息 → service 层插桩决策 2；
  *     幂等 replay 不重复记；newData 白名单 {messageId, topicId, topicTitle}，content 黑名单）
@@ -43,21 +43,64 @@
  *         （creator+participant 去 open 源，participant 口径 = status IN invited/active
  *         对齐 unread SQL，admin 不短路）。缓存键 topic:mine:<actorKey> 前缀隔离。
  *
- * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(发送即已读+join/邀请游标初始化) ATT-PROJ-SNAPSHOT(附件投影是发送时刻快照：直改附件行的 expires_at 不改写历史消息，expired 只在响应时按快照算) ATT-CASCADE(m5：删话题连带软删附件，删除入口的语义反转——成员不再可读)
+ * [踩坑索引] D-6(排序方向) B-1(type序列化) B-5(可见性控制) senderType映射 D5(权限迁移) B-50(列表权限过滤) B-55(QueryBuilder orderBy select 风险) E3(tie-break全序+markAsRead防回退+upsert修复) E3-fix(游标DB内行值比较+统计trigger单一事实源) OWNER-PROXY(sendMessage放行) JOINED-AT(joinedAt语义+upsert覆盖role) SYS-PARTICIPANT(参与者列表过滤system哨兵) R1(公共解析收口) A2.5(写入口assertActorUsable) R11(update只拦新增id) UNREAD-CURSOR(游标只经 markAsRead/digest 推进 + join/邀请游标初始化 + 首发 auto-join 例外) MENTIONS(写时提取+读面双点同步) PARTIAL-UPDATE(既有参与者行一律定点 update，禁整行 save) ATT-PROJ-SNAPSHOT(附件投影是发送时刻快照：直改附件行的 expires_at 不改写历史消息，expired 只在响应时按快照算) ATT-CASCADE(m5：删话题连带软删附件，删除入口的语义反转——成员不再可读)
  *
  * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #17(测试契约) #18(不变量检查) #4(文档优先) #12(文档联动)
  *
+ * [凭证扫描挂点]（v1.94.0-dev，卡 349d337e）**两条**写路径各一处：幂等路径（事务 resolve
+ *   之后）+ `sendMessageInternal`（无幂等路径，也是圆桌座位/系统消息的写口 ⇒ 那些消息同样被扫）。
+ *   replay 分支在 catch 中提前返回 ⇒ 天然不扫；命中只落告警行 + 领域事实，正文不进观测面。
+ *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
- *   UNREAD-CURSOR: 游标只在 markAsRead/digest 推进；v1.69 起「发送即已读」——
- *       修复原症状「自己发的消息算自己未读 + join/邀请后全历史未读」
- *       （2026-08-28 Kimi-Kairos 反馈采纳）：发送即已读（AUTO_JOIN_SQL $3 单调推进，
- *       含旧锚点软删 NOT EXISTS 逃生口，与 markAsRead 防回退语义对齐）+
- *       join/邀请建行游标初始化（re-join 保留原游标=离开期间未读）；
+ *   UNREAD-CURSOR: **游标只经 markAsRead / digest(markRead=true) 推进**（v1.96.0-dev
+ *       未读语义批 D1 **行为变更**，取代 v1.69「发送即已读」）。发送消息不再推进
+ *       发送者游标（ON CONFLICT 分支已整段删除 `last_read_message_id` CASE），
+ *       也不再影响其他参与者——「我发了话」≠「我读完了之前的话」。
+ *       删除是安全的：v1.85 起「自己发的消息算自己未读」已由**谓词**根治
+ *       （buildUnreadMessageQb 的 sender_id 排除 + agent.service 的
+ *       m.sender_id <> tp.participant_id），不再依赖发送时推进游标。
+ *       **INSERT 分支保留 $3（显式例外）**：无参与者行的 actor 向 OPEN 话题首发 =
+ *       auto-join，游标落本条 = 「加入点即已读点」，与 join() 初始化同语义；
+ *       不吞可观测未读（agent 面无 per-topic unread 工具、human 详情页挂载即
+ *       auto-markAsRead 先建行），唯一边缘「只读不 join 直调 getUnread」语义 =
+ *       「从未读过本话题」，e2e 锁为契约。
+ *       悬空锚点自愈窗口从「发送时」移到「读到时」（markAsRead 的 rows 空 →
+ *       允许推进分支），unread-cursor e2e 用例⑤锁死。
+ *       历史（v1.69 症状与修法）：原症状 = 自己发的消息算自己未读 + join/邀请后
+ *       全历史未读（2026-08-28 Kimi-Kairos 反馈采纳）——修法是发送即已读
+ *       （AUTO_JOIN_SQL $3 单调推进，含旧锚点软删 NOT EXISTS 逃生口）+
+ *       join/邀请建行游标初始化（re-join 保留原游标 = 离开期间未读）；
  *       行值比较全部 DB 内完成（E3-fix 精度教训）。**v1.85 收口**：getUnread 的
  *       降级路径（无游标 / 锚点悬空）不再取 topic.messageCount，改真 COUNT 并统一
  *       带 sender 排除（buildUnreadMessageQb 单一谓词构造点）→ count/list/hasMore
  *       同口径，自发消息在任何路径下都不算自己未读。
- *       见 .kimi/plans/unread-cursor-semantics.md。
+ *       见 .kimi/plans/unread-cursor-semantics.md（v1.69 历史设计）。
+ *   MENTIONS: `messages.mentions` 自 v1.96.0-dev 起**写时提取**（D3，发送两条写路径
+ *       各回填一次，fail-open 写 []）并被**两个读面**消费（D4 双点同步，改任一侧必须
+ *       同步另一侧 + unread-cursor / agent-unread 两个真 PG 套件）：
+ *       ① buildUnreadMessageQb 的 `message.mentions @> :meMention::jsonb` 提及分支；
+ *       ② agent.service findMyUnreadCounts 的 LEFT JOIN ON 子句内联谓词。
+ *       键名单源 = shared NOTIFY_KEY_MENTIONS_ONLY（裸 SQL 走常量模板插值）。
+ *       ⚠️ 存量 mentions 全 []（183/183，含 81 条带 @ 的历史消息）——**不回填**，
+ *       历史 @ 在 mentions_only 下永不可见，经 hiddenUnreadCount + 公告披露。
+ *   PARTIAL-UPDATE: **既有参与者行一律定点 `participantRepo.update()`，禁止整行 `save()`**
+ *       （v1.96.0-dev 未读语义批 D9 + 终审 F1，共 9 处：markAsRead / join / leave /
+ *       removeParticipant / inviteAgent / addEditor / removeEditor / uninviteAgent /
+ *       uninviteUser）。根因：`save()` 把**读到的整行**（含 `notification_settings`）
+ *       全列回写——本批引入 notification_settings 的首个写入者（PATCH
+ *       notification-settings）后，「并发 PATCH 开静默」与「一次已读/加入/退出/邀请」
+ *       交错时，后者会把前者刚写的收件偏好**静默翻回旧值**（用户的收件偏好被一次
+ *       无关操作回滚）。修法：只把**本次语义真正改动的列**放进 update 载荷。
+ *       ⚠️ 逐处列清单见各方法内注释；新增/修改既有行写路径时**必须**照此办理，
+ *       并配 `expectPointUpdate`（载荷键集合精确 + 不含 notificationSettings + save 零调用）
+ *       与 topic.service.spec.ts 的 F1 汇总白名单锁（新增列 = 显式评审事件）。
+ *       insert 分支不受影响（新实体无并发回写面）。DB 侧
+ *       `trg_topics_participant_count` 是 `AFTER ... UPDATE OF status` 且按 OLD/NEW
+ *       差值算——SET 含 status 的站点触发行为与 save 同效；仅改 role 的站点
+ *       （addEditor/removeEditor）不触发，但该触发器本就有 `OLD.status != NEW.status`
+ *       守卫 ⇒ 净效果一致（终审逐处核对过，无依赖 save 副作用的站点）。
+ *       另：join() 的游标只在**原本为 null**时才进 SET——否则会把并发 markAsRead 的
+ *       推进回滚（同类的 read-modify-write 面）。
  *   A2.5: 写入口（inviteAgent/addEditor/create/update 的 invitedAgentIds）统一走
  *       ActorProfileService.assertActorUsable（存在+未软删两态，404 AGENT_NOT_FOUND）。
  *       ⚠️ R11: update 的 invitedAgentIds 是完整替换语义，一刀切校验会让「存量含已删
@@ -106,6 +149,7 @@ import {
   BadRequestException,
   ForbiddenException,
   ConflictException,
+  Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, In } from 'typeorm';
@@ -133,10 +177,15 @@ import {
   UserRole,
   TopicKind,
   WakePolicy,
+  SYSTEM_ACTOR_ID,
+  NOTIFY_KEY_MENTIONS_ONLY,
 } from '@agent-chamber/shared';
 import type { TopicDetail, MessageAttachment } from '@agent-chamber/shared';
 import { buildContentUrl, buildThumbnailUrl } from '../attachments/dto/attachment-response.dto';
 import { isAttachmentExpired } from '../attachments/attachment.constants';
+// mention 三纯函数（R5 圆桌规则，无副作用无依赖）：@label 提取在话题写路径**复用**
+// 圆桌同一套 token 级边界规则——两处各写一份正则必然漂移（D3）
+import { stripMentionNoise, findMentionedLabels, hasAllMention } from '../roundtable/mention';
 import {
   CreateTopicDto,
   UpdateTopicDto,
@@ -145,6 +194,7 @@ import {
   MarkAsReadDto,
   GetMessagesQueryDto,
   UnreadQueryDto,
+  UpdateNotificationSettingsDto,
 } from './dto';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
@@ -154,6 +204,14 @@ import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import { AuditService } from '../audit/audit.service';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
+// hint 事实袋（阶段二「该提名了」提示的**输入**）：service 只写领域语言的事实。
+// ⚠️ 必须 import 平台单例（禁本地 new 一份 ALS——provider 读到的袋会恒为空、提示静默消失）；
+// 无请求袋（定时任务 / 脚本 / 圆桌内部调用）时 emitFact 是 no-op（fail-open）
+import { emitFact } from '../hints/hint-facts';
+// 凭证粘贴扫描（v1.94.0-dev，卡 349d337e）：topic 消息的**两个**写口各一处
+// （幂等路径 + 无幂等路径 sendMessageInternal——两条路径的收件人可能不同，故都要扫；
+// 幂等 replay 分支在 catch 中提前返回，天然不扫）
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
 import { AuditAction } from '@agent-chamber/shared';
 
 /**
@@ -176,16 +234,33 @@ import { AuditAction } from '@agent-chamber/shared';
  * 的读-改-写竞态）。事件一致性：本路径只发 NEW_MESSAGE，不新增
  * AGENT_JOINED 事件（隐式激活不广播加入事件，与历史行为一致）。
  *
- * 发送即已读（v1.69 未读游标语义修正，Kimi-Kairos 反馈采纳）：$3 = 本次
- * 新消息 id，发送者自己的 last_read_message_id 随发送单调推进——
- * 自己发的消息不再计入自己未读（IM 通用语义）。INSERT 分支（首发消息的
- * 新参与者）游标直接落 $3，无历史洪水。ON CONFLICT 四分支 CASE：
- * ① 游标 NULL → 推进；② 旧锚点消息已软删（NOT EXISTS 逃生口，与
- * markAsRead「rows 为空 → 允许推进」语义对齐，否则行值比较得 NULL 落入
- * ELSE，悬空游标永不自愈 = 永久全量未读）→ 推进；③ DB 内行值比较
- * (created_at, id) 严格更新 → 推进（沿用 markAsRead 精度教训：禁止
- * JS Date 比较，微秒精度只在 DB 内可靠）；④ ELSE 保留旧值（防同一
- * 发送者并发两条消息时游标回退）。仅推进发送者本人行，不影响其他参与者。
+ * ── 未读游标语义（v1.96.0-dev 未读语义批 D1 **行为变更**，取代 v1.69「发送即已读」）──
+ *
+ * **ON CONFLICT 分支不再触碰 `last_read_message_id`**（SET 列表里没有该列，
+ * 因而没有 NULL 歧义，也不需要 ELSE 兜底）。语义定型：
+ * **游标只经 markAsRead / digest(markRead=true) 推进**；发送消息既不推进自己的、
+ * 更不影响其他参与者——"我发了话"不等于"我读完了别人之前说的话"。
+ *
+ * 为什么 v1.69 的「发送即已读」可以整段删除（冗余性论证，评审核实）：
+ * v1.85 起自发消息已由谓词排除根治（topic.service `buildUnreadMessageQb` 的
+ * `sender_id <> :actorId` + agent.service `findMyUnreadCounts` 的
+ * `m.sender_id <> tp.participant_id`），"自己发的消息算自己未读"这一原始症状
+ * 已由**谓词**兜住，不再依赖发送时推进游标。
+ *
+ * **INSERT 分支保留 $3（显式例外，不是遗漏）**：无参与者行的 actor 向 OPEN
+ * 话题首发 = auto-join，此时游标落本条消息 = 「加入点即已读点」，与 `join()`
+ * 的游标初始化（`findLatestMessageId`）**同语义**——未读 = 加入之后的增量，
+ * 不把加入前的历史洪水倒给新参与者。该例外**不吞可观测未读**（架构复核加固）：
+ *   ① agent 面无观测点——agent.json 白名单无 per-topic unread 工具，
+ *      `findMyUnreadCounts` 以 participant 行为起点（无行 = 不出现）；
+ *   ② human 面不可达——话题详情页挂载即 auto-markAsRead 先建行
+ *      （web `topics/[id]/page.tsx` 的挂载副作用）。
+ * 唯一边缘：只读不 join 的 agent 对 OPEN 话题直调 getUnread 见全量 → 首发后归零；
+ * 其语义 = 「你从未读过本话题」，与 join 一致，e2e 锁为契约。
+ *
+ * 悬空锚点自愈：游标锚定的消息被软删后，**发送不再自愈**（本批行为变更）——
+ * 降级为全量未读（谓词口径），由 markAsRead 的「rows 空 → 允许推进」分支
+ * 在读到时自愈。自愈窗口从「发送时」移到「读到时」，unread-cursor e2e 用例⑤锁死。
  */
 const AUTO_JOIN_PARTICIPANT_SQL = `
   INSERT INTO topic_participants (topic_id, participant_id, role, status, joined_at, last_read_message_id)
@@ -194,17 +269,7 @@ const AUTO_JOIN_PARTICIPANT_SQL = `
     status = CASE WHEN topic_participants.status IN ('invited', 'left')
                   THEN 'active' ELSE topic_participants.status END,
     joined_at = CASE WHEN topic_participants.status IN ('invited', 'left')
-                     THEN now() ELSE topic_participants.joined_at END,
-    last_read_message_id = CASE
-      WHEN topic_participants.last_read_message_id IS NULL THEN $3
-      WHEN NOT EXISTS (SELECT 1 FROM messages o
-                       WHERE o.id = topic_participants.last_read_message_id
-                         AND o.deleted_at IS NULL) THEN $3
-      WHEN (SELECT (n.created_at, n.id) FROM messages n WHERE n.id = $3)
-         > (SELECT (o.created_at, o.id) FROM messages o
-            WHERE o.id = topic_participants.last_read_message_id) THEN $3
-      ELSE topic_participants.last_read_message_id
-    END
+                     THEN now() ELSE topic_participants.joined_at END
 `;
 
 /**
@@ -239,6 +304,19 @@ const TOPIC_STATUS_TRANSITIONS: Record<TopicStatus, readonly TopicStatus[]> = {
 
 @Injectable()
 export class TopicService {
+  /**
+   * fail-open 降级日志出口（v1.96.0-dev 未读语义批）。
+   *
+   * 为什么是**类字段**而不是构造函数参数：TopicService 的 16 参签名被三个真 PG e2e
+   * 套件手工 new（unread-cursor / agent-unread / deleted-actor-projection），
+   * 增删构造参数会直接打断那些套件（同 agent.service.ts 的关键不变量）。字段初始化
+   * 不改变签名，故安全。
+   *
+   * 用途：发送响应附带的 unreadCount / mentions 计算失败时的 warn/error 记录——
+   * 附带统计失败不得让发送失败，但必须留下可观测痕迹（否则"省略键"与"没算"无从区分）。
+   */
+  private readonly logger = new Logger(TopicService.name);
+
   constructor(
     @InjectRepository(Topic)
     private topicRepo: Repository<Topic>,
@@ -459,7 +537,7 @@ export class TopicService {
     // 圆桌唤醒策略 effective 值（仅 kind='roundtable' 时输出，normal topic 缺省）：
     // settings.wakePolicy 显式值优先，缺省 → 'mention'。与 roundtable.service
     // resolveWakePolicy 同规（真相源，其还处理 normal→broadcast 兜底，本字段只服务
-    // web 圆桌 UI 提示，故 normal 不输出）——设计 docs/roundtable-design.md §6。
+    // web 圆桌 UI 提示，故 normal 不输出）——设计 docs/modules/roundtable-design.md §6。
     const settings = topic.settings as Record<string, unknown> | null | undefined;
     const wakePolicy = topic.kind === TopicKind.ROUNDTABLE ? settings?.wakePolicy : undefined;
     const effectiveWakePolicy =
@@ -511,7 +589,7 @@ export class TopicService {
       visibility,
       ...restConfig,
     };
-    // 圆桌唤醒策略缺省 'mention'（设计 docs/roundtable-design.md §6 默认：仅 @唤醒，
+    // 圆桌唤醒策略缺省 'mention'（设计 docs/modules/roundtable-design.md §6 默认：仅 @唤醒，
     // 新桌默认省钱安全）；普通桌 wakePolicy 原样透传（零感知，无路由逻辑消费该值）
     if (kind === TopicKind.ROUNDTABLE && settings.wakePolicy === undefined) {
       settings.wakePolicy = WakePolicy.MENTION;
@@ -888,6 +966,7 @@ export class TopicService {
     let tp = await this.participantRepo.findOne({
       where: { topicId, participantId },
     });
+    const isExistingRow = tp != null;
 
     if (tp) {
       // 激活已存在行（invited→active / left→re-join）：刷新 joinedAt 为本次激活时间。
@@ -911,10 +990,32 @@ export class TopicService {
     // （全新行 / legacy invited·left 行）→ 初始化为当前最新消息，未读只反映
     // "加入之后"的增量，历史考古走消息分页/搜索；游标非 null（re-join 或
     // invite 时已初始化）→ 保留——离开/受邀期间的消息仍是未读，信号语义正确。
-    if (tp.lastReadMessageId == null) {
+    const cursorInitialized = tp.lastReadMessageId == null;
+    if (cursorInitialized) {
       tp.lastReadMessageId = await this.findLatestMessageId(topicId);
     }
-    await this.participantRepo.save(tp);
+
+    if (isExistingRow) {
+      // ── 既有行：定点 UPDATE，只写本次激活真正改动的列 ──（F1，与 D9 同款修法）
+      // 为什么：整行 save() 会把**读到的整行**（含 notification_settings）全列回写，
+      // 并发 PATCH notification-settings 刚写的收件偏好会被一次 join 静默翻回。
+      // 本次激活语义上只改 3 列（status/leftAt/joinedAt）+ **仅在游标原本为 null 时**
+      // 初始化游标（`cursorInitialized` 为 false 时**不把读到的旧游标写回去**——否则
+      // 并发的 markAsRead 推进会被这次 join 回滚；这是与 notification_settings 同类的
+      // read-modify-write 面）。role 不动（invited/left 行激活不改角色，与 v1.40 一致）。
+      await this.participantRepo.update(
+        { topicId, participantId },
+        {
+          status: ParticipantStatus.ACTIVE,
+          leftAt: null,
+          joinedAt: tp.joinedAt,
+          ...(cursorInitialized ? { lastReadMessageId: tp.lastReadMessageId } : {}),
+        },
+      );
+    } else {
+      // 新行 insert 分支：整行写入（新实体，无并发回写面）
+      await this.participantRepo.save(tp);
+    }
 
     await this.eventService.create({
       eventType: EventType.AGENT_JOINED,
@@ -1007,9 +1108,17 @@ export class TopicService {
     if (!tp)
       throw new ForbiddenException({ message: 'Not in topic', code: ErrorCode.AGENT_NOT_IN_TOPIC });
 
-    tp.status = ParticipantStatus.LEFT;
-    tp.leftAt = new Date();
-    await this.participantRepo.save(tp);
+    // ── 定点 UPDATE：只写本次离开改动的两列 ──（F1，与 D9 同款修法）
+    // 整行 save() 会把读到的整行（含 notification_settings）全列回写——并发
+    // PATCH notification-settings 刚写的收件偏好会被一次 leave 静默翻回。
+    // 离开语义只改 status + leftAt；role/joinedAt/游标一律不动（游标保留 =
+    // 离开期间的消息仍计未读，v1.69 D2 语义）。DB 侧 trg_topics_participant_count
+    // 是 `UPDATE OF status` 触发且按 OLD/NEW 差值算，SET 含 status ⇒ 与 save 同效。
+    const leftAt = new Date();
+    await this.participantRepo.update(
+      { topicId, participantId },
+      { status: ParticipantStatus.LEFT, leftAt },
+    );
 
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
@@ -1018,10 +1127,10 @@ export class TopicService {
       topicId: topicId ?? undefined,
       actorId: participantId,
       actorType: participantType,
-      payload: { participantId, leftAt: tp.leftAt },
+      payload: { participantId, leftAt },
     });
 
-    return { topicId, participantId, leftAt: tp.leftAt };
+    return { topicId, participantId, leftAt };
   }
 
   async removeParticipant(topicId: string, actorId: string, participantId: string) {
@@ -1045,9 +1154,13 @@ export class TopicService {
         code: ErrorCode.AGENT_NOT_IN_TOPIC,
       });
 
-    tp.status = ParticipantStatus.LEFT;
-    tp.leftAt = new Date();
-    await this.participantRepo.save(tp);
+    // ── 定点 UPDATE：只写 status + leftAt ──（F1，与 D9 同款修法；理由同 leave()：
+    // 整行 save 会回写 notification_settings 等未改动列）
+    const leftAt = new Date();
+    await this.participantRepo.update(
+      { topicId, participantId },
+      { status: ParticipantStatus.LEFT, leftAt },
+    );
 
     const participantType = await this.resolveActorTypes([participantId]).then(
       (map) => map.get(participantId) ?? ActorType.HUMAN,
@@ -1060,7 +1173,7 @@ export class TopicService {
       topicId: topicId ?? undefined,
       actorId: participantId,
       actorType: participantType,
-      payload: { participantId, removedBy: actorId, leftAt: tp.leftAt },
+      payload: { participantId, removedBy: actorId, leftAt },
     });
 
     // 审计（Phase 2）：DELETE + topic_participant（kick）；actor=操作者（actorId 参数，
@@ -1074,7 +1187,7 @@ export class TopicService {
       source: 'api',
     });
 
-    return { topicId, participantId, leftAt: tp.leftAt };
+    return { topicId, participantId, leftAt };
   }
 
   async getMessages(topicId: string, query: GetMessagesQueryDto) {
@@ -1245,6 +1358,118 @@ export class TopicService {
   }
 
   /**
+   * 提取本条消息的提及列表（D3 写时提取，v1.96.0-dev 未读语义批）。
+   *
+   * 契约（**两个不同的失败语义，勿混**）：
+   * - **成功**：恒返**数组**（无提及 → `[]`，绝不 null——`messages.mentions` 是 jsonb
+   *   NOT NULL，写 null 会 23502）；元素一律**小写** actor id，外加广播令牌 `"*"`。
+   *   小写是双读面稳定性的必要条件：PG `::text` 恒小写而 JS 侧源头来自 DB，写入侧再
+   *   `toLowerCase()` 一次，两读面（buildUnreadMessageQb / findMyUnreadCounts）永不漂移。
+   * - **失败**：本方法**抛出**（不吞、不返回 `[]`）——由**调用方** fail-open 处理：
+   *   `sendMessage` 用 try/catch 包住本调用，失败时 `mentions` 保持 `undefined`
+   *   ⇒ 该列不进 save（DB default `[]` 兜底）+ 响应**省略 `mentions` 键** + error 日志。
+   *   ⚠️ 「省略键」≠「无提及」：无提及是 `[]`，省略是"没算出来"——调用方不得把两者当同一件事
+   *   （这也是本方法不返回 `[]` 兜底的原因：吞掉异常会让"提取失败"伪装成"真的没有提及"）。
+   *
+   * 规则（全谱，逐条对应 plan D3）：
+   * 1. `stripMentionNoise(content)` 剥噪——fenced code / inline code / blockquote 里的
+   *    `@` 不算提及（复用圆桌 R5 同款纯函数，禁止另写正则）；
+   * 2. 候选 = **全部**参与者行（含 invited / left，不只 active）过滤 system 哨兵——
+   *    受邀/离开期间被 @ 必须被记录：left 行 re-join 后该消息才在其未读中生效
+   *    （未读只统计 invited/active 行），漏记 = re-join 后信号永久丢失；
+   * 3. `findMentionedLabels` 在候选**显示名**上做 token 级精确匹配，命中后经
+   *    **name→ids 多值映射**展开（禁 `Map<name, id>`：显示名不唯一是合法数据，
+   *    后者覆盖前者 = 静默漏提）；
+   * 4. `hasAllMention` → 追加 `"*"`（PG `mentions @> '"*"'::jsonb` 命中数组含标量特例）；
+   * 5. **replyTo 闭环**：父消息存在且其 sender 是「本发送者 / system 哨兵 / 无参与者行」
+   *    之外的有效参与者 → 追加（回复某人 = 提及该人，收件人不因正文没写 @ 而漏收）；
+   * 6. 去重（Set）。
+   *
+   * 为什么多一个 `senderId`（plan 的签名简写为 `(topicId, content, replyToId)`）：
+   * 规则 5 必须能判定「父 sender = 本发送者 → 跳过」（自己 @ 自己没有意义，且自发消息
+   * 永不计入自己未读），不传发送者就无法实现该规则。语义与 plan 一致，只是把隐含参数
+   * 显式化。
+   *
+   * 成本：每次发送 +3 查询（参与者行 / profiles / replyTo 时 +1 父消息读）。
+   * **调用方必须 fail-open**（见上「失败」条：catch → 不写该列 + 省略 mentions 键 + error 日志）。
+   *
+   * @param topicId  话题 ID（参与者候选的取数范围）
+   * @param senderId 本发送者 actor id（用于 replyTo 自我提及短路）
+   * @param content  消息正文（自然 markdown）
+   * @param replyToId 回复的父消息 id（无回复传 null）
+   * @returns 成功时：小写 actor id 数组 + 可能的 `"*"`（无提及 → `[]`）；
+   *   失败时**抛出**（由调用方 fail-open，本方法不返回 `[]` 兜底）
+   * @throws 取候选行 / 解析 profile 的查询失败（不吞异常）
+   */
+  private async resolveMentionIds(
+    topicId: string,
+    senderId: string,
+    content: string,
+    replyToId: string | null,
+  ): Promise<string[]> {
+    // 1. 剥噪
+    const text = stripMentionNoise(content ?? '');
+
+    // 2. 候选参与者（全状态，过滤 system 哨兵——哨兵不可 @）
+    const rows = await this.participantRepo.find({
+      where: { topicId },
+      select: ['participantId'],
+    });
+    const candidateIds = [...new Set(rows.map((r) => r.participantId))].filter(
+      (id) => id !== SYSTEM_ACTOR_ID,
+    );
+
+    // 3. 显示名解析（R1 收口：一律经 ActorProfileService，禁止自建 actors 查询）
+    const profiles = candidateIds.length
+      ? await this.resolveActorProfiles(candidateIds)
+      : new Map<string, ActorProfile>();
+
+    // name → ids **多值**映射（同名参与者合法存在，单值映射会漏提）
+    const idsByName = new Map<string, string[]>();
+    for (const [id, profile] of profiles) {
+      const name = profile.name;
+      if (!name) continue; // 兜底名/空名不可寻址
+      const bucket = idsByName.get(name);
+      if (bucket) bucket.push(id);
+      else idsByName.set(name, [id]);
+    }
+
+    const mentions = new Set<string>();
+    for (const label of findMentionedLabels(text, [...idsByName.keys()])) {
+      for (const id of idsByName.get(label) ?? []) {
+        mentions.add(id.toLowerCase());
+      }
+    }
+
+    // 4. 广播令牌 @all → "*"
+    // 注记：若某参与者显示名恰为 "all"，@all 会同时命中其 id 与 "*"——与圆桌
+    // 「@all 永远按广播语义处理、无法单独寻址」同规，不阻断。
+    if (hasAllMention(text)) mentions.add('*');
+
+    // 5. replyTo 闭环
+    if (replyToId) {
+      const parent = await this.messageRepo.findOne({
+        where: { id: replyToId },
+        select: ['id', 'senderId'],
+      });
+      // 父消息已软删 → findOne 默认滤软删 → parent=null → 自然跳过
+      // （@DeleteDateColumn 的默认过滤即守卫，不手写 deleted_at 条件）
+      const parentSender = parent?.senderId;
+      if (
+        parentSender &&
+        parentSender !== senderId && // 自己回复自己不算提及（自发永不计入自己未读）
+        parentSender !== SYSTEM_ACTOR_ID && // 系统消息不可 @
+        candidateIds.includes(parentSender) // 父 sender 必须仍是本话题参与者
+      ) {
+        mentions.add(parentSender.toLowerCase());
+      }
+    }
+
+    // 6. 去重（Set 天然去重，转数组返回）
+    return [...mentions];
+  }
+
+  /**
    * 发送消息
    *
    * @param topicId 话题 ID
@@ -1371,9 +1596,24 @@ export class TopicService {
       delete messageDto.metadata.attachments;
     }
 
+    // --- 3.5 提及提取（D3，写时提取；两条写路径共用本结果）---
+    // 为什么在**事务外**提取（幂等路径）：提取是纯读 + 可能失败，放进事务会拖长事务
+    // 且在失败时回滚整条消息——提及是**附带事实**，不得让发送失败。fail-open 语义：
+    // 失败 → `mentions` 保持 undefined → save 时该列不出现（DB default `[]` 兜底，
+    // 绝不写 null——jsonb NOT NULL 会 23502）→ 响应省略 mentions 键 + error 日志。
+    let mentions: string[] | undefined;
+    try {
+      mentions = await this.resolveMentionIds(topicId, senderId, dto.content, dto.replyTo ?? null);
+    } catch (err) {
+      this.logger.error(
+        `mention extraction failed (fail-open, message still sent): topicId=${topicId} ` +
+          `senderId=${senderId} err=${(err as Error).message}`,
+      );
+    }
+
     // ── 无幂等键：走原路径（零开销） ──
     if (!clientRequestId) {
-      return this.sendMessageInternal(topicId, senderId, actorType, topic, messageDto);
+      return this.sendMessageInternal(topicId, senderId, actorType, topic, messageDto, mentions);
     }
 
     // ── 有幂等键：事务保护 ──
@@ -1388,6 +1628,8 @@ export class TopicService {
           content: messageDto.content,
           replyToId: messageDto.replyTo || null,
           metadata: messageDto.metadata || {},
+          // 提及（D3）：事务外已提取；undefined 时不设该列 → DB default [] 兜底
+          ...(mentions !== undefined ? { mentions } : {}),
         });
         const savedMsg = await msgRepo.save(message);
 
@@ -1401,13 +1643,27 @@ export class TopicService {
 
         // 自动 join（事务内，原子条件 upsert 防 PK 冲突 23505；
         // 不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释）
-        // $3=savedMsg.id：发送即已读，发送者游标推进到本条消息（同事务内可见）
+        // $3=savedMsg.id 只作用于 INSERT 分支（首发 auto-join 的「加入点即已读点」）；
+        // ON CONFLICT 分支不再推进游标（D1：游标只经 markAsRead/digest 推进）
         await manager.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId, savedMsg.id]);
 
         // topic 统计（message_count / last_message_at）由 DB trigger
         // trg_topics_message_stats 维护，应用层不写，避免双写。
 
         return { saved: savedMsg };
+      });
+
+      // 领域事实（hint 阶段二）：**幂等事务 resolve 之后**才写——事务内写会在回滚时留下
+      // 假事实；而下面的 replay 分支（catch 中 23505）**绝不 emit**（那不是一次真实写入，
+      // 重放若也发提示 = 同一动作被提示两次）
+      emitFact('topic.message_sent', { topicId, messageId: saved.id });
+
+      // 凭证扫描（v1.94.0-dev）：与上面的事实**同门控**（事务 resolve 之后）——幂等 replay
+      // 走 catch 分支提前返回，走不到这里（同一份消息不会被重复计入告警与提示分母）
+      emitCredentialScanFactIfHit(messageDto.content, {
+        resourceKind: 'topic_message',
+        resourceId: topicId,
+        actorId: senderId,
       });
 
       // 审计（Phase 2）：幂等键路径的真实写成功后记（replay 分支不记——决策 2
@@ -1440,8 +1696,8 @@ export class TopicService {
         payload: { messageId: saved.id, type: saved.type },
       });
 
-      // 查询 sender 信息并构建一致响应
-      return await this.buildMessageResponse(saved, senderId, actorType);
+      // 查询 sender 信息并构建一致响应（mentions = 本次写时提取结果）
+      return await this.buildMessageResponse(saved, senderId, actorType, mentions);
     } catch (err: unknown) {
       const pgErr = err as { code?: string; constraint?: string };
       if (pgErr.code === '23505' && pgErr.constraint === 'uq_idempotency_actor_key') {
@@ -1463,9 +1719,17 @@ export class TopicService {
           });
         }
 
-        // 构建与正常路径一致的响应形状
+        // 构建与正常路径一致的响应形状。
+        // mentions 取**已落库**的列（NOT NULL 恒数组）——重放回放的是首次写入时持久化的
+        // 提取结果（无法回溯"当时提取是否失败"，见 buildMessageResponse 的边界注记）；
+        // unreadCount 由 buildMessageResponse 现算（响应时刻快照，重放不写库故无变化）。
         return {
-          ...(await this.buildMessageResponse(existingMsg, senderId, actorType)),
+          ...(await this.buildMessageResponse(
+            existingMsg,
+            senderId,
+            actorType,
+            Array.isArray(existingMsg.mentions) ? existingMsg.mentions : [],
+          )),
           idempotentReplay: true,
         };
       }
@@ -1559,6 +1823,9 @@ export class TopicService {
 
   /**
    * sendMessage 无幂等键时的原路径（提取为独立方法，避免 sendMessage 过于臃肿）。
+   *
+   * @param mentions D3 写时提取的提及列表；undefined = 提取失败（fail-open，不设该列，
+   *   DB default `[]` 兜底——绝不写 null，jsonb NOT NULL 会 23502）
    */
   private async sendMessageInternal(
     topicId: string,
@@ -1566,6 +1833,7 @@ export class TopicService {
     actorType: ActorType,
     topic: Topic,
     dto: Omit<SendMessageDto, 'clientRequestId'>,
+    mentions?: string[],
   ) {
     // --- 3. 保存消息（支持显式 type） ---
     const message = this.messageRepo.create({
@@ -1576,9 +1844,22 @@ export class TopicService {
       content: dto.content,
       replyToId: dto.replyTo || null,
       metadata: dto.metadata || {},
+      ...(mentions !== undefined ? { mentions } : {}),
     });
     const savedRaw = await this.messageRepo.save(message);
     const saved = Array.isArray(savedRaw) ? savedRaw[0] : savedRaw;
+
+    // 领域事实（hint 阶段二「该提名了」提示的输入）：本条路径**无事务**——save 成功即
+    // 真实写入，故紧随其后 emit；只带 ID（正文由 provider 回库读，避免正文经事实袋外流）
+    emitFact('topic.message_sent', { topicId, messageId: saved.id });
+
+    // 凭证扫描（v1.94.0-dev）：本条路径**无事务**——save 成功即真实写入，紧随其后扫；
+    // 本方法也是圆桌座位/系统消息的写口，故那些消息同样被扫（它们是真实写入的正文）
+    emitCredentialScanFactIfHit(dto.content, {
+      resourceKind: 'topic_message',
+      resourceId: topicId,
+      actorId: senderId,
+    });
 
     // 审计（Phase 2）：CREATE + message；service 层（本方法是全仓唯一
     // messageRepo.create 点，roundtable 经它写座位/系统消息——controller 层会漏掉
@@ -1595,7 +1876,8 @@ export class TopicService {
 
     // --- 4. 自动 join（原子条件 upsert 防并发 PK 冲突 23505；
     //         不覆盖 role/joinedAt——见 AUTO_JOIN_PARTICIPANT_SQL 注释） ---
-    // $3=saved.id：发送即已读，发送者游标推进到本条消息
+    // $3=saved.id 只作用于 INSERT 分支（首发 auto-join 的「加入点即已读点」）；
+    // ON CONFLICT 分支不再推进游标（D1 行为变更：发送不冲未读）
     await this.participantRepo.query(AUTO_JOIN_PARTICIPANT_SQL, [topicId, senderId, saved.id]);
 
     // --- 5. topic 统计由 DB trigger trg_topics_message_stats 维护，应用层不写 ---
@@ -1620,8 +1902,8 @@ export class TopicService {
       payload: { messageId: saved.id, type: saved.type },
     });
 
-    // --- 6. 查询 sender 信息并构建一致响应 ---
-    return this.buildMessageResponse(saved, senderId, actorType);
+    // --- 6. 查询 sender 信息并构建一致响应（mentions = 本次写时提取结果，undefined 则省略键） ---
+    return this.buildMessageResponse(saved, senderId, actorType, mentions);
   }
 
   /**
@@ -1692,8 +1974,26 @@ export class TopicService {
    * 正常路径与幂等 replay 路径共用，保证响应契约一致。
    * 统一批 A2：sender 解析改走公共 ActorProfileService（withDeleted 查询覆盖软删 actor，
    * 顺带修复软删 agent 因 eager join 过滤而 senderAvatar 恒 null 的既有缺陷——R7 行为变更）。
+   *
+   * v1.96.0-dev 未读语义批 D2：本方法同时是**发送响应附带字段的唯一组装点**——
+   * `unreadCount` 与 `mentions` 都在这里条件展开，三条返回路径（无幂等 / 幂等 / replay）
+   * 天然同形状，不靠调用方各自拼装（那样必然漂移）。
+   *
+   * @param msg      已落库的消息实体（replay 路径传回放的既有行）
+   * @param senderId 发送者 actor id（unreadCount 的"我"）
+   * @param actorType 发送者类型（senderName 兜底分支用）
+   * @param mentions D3 提取结果：**undefined = 提取失败 → 省略 mentions 键**（fail-open）。
+   *   replay 路径由调用方传已落库的 `msg.mentions` 列（列是 NOT NULL，恒为数组）——
+   *   即"重放回放的是首次写入时**持久化**的提取结果"。已知边界（如实声明）：首次写入时
+   *   提取失败的行，其列是 DB 默认 `[]`，重放会回显 `[]`，与"真的无提及"无法区分——
+   *   本批不引入标记列（无 migration），该边界由列语义本身决定。
    */
-  private async buildMessageResponse(msg: Message, senderId: string, actorType: ActorType) {
+  private async buildMessageResponse(
+    msg: Message,
+    senderId: string,
+    actorType: ActorType,
+    mentions?: string[],
+  ) {
     const profile = (await this.actorProfileService.resolveProfiles([senderId])).get(senderId);
     // 真孤儿（actors 表无行）兜底：按 actorType 归位（契约：'Unknown' 仅留真孤儿）
     const senderName =
@@ -1701,13 +2001,30 @@ export class TopicService {
     const senderAvatar = profile?.avatarUrl ?? null;
 
     // 圆桌座位标签：仅透传 metadata.seatLabel 单键（座位子身份展示语义，
-    // 设计 docs/roundtable-design.md §6/§7），不透全量 metadata——隐私/体积。
+    // 设计 docs/modules/roundtable-design.md §6/§7），不透全量 metadata——隐私/体积。
     // 无该键时字段缺省：条件展开让响应对象字面缺键，JSON 序列化不出 null。
     const seatLabel = msg.metadata?.seatLabel;
     // 圆桌主脑标记（M3 阶段 3，r13）：仅透传 metadata.seatCoordinator 单键
     // （仅主脑座位落库时写入 true，缺省不写——载荷瘦，普通座位/人类/系统响应
     // 字面缺键），web 消息流据此渲染主脑 badge（§3 from.coordinator 同源语义）
     const seatCoordinator = msg.metadata?.seatCoordinator === true;
+
+    // ── D2：发送者本话题未读快照（fail-open，失败省略键 + warn）──
+    // 口径与 GET /topics/:id/messages/unread 完全同源（共用 resolveUnreadContext +
+    // countUnreadMessages）——「发送响应里的 unreadCount」与「随后 GET unread」必须一致，
+    // 否则调用方会看到自己刚被告诉的数字当场变化。
+    // 时序前提：本方法在游标 upsert **之后**才被调用（三条路径都是），故读到的是
+    // 发送生效后的真实快照。首次发言 auto-join（INSERT 分支游标落本条）自然得 0。
+    let unreadCount: number | undefined;
+    try {
+      const { anchorId, mentionsOnly } = await this.resolveUnreadContext(msg.topicId, senderId);
+      unreadCount = await this.countUnreadMessages(msg.topicId, anchorId, senderId, mentionsOnly);
+    } catch (err) {
+      this.logger.warn(
+        `send response unreadCount computation failed (fail-open, key omitted): ` +
+          `topicId=${msg.topicId} senderId=${senderId} err=${(err as Error).message}`,
+      );
+    }
 
     return {
       id: msg.id,
@@ -1724,6 +2041,10 @@ export class TopicService {
       createdAt: msg.createdAt,
       // 附件投影恒存在（P1，与 mapToMessageDtos 同规）
       attachments: this.projectAttachments(msg.metadata),
+      // D3 提及：条件展开——省略 = 提取失败（**不是**"无提及"，无提及是 `[]`）
+      ...(mentions !== undefined ? { mentions } : {}),
+      // D2 未读数：条件展开——省略 = 计算失败（**不是** 0，也不是"无未读"）
+      ...(unreadCount !== undefined ? { unreadCount } : {}),
     };
   }
 
@@ -1733,13 +2054,21 @@ export class TopicService {
    * 消息全序 = (created_at, id) ASC（plan §2.1 tie-break 契约）。
    *
    * 未读判据（v1.85 收口）：**自己发的消息不算自己未读**（sender_id <> actorId）。
-   * 主路径由「发送即已读」游标（v1.69：sendMessage 事务内单调推进发送者游标）天然排除；
-   * 本方法在 count / list / hasMore 三口径上再显式带上 sender 排除，覆盖游标缺失
-   * （无 participant 行 / lastReadMessageId 为空）与锚点悬空（游标消息被软删）两条
-   * **降级路径**——否则降级会把自发消息误算成未读（旧实现直接取 topic.messageCount）。
+   * 主路径由游标天然排除；本方法在 count / list / hasMore 三口径上再显式带上 sender
+   * 排除，覆盖游标缺失（无 participant 行 / lastReadMessageId 为空）与锚点悬空
+   * （游标消息被软删）两条**降级路径**——否则降级会把自发消息误算成未读。
    * - 无游标 → 全量未读 = 该 topic 未删且非自发的消息数，messages 从话题开头取前 limit 条；
    * - 否则返回 lastReadMessageId 之后的新消息数量（全序 after 语义），
    *   以及按全序 ASC 的前 limit 条未读消息。
+   *
+   * **提及过滤模式（D4，v1.96.0-dev）**：调用方在 `topic_participants.notification_settings`
+   * 开启 `mentions_only` 时，计数与列表只保留**提及我**（或 `@all`）的消息。响应恒带
+   * `mentionsOnly` 回显本响应采用的口径。
+   *
+   * ⚠️ **模式与锚点正交**（D4 硬约束）：只有「无参与者行」才取 `false`（没有设置可读）；
+   * **锚点悬空降级分支沿用该行设置**（participant 行存在、设置可读）。若悬空时改用
+   * `false`，本读面与 agent.service `findMyUnreadCounts`（无条件读该行设置）会在悬空态
+   * 分岔——那是本批必须禁止引入的新缺陷。
    *
    * @param query.limit 返回消息条数 1~50，默认 20；不影响 unreadCount
    * @param actorId 当前 actor；省略时仅返回话题消息总量，不参与未读语义（见下方分支注释）
@@ -1757,19 +2086,88 @@ export class TopicService {
     // 没有 actor 上下文就无从定义「谁的未读」，故回退话题消息总量（含自发、含语义上的
     // 全量口径），**不参与未读语义**。生产不可达：controller 恒传 actor.id；
     // 该分支只服务直调 service 的场景（如内部统计），行为与 v1.85 前逐字一致。
+    // mentionsOnly 恒带（false = 无 actor 即无设置可读），保持响应形状对调用方稳定。
     if (!actorId) {
-      return { topicId, unreadCount: topic.messageCount, messages: [], hasMore: false };
+      return {
+        topicId,
+        unreadCount: topic.messageCount,
+        messages: [],
+        hasMore: false,
+        mentionsOnly: false,
+      };
     }
 
+    // 游标 + 提及模式一次解析（与 sendMessage 的 D2 unreadCount 共用同一口径，
+    // 禁止在此内联第二份「participant → anchor → mode」逻辑）
+    const { anchorId, mentionsOnly } = await this.resolveUnreadContext(topicId, actorId);
+
+    // ── 无有效锚点（从未读过 / 无 participant 行 / 锚点悬空）→ 全量未读，messages 从头给 ──
+    // 三个子场景同谓词（仅 anchor 为 null），故合并为一个分支；差异只在是否回带
+    // lastReadMessageId（只有真锚点存在时才回带，保持既有响应形状不变）。
+    if (!anchorId) {
+      const unreadCount = await this.countUnreadMessages(topicId, null, actorId, mentionsOnly);
+      const messages = await this.fetchUnreadMessages(topicId, null, limit, actorId, mentionsOnly);
+      return {
+        topicId,
+        unreadCount,
+        messages,
+        hasMore: unreadCount > messages.length,
+        mentionsOnly,
+      };
+    }
+
+    // tie-break after 语义：子查询行比较（DB 内微秒精度，避免 JS Date 毫秒截断误算锚点自身）
+    const unreadCount = await this.countUnreadMessages(topicId, anchorId, actorId, mentionsOnly);
+
+    // 取前 limit 条未读消息
+    const messages = await this.fetchUnreadMessages(
+      topicId,
+      anchorId,
+      limit,
+      actorId,
+      mentionsOnly,
+    );
+
+    return {
+      topicId,
+      unreadCount,
+      lastReadMessageId: anchorId,
+      messages,
+      hasMore: unreadCount > messages.length,
+      mentionsOnly,
+    };
+  }
+
+  /**
+   * 未读口径解析：游标锚点 + 提及过滤模式（D4 单一解析点）。
+   *
+   * `getUnread` 与 `sendMessage` 的 D2 `unreadCount` **共用本方法**——两个读面若各写
+   * 一份「participant → anchor → mode」推导，必然在某次改动后分岔（本批的核心风险面）。
+   *
+   * 语义（与 v1.85 逐字一致 + D4 模式正交）：
+   * - 无参与者行 → `anchorId=null`（全量未读）、`mentionsOnly=false`（无设置可读）；
+   * - 游标为 NULL（从未读过）→ `anchorId=null`、模式取该行设置；
+   * - 锚点消息已软删 → `anchorId=null`（降级全量）、**模式仍取该行设置**（正交）；
+   * - 锚点有效 → `anchorId=游标`、模式取该行设置。
+   *
+   * 模式判定 = 严格 `=== true`：与 DB 侧 `notification_settings @> '{"mentions_only": true}'::jsonb`
+   * 同口径（后者对脏值不抛错，且只认精确 true——JS 侧不得用 truthy 放宽）。
+   *
+   * @returns anchorId=null 表示「按全量未读取数」（无游标或锚点悬空），
+   *   mentionsOnly=本响应应采用的口径
+   */
+  private async resolveUnreadContext(
+    topicId: string,
+    actorId: string,
+  ): Promise<{ anchorId: string | null; mentionsOnly: boolean }> {
     const participant = await this.participantRepo.findOne({
       where: { topicId, participantId: actorId },
     });
 
-    // ── 无有效锚点（从未读过 or 无 participant 行）→ 全量未读，messages 从头给 ──
-    if (!participant || !participant.lastReadMessageId) {
-      const unreadCount = await this.countUnreadMessages(topicId, null, actorId);
-      const messages = await this.fetchUnreadMessages(topicId, null, limit, actorId);
-      return { topicId, unreadCount, messages, hasMore: unreadCount > messages.length };
+    const mentionsOnly = participant?.notificationSettings?.[NOTIFY_KEY_MENTIONS_ONLY] === true;
+
+    if (!participant?.lastReadMessageId) {
+      return { anchorId: null, mentionsOnly };
     }
 
     // 锚点存在性校验（软删则降级为全量未读）；谓词用子查询行比较，无需读回 createdAt
@@ -1778,47 +2176,34 @@ export class TopicService {
       select: ['id'],
     });
 
-    if (!lastReadMessage) {
-      // 锚点消息已删 → 降级为全量未读，messages 从头给（与上一段同谓词，仅 anchor 为 null）
-      const unreadCount = await this.countUnreadMessages(topicId, null, actorId);
-      const messages = await this.fetchUnreadMessages(topicId, null, limit, actorId);
-      return { topicId, unreadCount, messages, hasMore: unreadCount > messages.length };
-    }
-
-    // tie-break after 语义：子查询行比较（DB 内微秒精度，避免 JS Date 毫秒截断误算锚点自身）
-    const unreadCount = await this.countUnreadMessages(
-      topicId,
-      participant.lastReadMessageId,
-      actorId,
-    );
-
-    // 取前 limit 条未读消息
-    const messages = await this.fetchUnreadMessages(
-      topicId,
-      participant.lastReadMessageId,
-      limit,
-      actorId,
-    );
-
     return {
-      topicId,
-      unreadCount,
-      lastReadMessageId: participant.lastReadMessageId,
-      messages,
-      hasMore: unreadCount > messages.length,
+      anchorId: lastReadMessage ? participant.lastReadMessageId : null,
+      mentionsOnly,
     };
   }
 
   /**
    * 未读消息谓词唯一构造点（count 与 list 共用，防两口径漂移）：
    * - 限定 topic、排除软删消息；
-   * - **排除自己发的消息**（`sender_id <> :actorId`）——主路径靠游标「发送即已读」，
-   *   降级路径靠本谓词，两条路径语义一致（sender 判据只用单列 sender_id：
-   *   messages.sender_type 列已在 ActorUnification migration 中 DROP，actors 统一根表
-   *   PK 使跨类型 uuid 碰撞结构上不可能）；
-   * - anchorId 非 null 时追加 (created_at, id) 行值比较 after 语义（DB 内微秒精度）。
+   * - **排除自己发的消息**（`sender_id <> :actorId`）——主路径靠游标，降级路径靠本谓词，
+   *   两条路径语义一致（sender 判据只用单列 sender_id：messages.sender_type 列已在
+   *   ActorUnification migration 中 DROP，actors 统一根表 PK 使跨类型 uuid 碰撞结构上
+   *   不可能）；
+   * - anchorId 非 null 时追加 (created_at, id) 行值比较 after 语义（DB 内微秒精度）；
+   * - `mentionsOnly=true` 时追加**提及过滤**（D4）：`mentions @> [我]` OR `mentions @> "*"`。
+   *
+   * 提及谓词的两处 DB 事实（PG 15 实测，勿"简化"）：
+   * ① 参数必须 `JSON.stringify([actorId])` 后经 `::jsonb` 绑定——直传 JS 数组会 500，
+   *    而 `::jsonb` cast 不会被 TypeORM 误判成新参数占位；
+   * ② 广播令牌 `"*"` 是**数组含标量**的特例，PG `@>` 对 `'"*"'::jsonb` 返回 true
+   *    （`'[]' @> ...` 为 false）——故用 `'"*"'::jsonb` 而不是 `'["*"]'::jsonb`。
    */
-  private buildUnreadMessageQb(topicId: string, anchorId: string | null, actorId: string) {
+  private buildUnreadMessageQb(
+    topicId: string,
+    anchorId: string | null,
+    actorId: string,
+    mentionsOnly: boolean,
+  ) {
     const qb = this.messageRepo
       .createQueryBuilder('message')
       .where('message.topic_id = :topicId', { topicId })
@@ -1832,6 +2217,12 @@ export class TopicService {
       );
     }
 
+    if (mentionsOnly) {
+      qb.andWhere(`(message.mentions @> :meMention::jsonb OR message.mentions @> '"*"'::jsonb)`, {
+        meMention: JSON.stringify([actorId]),
+      });
+    }
+
     return qb;
   }
 
@@ -1843,8 +2234,9 @@ export class TopicService {
     topicId: string,
     anchorId: string | null,
     actorId: string,
+    mentionsOnly: boolean,
   ): Promise<number> {
-    return this.buildUnreadMessageQb(topicId, anchorId, actorId).getCount();
+    return this.buildUnreadMessageQb(topicId, anchorId, actorId, mentionsOnly).getCount();
   }
 
   /**
@@ -1853,7 +2245,8 @@ export class TopicService {
    * （子查询行比较，DB 内微秒精度）。
    *
    * 谓词与 countUnreadMessages 同源：自己发的消息既不计入 unreadCount，
-   * 也不出现在 messages 里。
+   * 也不出现在 messages 里；mentionsOnly 时列表与计数同受提及过滤
+   * （count 与 list 必须同口径，否则 hasMore 会撒谎）。
    *
    * 消息对象形状与 getMessages 返回一致（含 senderName/senderAvatar 注入），
    * 复用 resolveActorProfiles 与同一映射逻辑。
@@ -1863,8 +2256,9 @@ export class TopicService {
     anchorId: string | null,
     limit: number,
     actorId: string,
+    mentionsOnly: boolean,
   ) {
-    const qb = this.buildUnreadMessageQb(topicId, anchorId, actorId)
+    const qb = this.buildUnreadMessageQb(topicId, anchorId, actorId, mentionsOnly)
       .orderBy('message.createdAt', 'ASC')
       .addOrderBy('message.id', 'ASC')
       .take(limit);
@@ -1887,7 +2281,7 @@ export class TopicService {
       const senderType = profile?.type ?? ActorType.SYSTEM;
 
       // 圆桌座位标签：仅透传 metadata.seatLabel 单键（与 buildMessageResponse 同规，
-      // 设计 docs/roundtable-design.md §6/§7）；无该键时响应对象缺键。
+      // 设计 docs/modules/roundtable-design.md §6/§7）；无该键时响应对象缺键。
       const seatLabel = msg.metadata?.seatLabel;
       // 圆桌主脑标记（M3 阶段 3，r13）：与 buildMessageResponse 同规单键透传
       const seatCoordinator = msg.metadata?.seatCoordinator === true;
@@ -1918,13 +2312,19 @@ export class TopicService {
   /**
    * 标记话题消息为已读（单调递增，不防回退时 advanced=false）。
    *
+   * **本方法与 digest(markRead=true) 是游标推进的唯二入口**（v1.96.0-dev D1 起发送
+   * 不再推进游标——见 AUTO_JOIN_PARTICIPANT_SQL 注释）。
+   *
    * - 不传 messageId：取该话题最新消息（按全序 (created_at DESC, id DESC) LIMIT 1）
    * - 已有游标：DB 内行值比较新旧锚点 (created_at, id)（不读回 JS，避免毫秒精度截断）；
    *   新目标严格更旧 → 不写库，返回 advanced: false；
    *   相等（同消息重复标）→ 幂等成功 advanced: false；
    *   新目标更新 → 写库，返回 advanced: true。
-   * - upsert 修复：参与者行存在 → 仅 update lastReadMessageId；
-   *   不存在 → insert 完整行（自动 join 语义保持）。不覆盖 role/joinedAt 等字段。
+   *   旧锚点消息已软删（比较子查询 rows 为空）→ **允许推进**：这是悬空游标的**自愈点**
+   *   （D1 把自愈窗口从「发送时」移到「读到时」，unread-cursor e2e 用例⑤锁死）。
+   * - 参与者行存在 → **定点 UPDATE 只写 last_read_message_id**（D9：整行 save 会静默回滚
+   *   并发的 notification_settings 写入）；不存在 → insert 完整行（自动 join 语义保持）。
+   *   两条分支都不覆盖 role/joinedAt。
    *
    * @returns { topicId, lastReadMessageId, advanced }
    */
@@ -1983,10 +2383,19 @@ export class TopicService {
       }
     }
 
-    // ── upsert 修复：存在参与者行 → 只 update lastReadMessageId；不存在 → insert ──
+    // ── 存在参与者行 → **定点 UPDATE 只写 last_read_message_id**；不存在 → insert ──
     if (existingParticipant) {
-      existingParticipant.lastReadMessageId = messageId;
-      await this.participantRepo.save(existingParticipant);
+      // D9（v1.96.0-dev）：整行 `save()` → 定点 `update()`。
+      // 为什么必须定点：save() 会把**内存里读到的整行**（含 notification_settings）全列回写。
+      // 本批引入 notification_settings 的首个写入者（PATCH notification-settings）之后，
+      // 「并发 PATCH 开静默」与「markAsRead 推进游标」交错时，后者会把前者刚写的设置
+      // 静默翻回旧值——用户的收件偏好被一次已读操作悄悄回滚。update() 生成的语句
+      // 只含 `SET last_read_message_id = $1 WHERE topic_id = $2 AND participant_id = $3`，
+      // 结构上不可能碰到其他列（本实体无 updatedAt 列，故不会附带写入时间戳）。
+      await this.participantRepo.update(
+        { topicId, participantId: actorId },
+        { lastReadMessageId: messageId },
+      );
     } else {
       // 无参与者行 → insert ACTIVE 新行（自动 join 语义）；显式写 joinedAt
       // （DB DEFAULT NOW() 已移除，active 行必须由应用写入 joinedAt）
@@ -2003,6 +2412,116 @@ export class TopicService {
     }
 
     return { topicId, lastReadMessageId: messageId, advanced: true };
+  }
+
+  /**
+   * 更新当前 actor 在本话题的通知设置（PATCH /topics/:id/notification-settings，D5）。
+   *
+   * 契约（v1.96.0-dev 未读语义批 D5 钉死）：
+   * - **领域前置条件**：调用方必须在本话题有 invited/active 参与行——「没有参与行就没有
+   *   设置可存」（设置是 `topic_participants` 的行内 jsonb）。left 视同无行（其未读不计，
+   *   设置也无意义），re-join 后重新设置。
+   * - **错误按可见性分岔**（跨可见性先例 = `leave` 的 1006；sendMessage 的 1006 仅 PRIVATE 分支）：
+   *   · 话题不存在 / 已软删 → 404 + TOPIC_NOT_FOUND(2000)（`findById` 的 @DeleteDateColumn 默认过滤）；
+   *   · **PRIVATE + 非参与者/left → 404 + TOPIC_NOT_FOUND(2000)**（安全隐没：不泄露私密话题
+   *     的存在性，message 给双候选指引「核对 id 或找创建者邀请」）；
+   *   · **OPEN + 非参与者/left → 403 + AGENT_NOT_IN_TOPIC(1006)**（话题公开可见，存在性不是
+   *     秘密，此时该说的是"你不是成员"，message 分岔 join / rejoin 两条恢复路径）。
+   *   ⚠️ HTTP 路径上 PRIVATE 分支通常由 controller 的 `ensureCan(read)` **先**命中
+   *   （同为 404/2000，message 为权限层的通用文案）——两层状态码/错误码一致，本方法
+   *   的文案对直调 service 与 admin（bypass 权限层）可见。
+   * - **状态无关**：archived / closed 话题**允许**改设置（测试锁）——静默模式是收件偏好，
+   *   与话题生命周期正交；且历史话题开启静默后不再累积未读正是该开关的主要用途。
+   * - **写 = SQL 侧 jsonb 合并**：`notification_settings || jsonb_build_object(键, $::boolean)`
+   *   ——只改 mentions_only 一键，**保留 mute 等未知/既有键**（实体整行 save 会把并发写入的
+   *   其他键静默回滚）。键名走 shared 常量模板插值（值面全部参数绑定）。
+   * - **响应 = 库读回**（不信内存推导）：`{ topicId, mentionsOnly, hiddenUnreadCount? }`。
+   *   `hiddenUnreadCount` 定义逐字 = 「此刻未读中因 mentionsOnly 开启而不计数的消息数
+   *   = mode off 计数 − mode on 计数」；**结果模式为 true 时恒附**（状态语义，重试不丢），
+   *   为 false 时省略（省略 ≠ 0）。COUNT 失败 → 省略 + warn（fail-open，设置已写入成功，
+   *   不因附带统计失败而让调用方以为设置没生效）。
+   *
+   * 幂等：同一 `mentionsOnly` 重复提交 → 同结果（SQL 合并是幂等的，重复 true 恒附同值
+   * 的 hiddenUnreadCount 快照）；无需幂等键。
+   *
+   * @param topicId 话题 ID
+   * @param actorId 当前 actor id
+   * @param dto 设置（mentionsOnly 必填布尔；未知键已在 DTO 层 400）
+   */
+  async updateNotificationSettings(
+    topicId: string,
+    actorId: string,
+    dto: UpdateNotificationSettingsDto,
+  ): Promise<{ topicId: string; mentionsOnly: boolean; hiddenUnreadCount?: number }> {
+    const topic = await this.findById(topicId); // 不存在/软删 → 404 TOPIC_NOT_FOUND
+
+    // ── 领域前置条件：必须持有 invited/active 参与行 ──
+    const participant = await this.participantRepo.findOne({
+      where: { topicId, participantId: actorId },
+    });
+    const hasRow =
+      participant != null &&
+      (participant.status === ParticipantStatus.INVITED ||
+        participant.status === ParticipantStatus.ACTIVE);
+
+    if (!hasRow) {
+      // 可见性分岔（见上方契约）：PRIVATE 隐没为 404，OPEN 明说 403
+      if (topic.settings?.visibility === Visibility.PRIVATE) {
+        throw new NotFoundException({
+          message:
+            'Topic not found. If you are sure the topic ID is correct, ask the topic creator ' +
+            'to invite you (private topics are only visible to their participants).',
+          code: ErrorCode.TOPIC_NOT_FOUND,
+        });
+      }
+      throw new ForbiddenException({
+        message:
+          participant?.status === ParticipantStatus.LEFT
+            ? 'You have left this topic, so it has no notification settings row for you. ' +
+              'Re-join the topic first (POST /topics/:id/join), then set your notification settings.'
+            : 'You are not a participant of this topic, so it has no notification settings row ' +
+              'for you. Join the topic first (POST /topics/:id/join), then set your notification settings.',
+        code: ErrorCode.AGENT_NOT_IN_TOPIC,
+      });
+    }
+
+    // ── 写：SQL 侧 jsonb 合并（只动 mentions_only 一键，保留 mute 等既有键）──
+    // 键名常量模板插值（裸 SQL 写不出绑定占位符；键名是编译期常量，值面 $3 全部绑定）
+    await this.participantRepo.query(
+      `UPDATE topic_participants
+          SET notification_settings = notification_settings || jsonb_build_object('${NOTIFY_KEY_MENTIONS_ONLY}', $3::boolean)
+        WHERE topic_id = $1 AND participant_id = $2`,
+      [topicId, actorId, dto.mentionsOnly],
+    );
+
+    // ── 读回：以库为准（并发下内存推导会撒谎）──
+    const updated = await this.participantRepo.findOne({
+      where: { topicId, participantId: actorId },
+    });
+    // 判定与读谓词同口径（严格 === true；DB 侧等价于 @> '{"mentions_only": true}'::jsonb）
+    const mentionsOnly = updated?.notificationSettings?.[NOTIFY_KEY_MENTIONS_ONLY] === true;
+
+    // ── hiddenUnreadCount（仅结果模式为 true 时附）──
+    let hiddenUnreadCount: number | undefined;
+    if (mentionsOnly) {
+      try {
+        const { anchorId } = await this.resolveUnreadContext(topicId, actorId);
+        const modeOff = await this.countUnreadMessages(topicId, anchorId, actorId, false);
+        const modeOn = await this.countUnreadMessages(topicId, anchorId, actorId, true);
+        hiddenUnreadCount = modeOff - modeOn;
+      } catch (err) {
+        this.logger.warn(
+          `hiddenUnreadCount computation failed (fail-open, key omitted): ` +
+            `topicId=${topicId} actorId=${actorId} err=${(err as Error).message}`,
+        );
+      }
+    }
+
+    return {
+      topicId,
+      mentionsOnly,
+      ...(hiddenUnreadCount !== undefined ? { hiddenUnreadCount } : {}),
+    };
   }
 
   async removeMessage(topicId: string, messageId: string, actorId: string) {
@@ -2080,8 +2599,14 @@ export class TopicService {
         });
       }
       // status === 'left': update status to 'invited'
-      tp.status = ParticipantStatus.INVITED;
-      await this.participantRepo.save(tp);
+      // ── 定点 UPDATE：只写 status 一列 ──（F1，与 D9 同款修法）
+      // 整行 save 会回写 notification_settings 等未改动列。邀请语义只改状态：
+      // role 不动（left 行可能是 editor，re-invite 不改变角色）、joinedAt 不动
+      // （invited 行语义为 NULL，激活时才写）、**游标不动**（保留 = 离开期间消息仍计未读）。
+      await this.participantRepo.update(
+        { topicId: id, participantId: agentId },
+        { status: ParticipantStatus.INVITED },
+      );
     } else {
       // No row: insert new invited row（有意不写 joinedAt，激活时才写入）
       // 未读游标初始化（v1.69 D3）：受邀时刻起算未读，邀请前历史不计
@@ -2156,8 +2681,15 @@ export class TopicService {
       }
       if (tp.role !== TopicParticipantRole.EDITOR) {
         // member → editor 升级（保留原 status：invited/active 均可，不隐式改状态）
-        tp.role = TopicParticipantRole.EDITOR;
-        await this.participantRepo.save(tp);
+        // ── 定点 UPDATE：只写 role 一列 ──（F1，与 D9 同款修法）
+        // 整行 save 会回写 notification_settings 等未改动列。本操作语义上**只改角色**
+        // （D5 钉死「保留原 status，不隐式改状态」），status 不进 SET 子句 ⇒
+        // trg_topics_participant_count 不触发（该触发器本就有 OLD.status != NEW.status
+        // 守卫，save 时即使触发也是空操作 ⇒ 净效果一致）。
+        await this.participantRepo.update(
+          { topicId: id, participantId: agentId },
+          { role: TopicParticipantRole.EDITOR },
+        );
       }
     } else {
       // 无行：新建 editor + invited 行（D4：invited 未 join 的 editor 可直接编辑，
@@ -2219,8 +2751,12 @@ export class TopicService {
     }
 
     // editor → member 降级（保留 status/joinedAt，不踢人）
-    tp.role = TopicParticipantRole.MEMBER;
-    await this.participantRepo.save(tp);
+    // ── 定点 UPDATE：只写 role 一列 ──（F1，与 D9 同款修法）
+    // 整行 save 会回写 notification_settings 等未改动列（本操作与设置面无关）。
+    await this.participantRepo.update(
+      { topicId: id, participantId: agentId },
+      { role: TopicParticipantRole.MEMBER },
+    );
 
     // 触发事件
     await this.eventService.create({
@@ -2269,9 +2805,11 @@ export class TopicService {
       await this.participantRepo.remove(tp);
     } else if (tp.status === ParticipantStatus.ACTIVE) {
       // Already joined member: set status='left'
-      tp.status = ParticipantStatus.LEFT;
-      tp.leftAt = new Date();
-      await this.participantRepo.save(tp);
+      // ── 定点 UPDATE：只写 status + leftAt ──（F1，与 D9 同款修法；理由同 leave()）
+      await this.participantRepo.update(
+        { topicId: id, participantId: agentId },
+        { status: ParticipantStatus.LEFT, leftAt: new Date() },
+      );
     } else {
       // status === 'left' or other
       throw new ConflictException({
@@ -2320,9 +2858,13 @@ export class TopicService {
       });
     }
 
-    tp.status = ParticipantStatus.LEFT;
-    tp.leftAt = new Date();
-    await this.participantRepo.save(tp);
+    // ── 定点 UPDATE：只写 status + leftAt ──（F1，与 D9 同款修法；理由同 leave()：
+    // 整行 save 会回写 notification_settings 等未改动列）
+    const leftAt = new Date();
+    await this.participantRepo.update(
+      { topicId, participantId: userId },
+      { status: ParticipantStatus.LEFT, leftAt },
+    );
 
     await this.eventService.create({
       eventType: EventType.AGENT_LEFT,
@@ -2331,9 +2873,9 @@ export class TopicService {
       topicId: topicId ?? undefined,
       actorId: userId,
       actorType: ActorType.HUMAN,
-      payload: { participantId: userId, leftAt: tp.leftAt },
+      payload: { participantId: userId, leftAt },
     });
 
-    return { topicId, participantId: userId, leftAt: tp.leftAt };
+    return { topicId, participantId: userId, leftAt };
   }
 }

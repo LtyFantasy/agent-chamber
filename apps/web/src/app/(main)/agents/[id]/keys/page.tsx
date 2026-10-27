@@ -1,10 +1,14 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { toast } from '@/lib/notify';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf } from '@/lib/error-message';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
@@ -29,28 +33,40 @@ interface ApiKey {
   revokedAt: string | null;
 }
 
-interface AgentDetail {
-  id: string;
-  name: string;
-}
-
 interface CreateKeyResponse {
   id: string;
   name: string;
   apiKey: string;
+  /** 新 key 的实际 scopes（后端白名单字段，2026-10-16 卡 72566c2e）；旧后端无此字段时为 undefined */
+  scopes?: string[];
 }
 
 export default function AgentKeysPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('agents.keys');
+  const tRead = useTranslations('common');
+  const queryClient = useQueryClient();
   const locale = useLocale();
   const tCommon = useTranslations('common');
 
-  const [agent, setAgent] = useState<AgentDetail | null>(null);
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const agentQuery = useQuery({
+    queryKey: ['agents', 'detail', id],
+    queryFn: () => Api.agents.getById(id),
+    enabled: !!id,
+  });
+  const keysQuery = useQuery({
+    queryKey: ['agents', 'keys', id],
+    queryFn: () => Api.agents.findKeys(id),
+    enabled: !!id,
+  });
+  const agent = agentQuery.data;
+  const keys = keysQuery.data ?? [];
+  /** Preserve the existing create/revoke cache updates without coupling the two reads. */
+  const setKeys = (update: (previous: ApiKey[]) => ApiKey[]) =>
+    queryClient.setQueryData(['agents', 'keys', id], (previous: ApiKey[] | undefined) =>
+      update(previous ?? []),
+    );
 
   const [createOpen, setCreateOpen] = useState(false);
   const [newKeyName, setNewKeyName] = useState('');
@@ -61,26 +77,6 @@ export default function AgentKeysPage() {
 
   const [revokeKey, setRevokeKey] = useState<ApiKey | null>(null);
   const [revokeLoading, setRevokeLoading] = useState(false);
-
-  useEffect(() => {
-    if (!id) return;
-
-    setIsLoading(true);
-    setError(null);
-
-    Promise.all([Api.agents.getById(id).catch(() => null), Api.agents.findKeys(id).catch(() => [])])
-      .then(([agentData, keysData]) => {
-        setAgent(agentData);
-        setKeys(keysData ?? []);
-      })
-      .catch((err) => {
-        setError(err?.response?.data?.message || t('loadError'));
-      })
-      .finally(() => {
-        setIsLoading(false);
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
 
   const handleCreate = async () => {
     if (!newKeyName.trim()) return;
@@ -101,10 +97,7 @@ export default function AgentKeysPage() {
         ...prev,
       ]);
     } catch (err: unknown) {
-      setCreateError(
-        (err as { response?: { data?: { message?: string } }; message?: string })?.response?.data
-          ?.message || t('createError'),
-      );
+      setCreateError(errorMessageOf(err, t('createError')));
     } finally {
       setCreateLoading(false);
     }
@@ -141,34 +134,11 @@ export default function AgentKeysPage() {
       );
       setRevokeKey(null);
     } catch (err: unknown) {
-      alert(
-        (err as { response?: { data?: { message?: string } }; message?: string })?.response?.data
-          ?.message || t('revokeError'),
-      );
+      toast.error({ title: errorMessageOf(err, t('revokeError')) });
     } finally {
       setRevokeLoading(false);
     }
   };
-
-  if (isLoading) {
-    return (
-      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] items-center justify-center">
-        <Loading size="lg" />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
-        <h2 className="text-xl font-semibold">{t('loadError')}</h2>
-        <p className="text-muted-foreground mt-2">{error}</p>
-        <Link href="/agents" className="mt-4 text-primary hover:underline">
-          {t('backToList')}
-        </Link>
-      </div>
-    );
-  }
 
   const activeKeys = keys.filter((k) => !k.revokedAt);
   const revokedKeys = keys.filter((k) => k.revokedAt);
@@ -176,6 +146,17 @@ export default function AgentKeysPage() {
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
+      {agentQuery.isError && (
+        <QueryFeedback
+          compact={agentQuery.data !== undefined}
+          message={errorMessageOf(
+            agentQuery.error,
+            tRead(agentQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void agentQuery.refetch()}
+          busy={agentQuery.isFetching}
+        />
+      )}
       {/* Header */}
       <div className="flex items-start gap-4">
         <Link href={`/agents/${id}`}>
@@ -196,7 +177,30 @@ export default function AgentKeysPage() {
       </div>
 
       {/* Keys List */}
-      {displayKeys.length === 0 ? (
+      {keysQuery.isError && keysQuery.data !== undefined && (
+        <QueryFeedback
+          compact={keysQuery.data !== undefined}
+          message={errorMessageOf(
+            keysQuery.error,
+            tRead(keysQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void keysQuery.refetch()}
+          busy={keysQuery.isFetching}
+        />
+      )}
+      {keysQuery.isError && keysQuery.data === undefined ? (
+        <QueryFeedback
+          compact={keysQuery.data !== undefined}
+          message={errorMessageOf(
+            keysQuery.error,
+            tRead(keysQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void keysQuery.refetch()}
+          busy={keysQuery.isFetching}
+        />
+      ) : keysQuery.isLoading ? (
+        <Loading />
+      ) : displayKeys.length === 0 ? (
         <EmptyState
           title={t('empty')}
           description={t('emptyDesc')}
@@ -319,6 +323,12 @@ export default function AgentKeysPage() {
                   {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
                 </Button>
               </div>
+              {/* 实际 scopes（后端白名单字段直读；旧后端无该字段则不渲染） */}
+              {newKeyResult.scopes && (
+                <p className="text-muted-foreground text-sm" data-testid="new-key-scopes">
+                  {t('scopes')}: {newKeyResult.scopes.join(', ') || '—'}
+                </p>
+              )}
             </div>
             <DialogFooter>
               <Button onClick={handleCloseCreate}>{t('saved')}</Button>

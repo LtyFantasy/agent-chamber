@@ -4,7 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/api-definition.md §Downloads 分发端点
- *   - 补充: docs/roundtable-design.md §8c 最后一公里连接向导（P2 平台托管一键安装）
+ *   - 补充: docs/modules/roundtable-design.md §8c 最后一公里连接向导（P2 平台托管一键安装）
  *
  * [踩坑索引] D5(路径遍历)
  *

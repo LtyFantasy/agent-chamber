@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "nest build && mkdir -p dist/.agents && (cp -r ../../.agents/skills dist/.agents/skills 2>/dev/null || cp -r ../../../.agents/skills dist/.agents/skills)",
+    "build": "nest build && node scripts/copy-agent-skills.js",
+    "build:shadow": "nest build --path tsconfig.build.shadow.json && DIST_DIR=dist-new node scripts/copy-agent-skills.js",
     "dev": "nest start --watch",
     "start": "node dist/apps/backend/src/main",
     "start:debug": "nest start --debug --watch",
-    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix --max-warnings 100",
+    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --max-warnings 100",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
@@ -16,7 +17,8 @@
     "migration:generate": "typeorm-ts-node-commonjs migration:generate -d src/database/data-source.ts",
     "migration:run": "typeorm-ts-node-commonjs migration:run -d src/database/data-source.ts",
     "migration:revert": "typeorm-ts-node-commonjs migration:revert -d src/database/data-source.ts",
-    "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts"
+    "migration:show": "typeorm-ts-node-commonjs migration:show -d src/database/data-source.ts",
+    "lint:fix": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix --max-warnings 100"
   },
   "dependencies": {
     "@agent-chamber/roundtable-protocol": "workspace:*",
@@ -48,6 +50,7 @@
     "rxjs": "^7.8.0",
     "sharp": "^0.35.4",
     "typeorm": "^0.3.20",
+    "undici": "^6.29.0",
     "uuid": "^9.0.0",
     "ws": "^8.21.2"
   },

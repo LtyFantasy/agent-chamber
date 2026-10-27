@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §2 (组件与代码归属: chamber ② 控制通道层 + ③ 会话层)
- *   - 补充: docs/roundtable-design.md §4 (控制面协议 WebSocket) / §5 (数据模型)
+ *   - 主文档: docs/modules/roundtable-design.md §2 (组件与代码归属: chamber ② 控制通道层 + ③ 会话层)
+ *   - 补充: docs/modules/roundtable-design.md §4 (控制面协议 WebSocket) / §5 (数据模型)
  *
  * [踩坑索引]
  *
@@ -42,7 +42,7 @@ import { RoundtableController } from './roundtable.controller';
 /**
  * 圆桌模式后端模块（M1 计划阶段 3：控制面 + 最小闭环）
  *
- * 职责切分（docs/roundtable-design.md §2）：
+ * 职责切分（docs/modules/roundtable-design.md §2）：
  * - RunnerGateway：② 控制通道层服务端——/ws/runner 握手认证、信封收发、连接生命周期
  * - RunnerRegistryService：② runner 注册表——在线表、一 key 一 runner 踢旧、座位绑定与
  *   seat.assign 下行

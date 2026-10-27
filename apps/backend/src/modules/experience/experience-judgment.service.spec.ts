@@ -149,6 +149,7 @@ describe('ExperienceJudgmentService', () => {
       baseUrl: 'https://api.typesafe.ai',
       apiKey: 'k',
       typesafeModel: 'jev-latest',
+      proxyUrl: null,
       timeoutMs: 8000,
       rateLimitPerHour: 3,
       globalRateLimitPerHour: 240,

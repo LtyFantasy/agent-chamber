@@ -8,6 +8,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -36,37 +38,37 @@ export default function SkillDetailPage() {
   const params = useParams();
   const name = params.name as string;
   const t = useTranslations('skills');
+  const tRead = useTranslations('common');
   const locale = useLocale();
 
   /** 复制按钮的临时状态：key -> 是否已复制 */
   const [copiedMap, setCopiedMap] = useState<Record<string, boolean>>({});
 
-  const {
-    data: skill,
-    isLoading,
-    error,
-  } = useQuery({
+  const skillQuery = useQuery({
     queryKey: ['skills', 'detail', name],
     queryFn: () => Api.skills.get(name),
     enabled: !!name,
   });
+  const { data: skill, isLoading } = skillQuery;
 
   /** 子 Skill 列表（如 topics、taskboard、docs）；null = 尚未加载完成 */
-  const { data: subs } = useQuery({
+  const subsQuery = useQuery({
     queryKey: ['skills', 'subs', name],
     queryFn: () => Api.skills.getSubs(name),
     enabled: !!name,
   });
+  const { data: subs } = subsQuery;
 
   /** 当前选中的子 Skill 路径；null = 展示主 Skill 内容 */
   const [selectedSub, setSelectedSub] = useState<string | null>(null);
 
   /** 选中子 Skill 的详情内容 */
-  const { data: subDetail, isLoading: subLoading } = useQuery({
+  const subQuery = useQuery({
     queryKey: ['skills', 'sub', name, selectedSub],
     queryFn: () => Api.skills.getSub(name, selectedSub as string),
     enabled: !!name && !!selectedSub,
   });
+  const { data: subDetail, isLoading: subLoading } = subQuery;
 
   /**
    * 一键安装命令，基于当前页面域名动态生成。
@@ -140,8 +142,8 @@ export default function SkillDetailPage() {
     );
   }
 
-  // 请求失败或 Skill 不存在时展示 404 提示
-  if (error || !skill) {
+  // Only a real uncached 404 may claim that the skill does not exist.
+  if (!skill && httpStatusOf(skillQuery.error) === 404) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center px-4">
         <AlertCircle className="mb-4 h-12 w-12 text-muted-foreground" />
@@ -158,10 +160,34 @@ export default function SkillDetailPage() {
     );
   }
 
+  if (!skill)
+    return (
+      <QueryFeedback
+        compact={skillQuery.data !== undefined}
+        message={errorMessageOf(
+          skillQuery.error,
+          tRead(skillQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void skillQuery.refetch()}
+        busy={skillQuery.isFetching}
+      />
+    );
+
   return (
     // 不刷不透明 bg-background（ui-design-system §3：底色由 body 负责，避免盖住全局网格纹理）
     <main className="min-h-screen px-4 py-8 md:px-8">
       <div className="mx-auto max-w-4xl">
+        {skillQuery.isError && (
+          <QueryFeedback
+            compact={skillQuery.data !== undefined}
+            message={errorMessageOf(
+              skillQuery.error,
+              tRead(skillQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+            )}
+            onRetry={() => void skillQuery.refetch()}
+            busy={skillQuery.isFetching}
+          />
+        )}
         <Card>
           <CardHeader>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -206,6 +232,17 @@ export default function SkillDetailPage() {
             </div>
           </CardHeader>
 
+          {subsQuery.isError && (
+            <QueryFeedback
+              compact={subsQuery.data !== undefined}
+              message={errorMessageOf(
+                subsQuery.error,
+                tRead(subsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void subsQuery.refetch()}
+              busy={subsQuery.isFetching}
+            />
+          )}
           {/* 子 Skill 导航条：主 Skill + 各子 Skill 标签，点击切换内容区 */}
           {subs && subs.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 border-b px-6 pb-4">
@@ -235,12 +272,33 @@ export default function SkillDetailPage() {
             {/* Markdown 预览：固定最大高度，支持滚动；选中子 Skill 时渲染子内容 */}
             <div className="max-h-[60vh] overflow-y-auto rounded-md border bg-card p-4 sm:p-6">
               {selectedSub ? (
-                subLoading || !subDetail ? (
+                subQuery.isError && subDetail === undefined ? (
+                  <QueryFeedback
+                    compact={subQuery.data !== undefined}
+                    message={errorMessageOf(
+                      subQuery.error,
+                      tRead(subQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                    )}
+                    onRetry={() => void subQuery.refetch()}
+                    busy={subQuery.isFetching}
+                  />
+                ) : subLoading || !subDetail ? (
                   <div className="flex justify-center py-8">
                     <Loading size="sm" />
                   </div>
                 ) : (
                   <>
+                    {subQuery.isError && (
+                      <QueryFeedback
+                        compact={subQuery.data !== undefined}
+                        message={errorMessageOf(
+                          subQuery.error,
+                          tRead(subQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                        )}
+                        onRetry={() => void subQuery.refetch()}
+                        busy={subQuery.isFetching}
+                      />
+                    )}
                     <article className="prose prose-sm dark:prose-invert max-w-none">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{subDetail.content}</ReactMarkdown>
                     </article>

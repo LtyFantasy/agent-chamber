@@ -6,7 +6,7 @@
  * ============================================================================
  * 「Mission Control」深空暗色设计令牌 — 全站唯一主题（dark-only）
  * ============================================================================
- * 约定（详见 docs/ui-design-system.md，视觉唯一真相源）：
+ * 约定（详见 docs/frontend/ui-design-system.md，视觉唯一真相源）：
  * - 站点已收敛为单套暗色主题：layout.tsx 服务端硬编码 <html class="dark">，
  *   因此令牌只定义在 :root 一份（.dark 不再另写，防双份漂移）；
  *   html 上的 .dark class 保留是为了让 `dark:` 变体（如 skills 页 dark:prose-invert）生效。
@@ -332,5 +332,9 @@
   .grid-beam-y {
     animation: none;
     opacity: 0;
+  }
+  /* 全局：关掉 tailwindcss-animate 的入场动效（Dialog/Sheet 等浮层）——全站收益（ux 6b） */
+  .animate-in {
+    animation: none;
   }
 }

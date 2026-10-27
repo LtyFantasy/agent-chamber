@@ -16,7 +16,7 @@
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
  * =============================================================================
  */
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder } from 'typeorm';
 import { DocRoute } from '../../database/entities/doc-route.entity';
@@ -27,8 +27,15 @@ import { CreateDocRouteDto, UpdateDocRouteDto } from './dto';
 import { CODE_ENTRY_TYPE } from './doc-constants';
 import { AuditService } from '../audit/audit.service';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
+// hint（2 期，v1.92.0-dev）：route_target_excluded——primaryDoc 被空间 overviewFilter 排除
+import { buildRouteTargetExcludedHint, DOC_HINT_PROFILE } from './doc-hints.helper';
+// hint 基建（阶段一抽核到 modules/hints/）：去重窗口 + 信封接线
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
 import {
   DocRouteCodeEntryType,
+  DocRouteWriteResult,
+  DocHint,
   ErrorCode,
   PaginatedResponse,
   AuditAction,
@@ -86,7 +93,12 @@ export class DocRouteService {
     private readonly docRepo: Repository<Doc>,
     private readonly docService: DocService,
     private readonly auditService: AuditService,
+    // hint 去重窗口（2 期，v1.92.0-dev）：内存 TTL Map 的 Nest provider（A5）
+    private readonly hintDedup: HintDedupService,
   ) {}
+
+  /** NestJS 内置 Logger（hint 埋点落行归属本 service 日志源） */
+  private readonly logger = new Logger(DocRouteService.name);
 
   // ─── CRUD ───────────────────────────────────────────────────
 
@@ -182,7 +194,11 @@ export class DocRouteService {
   }
 
   /** 创建路由：写时校验通过后落库，createdBy=actor.id。 */
-  async create(spaceId: string, dto: CreateDocRouteDto, actor: UnifiedActor): Promise<DocRoute> {
+  async create(
+    spaceId: string,
+    dto: CreateDocRouteDto,
+    actor: UnifiedActor,
+  ): Promise<DocRouteWriteResult> {
     await this.validateRouteRefs(spaceId, dto);
 
     const route = this.routeRepo.create({
@@ -210,7 +226,15 @@ export class DocRouteService {
       newData: { routeId: saved.id, spaceId, intent: saved.intent },
       source: 'api',
     });
-    return saved;
+    // hint（2 期，v1.92.0-dev）：route_target_excluded——primaryDoc 被空间默认
+    // overviewFilter 排除（路由点了在 overview 地图里看不到）。族关 → 零查询零 hints。
+    const hints = await this.buildRouteTargetExcludedHints(
+      spaceId,
+      saved.id,
+      saved.primaryDocId,
+      actor.id,
+    );
+    return { ...saved, ...(hints ? { hints } : {}) };
   }
 
   /**
@@ -224,7 +248,11 @@ export class DocRouteService {
    * @param operatorActorId 操作者 actor id（审计用；importBundle 回导时传 bundle 操作者，
    *                        缺省 = 无（系统/批量路径兜底 null））
    */
-  async update(id: string, dto: UpdateDocRouteDto, operatorActorId?: string): Promise<DocRoute> {
+  async update(
+    id: string,
+    dto: UpdateDocRouteDto,
+    operatorActorId?: string,
+  ): Promise<DocRouteWriteResult> {
     const route = await this.findById(id);
 
     const refsChanged =
@@ -279,7 +307,72 @@ export class DocRouteService {
       },
       source: 'api',
     });
-    return saved;
+    // hint（2 期，v1.92.0-dev）：同 create——按**更新后**的 primaryDocId 判定
+    const hints = await this.buildRouteTargetExcludedHints(
+      saved.spaceId,
+      saved.id,
+      saved.primaryDocId,
+      operatorActorId ?? 'system',
+    );
+    return { ...saved, ...(hints ? { hints } : {}) };
+  }
+
+  /**
+   * 组装 route 写路径的 hint（2 期，v1.92.0-dev）。
+   *
+   * 唯一 code = `route_target_excluded`（suggestion）：primaryDoc 的 docType ∈ 空间
+   * `overviewFilter.excludeTypes`，或其 category slug ∈ `excludeCategories`——该文档不会
+   * 出现在 overview 地图里（路由点了看不到，属策展一致性问题而非错误）。
+   *
+   * 数据源（plan §2）：space settings 一次 PK 读（经 DocService 的写上下文单源）+
+   * primaryDoc 轻查（id/path/docType/categoryId）+ category slug 小表解析。
+   * 族关 / 未配 overviewFilter → 零查询（**在读 settings 之前就短路**：族开关本身要先读，
+   * 这是闸门读，不是额外业务 IO）。
+   *
+   * @returns ≤3 条 DocHint；族关 / 未配过滤 / 无命中 → undefined
+   */
+  private async buildRouteTargetExcludedHints(
+    spaceId: string,
+    routeId: string,
+    primaryDocId: string,
+    actorId: string,
+  ): Promise<DocHint[] | undefined> {
+    const spaceCtx = await this.docService.getSpaceWriteContext(spaceId);
+    if (spaceCtx.hintToggles?.routes !== true) return undefined;
+
+    const overviewFilter = spaceCtx.settings.overviewFilter as
+      | { excludeTypes?: unknown; excludeCategories?: unknown }
+      | null
+      | undefined;
+    if (!overviewFilter) return undefined;
+
+    const doc = await this.docRepo.findOne({
+      where: { id: primaryDocId },
+      select: ['id', 'path', 'docType', 'categoryId'],
+    });
+    if (!doc) return undefined;
+
+    const categorySlug = await this.docService.findCategorySlug(doc.categoryId);
+    const candidate = buildRouteTargetExcludedHint(
+      routeId,
+      doc.path,
+      doc.docType,
+      categorySlug,
+      overviewFilter,
+    );
+    if (!candidate) return undefined;
+
+    return emitHints(
+      this.logger,
+      this.hintDedup,
+      [candidate],
+      {
+        surface: 'route_write',
+        spaceId,
+        actorId,
+      },
+      { profile: DOC_HINT_PROFILE },
+    );
   }
 
   /** 删除路由（硬删——路由是纯策展元数据，无审计/事件契约）。不存在 → 404。 */

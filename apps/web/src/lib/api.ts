@@ -18,6 +18,7 @@ import type {
   UpdateTopicRequest,
   Message,
   SendMessageRequest,
+  SendMessageResponse,
   Board,
   BoardDetail,
   BoardList,
@@ -107,6 +108,40 @@ import {
 } from '@agent-chamber/shared';
 // 命名访问对象 re-export（值域单源 = shared enums，见下方 SEAT_LIFECYCLE_STATUSES / PRESENCE_PHASES 注释）
 export { SEAT_LIFECYCLE_STATUS, PRESENCE_PHASE } from '@agent-chamber/shared';
+// Memory（二期 web 只读视图）：响应形状与查询参数装配的单源在 lib/memory（后端 memory-contract.ts
+// 的逐字镜像 + 参数装配函数），本文件只做请求编排——契约细节不在这里复制第二份。
+import type {
+  MemoryCreateProjectInput,
+  MemoryNominationFilters,
+  MemoryNominationDto,
+  MemoryNominationListResponse,
+  MemoryGraphFilters,
+  MemoryGraphViewResponse,
+  MemoryProjectDto,
+  MemoryProjectListResponse,
+  MemoryRecallResponse,
+  MemoryViewHistoryResponse,
+  MemoryViewRepresentationResponse,
+  MemoryViewResponse,
+} from './memory';
+import { buildMemoryGraphQueryParams, buildMemoryNominationQueryParams } from './memory';
+// Usage（/usage 两个一级 Tab）：请求形状镜像 + 参数装配在 lib/usage，本文件只做请求编排。
+import type {
+  ApiUsageQuery,
+  ApiUsageResponse,
+  MemoryUsageSummaryResponse,
+  MemoryUsageTraceResponse,
+  UsageSummaryQuery,
+  UsageTraceQuery,
+} from './usage';
+// 通知设置面契约（形状与 10 类别值域单源；api.ts 只做请求编排，见 lib 文件头）
+import type {
+  NotificationCategoryPrefs,
+  NotificationChannelView,
+  NotificationSettingsView,
+  NotificationTestEnvelope,
+} from './notification-settings';
+import { buildLoginRedirect, LOGIN_PATH } from './login-redirect';
 
 /**
  * 认证钩子注入口（review-0831 任务 04e8d744 拆环：api.ts ↔ auth.store.ts 循环依赖）
@@ -177,8 +212,16 @@ axiosInstance.interceptors.response.use(
       switch (status) {
         case 401:
           authHooks.onUnauthorized();
-          if (typeof window !== 'undefined') {
-            window.location.href = '/login';
+          // ⚠️ 已在登录页则不重定向：登录失败本身就是 401（POST /auth/login），
+          // 在此整页导航会同时冲掉 URL 上的 `?next=`（深链丢失）与用户已输入的
+          // 邮箱/错误文案——正是「点通知 → 输错密码 → next 没了」的最短路径。
+          // 附带更正一处易误读的前提：注入的 onUnauthorized 实现是
+          // `() => useAuthStore.getState().logout`（只**返回**函数、并未调用，见
+          // stores/auth.store.ts），故不存在「logout 先导航、本行再覆盖」的时序。
+          if (typeof window !== 'undefined' && window.location.pathname !== LOGIN_PATH) {
+            // 带上当前地址（含 hash）：未登录深链（如通知里的 /tasks/xxx）登录后可回跳
+            const { pathname, search, hash } = window.location;
+            window.location.href = buildLoginRedirect(pathname, search, hash);
           }
           break;
         case 403:
@@ -387,7 +430,8 @@ export interface SkillDetail extends SkillListItem {
 
 /**
  * 事件轮询项（GET /events/poll 返回的事件投影；字段对齐 backend Event entity——
- * event.entity.ts，cursor 为微秒时间戳 bigint 字符串，单调递增，直接回传下一轮 poll）
+ * event.entity.ts，cursor 为**DB 序列发的不透明单调序列号**（bigint 十进制字符串），
+ * 与墙钟解耦、直接回传下一轮 poll）
  */
 export interface EventItem {
   id: string;
@@ -401,7 +445,7 @@ export interface EventItem {
   boardId: string | null;
   /** 事件负载（jsonb 原样透出，形状按 eventType 解释、未冻结；new_message 含 messageId） */
   payload: Record<string, unknown>;
-  /** 轮询游标：微秒时间戳 bigint 字符串，服务端保证单调递增，作为下一轮 poll 的 cursor */
+  /** 轮询游标：不透明单调序列号（bigint 十进制字符串，与墙钟解耦），作为下一轮 poll 的 cursor */
   cursor: string;
   delivered: boolean;
   deliveredAt: string | null;
@@ -481,13 +525,28 @@ const agents = {
   delete: (id: string) => apiRequest<void>('DELETE', `/agents/${id}`),
   toggle: (id: string) =>
     apiRequest<{ id: string; status: string }>('POST', `/agents/${id}/toggle`),
-  resetKey: (id: string) => apiRequest<{ apiKey: string }>('POST', `/agents/${id}/reset-key`),
+  resetKey: (id: string) =>
+    apiRequest<{ apiKey: string; scopes: string[] }>('POST', `/agents/${id}/reset-key`),
   findKeys: (id: string) =>
     apiRequest<
-      { id: string; name: string; keyPrefix: string; createdAt: string; revokedAt: string | null }[]
+      {
+        id: string;
+        name: string;
+        keyPrefix: string;
+        /** 权限范围（2026-10-16 卡 72566c2e；白名单投影，非法形态 → []） */
+        scopes: string[];
+        createdAt: string;
+        lastUsedAt: string | null;
+        expiresAt: string | null;
+        revokedAt: string | null;
+      }[]
     >('GET', `/agents/${id}/keys`),
-  createKey: (id: string, data: { name: string }) =>
-    apiRequest<{ id: string; name: string; apiKey: string }>('POST', `/agents/${id}/keys`, data),
+  createKey: (id: string, data: { name: string; scopes?: string[] }) =>
+    apiRequest<{ id: string; name: string; apiKey: string; scopes: string[] }>(
+      'POST',
+      `/agents/${id}/keys`,
+      data,
+    ),
   revokeKey: (id: string, keyId: string) =>
     apiRequest<void>('DELETE', `/agents/${id}/keys/${keyId}`),
 };
@@ -536,8 +595,11 @@ const topics = {
       undefined,
       { params },
     ),
+  // 发送响应是独立契约面（SendMessageResponse，不 extends Message）：除消息本体外
+  // 附 unreadCount?/mentions?（fail-open 可选）+ 幂等重放的 idempotentReplay?。
+  // 见 shared dto/topic-response.dto.ts 的接口注释（v1.96.0-dev 未读语义批 D2）。
   sendMessage: (id: string, data: SendMessageRequest) =>
-    apiRequest<Message>('POST', `/topics/${id}/messages`, data),
+    apiRequest<SendMessageResponse>('POST', `/topics/${id}/messages`, data),
   removeMessage: (topicId: string, messageId: string) =>
     apiRequest<void>('DELETE', `/topics/${topicId}/messages/${messageId}`),
   updateAgenda: (id: string, data: { agenda: AgendaItemInput[] }) =>
@@ -1162,6 +1224,204 @@ const experiences = {
 };
 
 // ──────────────────────────────────────────────
+// Memory（Hument 集成：web 读面 + 项目创建写路径）
+//
+// 端面构成：项目注册表读面 + 账本读面 + 召回 + 项目创建（优化批落地，首个 web 写路径）。
+// 其余写路径（nominate / correct / recover / retry / 项目 PATCH）本期**不暴露**——
+// 它们是三期的表单面，现在给它一个入口等于给一个没有 UI 的 API。
+// ──────────────────────────────────────────────
+const memory = {
+  /**
+   * 项目列表（GET /memory/projects）。
+   *
+   * 只返回**你能读**的项目（或你是 creator/admin 的治理观察项）。
+   * 每个 item 恒带 `engineAvailability` 块 ⇒ 页面横幅**无需**额外请求。
+   * 信封另带部署级 `provisioningAvailable`（缺失/false ⇒ 前端按不可用，见 lib/memory）。
+   */
+  projects: (params: { page?: number; pageSize?: number; slug?: string } = {}) =>
+    apiRequest<MemoryProjectListResponse>('GET', '/memory/projects', undefined, { params }),
+
+  /**
+   * 创建项目（POST /memory/projects）——**首个 web 写路径，无幂等键**（已知债）。
+   *
+   * 后端语义（详见 `CreateMemoryProjectDto`）：`bindings` 至少一条且每条都必须**本人可读**
+   * （绑定即权限来源），否则 400 指名字段；`slug` 唯一（409/14002）；`engine=hument` 时引擎
+   * 三键**全缺**（部署启用自助开通）⇒ 自动在 Hub 注册，**部分缺** ⇒ 400，**全显式** ⇒ 手工复用。
+   * 自助开通失败一律 503/14000（`data.reason` 四值分叉，`data.engineCode` 附带因）。
+   */
+  create: (data: MemoryCreateProjectInput) =>
+    apiRequest<MemoryProjectDto>('POST', '/memory/projects', data),
+
+  /** 项目详情（GET /memory/projects/:id；零副作用，恒带 engineAvailability） */
+  project: (id: string) => apiRequest<MemoryProjectDto>('GET', `/memory/projects/${id}`),
+
+  /**
+   * 账本列表（GET /memory/projects/:id/nominations）。
+   *
+   * 排序恒为 `created_at DESC`；`total` 是**裁剪前全量行数**（分页在服务端内存里做），
+   * 故调用方可以用它做 tab 计数与截断检测。响应恒带 `engineAvailability`。
+   */
+  nominations: (projectId: string, filters: MemoryNominationFilters = {}) =>
+    apiRequest<MemoryNominationListResponse>(
+      'GET',
+      `/memory/projects/${projectId}/nominations`,
+      undefined,
+      { params: buildMemoryNominationQueryParams(filters) },
+    ),
+
+  /**
+   * 账本行详情（GET /memory/nominations/:id——**非**项目嵌套路径；零副作用）。
+   *
+   * `metadata` 投影（治理观察者）也走 200，调用方按 `projection` 分叉渲染
+   * （403 只在**内容面**端点出现，见 recall）。
+   */
+  nomination: (id: string) => apiRequest<MemoryNominationDto>('GET', `/memory/nominations/${id}`),
+
+  /**
+   * 语义召回（POST /memory/projects/:id/recalls）——**有副作用**。
+   *
+   * 每次调用都会落遥测 + 引擎呈现事件 + 烧配额（后端契约明文：不是 GET，别当缓存用）。
+   * 故调用方纪律（plan §1 D7）：
+   * - **不是** mutation 而是 `useQuery({enabled:false, retry:false, refetchOnWindowFocus:false})`
+   *   + 提交时手动 `refetch()`（全局 `mutations.retry=1` 会重发这个 POST）；
+   * - `contextEpoch` 每次提交取**新值**（**入 payload 不入 queryKey**，否则缓存永远打不中）；
+   *   取值必须走 `memoryContextEpoch()`（秒级相对纪元）——引擎硬上限 1e9，
+   *   `Date.now()` 毫秒与 Unix 秒都超，会被后端 DTO 当场 400；
+   * - 同 key 重搜命中缓存**不再打引擎**（返回详情再回来结果仍在）。
+   */
+  recall: (
+    projectId: string,
+    body: {
+      query: string;
+      contextIdentity: string;
+      /** 上下文世代（每次提交取新值；用 `memoryContextEpoch()`，值域 = 引擎 0..1e9） */
+      contextEpoch: number;
+      /** 条数预算（web 视图显式取 `MEMORY_RECALL_MAX_ITEMS` 并写进界面承诺） */
+      maxItems?: number;
+      view?: string;
+    },
+  ) => apiRequest<MemoryRecallResponse>('POST', `/memory/projects/${projectId}/recalls`, body),
+
+  // ── 引擎投影读面（hument alpha.5 四读面；`/views/` 前缀与上面 12 个端点区分）────────
+  //
+  // 与 19.16 `nomination()` 的分工：那个是**账本信封 + 来源投影**（详情页主数据），
+  // 这四个是**引擎投影**（ladder / history / relations / 正文）。不合并的理由：合并会让
+  // 一次请求打两个引擎动词，延迟与失败面相乘。
+  //
+  // ⚠️ `scope` **不在任何入参里**——后端恒填 `actor_private`，客户端自带会被引擎的
+  // `forbidNonWhitelisted` 拒成 400（fail-closed 是设计意图，不是漏参数）。
+
+  /**
+   * 关系图投影（GET /memory/projects/:id/views/graph）。
+   *
+   * ⚠️ 分页**只在组件 state 累积**，cursor 不入 queryKey；且 cursor 同时绑
+   * `snapshot_digest` 与 `query_digest`——**携 cursor 改任一过滤器 = 400 invalid_argument**
+   * （经平台层落成 502/14004），故过滤器变更必须同时清空累积页（调用方负责）。
+   * 平台不设默认值：`filters` 里的 `undefined` 键不出现在 query，引擎默认档生效并在
+   * 响应 `engine.budget` 里回声。
+   *
+   * @param projectId - 记忆项目 id
+   * @param filters - kind / status / relation_type（未选即不发送）
+   * @param cursor - 下一页游标（首页不传）
+   */
+  graphView: (projectId: string, filters: MemoryGraphFilters = {}, cursor?: string) =>
+    apiRequest<MemoryGraphViewResponse>(
+      'GET',
+      `/memory/projects/${projectId}/views/graph`,
+      undefined,
+      {
+        params: { ...buildMemoryGraphQueryParams(filters), ...(cursor ? { cursor } : {}) },
+      },
+    ),
+
+  /**
+   * 单条引擎记忆的投影（GET /memory/projects/:id/views/memories/:engineMemoryId）。
+   *
+   * 返回五槽 ladder（`current` 就是完整正文，**不必再请求** representation）+ anchors +
+   * relations + provenance 全谱。404/14003 = 映射缺失或来源不可见（**不给通用重试**）。
+   */
+  memoryView: (projectId: string, engineMemoryId: string) =>
+    apiRequest<MemoryViewResponse>(
+      'GET',
+      `/memory/projects/${projectId}/views/memories/${encodeURIComponent(engineMemoryId)}`,
+    ),
+
+  /**
+   * 某一分辨率的**旧版本**列表（GET …/views/memories/:engineMemoryId/history/:resolution）。
+   *
+   * ⚠️ 这是"同一条引擎记忆在**同一分辨率**下被重新形成"的历史，**不是**更正链
+   * （跨记忆的 supersedes 链）——UI 上两者分开展示。`items[].current` 引擎只查
+   * `is_current = 0` ⇒ **恒 false**，前端不渲染该标记。
+   *
+   * @param cursor - 下一页游标（与 `historyLimit` 一起进引擎的 query_digest）
+   */
+  memoryViewHistory: (
+    projectId: string,
+    engineMemoryId: string,
+    resolution: string,
+    params: { historyLimit?: number; cursor?: string } = {},
+  ) =>
+    apiRequest<MemoryViewHistoryResponse>(
+      'GET',
+      `/memory/projects/${projectId}/views/memories/${encodeURIComponent(engineMemoryId)}/history/${encodeURIComponent(resolution)}`,
+      undefined,
+      { params },
+    ),
+
+  /**
+   * 单份表示正文（GET …/views/memories/:engineMemoryId/representations/:representationId）。
+   *
+   * `body` 是**纯文本**快照（≤64KiB）——渲染走 `whitespace-pre-wrap`，**不走 markdown**，
+   * 无 HTML 注入面。入参仅 scope/workspace_id/actor_id（后端恒填）。
+   */
+  memoryViewRepresentation: (projectId: string, engineMemoryId: string, representationId: string) =>
+    apiRequest<MemoryViewRepresentationResponse>(
+      'GET',
+      `/memory/projects/${projectId}/views/memories/${encodeURIComponent(engineMemoryId)}/representations/${encodeURIComponent(representationId)}`,
+    ),
+};
+
+// ──────────────────────────────────────────────
+// Usage（/usage 两个一级 Tab）
+//
+// 三路读端点：
+//   - `GET /system/api-usage` — 平台 API/MCP 调用统计（**admin-only**；非 admin 不发请求）
+//   - `GET /memory/projects/:id/usage/summary` — Hument 已记录用量汇总（无分页）
+//   - `GET /memory/projects/:id/usage/trace` — Hument 已记录用量明细（cursor 分页）
+//
+// 响应/参数形状单源在 `lib/usage.ts`（后端合同逐字镜像）；本文件只做请求编排。
+// 两族响应都带 `Cache-Control: no-store`——前端不持久化、不把 as_of 写进 queryKey。
+// ──────────────────────────────────────────────
+const usage = {
+  /** 平台调用统计（admin-only；参数省略空值） */
+  apiUsage: (query: ApiUsageQuery) =>
+    apiRequest<ApiUsageResponse>('GET', '/system/api-usage', undefined, { params: query }),
+
+  /** Hument 汇总（summary 不分页；`totals` 覆盖完整匹配集） */
+  summary: (projectId: string, query: UsageSummaryQuery) =>
+    apiRequest<MemoryUsageSummaryResponse>(
+      'GET',
+      `/memory/projects/${projectId}/usage/summary`,
+      undefined,
+      { params: query },
+    ),
+
+  /**
+   * Hument 明细（cursor 分页）。
+   *
+   * 带 cursor 时调用方必须回送首页的 `since`/`until`/filter/limit（DTO 会 400 否则）；
+   * `limit` 由页面显式给出（1–200，默认 100），**永不发 0**。
+   */
+  trace: (projectId: string, query: UsageTraceQuery) =>
+    apiRequest<MemoryUsageTraceResponse>(
+      'GET',
+      `/memory/projects/${projectId}/usage/trace`,
+      undefined,
+      { params: query },
+    ),
+};
+
+// ──────────────────────────────────────────────
 // Dashboard
 // ──────────────────────────────────────────────
 const dashboard = {
@@ -1204,6 +1464,59 @@ const events = {
     apiRequest<{ events: EventItem[]; nextCursor: string }>('GET', '/events/poll', undefined, {
       params: { cursor, limit },
     }),
+};
+
+// ──────────────────────────────────────────────
+// Notification Settings（Notifications 二期批 3：通知设置面六个 JWT 人类端点）
+// ──────────────────────────────────────────────
+
+/**
+ * 通知设置命名空间（`/notification-settings/*`，六个端点，见 plan §D5）。
+ *
+ * 契约形状（`NotificationSettingsView` / `NotificationChannelView` / `NotificationTestEnvelope`）
+ * 单源在 `@/lib/notification-settings`——那里同时是 10 类别顺序与错误判据的单源
+ * （本文件只做请求编排；形状若写在这里会与 lib 成环，见该文件注释）。
+ */
+const notificationSettings = {
+  /** 当前用户的通知设置（渠道 + 归一偏好 + 平台能力）；`channels` 已过滤 tombstone 行 */
+  getMe: () => apiRequest<NotificationSettingsView>('GET', '/notification-settings/me'),
+
+  /**
+   * upsert 一个渠道绑定。
+   * - 传 `recipientOpenId` = 设置/更换地址（**更换会清空验证态**，需重新测试）；
+   * - 省略 = 只改状态（静音/启用不该逼客户端回填地址）；
+   * - `enabled=true` 在地址未验证时为 400（服务端验证不变量）；`enabled=false` = 静音。
+   */
+  upsertChannel: (provider: string, data: { recipientOpenId?: string; enabled?: boolean }) =>
+    apiRequest<NotificationChannelView>(
+      'PUT',
+      `/notification-settings/me/channels/${provider}`,
+      data,
+    ),
+
+  /** 解绑渠道（tombstone）；从未绑定 / 已解绑均 404（对用户是同一件事） */
+  deleteChannel: (provider: string) =>
+    apiRequest<{ deleted: true }>('DELETE', `/notification-settings/me/channels/${provider}`),
+
+  /**
+   * 发送测试消息（真出境）。成功会自动把该渠道置为启用（调用方需刷新设置数据）。
+   * 429 携带 `Retry-After` 头与 `data.retryAfterSeconds`（两者同源）。
+   */
+  testChannel: (provider: string) =>
+    apiRequest<NotificationTestEnvelope>(
+      'POST',
+      `/notification-settings/me/channels/${provider}/test`,
+    ),
+
+  /** 稀疏覆盖类别偏好（只写给出的键）→ 返回全量归一映射 */
+  updatePrefs: (notificationCategories: Partial<NotificationCategoryPrefs>) =>
+    apiRequest<NotificationCategoryPrefs>('PUT', '/notification-settings/me/prefs', {
+      notificationCategories,
+    }),
+
+  /** 恢复默认偏好（键级删除，不动 `users.preferences` 的其余键）→ 返回归一映射 */
+  deletePrefs: () =>
+    apiRequest<NotificationCategoryPrefs>('DELETE', '/notification-settings/me/prefs'),
 };
 
 // ──────────────────────────────────────────────
@@ -1400,10 +1713,13 @@ export const Api = {
   tasks,
   docs,
   experiences,
+  memory,
+  usage,
   dashboard,
   avatars,
   search,
   events,
+  notificationSettings,
   webhooks,
   monitoring,
   logs,

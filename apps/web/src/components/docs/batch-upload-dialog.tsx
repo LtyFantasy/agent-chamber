@@ -1,24 +1,18 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: plans/big-barda-big-barda-pantha.md §2 D8（web 批量上传）
- *   - 补充: plans/big-barda-big-barda-pantha.md §7 A3（lint 范围外还原禁令）
- *
- * [踩坑索引]
- *   - BATCH-UP-1(live FileList): 浏览器 `input.files` 是 live 引用——先 `value=''` 重置会把
- *     已捕获的 FileList 一起清空（选择静默无响应，生产存量 bug，任务 66012ed7）。
- *     安全方向：**先 `Array.from(files)` 快照再重置**；jsdom FileList 非 live，单测测不出
- *
- * [铁律关联] #1（每次 session 必读 AGENTS.md/INDEX.md） #12（写/改文件分批、匹配现有风格）
- *
- * [详细踩坑]（暂无）
- *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [功能概念] 批量文档上传与被拒文件反馈
+ * [代码职责] 选择/预检/分片上传；在 Dialog 保留完整拒绝清单，toast 仅展示摘要。
+ * [权威文档] DocSpace Agent Chamber: docs/frontend/frontend-architecture.md §12。
+ * [关键不变量] 超限文件先按 size 拒绝再读取；完整名称/大小跨选择保留至关闭。
+ * [持久踩坑] BATCH-UP-1: input.files 是 live 引用；先 Array.from 快照，再重置 input。
+ * [关联代码] lib/docs-upload-limit.ts；batch-upload-dialog.feedback.test.tsx。
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -36,6 +30,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Api } from '@/lib/api';
+import { toast } from '@/lib/notify';
 import { FILE_MAX_BYTES, isOverFileLimit } from '@/lib/docs-upload-limit';
 
 // ── 内联类型（跟随 api.ts 写法，不从 shared 引新 DTO） ──
@@ -142,6 +137,8 @@ export function BatchUploadDialog({
   const t = useTranslations('docs.upload');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Full rejected names/sizes outlive the summary toast and subsequent selections. */
+  const [rejectedFiles, setRejectedFiles] = useState<{ name: string; size: number }[]>([]);
   const [phase, setPhase] = useState<UploadPhase>('selecting');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
@@ -174,6 +171,7 @@ export function BatchUploadDialog({
 
   /** 重置所有状态 */
   const reset = useCallback(() => {
+    setRejectedFiles([]);
     setPhase('selecting');
     setPendingFiles([]);
     setProgress({ done: 0, total: 0 });
@@ -226,10 +224,10 @@ export function BatchUploadDialog({
         }
       }
 
-      // B4：超限提示——一次 alert 汇总所有被拒文件（文件名 + 大小），避免逐个弹窗
+      // Keep all details locally; only the short, localized limit summary belongs in a toast.
       if (rejected.length > 0) {
-        const lines = rejected.map((f) => `${f.name} (${formatSize(f.size)})`).join('\n');
-        alert(`${t('fileTooLarge', { max: formatSize(FILE_MAX_BYTES) })}\n${lines}`);
+        setRejectedFiles((previous) => [...previous, ...rejected]);
+        toast.warning({ title: t('fileTooLarge', { max: formatSize(FILE_MAX_BYTES) }) });
       }
 
       // 去重：同名已在待传列表或本次选择内重复则跳过——防 React key 重复与批内互撞
@@ -354,6 +352,22 @@ export function BatchUploadDialog({
           </>
         )}
 
+        {rejectedFiles.length > 0 && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm"
+          >
+            <p>{t('fileTooLarge', { max: formatSize(FILE_MAX_BYTES) })}</p>
+            <ul className="mt-2 max-h-64 space-y-1 overflow-y-auto break-all">
+              {rejectedFiles.map((file, index) => (
+                <li key={index}>
+                  {file.name} ({formatSize(file.size)})
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {/* ── 待传列表 ── */}
         {pendingFiles.length > 0 && (
           <div className="rounded-md border border-border/50">

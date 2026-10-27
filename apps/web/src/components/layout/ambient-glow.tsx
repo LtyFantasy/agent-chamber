@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils';
  * AmbientGlow — 页面级深空氛围光斑（纯视觉，无逻辑）。
  *
  * 用途：登录/注册/dashboard 等「展厅级」页面的背景径向渐变光斑。
- * 【红线】仅页面级使用，禁止挂到全局 body 或工作区滚动容器（见 docs/ui-design-system.md）；
+ * 【红线】仅页面级使用，禁止挂到全局 body 或工作区滚动容器（见 docs/frontend/ui-design-system.md）；
  * 动画只用 transform（tailwind animate-drift / animate-drift-slow），不触发 layout。
  *
  * 渲染 3 个光斑：青（左上）、紫（右下）、青（底部居中偏暗），

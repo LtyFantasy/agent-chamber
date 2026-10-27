@@ -17,7 +17,7 @@
  *   - 导出纯函数分类器与 `isInlineImageAttachment` 供消息气泡过滤复用（单测直测）
  *
  * [权威文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（消息渲染）— 附件卡片
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（消息渲染）— 附件卡片
  *   - 补充: docs/api-definition.md §16a（附件 TTL / 410·12009 / 四表面口径）
  *
  * [关键不变量]

@@ -12,7 +12,7 @@
  *   - 主文档: .kimi/plans/plan-experience-base.md §3（详情端点契约：按 id 只过滤软删，
  *     suspect/过期条目照常可见并带标记）/§4（工具契约：expired/quality 必须透传）
  *   - 补充: packages/shared/src/dto/experience-response.dto.ts — ExperienceDetail 形状单源
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` 后，权威文档指针改为该线上文档
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` 后，权威文档指针改为该线上文档
  *
  * [关键不变量]
  *   - **详情与列表的过滤口径刻意不同**：列表默认排除 suspect/过期，详情**只过滤软删**——

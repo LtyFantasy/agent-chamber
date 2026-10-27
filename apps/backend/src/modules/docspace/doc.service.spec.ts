@@ -1,4 +1,4 @@
-import { Repository, SelectQueryBuilder } from 'typeorm';
+import { QueryFailedError, Repository, SelectQueryBuilder } from 'typeorm';
 import { DocService } from './doc.service';
 import { chunkMarkdown } from './markdown-chunker';
 import { Doc } from '../../database/entities/doc.entity';
@@ -10,14 +10,23 @@ import { DocSpace } from '../../database/entities/doc-space.entity';
 import { Board } from '../../database/entities/board.entity';
 import { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
 import { ErrorCode, AuditAction, ActorType, EventType } from '@agent-chamber/shared';
-import { NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
+import { NotFoundException, ConflictException, BadRequestException, Logger } from '@nestjs/common';
 import { EventService } from '../event/event.service';
 import { RouteHealthService } from './route-health.service';
 import { DiagramRendererService } from './diagram-renderer.service';
 import type { BatchUpsertItemDto } from './dto';
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX } from './doc-constants';
+
+// 凭证扫描挂点（v1.94.0-dev）：批量通道的逐条门控由本套件的真值表钉（评审 P2-1 后含
+// 23505 并发败者档）——扫描器本体/告警行字段封闭由 credential-scan.spec 覆盖
+jest.mock('../hints/credential-scan', () => ({ emitCredentialScanFactIfHit: jest.fn() }));
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
 
 describe('DocService', () => {
   let service: DocService;
+  /** hint 去重窗口（2 期，v1.92.0-dev）：真实例（内存 TTL Map） */
+  let hintDedup: HintDedupService;
   let docRepo: jest.Mocked<Repository<Doc>>;
   let sectionRepo: jest.Mocked<Repository<DocSection>>;
   let versionRepo: jest.Mocked<Repository<DocVersion>>;
@@ -32,6 +41,8 @@ describe('DocService', () => {
   // Diagram IR v1 渲染门 mock：diagram 分支用例在 beforeEach/具体用例里设置返回值
   let diagramRenderer: { validateAndRender: jest.Mock };
   let mockTransaction: jest.Mock;
+  /** 默认事务桩显式镜像最近读到的 Doc；需要竞态的用例另给独立 fresh。 */
+  let lastDocRead: Doc | null = null;
 
   /** 冲刷 setImmediate 队列：让 upsert/remove 里 fire-and-forget 的异步任务先于本回调执行 */
   const flushImmediates = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -104,7 +115,19 @@ describe('DocService', () => {
       addOrderBy: jest.fn().mockReturnThis(),
       getManyAndCount: jest.fn().mockResolvedValue([items, count]),
       getMany: jest.fn().mockResolvedValue(items),
-      getOne: jest.fn().mockResolvedValue(items[0] ?? null),
+      getOne: jest.fn(async () => {
+        const row = items[0] ?? null;
+        if (
+          row &&
+          typeof row === 'object' &&
+          'contentHash' in row &&
+          'source' in row &&
+          'spaceId' in row &&
+          'path' in row
+        )
+          lastDocRead = { ...row } as unknown as Doc;
+        return row;
+      }),
       getRawMany: jest.fn().mockResolvedValue([]),
       getRawOne: jest.fn().mockResolvedValue({ count: '0' }),
       select: jest.fn().mockReturnThis(),
@@ -122,14 +145,22 @@ describe('DocService', () => {
     } as unknown as SelectQueryBuilder<any>;
   }
 
+  /** Doc 事务查询返回实体快照，其他实体不得误用这份 Doc。 */
+  function createDocTransactionQueryBuilder() {
+    return createMockQueryBuilder(lastDocRead ? [{ ...lastDocRead }] : [], lastDocRead ? 1 : 0);
+  }
+
   beforeEach(() => {
+    lastDocRead = null;
     // Transaction mock: by default just invokes the callback with a simple manager
     mockTransaction = jest.fn((fn: any) =>
       fn({
-        getRepository: jest.fn(() => ({
+        getRepository: jest.fn((entity: unknown) => ({
           save: jest.fn((x: any) => Promise.resolve(x)),
           create: jest.fn((x: any) => x),
-          createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+          createQueryBuilder: jest.fn(() =>
+            entity === Doc ? createDocTransactionQueryBuilder() : createMockQueryBuilder([], 0),
+          ),
         })),
       }),
     );
@@ -200,6 +231,8 @@ describe('DocService', () => {
 
     diagramRenderer = { validateAndRender: jest.fn() };
 
+    hintDedup = new HintDedupService();
+
     service = new DocService(
       docRepo,
       sectionRepo,
@@ -212,6 +245,8 @@ describe('DocService', () => {
       routeHealthService as unknown as RouteHealthService,
       idempotencyRepo as unknown as Repository<IdempotencyRecord>,
       diagramRenderer as unknown as DiagramRendererService,
+      // hint 去重窗口（2 期）：真实例（跨用例共享窗口时由各用例自建/重置）
+      hintDedup,
     );
   });
 
@@ -400,7 +435,14 @@ describe('DocService', () => {
         create: jest.fn((x: unknown) => x),
         createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
       };
-      mockTransaction.mockImplementation((fn: any) => fn({ getRepository: () => managerRepo }));
+      mockTransaction.mockImplementation((fn: any) =>
+        fn({
+          getRepository: (entity: unknown) =>
+            entity === Doc
+              ? { ...managerRepo, createQueryBuilder: jest.fn(createDocTransactionQueryBuilder) }
+              : managerRepo,
+        }),
+      );
 
       await service.upsert('space-1', { ...dto, sourceSha: 'new-sha' });
       expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceSha: 'new-sha' }));
@@ -529,6 +571,10 @@ describe('DocService', () => {
       expect(result.id).toBe('winner-1');
       expect(result.sectionCount).toBe(5);
       expect(result.created).toBe(false);
+      // **并发败者标记**（评审 P2-1）：本请求写入的 content 未落库、返回数据全来自胜者
+      // ⇒ 领域侧（controller 的 doc.upserted 事实 + 凭证扫描 / batch 逐条扫描）据此跳过
+      // 「未写入却 emit」的观测面。缺这个标记会把本请求正文扫出告警并指到胜者 docId 上。
+      expect(result.concurrentWinner).toBe(true);
     });
 
     it('re-throws non-23505 errors', async () => {
@@ -576,12 +622,10 @@ describe('DocService', () => {
       };
       (docSpaceRepo.createQueryBuilder as jest.Mock).mockReturnValue(spaceQb);
 
+      const createdDoc = makeDoc({ id: 'doc-new', path: 'docs/test.md', title: 'Test Doc' });
       mockTransaction.mockResolvedValue({
-        doc: makeDoc({ id: 'doc-new', path: 'docs/test.md', title: 'Test Doc' }),
-        assembled: {
-          ...makeDoc({ id: 'doc-new', path: 'docs/test.md', title: 'Test Doc' }),
-          created: true,
-        },
+        doc: createdDoc,
+        assembled: { ...createdDoc, created: true },
       });
 
       await service.upsert('space-1', dto);
@@ -593,7 +637,12 @@ describe('DocService', () => {
         actorId: undefined,
         topicId: 'topic-1',
         boardId: undefined,
-        payload: { spaceId: 'space-1', docId: 'doc-new', path: 'docs/test.md', title: 'Hello' },
+        payload: {
+          spaceId: 'space-1',
+          docId: 'doc-new',
+          path: 'docs/test.md',
+          title: createdDoc.title,
+        },
       });
     });
 
@@ -626,7 +675,12 @@ describe('DocService', () => {
         actorId: undefined,
         topicId: 'topic-1',
         boardId: undefined,
-        payload: { spaceId: 'space-1', docId: 'doc-1', path: 'docs/test.md', title: 'Hello' },
+        payload: {
+          spaceId: 'space-1',
+          docId: 'doc-1',
+          path: 'docs/test.md',
+          title: updatedDoc.title,
+        },
       });
     });
 
@@ -829,7 +883,14 @@ describe('DocService', () => {
     mockTransaction.mockImplementation((fn: any) =>
       fn({
         getRepository: jest.fn((Entity: unknown) =>
-          Entity === DocVersion ? versionTransRepo : genericTransRepo,
+          Entity === DocVersion
+            ? versionTransRepo
+            : Entity === Doc
+              ? {
+                  ...genericTransRepo,
+                  createQueryBuilder: jest.fn(createDocTransactionQueryBuilder),
+                }
+              : genericTransRepo,
         ),
       }),
     );
@@ -958,7 +1019,14 @@ describe('DocService', () => {
         };
         return fn({
           getRepository: jest.fn((Entity: unknown) =>
-            Entity === DocVersion ? versionTxRepo : genericTxRepo,
+            Entity === DocVersion
+              ? versionTxRepo
+              : Entity === Doc
+                ? {
+                    ...genericTxRepo,
+                    createQueryBuilder: jest.fn(createDocTransactionQueryBuilder),
+                  }
+                : genericTxRepo,
           ),
         });
       });
@@ -1224,6 +1292,79 @@ describe('DocService', () => {
       expect(result.summary).toEqual({ total: 2, created: 1, updated: 0, unchanged: 0, failed: 1 });
     });
 
+    it('QueryFailedError 喂入 → 消毒文案 + 派生 code，PG 原文绝不出现在 per-item error（F4 项5）', async () => {
+      const upsertSpy = jest.spyOn(service, 'upsert');
+      upsertSpy.mockRejectedValueOnce(
+        new QueryFailedError(
+          'INSERT',
+          [],
+          Object.assign(
+            new Error('duplicate key value violates unique constraint "docs_path_key"'),
+            {
+              code: '23505',
+            },
+          ),
+        ),
+      );
+
+      const result = await service.batchUpsert('space-1', [baseDto]);
+
+      expect(result.summary).toEqual({ total: 1, created: 0, updated: 0, unchanged: 0, failed: 1 });
+      // 映射单源（pg-error.util）的固定文案 + 派生业务码
+      expect(result.results[0].error).toEqual({
+        message: 'Resource conflict',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+      // 泄露面回归：per-item 结果整体不含表名 / 约束名 / PG 关键字 / PG 原文片段
+      expect(JSON.stringify(result.results[0])).not.toMatch(
+        /relation|constraint|violates|docs_path_key/i,
+      );
+    });
+
+    it('per-item 失败日志接线与上界：前 10 条明细 + 一条聚合行（复审 MAJOR-2）', async () => {
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const upsertSpy = jest.spyOn(service, 'upsert');
+        // 全部 11 条失败 → 恰好越过 PER_ITEM_LOG_DETAIL_MAX(10) 一条
+        upsertSpy.mockRejectedValue(
+          new QueryFailedError(
+            'INSERT',
+            [],
+            Object.assign(
+              new Error('duplicate key value violates unique constraint "docs_path_key"'),
+              { code: '23505' },
+            ),
+          ),
+        );
+
+        const docs = Array.from({ length: 11 }, (_, i) => ({
+          ...baseDto,
+          path: `docs/f${i}.md`,
+          content: 'x',
+        }));
+        const result = await service.batchUpsert('space-1', docs);
+
+        expect(result.summary.failed).toBe(11);
+        const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+        const detail = lines.filter((l) => l.startsWith('batchUpsert per-item failed:'));
+        const aggregate = lines.filter((l) =>
+          l.startsWith('batchUpsert per-item failures truncated:'),
+        );
+
+        expect(detail).toHaveLength(10);
+        expect(aggregate).toHaveLength(1);
+        expect(aggregate[0]).toContain('total=11');
+        expect(aggregate[0]).toContain('first 10');
+        expect(detail[0]).toContain(
+          'path=docs/f0.md err=QueryFailedError sqlstate=23505 msg=Resource conflict',
+        );
+        // 日志行同样不得回显 PG 原文（与响应面共用同一份消毒文案）
+        expect(detail.join('\n')).not.toMatch(/docs_path_key|constraint|violates/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it('distinguishes created=true / updated=false / 23505-winner=false in result flags', async () => {
       const upsertSpy = jest.spyOn(service, 'upsert');
       upsertSpy
@@ -1253,6 +1394,43 @@ describe('DocService', () => {
       expect(result.summary.updated).toBe(1);
       expect(result.summary.unchanged).toBe(0);
       expect(result.summary.failed).toBe(0);
+    });
+
+    it('**23505 并发败者出口的 item 不触发凭证扫描**（评审 P2-1；同用例内带对照组）', async () => {
+      const upsertSpy = jest.spyOn(service, 'upsert');
+      upsertSpy
+        // 败者：status 仍是 'updated'（created:false），**只有 concurrentWinner 能区分**
+        .mockResolvedValueOnce({
+          id: 'winner-doc',
+          path: 'docs/lost.md',
+          sectionCount: 1,
+          tokenEstimate: 10,
+          created: false,
+          concurrentWinner: true,
+        })
+        // 正常写入：对照组（证明门控不是「整体没扫」）
+        .mockResolvedValueOnce({
+          id: 'ok-doc',
+          path: 'docs/ok.md',
+          sectionCount: 1,
+          tokenEstimate: 10,
+          created: true,
+        });
+
+      const result = await service.batchUpsert('space-1', [
+        { ...baseDto, path: 'docs/lost.md', content: 'loser-content' },
+        { ...baseDto, path: 'docs/ok.md', content: 'winner-content' },
+      ]);
+
+      // 状态面无法区分两者（都是 updated/created）——门控必须靠 concurrentWinner
+      expect(result.results.map((item) => item.status)).toEqual(['updated', 'created']);
+      // **只有真正写入的那条被扫**，且 resourceId 是本条自己的 docId（不是别人的）
+      expect(emitCredentialScanFactIfHit).toHaveBeenCalledTimes(1);
+      expect(emitCredentialScanFactIfHit).toHaveBeenCalledWith('winner-content', {
+        resourceKind: 'doc',
+        resourceId: 'ok-doc',
+        actorId: null,
+      });
     });
 
     it('returns total=0 for empty array (service-level direct call, DTO validation separate)', async () => {
@@ -1292,6 +1470,11 @@ describe('DocService', () => {
         undefined,
         // 第 4 参 = clientRequestId（v1.63.0 幂等透传；本用例 batch 元素未携带 → undefined）
         undefined,
+        // 第 5 参 = 空间写上下文（2 期 v1.92.0-dev：逐 batch 提升的词表 + hint 闸门 +
+        // pathTypes 三合一；本用例空间 settings 为空 → 三键皆 null）
+        expect.objectContaining({ vocabulary: null, hintToggles: null, pathTypes: null }),
+        // 第 6 参 = hint 埋点面标识（m1：批量通道 → 'batch_upsert'，日志可区分来源）
+        'batch_upsert',
       );
       const callArg = upsertSpy.mock.calls[0][1] as Record<string, unknown>;
       expect(callArg.forceRechunk).toBeUndefined();
@@ -1618,13 +1801,211 @@ describe('DocService', () => {
       );
       expect(catQb.andWhere).toHaveBeenCalledWith('dc.id IS NOT NULL');
     });
+
+    // ── 词表状态与 vocabulary 回显（v1.92.0-dev，DocSpace 元数据治理 1 期）──
+
+    it('marks types declared/undeclared when settings.docTypes is declared', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([
+        { value: 'guide', count: '3' },
+        { value: 'legacy', count: '1' },
+      ]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      const result = await service.findFacets('space-1', { docTypes: ['guide'] });
+
+      expect(result.types).toEqual([
+        { value: 'guide', count: 3, vocabStatus: 'declared' },
+        { value: 'legacy', count: 1, vocabStatus: 'undeclared' },
+      ]);
+      expect(result.vocabulary?.docTypes).toEqual(['guide']);
+    });
+
+    it('marks tags canonical (exact) / alias (case variant) / undeclared + canonicalValue', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([
+        { value: 'npc', count: '5' },
+        { value: 'OpenViking', count: '2' },
+        { value: 'misc', count: '1' },
+      ]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      const result = await service.findFacets('space-1', {
+        canonicalTags: [
+          { value: 'npc', aliases: ['NPC'] },
+          { value: 'openviking', aliases: ['OpenViking'] },
+        ],
+      });
+
+      expect(result.tags).toEqual([
+        { value: 'npc', count: 5, vocabStatus: 'canonical' },
+        { value: 'OpenViking', count: 2, vocabStatus: 'alias', canonicalValue: 'openviking' },
+        { value: 'misc', count: 1, vocabStatus: 'undeclared' },
+      ]);
+    });
+
+    it('omits vocabStatus and vocabulary when the space declares no vocabulary', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'guide', count: '3' }]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'npc', count: '1' }]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      const result = await service.findFacets('space-1', { visibility: 'open' });
+
+      expect(result.vocabulary).toBeUndefined();
+      expect(result.types[0].vocabStatus).toBeUndefined();
+      expect(result.tags[0].vocabStatus).toBeUndefined();
+    });
+
+    it('survives dirty vocabulary shapes (F1: string array / non-string entries)', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'guide', count: '3' }]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'openviking', count: '1' }]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      // canonicalTags 为字符串数组（旧实现 entry.value.toLowerCase() 抛）+ docTypes 含非字符串
+      const result = await service.findFacets('space-1', {
+        canonicalTags: ['openviking'],
+        docTypes: [123, 'guide'],
+      });
+
+      // 脏族按「无词表」处理：无 vocabulary 回显、无 tags 状态；合法条目仍生效
+      expect(result.vocabulary?.canonicalTags ?? null).toBeNull();
+      expect(result.tags[0].vocabStatus).toBeUndefined();
+      expect(result.types[0].vocabStatus).toBe('declared');
+    });
+
+    it('keeps a partially dirty canonicalTags entry list (F1: per-element gate)', async () => {
+      const typeQb = createMockQueryBuilder([], 0);
+      typeQb.getRawMany = jest.fn().mockResolvedValue([]);
+      const tagQb = createMockQueryBuilder([], 0);
+      tagQb.getRawMany = jest.fn().mockResolvedValue([{ value: 'npc', count: '2' }]);
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getRawMany = jest.fn().mockResolvedValue([]);
+      (docRepo.createQueryBuilder as jest.Mock)
+        .mockReturnValueOnce(typeQb)
+        .mockReturnValueOnce(tagQb)
+        .mockReturnValueOnce(catQb);
+
+      const result = await service.findFacets('space-1', {
+        canonicalTags: [
+          { value: null, aliases: [] },
+          { value: 'npc', aliases: ['NPC'] },
+        ],
+      });
+
+      expect(result.vocabulary?.canonicalTags).toEqual([{ value: 'npc', aliases: ['NPC'] }]);
+      expect(result.tags[0].vocabStatus).toBe('canonical');
+    });
+  });
+
+  // ─── resolveTags（空间词表归一，v1.92.0-dev）──────────────────
+
+  describe('resolveTags', () => {
+    /** 私有方法直取（spec 内允许，对齐既有 (x as any) 用法） */
+    const resolveTags = (
+      tags: string[] | undefined,
+      vocabulary: Array<{ value: string; aliases?: string[] }> | null,
+    ) => (service as any).resolveTags(tags, vocabulary);
+
+    it('returns tags unchanged with no normalizations when vocabulary is absent', () => {
+      const r = resolveTags(['NPC', 'misc'], null);
+      expect(r.tags).toEqual(['NPC', 'misc']);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('matches canonical value case-insensitively without recording a no-op normalization', () => {
+      const r = resolveTags(['npc'], [{ value: 'npc', aliases: ['NPC'] }]);
+      expect(r.tags).toEqual(['npc']);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('normalizes alias hits (case-insensitive) to the canonical form', () => {
+      const r = resolveTags(
+        ['NPC', 'OpenViking'],
+        [
+          { value: 'npc', aliases: ['NPC'] },
+          { value: 'openviking', aliases: ['OpenViking'] },
+        ],
+      );
+      expect(r.tags).toEqual(['npc', 'openviking']);
+      expect(r.normalizations).toEqual([
+        { from: 'NPC', to: 'npc' },
+        { from: 'OpenViking', to: 'openviking' },
+      ]);
+    });
+
+    it('trims for matching but leaves unlisted tags byte-identical', () => {
+      const r = resolveTags([' Weird '], [{ value: 'npc', aliases: [] }]);
+      expect(r.tags).toEqual([' Weird ']);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('dedupes after normalization keeping first occurrence', () => {
+      const r = resolveTags(['NPC', 'npc'], [{ value: 'npc', aliases: ['NPC'] }]);
+      expect(r.tags).toEqual(['npc']);
+      expect(r.normalizations).toEqual([{ from: 'NPC', to: 'npc' }]);
+    });
+
+    it('short-circuits on empty tags', () => {
+      const r = resolveTags([], [{ value: 'npc', aliases: [] }]);
+      expect(r.tags).toEqual([]);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('keeps unlisted duplicates verbatim (F3: dedupe only applies to normalized values)', () => {
+      const r = resolveTags(['foo', 'foo'], [{ value: 'npc', aliases: ['NPC'] }]);
+      expect(r.tags).toEqual(['foo', 'foo']);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('still dedupes matched values (F3: matched branch keeps first occurrence)', () => {
+      const r = resolveTags(['npc', 'NPC'], [{ value: 'npc', aliases: ['NPC'] }]);
+      // 首现 'npc' 已是声明形态（零归一），后到的 'NPC' 被去重丢弃 → 无归一记录
+      expect(r.tags).toEqual(['npc']);
+      expect(r.normalizations).toEqual([]);
+    });
+
+    it('treats a missing aliases field as an empty list (F5: aliases optional)', () => {
+      const r = resolveTags(['NPC'], [{ value: 'npc' }]);
+      // aliases 缺省 = 合法空表（不剔除条目）；canonical 值 ci 匹配仍生效
+      expect(r.tags).toEqual(['npc']);
+      expect(r.normalizations).toEqual([{ from: 'NPC', to: 'npc' }]);
+    });
   });
 
   // ─── findOne ────────────────────────────────────────────────
 
   describe('findOne', () => {
     it('returns doc with section outline (no content) for large docs', async () => {
-      // 大文档（tokenEstimate > 2000 阈值）→ 仅大纲，零 content 开销
+      // 大文档（tokenEstimate > 2000 阈值）→ 仅大纲；响应体零 content
+      // （查询侧 v1.93.0 批 2 起会多取一列 content 供派生 sectionHash，见下条用例）
       const doc = makeDoc({ tokenEstimate: 5000 });
       const docQb = createMockQueryBuilder([doc], 1);
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
@@ -1652,8 +2033,63 @@ describe('DocService', () => {
       expect((result.sections![0] as any).content).toBeUndefined();
       expect(result.mode).toBe('outline');
       expect((result as any).content).toBeUndefined();
-      // outline 分支零额外开销：仅一次 section 查询
+      // outline 分支不追加查询：section 查询仍只有一次（full 分支才发第二次全量查询）
       expect(sectionRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+
+    it('v1.93.0 批 2：outline 每节携带 sectionHash（与 positions[] 同口径逐项相等，存储三元组派生）', async () => {
+      // 复核场景验收：一次 outline 调用即可完成全篇对账。outline 的 sectionHash 经内存
+      // 派生（查询额外 select content 列，派生后即丢，不进响应体）——口径与 positions[]
+      // 批量通道 / getSection 完全一致（同一 computeSectionHash）。
+      const doc = makeDoc({ tokenEstimate: 5000 });
+      (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([doc], 1));
+
+      // 确定性 content 是 hash 判别力的前提：hash 输入 = 存储三元组
+      // （headingPath / headingLevel / content），mock 实体必须显式给值
+      const s0 = makeSection({
+        position: 0,
+        headingPath: 'Intro',
+        headingLevel: 1,
+        content: 'Intro body.',
+      });
+      const s1 = makeSection({
+        position: 1,
+        headingPath: 'Intro § Details',
+        headingLevel: 2,
+        content: 'Details body.',
+      });
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([s0, s1], 2),
+      );
+
+      const result = await service.findOne('doc-1');
+      expect(result.mode).toBe('outline');
+
+      // 与服务端 computeSectionHash 同口径的期望值（同一公式在测试侧复算）
+      const expectedHash = (s: {
+        headingPath: string | null;
+        headingLevel: number;
+        content: string;
+      }) =>
+        require('crypto')
+          .createHash('sha256')
+          .update(`${s.headingPath ?? ''}\n${s.headingLevel}\n${s.content}`)
+          .digest('hex');
+
+      expect(result.sections![0].sectionHash).toBe(expectedHash(s0));
+      expect(result.sections![1].sectionHash).toBe(expectedHash(s1));
+
+      // 口径一致（任务验收第 1 条）：outline 与批量读通道同节 hash 逐项相等
+      (sectionRepo.createQueryBuilder as jest.Mock).mockReturnValue(
+        createMockQueryBuilder([s0, s1], 2),
+      );
+      const batch = await service.getSections('doc-1', [0, 1]);
+      expect(result.sections!.map((s) => s.sectionHash)).toEqual(
+        batch.sections.map((s) => s.sectionHash),
+      );
+
+      // 响应体仍精简：派生用的 content 列不外泄
+      expect((result.sections![0] as any).content).toBeUndefined();
     });
 
     it('derives local heading as last headingPath segment (display field)', async () => {
@@ -2972,7 +3408,11 @@ describe('DocService', () => {
       await expect(
         service.patchSection('doc-1', 1, '## 第二节\n\n篡改', 'native', undefined, 'stale-hash'),
       ).rejects.toMatchObject({
-        response: { code: ErrorCode.DOC_CONTENT_CONFLICT, data: { sectionCount: 2 } },
+        response: {
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { sectionCount: 2 },
+          message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
+        },
       });
       expect(upsertSpy).not.toHaveBeenCalled();
     });
@@ -3483,19 +3923,25 @@ describe('DocService', () => {
       content: '# Hello\n\nSome content.',
     };
 
-    it('hash 不符 → 409 DOC_CONTENT_CONFLICT（事务外快速失败），不进事务', async () => {
+    it('hash 不符 → 409 DOC_CONTENT_CONFLICT（事务外快速失败），不进事务 + **message 含恢复动作**', async () => {
       const existingDoc = makeDoc({ contentHash: 'abc123' });
       (docRepo.createQueryBuilder as jest.Mock).mockReturnValue(
         createMockQueryBuilder([existingDoc], 1),
       );
 
-      await expect(
-        service.upsert('space-1', { ...dto, expectedContentHash: 'deadbeef' }),
-      ).rejects.toMatchObject({
-        response: {
-          code: ErrorCode.DOC_CONTENT_CONFLICT,
-          data: { currentContentHash: 'abc123' },
-        },
+      let caught: Error | null = null;
+      try {
+        await service.upsert('space-1', { ...dto, expectedContentHash: 'deadbeef' });
+      } catch (e: unknown) {
+        caught = e as Error;
+      }
+      // 八处抛点共用同一句恢复动作单源（doc-constants.DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX）：
+      // 先 read_doc 重取 contentHash + 勿用同一 payload 盲重试——**不是**在异常过滤器里
+      // 按 code 挂文案（那会把 task 侧同码跨域抛点一并改写）
+      expect(caught?.message).toContain(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX);
+      expect((caught as unknown as { getResponse: () => unknown }).getResponse()).toMatchObject({
+        code: ErrorCode.DOC_CONTENT_CONFLICT,
+        data: { currentContentHash: 'abc123' },
       });
       expect(mockTransaction).not.toHaveBeenCalled();
     });
@@ -3506,7 +3952,11 @@ describe('DocService', () => {
       await expect(
         service.upsert('space-1', { ...dto, expectedContentHash: 'abc123' }),
       ).rejects.toMatchObject({
-        response: { code: ErrorCode.DOC_CONTENT_CONFLICT, data: { currentContentHash: null } },
+        response: {
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { currentContentHash: null },
+          message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
+        },
       });
       expect(mockTransaction).not.toHaveBeenCalled();
     });
@@ -3561,6 +4011,7 @@ describe('DocService', () => {
         response: {
           code: ErrorCode.DOC_CONTENT_CONFLICT,
           data: { currentContentHash: 'concurrent-change' },
+          message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
         },
       });
       expect(saveSpy).not.toHaveBeenCalled();
@@ -3606,6 +4057,337 @@ describe('DocService', () => {
 
       const created = await service.upsert('space-1', dto);
       expect(created.contentHash).toBe('createdhash');
+    });
+  });
+
+  describe('upsert — A2 locked content intent', () => {
+    /** 固定锁前/锁后快照与分实体事务仓储，断言真实业务顺序而非空 getOne。 */
+    function arrange(fresh: Doc | null, before: Partial<Doc> = {}) {
+      const existing = makeDoc({ contentHash: 'before', ...before });
+      docRepo.createQueryBuilder.mockReturnValue(createMockQueryBuilder([existing], 1));
+      const lockQb = createMockQueryBuilder(fresh ? [fresh] : [], fresh ? 1 : 0);
+      const sectionQb = createMockQueryBuilder([], 0);
+      const txDoc = {
+        createQueryBuilder: jest.fn(() => lockQb),
+        save: jest.fn(async (doc: Doc) => doc),
+      };
+      const txSections = {
+        createQueryBuilder: jest.fn(() => sectionQb),
+        create: jest.fn((row: unknown) => row),
+        save: jest.fn(async (rows: unknown) => rows),
+      };
+      const txVersions = {
+        createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+        create: jest.fn((row: unknown) => row),
+        save: jest.fn(async (row: unknown) => row),
+      };
+      const txIdempotency = { save: jest.fn(async (row: unknown) => row) };
+      mockTransaction.mockImplementation(async (fn: any) =>
+        fn({
+          getRepository: (entity: unknown) => {
+            if (entity === Doc) return txDoc;
+            if (entity === DocSection) return txSections;
+            if (entity === DocVersion) return txVersions;
+            if (entity === IdempotencyRecord) return txIdempotency;
+            throw new Error('Unexpected transaction entity');
+          },
+        }),
+      );
+      return { existing, lockQb, sectionQb, txDoc, txSections, txVersions, txIdempotency };
+    }
+
+    const input = { path: 'docs/test.md', content: '# Changed\n\nNew body.' };
+    const contentHash = () =>
+      require('crypto').createHash('sha256').update(input.content).digest('hex');
+
+    /** 合法最小 IR；renderer stub 与 PG/真实渲染验收明确分离。 */
+    const ir = {
+      schema_version: 1,
+      diagram_type: 'architecture',
+      meta: { title: 'A2' },
+      components: [{ id: 'api', type: 'backend', label: 'API', pos: [40, 40] }],
+      connections: [],
+    };
+    const canonical = JSON.stringify(ir, null, 2);
+    const irHash = require('crypto').createHash('sha256').update(canonical).digest('hex');
+    const renderMeta = {
+      renderedAt: '2026-10-25T00:00:00Z',
+      rendererVersion: 'fixture',
+      qualityProfile: 'standard',
+      htmlBytes: 10,
+      htmlSha256: 'fixture',
+    };
+
+    it('prepared diagram becoming Markdown rejects before destructive writes', async () => {
+      const fx = arrange(makeDoc({ docType: 'note' }), { docType: 'diagram' });
+      diagramRenderer.validateAndRender.mockResolvedValue({ html: '<svg/>', meta: renderMeta });
+      await expect(
+        service.upsert('space-1', { path: input.path, content: canonical }),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.DOC_CONTENT_CONFLICT } });
+      expect(fx.txDoc.save).not.toHaveBeenCalled();
+      expect(fx.sectionQb.execute).not.toHaveBeenCalled();
+    });
+
+    it('explicit docType conversion keeps current caller intent despite prepared/fresh drift', async () => {
+      const fx = arrange(makeDoc({ docType: 'diagram', diagramType: 'architecture', renderMeta }), {
+        docType: 'note',
+      });
+      await service.upsert('space-1', { ...input, docType: 'guide' });
+      expect(fx.txDoc.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          docType: 'guide',
+          diagramType: null,
+          renderedHtml: null,
+          renderMeta: null,
+        }),
+      );
+    });
+
+    it('internal diagram PATCH preserves locked curation and emits stored title', async () => {
+      const fx = arrange(
+        makeDoc({ docType: 'diagram', title: 'Fresh IR title', summary: 'Fresh IR summary' }),
+        { docType: 'diagram' },
+      );
+      diagramRenderer.validateAndRender.mockResolvedValue({ html: '<svg/>', meta: renderMeta });
+      await service.upsert(
+        'space-1',
+        {
+          path: input.path,
+          content: canonical,
+          title: 'Old title',
+          summary: 'Old summary',
+          versionSource: 'patch',
+        },
+        { id: 'actor-1', type: ActorType.HUMAN } as any,
+      );
+      expect(fx.txDoc.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Fresh IR title',
+          summary: 'Fresh IR summary',
+          contentHash: irHash,
+        }),
+      );
+      expect(auditRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ newData: { path: input.path, title: 'Fresh IR title' } }),
+      );
+      expect(eventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ payload: expect.objectContaining({ title: 'Fresh IR title' }) }),
+      );
+    });
+
+    it('late unchanged diagram response uses locked render metadata', async () => {
+      const fx = arrange(
+        makeDoc({
+          docType: 'diagram',
+          diagramType: 'architecture',
+          contentHash: irHash,
+          renderMeta,
+        }),
+        { docType: 'diagram' },
+      );
+      diagramRenderer.validateAndRender.mockResolvedValue({
+        html: '<svg/>',
+        meta: { ...renderMeta, rendererVersion: 'prepared' },
+      });
+      const result = await service.upsert('space-1', { path: input.path, content: canonical });
+      expect(result).toMatchObject({
+        unchanged: true,
+        contentHash: irHash,
+        diagramType: 'architecture',
+        render: { rendererVersion: 'fixture' },
+      });
+      expect(fx.txDoc.save).not.toHaveBeenCalled();
+      expect(fx.txVersions.save).not.toHaveBeenCalled();
+      expect(eventService.create).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, 'before'])(
+      'locks complete locator before replacing sections (expected=%s)',
+      async (expectedContentHash) => {
+        const fx = arrange(makeDoc({ contentHash: 'before' }));
+        await service.upsert('space-1', { ...input, expectedContentHash });
+        expect(fx.lockQb.setLock).toHaveBeenCalledWith('pessimistic_write');
+        expect(fx.lockQb.where).toHaveBeenCalledWith('d.id = :id', { id: 'doc-1' });
+        expect(fx.lockQb.andWhere).toHaveBeenCalledWith('d.space_id = :spaceId', {
+          spaceId: 'space-1',
+        });
+        expect(fx.lockQb.andWhere).toHaveBeenCalledWith('d.path = :path', { path: input.path });
+        expect(fx.lockQb.andWhere).toHaveBeenCalledWith('d.deleted_at IS NULL');
+        expect((fx.lockQb.getOne as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+          (fx.sectionQb.execute as jest.Mock).mock.invocationCallOrder[0],
+        );
+      },
+    );
+
+    it.each([
+      ['missing or moved', null, undefined, ErrorCode.DOC_CONTENT_CONFLICT],
+      [
+        'stale expected hash',
+        makeDoc({ contentHash: 'after' }),
+        'before',
+        ErrorCode.DOC_CONTENT_CONFLICT,
+      ],
+      [
+        'changed source',
+        makeDoc({ source: 'git:other' }),
+        undefined,
+        ErrorCode.DOC_SOURCE_MISMATCH,
+      ],
+      [
+        'prepared markdown became diagram',
+        makeDoc({ docType: 'diagram' }),
+        undefined,
+        ErrorCode.DOC_CONTENT_CONFLICT,
+      ],
+    ])(
+      '%s rejects before any content destruction',
+      async (_label, fresh, expectedContentHash, code) => {
+        const fx = arrange(fresh as Doc | null);
+        await expect(
+          service.upsert('space-1', {
+            ...input,
+            expectedContentHash: expectedContentHash as string | undefined,
+          }),
+        ).rejects.toMatchObject({ response: { code } });
+        expect(fx.sectionQb.execute).not.toHaveBeenCalled();
+        expect(fx.txDoc.save).not.toHaveBeenCalled();
+        expect(fx.txVersions.save).not.toHaveBeenCalled();
+        expect(eventService.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('inherits fresh omitted metadata and ordinary Markdown type changes', async () => {
+      const fresh = makeDoc({
+        contentHash: 'after',
+        docType: 'guide',
+        tags: ['fresh'],
+        categoryId: 'fresh-category',
+        sourceSha: 'fresh-sha',
+        createdBy: 'fresh-author',
+      });
+      const fx = arrange(fresh, { docType: 'note' });
+      await service.upsert('space-1', input);
+      expect(fx.txDoc.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          docType: 'guide',
+          tags: ['fresh'],
+          categoryId: 'fresh-category',
+          sourceSha: 'fresh-sha',
+          createdBy: 'fresh-author',
+        }),
+      );
+    });
+
+    it.each(['patch', 'append'] as const)(
+      '%s keeps locked curated title/summary in storage, audit and event',
+      async (versionSource) => {
+        const fx = arrange(
+          makeDoc({ title: 'Fresh curated title', summary: 'Fresh curated summary' }),
+        );
+        await service.upsert(
+          'space-1',
+          { ...input, title: 'Old title', summary: 'Old summary', versionSource },
+          { id: 'actor-1', type: ActorType.HUMAN } as any,
+        );
+        expect(fx.txDoc.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: 'Fresh curated title',
+            summary: 'Fresh curated summary',
+          }),
+        );
+        expect(auditRepo.save).toHaveBeenCalledWith(
+          expect.objectContaining({ newData: { path: input.path, title: 'Fresh curated title' } }),
+        );
+        expect(eventService.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            payload: expect.objectContaining({ title: 'Fresh curated title' }),
+          }),
+        );
+      },
+    );
+
+    it.each(['upsert', 'import'] as const)(
+      '%s honors current title/summary intent',
+      async (versionSource) => {
+        const fx = arrange(makeDoc({ title: 'Fresh', summary: 'Fresh' }));
+        await service.upsert('space-1', {
+          ...input,
+          title: 'Requested',
+          summary: 'Requested summary',
+          versionSource,
+        });
+        expect(fx.txDoc.save).toHaveBeenCalledWith(
+          expect.objectContaining({ title: 'Requested', summary: 'Requested summary' }),
+        );
+      },
+    );
+
+    it.each([false, true])(
+      'late unchanged skips content, version, hints, audit and event (key=%s)',
+      async (withKey) => {
+        const fx = arrange(
+          makeDoc({
+            contentHash: contentHash(),
+            title: 'Fresh',
+            sectionCount: 7,
+            tokenEstimate: 77,
+            linkHealth: { total: 0 },
+          }),
+        );
+        const hints = jest.spyOn(service as any, 'buildDocWriteHints');
+        const result = await service.upsert(
+          'space-1',
+          input,
+          { id: 'actor-1', type: ActorType.HUMAN } as any,
+          withKey ? 'a2-late' : undefined,
+        );
+        await flushImmediates();
+        expect(result).toMatchObject({
+          unchanged: true,
+          contentHash: contentHash(),
+          sectionCount: 7,
+          tokenEstimate: 77,
+        });
+        expect(fx.sectionQb.execute).not.toHaveBeenCalled();
+        expect(fx.txDoc.save).not.toHaveBeenCalled();
+        expect(fx.txVersions.save).not.toHaveBeenCalled();
+        expect(hints).not.toHaveBeenCalled();
+        expect(auditRepo.save).not.toHaveBeenCalled();
+        expect(eventService.create).not.toHaveBeenCalled();
+        expect(routeHealthService.recheckSpace).not.toHaveBeenCalled();
+        expect(idempotencyRepo.save).not.toHaveBeenCalled();
+        if (withKey)
+          expect(fx.txIdempotency.save).toHaveBeenCalledWith(
+            expect.objectContaining({ responseSnapshot: result }),
+          );
+        else expect(fx.txIdempotency.save).not.toHaveBeenCalled();
+      },
+    );
+
+    it('late unchanged backfills only missing linkHealth/sourceSha through transaction repo', async () => {
+      const fx = arrange(
+        makeDoc({ contentHash: contentHash(), sourceSha: 'old-sha', linkHealth: null }),
+      );
+      await service.upsert('space-1', { ...input, sourceSha: 'new-sha' });
+      expect(fx.txDoc.save).not.toHaveBeenCalled();
+      expect((fx.lockQb as any).set).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceSha: 'new-sha', linkHealth: expect.any(Object) }),
+      );
+      expect(fx.sectionQb.execute).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['fresh now equals requested', 'before', true],
+      ['fresh differs despite old equality', contentHash(), false],
+    ])('forceRechunk recomputes version/event branch: %s', async (_label, oldHash, sameFresh) => {
+      const fx = arrange(makeDoc({ contentHash: sameFresh ? contentHash() : 'fresh-other' }), {
+        contentHash: oldHash,
+      });
+      const result = await service.upsert('space-1', { ...input, forceRechunk: true });
+      expect(result.rechunked).toBe(sameFresh ? true : undefined);
+      expect(fx.txVersions.save).toHaveBeenCalledTimes(sameFresh ? 0 : 1);
+      const event = eventService.create.mock.calls[0][0];
+      expect(event.payload.rechunked).toBe(sameFresh ? true : undefined);
     });
   });
 
@@ -3747,7 +4529,7 @@ describe('DocService', () => {
                   return Promise.resolve(x);
                 }),
                 create: jest.fn((x: any) => x),
-                createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+                createQueryBuilder: jest.fn(createDocTransactionQueryBuilder),
               };
             }
             return {
@@ -3974,11 +4756,15 @@ describe('DocService', () => {
     }
 
     /**
-     * 定制 patchMetadata 的事务 mock：事务内 QB 消费顺序 = 锁行（setLock getOne）→
-     * UPDATE（update/set/where/execute）→ fresh 重读（getOne）。
-     * 返回 setMock/executeMock 供断言「只 UPDATE 变更列」与「是否产生写」。
+     * 定制 patchMetadata 的事务 mock：Doc QB 顺序 = 锁行 → UPDATE → fresh 重读。
+     * 分类与幂等 repo 按实体独立分流，不得消费 Doc 的 QB 队列。
+     * 返回写入 spy 与事务分类 repo/QB，供断言变更列、零写和读取归属。
      */
-    function mockMetadataTx(locked: Doc | null, fresh?: Doc | null) {
+    function mockMetadataTx(
+      locked: Doc | null,
+      fresh?: Doc | null,
+      category: DocCategory | null = null,
+    ) {
       const setMock = jest.fn().mockReturnThis();
       const executeMock = jest.fn().mockResolvedValue({ affected: 1 });
       const lockQb = createMockQueryBuilder(locked ? [locked] : [], locked ? 1 : 0);
@@ -3990,15 +4776,65 @@ describe('DocService', () => {
       };
       const freshQb = createMockQueryBuilder(fresh ? [fresh] : [], fresh ? 1 : 0);
       const qbs: unknown[] = [lockQb, updateQb, freshQb];
+      const txDocRepo = { createQueryBuilder: jest.fn(() => qbs.shift()) };
+      const categoryQb = createMockQueryBuilder(category ? [category] : [], category ? 1 : 0);
+      const txCategoryRepo = { createQueryBuilder: jest.fn(() => categoryQb) };
+      const txIdempotencyRepo = { save: jest.fn(async (row: unknown) => row) };
+      const getRepository = jest.fn((entity: unknown) => {
+        if (entity === Doc) return txDocRepo;
+        if (entity === DocCategory) return txCategoryRepo;
+        if (entity === IdempotencyRecord) return txIdempotencyRepo;
+        throw new Error('Unexpected metadata transaction repository');
+      });
       docRepo.manager.transaction = jest.fn(async (fn: (manager: unknown) => Promise<unknown>) =>
-        fn({
-          getRepository: jest.fn(() => ({
-            createQueryBuilder: jest.fn(() => qbs.shift()),
-          })),
-        }),
+        fn({ getRepository }),
       ) as unknown as typeof docRepo.manager.transaction;
-      return { setMock, executeMock };
+      return { setMock, executeMock, txDocRepo, txCategoryRepo, categoryQb, getRepository };
     }
+
+    it.each([true, false])(
+      '已有分类 changed=%s：仅改 title 时视图读取归当前事务 repo',
+      async (changed) => {
+        const doc = makeDoc({ contentHash: HASH, title: '原始标题', categoryId: 'cat-1' });
+        const title = changed ? '更新标题' : doc.title;
+        const category = makeCategory({ id: 'cat-1', name: '事务分类' });
+        mockFindById(doc);
+        const { txDocRepo, txCategoryRepo, categoryQb, getRepository, executeMock } =
+          mockMetadataTx(doc, changed ? makeDoc({ ...doc, title }) : undefined, category);
+
+        const result = await service.patchMetadata(
+          doc.id,
+          { title, expectedContentHash: HASH },
+          { id: 'actor-1', type: ActorType.HUMAN },
+        );
+
+        expect(result.metadata).toEqual({
+          title,
+          summary: doc.summary,
+          docType: doc.docType,
+          tags: doc.tags,
+          categoryId: category.id,
+          categoryName: category.name,
+        });
+        expect(result.unchanged).toBe(!changed);
+        expect(result.changedFields).toEqual(changed ? ['title'] : []);
+        expect(getRepository).toHaveBeenNthCalledWith(1, Doc);
+        expect(getRepository).toHaveBeenNthCalledWith(2, DocCategory);
+        expect(getRepository).toHaveBeenCalledTimes(2);
+        expect(txDocRepo.createQueryBuilder).toHaveBeenCalledTimes(changed ? 3 : 1);
+        expect(txCategoryRepo.createQueryBuilder).toHaveBeenCalledWith('dc');
+        expect(txCategoryRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+        expect(categoryQb.select).toHaveBeenCalledWith(['dc.id', 'dc.name']);
+        expect(categoryQb.where).toHaveBeenCalledWith('dc.id = :id', { id: category.id });
+        expect(categoryQb.andWhere).toHaveBeenCalledWith('dc.deleted_at IS NULL');
+        expect(categoryQb.getOne).toHaveBeenCalledTimes(1);
+        expect(categoryRepo.createQueryBuilder).not.toHaveBeenCalled();
+        expect(categoryRepo.save).not.toHaveBeenCalled();
+        expect(executeMock).toHaveBeenCalledTimes(changed ? 1 : 0);
+        expect(auditRepo.save).toHaveBeenCalledTimes(changed ? 1 : 0);
+        expect(eventService.create).toHaveBeenCalledTimes(changed ? 1 : 0);
+      },
+    );
 
     it('partial：仅显式字段进入 UPDATE（缺席字段不动，changedFields 精确）', async () => {
       const doc = makeDoc({ contentHash: HASH, title: '旧标题', tags: ['x'] });
@@ -4080,7 +4916,7 @@ describe('DocService', () => {
         tags: ['t1'],
         categoryId: 'cat-9',
       });
-      const { setMock } = mockMetadataTx(doc, fresh);
+      const { setMock } = mockMetadataTx(doc, fresh, cat);
 
       const result = await service.patchMetadata(
         'doc-1',
@@ -4114,6 +4950,7 @@ describe('DocService', () => {
         response: {
           code: ErrorCode.DOC_CONTENT_CONFLICT,
           data: { currentContentHash: 'current-hash' },
+          message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
         },
       });
       expect(txSpy).not.toHaveBeenCalled();
@@ -4132,6 +4969,7 @@ describe('DocService', () => {
         response: {
           code: ErrorCode.DOC_CONTENT_CONFLICT,
           data: { currentContentHash: 'edited-concurrently' },
+          message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
         },
       });
       expect(executeMock).not.toHaveBeenCalled();
@@ -4187,7 +5025,7 @@ describe('DocService', () => {
         createMockQueryBuilder([cat], 1),
       );
       const fresh = makeDoc({ contentHash: HASH, categoryId: 'cat-1' });
-      const { setMock } = mockMetadataTx(doc, fresh);
+      const { setMock } = mockMetadataTx(doc, fresh, cat);
 
       const result = await service.patchMetadata(
         'doc-1',
@@ -4207,7 +5045,7 @@ describe('DocService', () => {
       (categoryRepo.createQueryBuilder as jest.Mock).mockReturnValue(
         createMockQueryBuilder([cat], 1),
       );
-      const { executeMock } = mockMetadataTx(doc);
+      const { executeMock } = mockMetadataTx(doc, undefined, cat);
 
       const result = await service.patchMetadata('doc-1', {
         category: 'Test',
@@ -4222,14 +5060,12 @@ describe('DocService', () => {
     it('allowCreateCategory=true：未命中走 resolveCategory 自动创建', async () => {
       const doc = makeDoc({ contentHash: HASH, categoryId: null });
       mockFindById(doc);
-      // 第一次 QB（查找）未命中；resolveCategory 创建后 buildMetadataView 再查新分类名
+      // 全局 QB 只负责事务前查找；创建后的视图分类名由事务 repo 返回。
       const created = makeCategory({ id: 'cat-new', name: '新分类', slug: '新分类' });
-      (categoryRepo.createQueryBuilder as jest.Mock)
-        .mockReturnValueOnce(createMockQueryBuilder([], 0))
-        .mockReturnValue(createMockQueryBuilder([created], 1));
+      (categoryRepo.createQueryBuilder as jest.Mock).mockReturnValue(createMockQueryBuilder([], 0));
       (categoryRepo.save as jest.Mock).mockResolvedValue(created);
       const fresh = makeDoc({ contentHash: HASH, categoryId: 'cat-new' });
-      mockMetadataTx(doc, fresh);
+      mockMetadataTx(doc, fresh, created);
 
       const result = await service.patchMetadata(
         'doc-1',
@@ -4410,6 +5246,42 @@ describe('DocService', () => {
       expect(result.changedFields).toEqual(['docType']);
       expect((setMock.mock.calls[0][0] as Record<string, unknown>).docType).toBe('note');
     });
+
+    // ── 批 1：写侧 hint 作用域（plan nightwing-polaris-phil-coulson 改动 1）────
+
+    it('作用域收窄：未携带 tags 时 loadTagPool 不被调用（携带时才调，同 spy 对照）', async () => {
+      // 前置三件套（缺一即非判别）：族开 + 被测 doc 携带词表外 tag + 请求不带 tags
+      const doc = makeDoc({ contentHash: HASH, title: '旧', tags: ['openvikings'] });
+      mockFindById(doc);
+      (docSpaceRepo.findOne as jest.Mock).mockResolvedValue({
+        id: 'space-1',
+        settings: { hintToggles: { tags: true }, canonicalTags: [{ value: 'npc' }] },
+      });
+      const actor = { id: 'actor-1', type: ActorType.HUMAN };
+
+      // spy 目标 = doc-hint-pools 的具名导出（= doc.service.ts:227 import 的同一模块
+      // 对象；requireActual 绕开 mock 注册表拿到原始 exports，spy 才能拦到调用点）
+      const pools = jest.requireActual<typeof import('./doc-hint-pools')>('./doc-hint-pools');
+      const spy = jest.spyOn(pools, 'loadTagPool').mockResolvedValue([]);
+      try {
+        // 对照组（正控）：携带词表外 tag → 闸门开 → 确实查池（证明 spy 拦得到）
+        mockMetadataTx(doc, makeDoc({ contentHash: HASH, tags: ['openvikings'] }));
+        await service.patchMetadata(
+          'doc-1',
+          { tags: ['openvikings'], expectedContentHash: HASH },
+          actor,
+        );
+        expect(spy).toHaveBeenCalledTimes(1);
+
+        // 被测组：未携带 tags → 闸门关 → 零池查询（存量 tags 不构成评估作用域）
+        spy.mockClear();
+        mockMetadataTx(doc, makeDoc({ contentHash: HASH, title: '新', tags: ['openvikings'] }));
+        await service.patchMetadata('doc-1', { title: '新', expectedContentHash: HASH }, actor);
+        expect(spy).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 
   // ─── Diagram IR 分支（plan §3.3 / §6.1）────────────────────
@@ -4484,7 +5356,7 @@ describe('DocService', () => {
             return {
               create: docCreateSpy,
               save: docSaveSpy,
-              createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+              createQueryBuilder: jest.fn(createDocTransactionQueryBuilder),
             };
           }),
         }),

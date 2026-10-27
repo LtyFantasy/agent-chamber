@@ -56,6 +56,7 @@ import { Doc } from '../src/database/entities/doc.entity';
 import { DocRoute } from '../src/database/entities/doc-route.entity';
 import { TaskDocLink } from '../src/database/entities/task-doc-link.entity';
 import { compileQuery } from '../src/common/utils/search/tsquery-compiler';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 const SPACE_ID = 'e1e1e1e1-0000-4000-8000-0000000000b1';
 const ACTOR_ID = 'e1e1e1e1-0000-4000-8000-0000000000b2';
@@ -182,6 +183,7 @@ describe('字符类行为式差分（真 PG · 迁移链临时库）', () => {
       db().getRepository(DocRoute),
       db().getRepository(TaskDocLink),
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
   });
 

@@ -16,8 +16,21 @@ import { AgentStatus, ErrorCode } from '@agent-chamber/shared';
 function createMockRepo<T extends ObjectLiteral>() {
   return {
     findOne: jest.fn(),
-    save: jest.fn(),
+    // 保留 save spy：认证遥测不得整对象持久化，默认 Promise 兼容旧实现的 RED 验证。
+    save: jest.fn().mockResolvedValue(undefined),
+    update: jest.fn().mockResolvedValue({ affected: 1, raw: [], generatedMaps: [] }),
   } as unknown as jest.Mocked<Repository<T>>;
+}
+
+/** 显式控制写入完成/失败与调用到达的屏障，不用定时等待猜测异步顺序。 */
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 /** 构造 agent 对象（含 actor 关系，对齐 agentRepo.findOne relations:{actor:true}）。
@@ -48,6 +61,7 @@ describe('ApiKeyAuthService', () => {
       id: 'key-1',
       agentId: 'agent-1',
       keyHash: hashOf(VALID_KEY),
+      keyPrefix: 'ask_test',
       permissions: { scopes: ['read', 'write'] },
       revokedAt: null,
       deletedAt: null,
@@ -69,6 +83,10 @@ describe('ApiKeyAuthService', () => {
     }).compile();
 
     service = moduleRef.get<ApiKeyAuthService>(ApiKeyAuthService);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   it('should query api_keys by sha256(key) hash', async () => {
@@ -151,12 +169,18 @@ describe('ApiKeyAuthService', () => {
   });
 
   describe('成功路径', () => {
-    it('should return AgentPayload and touch lastUsedAt + lastActiveAt', async () => {
-      apiKeyRepo.findOne.mockResolvedValue(validApiKey());
+    it('should update only telemetry columns without mutating snapshots and preserve the payload', async () => {
+      const now = new Date('2026-10-25T08:00:00.000Z');
+      jest.useFakeTimers({ now });
       const agent = makeAgent();
+      const apiKey = validApiKey({
+        agent: agent.actor,
+        permissions: { scopes: ['read', 'write'], integration: { source: 'runner' } },
+      });
+      const keySnapshot = structuredClone(apiKey);
+      const agentSnapshot = structuredClone(agent);
+      apiKeyRepo.findOne.mockResolvedValue(apiKey);
       agentRepo.findOne.mockResolvedValue(agent);
-      apiKeyRepo.save.mockResolvedValue(validApiKey());
-      agentRepo.save.mockResolvedValue(agent);
 
       const payload = await service.authenticate(VALID_KEY);
 
@@ -164,22 +188,107 @@ describe('ApiKeyAuthService', () => {
         id: 'agent-1',
         name: 'Test Agent',
         ownerId: 'owner-1',
-        permissions: { scopes: ['read', 'write'] },
+        permissions: { scopes: ['read', 'write'], integration: { source: 'runner' } },
+        keyPrefix: 'ask_test',
       });
-      expect(apiKeyRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ lastUsedAt: expect.any(Date) }),
-      );
-      // lastActiveAt 异步 fire-and-forget：save 调用已发出（返回值由守卫 catch 吞掉）
-      expect(agentRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ lastActiveAt: expect.any(Date) }),
-      );
-      expect(agent.lastActiveAt).toBeInstanceOf(Date);
+      expect(payload.permissions).toBe(apiKey.permissions);
+      expect(apiKeyRepo.update).toHaveBeenCalledTimes(1);
+      expect(apiKeyRepo.update).toHaveBeenCalledWith('key-1', { lastUsedAt: now });
+      expect(agentRepo.update).toHaveBeenCalledTimes(1);
+      expect(agentRepo.update).toHaveBeenCalledWith('agent-1', { lastActiveAt: now });
+      expect(apiKeyRepo.save).not.toHaveBeenCalled();
+      expect(agentRepo.save).not.toHaveBeenCalled();
+      expect(apiKey).toEqual(keySnapshot);
+      expect(agent).toEqual(agentSnapshot);
+    });
+
+    it('should await the key timestamp write before starting agent telemetry or returning', async () => {
+      const keyWrite = createDeferred<void>();
+      const keyWriteStarted = createDeferred<void>();
+      apiKeyRepo.findOne.mockResolvedValue(validApiKey());
+      agentRepo.findOne.mockResolvedValue(makeAgent());
+      apiKeyRepo.update.mockImplementation(async () => {
+        keyWriteStarted.resolve();
+        await keyWrite.promise;
+        return { affected: 1, raw: [], generatedMaps: [] };
+      });
+      let settled = false;
+      const authentication = service.authenticate(VALID_KEY).then((payload) => {
+        settled = true;
+        return payload;
+      });
+
+      try {
+        // 旧实现会先返回；正确实现停在 update。两条路径均有显式完成信号供 RED 断言。
+        await Promise.race([keyWriteStarted.promise, authentication]);
+        expect(apiKeyRepo.update).toHaveBeenCalledTimes(1);
+        expect(settled).toBe(false);
+        expect(agentRepo.update).not.toHaveBeenCalled();
+        expect(agentRepo.save).not.toHaveBeenCalled();
+      } finally {
+        keyWrite.resolve();
+        await authentication;
+      }
+
+      expect(settled).toBe(true);
+      expect(agentRepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('should propagate a rejected key timestamp write without starting agent telemetry', async () => {
+      const failure = new Error('key timestamp write failed');
+      apiKeyRepo.findOne.mockResolvedValue(validApiKey());
+      agentRepo.findOne.mockResolvedValue(makeAgent());
+      apiKeyRepo.update.mockRejectedValue(failure);
+
+      await expect(service.authenticate(VALID_KEY)).rejects.toBe(failure);
+
+      expect(agentRepo.update).not.toHaveBeenCalled();
+      expect(agentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('should return while the agent timestamp write is still pending', async () => {
+      const agentWrite = createDeferred<void>();
+      const apiKey = validApiKey();
+      apiKeyRepo.findOne.mockResolvedValue(apiKey);
+      agentRepo.findOne.mockResolvedValue(makeAgent());
+      agentRepo.update.mockImplementation(async () => {
+        await agentWrite.promise;
+        return { affected: 1, raw: [], generatedMaps: [] };
+      });
+
+      try {
+        const payload = await service.authenticate(VALID_KEY);
+        expect(agentRepo.update).toHaveBeenCalledTimes(1);
+        expect(payload.id).toBe('agent-1');
+        expect(payload.permissions).toBe(apiKey.permissions);
+        expect(agentRepo.save).not.toHaveBeenCalled();
+      } finally {
+        // 认证返回以后才释放写入；若服务改为 await，测试会因无法返回而失败。
+        agentWrite.resolve();
+      }
+    });
+
+    it('should catch a rejected agent timestamp write and still authenticate', async () => {
+      const failure = new Error('agent timestamp write failed');
+      apiKeyRepo.findOne.mockResolvedValue(validApiKey());
+      agentRepo.findOne.mockResolvedValue(makeAgent());
+      agentRepo.update.mockRejectedValue(failure);
+
+      await expect(service.authenticate(VALID_KEY)).resolves.toMatchObject({
+        id: 'agent-1',
+        keyPrefix: 'ask_test',
+      });
+      expect(agentRepo.update).toHaveBeenCalledTimes(1);
+      expect(agentRepo.save).not.toHaveBeenCalled();
     });
 
     it('should not touch agent lastActiveAt when rejected (revoked path short-circuits)', async () => {
       apiKeyRepo.findOne.mockResolvedValue(validApiKey({ revokedAt: new Date() }));
       await expect(service.authenticate(VALID_KEY)).rejects.toThrow(UnauthorizedException);
       expect(agentRepo.findOne).not.toHaveBeenCalled();
+      expect(apiKeyRepo.update).not.toHaveBeenCalled();
+      expect(apiKeyRepo.save).not.toHaveBeenCalled();
+      expect(agentRepo.update).not.toHaveBeenCalled();
       expect(agentRepo.save).not.toHaveBeenCalled();
     });
   });

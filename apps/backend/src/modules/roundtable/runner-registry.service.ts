@@ -3,10 +3,10 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §2 (② 控制通道层: runner 注册表)
- *   - 补充: docs/roundtable-design.md §4 (控制面协议: seat.assign 下行/hello 对账)
- *           docs/roundtable-design.md §5 (roundtable_runners / roundtable_seats 表)
- *           docs/roundtable-design.md §7 (安全边界: API Key 复用, 一 key 一 runner 后到踢先到)
+ *   - 主文档: docs/modules/roundtable-design.md §2 (② 控制通道层: runner 注册表)
+ *   - 补充: docs/modules/roundtable-design.md §4 (控制面协议: seat.assign 下行/hello 对账)
+ *           docs/modules/roundtable-design.md §5 (roundtable_runners / roundtable_seats 表)
+ *           docs/modules/roundtable-design.md §7 (安全边界: API Key 复用, 一 key 一 runner 后到踢先到)
  *
  * [踩坑索引]
  *

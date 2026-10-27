@@ -45,10 +45,20 @@
  *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
-import { Body, Controller, HttpCode, HttpStatus, Logger, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Logger,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Request } from 'express';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AgentScope } from '../../common/decorators/agent-scope.decorator';
 import { SkipUsageStats } from './skip-usage-stats.decorator';
 import { UsageStatsBufferService } from './usage-stats-buffer.service';
 import { UsageEventDto } from './dto/usage-event.dto';
@@ -89,20 +99,34 @@ export class UsageEventsController {
       'Self-reported data — not for audit or security purposes.',
   })
   @ApiResponse({ status: 202, description: 'Accepted for aggregation' })
-  @ApiResponse({ status: 400, description: 'Malformed payload (tool name too long, unknown surface, negative latency)' })
+  @ApiResponse({
+    status: 400,
+    description: 'Malformed payload (tool name too long, unknown surface, negative latency)',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  // scope 豁免（清单单源 = config/agent-scope-exemptions.ts，机器强制 = 同名 spec）：
+  // automcp 以调用方自己 key fire-and-forget 上报；actorId 只取认证上下文，非审计面。
+  @AgentScope('read')
   async reportUsageEvent(
     @Req() request: Request,
     @Body() dto: UsageEventDto,
   ): Promise<UsageEventAccepted> {
+    // 服务端钳制（F4 项4 / M4）：`viaFallbackAuth` 是**归因提示**，只在有 Agent 身份时才有意义
+    // ——人类 JWT / bearer 通道下 agentId 为 null，此时若采信上报方的 true，本端点就成了
+    // 「无身份也能铸造 actor_type='system' 行」的通道（该标记是 distinctActors 可信度的
+    // 唯一生产者，见文件头不变量）。`=== true` 是显式判等：拒绝 truthy 非布尔值。
+    // 合法上报方（automcp fallback 模式）必携共享 agent key，故 agentId 非 null，钳制不影响它。
+    // 提到 try 之外只是为了参与上面的钳制判定：`readAgentId` 是**纯属性读取**（无 IO、不可能抛），
+    // 故 fail-open 语义不变——真正的可能抛点 `recordInvocation` 仍在 try 内。
+    const agentId = readAgentId(request);
     try {
       this.usageStatsBuffer.recordInvocation({
         toolName: dto.toolName,
         surface: dto.surface,
         ok: dto.ok,
         latencyMs: dto.latencyMs,
-        viaFallbackAuth: dto.viaFallbackAuth,
-        actorId: readAgentId(request),
+        viaFallbackAuth: dto.viaFallbackAuth === true && agentId !== null,
+        actorId: agentId,
       });
     } catch (err) {
       // fail-open：统计是旁路。上报方已经完成了一次工具调用，此处抛错只会让它

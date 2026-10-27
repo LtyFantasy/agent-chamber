@@ -21,6 +21,10 @@
  *   - 零副作用：本工具只发 POST validate，无任何写端点调用
  *   - 互斥语义：ir 与 path/docId/patches 互斥；path 与 docId 互斥；
  *     必须提供 ir | path | docId 三选一（工具侧快速失败，不发 HTTP）
+ *   - 空间作用域：给了 spaceName 时它与 docId 必须指向同一空间——后端
+ *     `DocService.findByIdInSpace` 单条 SQL 解析，跨空间一律 404 DOC_NOT_FOUND 且与
+ *     "文档不存在"同文同码（不泄露文档是否存在于别处）；不给 spaceName 时本工具用
+ *     GET /docs/:docId 反查该 doc 自身空间，因此恒同空间
  *   - 错误消费分层键名 = details（MCP 层 platform-client.ts:200 把 REST data 槽改名）
  *
  * [关联代码]
@@ -145,7 +149,9 @@ export const validateDiagramTool: CustomTool = {
           type: 'string',
           description:
             'Mode (b): document ID (mutually exclusive with ir / path). Works without ' +
-            'spaceName — the space is resolved from the document.',
+            'spaceName — the space is resolved from the document. When spaceName IS given, ' +
+            'spaceName and docId must refer to the same space (else 404 DOC_NOT_FOUND, ' +
+            'indistinguishable from a missing doc).',
         },
         ir: {
           type: 'object',

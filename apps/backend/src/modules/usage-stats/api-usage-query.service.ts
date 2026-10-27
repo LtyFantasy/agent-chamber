@@ -365,7 +365,9 @@ function resolveApiUsagePlan(dto: ApiUsageQueryDto, now: Date): ApiUsagePlan {
 
   // ③ 窗口归一：to 缺省 = now，from 缺省 = to − 7 天；比较是绝对时刻比较
   const to = dto.to ? new Date(dto.to) : now;
-  const from = dto.from ? new Date(dto.from) : new Date(to.getTime() - API_USAGE_DEFAULT_WINDOW_DAYS * API_USAGE_DAY_MS);
+  const from = dto.from
+    ? new Date(dto.from)
+    : new Date(to.getTime() - API_USAGE_DEFAULT_WINDOW_DAYS * API_USAGE_DAY_MS);
   const spanMs = to.getTime() - from.getTime();
   const maxSpanMs = API_USAGE_MAX_SPAN_DAYS * API_USAGE_DAY_MS;
   // to < from（spanMs < 0）同样落这里：静默返回空集会变成"零使用"的假结论
@@ -420,16 +422,27 @@ function buildScopeConditions(
   if (groupBy === 'tool') {
     if (metric === 'rest_calls') {
       return [
-        { sql: 's.channel = :scopeFanoutChannel', params: { scopeFanoutChannel: API_USAGE_FANOUT_CHANNEL } },
+        {
+          sql: 's.channel = :scopeFanoutChannel',
+          params: { scopeFanoutChannel: API_USAGE_FANOUT_CHANNEL },
+        },
         { sql: "s.tool_name <> ''" },
       ];
     }
     return [
-      { sql: 's.route = :scopeInvocationRoute', params: { scopeInvocationRoute: API_USAGE_INVOCATION_ROUTE } },
+      {
+        sql: 's.route = :scopeInvocationRoute',
+        params: { scopeInvocationRoute: API_USAGE_INVOCATION_ROUTE },
+      },
     ];
   }
   if (groupBy === 'route' && !hasExplicitRoute) {
-    return [{ sql: 's.route NOT LIKE :scopeMcpRouteLike', params: { scopeMcpRouteLike: API_USAGE_MCP_ROUTE_LIKE } }];
+    return [
+      {
+        sql: 's.route NOT LIKE :scopeMcpRouteLike',
+        params: { scopeMcpRouteLike: API_USAGE_MCP_ROUTE_LIKE },
+      },
+    ];
   }
   return [];
 }
@@ -441,7 +454,10 @@ function buildScopeConditions(
  * 尚未走完的当前小时桶算进来（数字随调用时间抖动）。
  * 所有过滤值走具名参数绑定；`tool_name <> ''` 这类字面量只来自常量。
  */
-function applyScopeAndFilters(qb: SelectQueryBuilder<ApiUsageStatsHourly>, plan: ApiUsagePlan): void {
+function applyScopeAndFilters(
+  qb: SelectQueryBuilder<ApiUsageStatsHourly>,
+  plan: ApiUsagePlan,
+): void {
   qb.where('s.bucket_start >= :windowFrom', { windowFrom: plan.from }).andWhere(
     's.bucket_start < :windowTo',
     { windowTo: plan.to },
@@ -453,8 +469,10 @@ function applyScopeAndFilters(qb: SelectQueryBuilder<ApiUsageStatsHourly>, plan:
 
   const { channel, surface, actorType, actorId, route, tool, method } = plan.filters;
   if (channel !== undefined) qb.andWhere('s.channel = :filterChannel', { filterChannel: channel });
-  if (surface !== undefined) qb.andWhere('s.mcp_surface = :filterSurface', { filterSurface: surface });
-  if (actorType !== undefined) qb.andWhere('s.actor_type = :filterActorType', { filterActorType: actorType });
+  if (surface !== undefined)
+    qb.andWhere('s.mcp_surface = :filterSurface', { filterSurface: surface });
+  if (actorType !== undefined)
+    qb.andWhere('s.actor_type = :filterActorType', { filterActorType: actorType });
   if (actorId !== undefined) qb.andWhere('s.actor_id = :filterActorId', { filterActorId: actorId });
   if (route !== undefined) qb.andWhere('s.route = :filterRoute', { filterRoute: route });
   if (tool !== undefined) qb.andWhere('s.tool_name = :filterTool', { filterTool: tool });

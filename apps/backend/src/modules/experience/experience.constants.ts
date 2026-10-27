@@ -11,7 +11,7 @@
  *
  * [权威文档]
  *   - 主文档: .kimi/plans/plan-experience-base.md §2（匹配契约）/§3（API 契约）/§8（观测）
- *     （对外文档 docs/experience-base.md 与 docs/api-definition.md 的经验库章随后续
+ *     （对外文档 docs/modules/experience-base.md 与 docs/api-definition.md 的经验库章随后续
  *     批次上线；两者落地后以线上文档为权威副本）
  *   - 补充: 线上 DocSpace `docs/spec.md` — 枚举词表与错误码（值域单源在 shared）
  *
@@ -26,6 +26,13 @@
  *     永不拒绝写入（写入面无重复拒绝通道）
  *   - 限流窗口是**进程内内存**（重启清零）：单实例前提写在 `EXPERIENCE_CREATE_RATE_*`
  *     注释里，多实例部署必须换成共享存储（Redis/DB）——本批明文接受该局限
+ *   - **`EXPERIENCE_SECRET_PATTERNS` 位置敏感**：400 文案带 `matched pattern #N`，插在
+ *     中间会让既有编号漂移；类别名表 `EXPERIENCE_SECRET_PATTERN_LABELS` 必须**同长同序**
+ *     （单测有长度断言）。三条前缀模式带 `(?<![A-Za-z0-9])` 左边界——去掉会重现
+ *     `background-task-timeout` 误伤（任务 `77bf7dd8`）
+ *   - **本表被三处复用**：录入/PATCH 闸门（`experience.service.ts`）、判别日志 redaction
+ *     （`judgment-payload.ts`）、检索词出境闸（`doc-search-rerank.ts`）——改任何一条都要
+ *     三处一起评估
  *
  * [关联代码]
  *   - experience.service.ts — 全部常量的消费方（归一化/打分/限流/闸门/幂等）
@@ -240,6 +247,24 @@ export const EXPERIENCE_JUDGMENT_LOG_PAYLOAD_MAX_BYTES = 16 * 1024;
 /** 判定失败 `{error}` 文案上限（plan §1.2：≤2000 字符） */
 export const EXPERIENCE_JUDGMENT_ERROR_MAX_LENGTH = 2000;
 
+/**
+ * 判定补跑（admin backfill）单批**缺省**条数。
+ *
+ * rationale：它不是"分页页大小"而是**批大小**——每批一次**严格串行**判定（单条 ≤8s +
+ * 每条一次全表 trgm 重复候选查询），缺省 20 对应最坏 ~3 分钟墙钟。客户端超时**不取消
+ * 批次**（后端继续跑继续耗配额），重调安全（已判条目自动脱离选取集）。
+ */
+export const EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT = 20;
+
+/**
+ * 判定补跑单批**上限**（100）。
+ *
+ * ⚠️ **这是墙钟契约，不只是数量契约**：`limit=100` 的最坏墙钟 ≈13 分钟（100 × 8s 判定
+ * 硬顶 + 100 次全表 trgm）。调大前必须先量自部署大库上 `findDuplicateCandidates` 的
+ * 单次代价——它自陈为低频写路径设计（plan §1.3），补跑把它变成了批量热路径。
+ */
+export const EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT = 100;
+
 // `status='skipped'` 行的 request 占位 reason **值域单源已上移 shared**
 // （`EXPERIENCE_JUDGMENT_SKIPPED_REASONS`）：三级成本闸各一个值，这里不再保留单常量——
 // 两处各写一份字面量正是"新增一级闸却漏改统计口径"的漂移源。
@@ -282,15 +307,33 @@ export const EXPERIENCE_JUDGMENT_ERROR_MAX_LENGTH = 2000;
  * `putty-user-key-file`（PuTTY 私钥文件头）/ `apikey_`（TypeSafe 官方云 key 前缀）。
  * `password=` / `age-secret-key-` / `putty-user-key-file` 走大小写不敏感（`PASSWORD=` 与
  * `Age-Secret-Key-` 同样危险）；`ask_` / `sk-` / `apikey_` 是**小写锚定**（前缀形态如此
- * 定义），且它们都不是散文常见词，误伤风险可忽略。
+ * 定义）。
+ *
+ * ── 三条前缀模式为什么必须带**左边界** `(?<![A-Za-z0-9])`（任务 `77bf7dd8` 实证）──
+ * 按子串匹配前缀的代价是"词中命中"：`background-task-timeout` 里的 `ta|sk-timeout`
+ * 命中 `sk-`，`task_timeout` 里的 `ta|sk_timeout` 同样（`snake_case` 版本），
+ * 而 `task_xxx` 类词含 `a|sk_xxx` 会命中 `ask_`。这些是**运维高频词**，误伤一次就把
+ * 正常排障笔记打成 400（意见箱 2026-10-15 报告的原样复现）。左边界 = 「前缀必须起一个
+ * token」：真实 key 前面恒为空白 / 换行 / `=` / 引号 / `:` / 字符串开头，全部仍命中；
+ * 词中命中（前面是字母数字）放行。**只此一处收紧，不改长度/字符集阈值**——收紧过度会
+ * 把真 key 放过去，那是比误伤更差的方向。
  *
  * ⚠️ **本表是"前缀命中"语义，与 redaction 表（`JUDGMENT_REDACTION_PATTERNS`）刻意分开**：
  * 本表只判"有没有密钥"（命中即 400 拒绝），redaction 表要"吃掉整个值"。两个表里同名族的
  * 两条**不是冗余**，勿当重复删（详见 `experience-judgment.service.ts` 的 redaction 注释）。
+ *
+ * 另有两处**复用本表**（改这几条前必须一起评估）：判别日志 redaction 基线
+ * （`judgment-payload.ts`，与本表组成并集）与检索词出境闸（`doc-search-rerank.ts` 的
+ * `egressAllow`，直接用本表）。注意：redaction 的长形态是**另一张独立表**
+ * （`common/utils/redaction-patterns.ts`），左边界在两表**各自**加固过——本表的左边界
+ * 不会自动作用于长形态，反之亦然；只改一边 = 只修一半（评审 M2 实证：长形态漏边界时
+ * 判别日志里的 `background-task-timeout` 被改写成 `background-ta[redacted]`）。
  */
 export const EXPERIENCE_SECRET_PATTERNS: readonly RegExp[] = [
-  /ask_[A-Za-z0-9]/,
-  /sk-[A-Za-z0-9]/,
+  // 左边界见上方 rationale：`task_xxx` 里的 `ask_` 不得命中
+  /(?<![A-Za-z0-9])ask_[A-Za-z0-9]/,
+  // 左边界见上方 rationale：`background-task-timeout` 里的 `sk-t` 不得命中
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9]/,
   // 私钥 PEM 头（闭类；**无 /i**，见上方 rationale 与正负例矩阵）
   /(?:-{2,5}\s*)?BEGIN(?:\s+[A-Z0-9-]+){0,3}\s+PRIVATE KEY/,
   /password\s*=/i,
@@ -300,7 +343,27 @@ export const EXPERIENCE_SECRET_PATTERNS: readonly RegExp[] = [
   /putty-user-key-file/i,
   // TypeSafe 官方云 key（`apikey_...`）。**追加在数组末尾**：400 文案带
   // `matched pattern #N`（experience.service.ts），位置敏感——插在中间会让既有编号漂移。
-  /apikey_[A-Za-z0-9]/,
+  // 左边界见上方 rationale（与前两条同口径）。
+  /(?<![A-Za-z0-9])apikey_[A-Za-z0-9]/,
+];
+
+/**
+ * 每条模式的**人类可读类别名**（下标与 `EXPERIENCE_SECRET_PATTERNS` 一一对应）。
+ *
+ * 用途：400 拒绝文案里的定位信息（"命中了哪一类"）。错误码/位置之外的类别名让调用方
+ * 不必猜编号含义，也避免把编号含义硬编码进消费者。
+ *
+ * ⚠️ **两数组必须同长同序**——单测 `experience.service.spec.ts` 有长度断言钉住；
+ * 新增/重排模式时同步本表（同 `matched pattern #N` 的位置敏感约束）。
+ */
+export const EXPERIENCE_SECRET_PATTERN_LABELS: readonly string[] = [
+  'API key prefix (ask_)',
+  'API key prefix (sk-)',
+  'private key PEM header',
+  'password assignment',
+  'age secret key file',
+  'PuTTY private key file header',
+  'API key prefix (apikey_)',
 ];
 
 // ─── 「验证方式」节提示（不阻断）──────────────────────────────────────────

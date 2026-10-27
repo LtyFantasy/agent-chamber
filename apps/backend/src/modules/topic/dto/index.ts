@@ -14,4 +14,5 @@ export * from './uninvite-topic-user.dto';
 export * from './remove-topic-participant.dto';
 export * from './get-messages-query.dto';
 export * from './unread-query.dto';
+export * from './update-notification-settings.dto';
 export * from './query-topic.dto';

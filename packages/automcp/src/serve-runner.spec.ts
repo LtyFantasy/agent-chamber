@@ -370,6 +370,196 @@ describe('runServe', () => {
         ),
       ).rejects.toThrow(/must have a "handler" function/);
     });
+
+    it('⑪ profile.excludeCustomTools 排除语义工具 → tools/list 不再包含且计数正确', async () => {
+      const modulePath = path.join(tmpDir, 'custom-tools.cjs');
+      fs.writeFileSync(
+        modulePath,
+        [
+          `module.exports = {`,
+          `  customTools: [{`,
+          `    tool: { name: 'my_custom_tool', description: 'A', inputSchema: { type: 'object' } },`,
+          `    handler: async () => ({ content: [{ type: 'text', text: 'a' }] }),`,
+          `  }, {`,
+          `    tool: { name: 'kept_tool', description: 'B', inputSchema: { type: 'object' } },`,
+          `    handler: async () => ({ content: [{ type: 'text', text: 'b' }] }),`,
+          `  }],`,
+          `};`,
+        ].join('\n'),
+        'utf-8',
+      );
+      const profilePath = path.join(tmpDir, 'agent-like.json');
+      fs.writeFileSync(
+        profilePath,
+        JSON.stringify({ include: ['.*'], excludeCustomTools: ['my_custom_tool'] }),
+        'utf-8',
+      );
+
+      const result = await runServe(
+        makeOptions(path.join(fixturesDir, 'openapi3-minimal.json'), {
+          profilePath,
+          customTools: modulePath,
+        }),
+      );
+
+      // 2 个自动映射 + 1 个保留的 custom tool；排除 1 个
+      expect(result.toolCount).toBe(3);
+      expect(result.customToolsExcluded).toBe(1);
+
+      const res = await axios.post(
+        `${result.url}/mcp`,
+        { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 5_000 },
+      );
+      const names = res.data.result.tools.map((t: { name: string }) => t.name);
+      expect(names).toEqual(['get_current_user', 'create_user', 'kept_tool']);
+
+      await result.stop();
+    });
+
+    it('⑫ profile.excludeCustomTools 拼错工具名 → 启动失败并列出可用名', async () => {
+      const modulePath = path.join(tmpDir, 'custom-tools.cjs');
+      fs.writeFileSync(
+        modulePath,
+        [
+          `module.exports = {`,
+          `  customTools: [{`,
+          `    tool: { name: 'my_custom_tool', description: 'A', inputSchema: { type: 'object' } },`,
+          `    handler: async () => ({ content: [{ type: 'text', text: 'a' }] }),`,
+          `  }],`,
+          `};`,
+        ].join('\n'),
+        'utf-8',
+      );
+      const profilePath = path.join(tmpDir, 'typo-profile.json');
+      fs.writeFileSync(
+        profilePath,
+        JSON.stringify({ excludeCustomTools: ['my_custom_tol'] }),
+        'utf-8',
+      );
+
+      await expect(
+        runServe(
+          makeOptions(path.join(fixturesDir, 'openapi3-minimal.json'), {
+            profilePath,
+            customTools: modulePath,
+          }),
+        ),
+      ).rejects.toThrow(/unknown custom tool\(s\): my_custom_tol/);
+    });
+
+    it('⑬ profile 有 excludeCustomTools 但未挂 --custom-tools → WARN 且排除数为 0', async () => {
+      // 该分支的语义：排除表在没有 custom tools 模块时完全惰性。静默 = 配置事故温床，
+      // 因此要求恰好一条 WARN（不 throw——只暴露原子工具的定制实例是合法用法）。
+      const profilePath = path.join(tmpDir, 'warn-profile.json');
+      fs.writeFileSync(
+        profilePath,
+        JSON.stringify({ include: ['.*'], excludeCustomTools: ['my_custom_tool'] }),
+        'utf-8',
+      );
+
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const result = await runServe(
+          makeOptions(path.join(fixturesDir, 'openapi3-minimal.json'), { profilePath }),
+        );
+
+        expect(result.customToolsExcluded).toBe(0);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(String(warnSpy.mock.calls[0][0])).toContain('the exclusion is inert');
+
+        await result.stop();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('⑭ tools/call 带未知键 → 真实 HTTP 链路上 fail-closed（映射工具与 custom tool 同口径）', async () => {
+      // 事故形状（MCP-ARG-1）：memory_controller_nominate 误传 content（正确键 contentOverride），
+      // 键被静默丢弃 → 记忆建成但正文为空。本用例走真实 serve + HTTP JSON-RPC 端点，
+      // 不用私有方法单测替代：静默丢弃的链路横跨 mcp-server 与 http-proxy 的 paramLocations。
+      const modulePath = path.join(tmpDir, 'strict-custom-tools.cjs');
+      fs.writeFileSync(
+        modulePath,
+        [
+          `module.exports = {`,
+          `  customTools: [{`,
+          `    tool: {`,
+          `      name: 'my_custom_tool',`,
+          `      description: 'A custom tool',`,
+          // 刻意不写 additionalProperties：运行时校验与注册期归一化都不该依赖手写 schema
+          `      inputSchema: { type: 'object', properties: { contentOverride: { type: 'string' } } },`,
+          `    },`,
+          `    handler: async () => ({ content: [{ type: 'text', text: 'hello' }] }),`,
+          `  }],`,
+          `};`,
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const result = await runServe(
+        makeOptions(path.join(fixturesDir, 'openapi3-minimal.json'), {
+          customTools: modulePath,
+        }),
+      );
+
+      const post = (body: Record<string, unknown>) =>
+        axios.post(`${result.url}/mcp`, body, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 5_000,
+        });
+
+      try {
+        // ⓪ 注册路径唯一性：手写 schema 没写 additionalProperties，advertised 必须是 false
+        //    （若归一化只在单测里成立、真实 serve 路径漏挂，这里立刻红）
+        const listRes = await post({ jsonrpc: '2.0', id: 0, method: 'tools/list' });
+        const advertised = (listRes.data.result.tools as Array<{
+          name: string;
+          inputSchema: { additionalProperties?: boolean };
+        }>).find((tool) => tool.name === 'my_custom_tool');
+        expect(advertised?.inputSchema.additionalProperties).toBe(false);
+
+        // ① custom tool：未知键 content → isError，文本点名未知键与合法键
+        const customRes = await post({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'my_custom_tool', arguments: { content: '正文' } },
+        });
+        expect(customRes.data.result.isError).toBe(true);
+        const customText = customRes.data.result.content[0].text as string;
+        expect(customText).toContain('"content"');
+        expect(customText).toContain('"contentOverride"');
+
+        // ② 自动映射工具：键集合来自 OpenAPI 展开的 inputSchema.properties（拼错的 nmae）
+        const mappedRes = await post({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: {
+            name: 'create_user',
+            arguments: { name: 'a', email: 'b', nmae: 'c' },
+          },
+        });
+        expect(mappedRes.data.result.isError).toBe(true);
+        expect(mappedRes.data.result.content[0].text).toMatch(
+          /^Invalid arguments for tool "create_user"/,
+        );
+        expect(mappedRes.data.result.content[0].text).toContain('"nmae"');
+
+        // ③ 反向对照：只传声明过的键 → 正常执行（拦截范围仅是未知键）
+        const okRes = await post({
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: { name: 'my_custom_tool', arguments: { contentOverride: '正文' } },
+        });
+        expect(okRes.data.result.isError).toBeUndefined();
+        expect(okRes.data.result.content[0].text).toBe('hello');
+      } finally {
+        await result.stop();
+      }
+    });
   });
 
   describe('body 大小上限（MCP-BODY-1 回归）', () => {

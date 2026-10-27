@@ -30,12 +30,17 @@
  *     （`routes.category` 是自由文本无 FK，**不**并入保留集——并入反造幽灵分类）。
  *   - **不带 pathPrefix ⇒ 输出与改动前逐字节一致**（全部分类含空分类、全部路由含孤儿、
  *     不出现 appliedFilters 键）；这是回归护栏（doc-bundle.service.spec 钉死）。
+ *   - **overwriteSpaceMeta 是唯一绕过 DTO 的 settings 写口**（bundle 来自外部文件，不经
+ *     ValidationPipe）：空间词表三键（docTypes/canonicalTags/pathTypes）必须过
+ *     doc-vocabulary.helper 的元素级闸门——异形元素剔除、整键无有效元素则删键 + warn，
+ *     **不 422 阻断导入**（灾备/迁移通道 fail-open + 可观测）。
  *
  * [关联代码]
  *   - attachment.service.ts — 媒体门面（listByDocIds/listByIds/readObjectBytes/importFromBundle/bindBundleMedia）
  *   - doc-bundle-url.ts — 正文附件 URL 两形态识别与重写（相对 + 同源绝对；纯函数）
  *   - doc-bundle.constants.ts — 预算/上限常量单一事实源（DTO 与两侧复检同源）
  *   - import-doc-bundle.dto.ts — bundle 形状契约（forbidNonWhitelisted：新增导出字段必须声明）
+ *   - doc-vocabulary.helper.ts — 空间词表读侧形状解析单源（本服务 overwriteSpaceMeta 复用）
  *   - common/utils/sql-like.ts — escapeLikePrefix 转义单源（与 doc.service findAll/findTree 共用）
  *
  * [持久踩坑]
@@ -77,12 +82,26 @@ import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
 import { DocRouteService } from './doc-route.service';
 import { CODE_ENTRY_TYPE } from './doc-constants';
+// 空间词表读侧形状解析单源（v1.92.0-dev，code-review F1）：本服务是唯一绕过 DTO 的
+// settings 写口（bundle 来自外部文件），三键过滤与读侧共用同一套闸门
+import {
+  parseCanonicalTags,
+  parseHintToggles,
+  parseStringList,
+  parsePathTypes,
+} from './doc-vocabulary.helper';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { DOC_BUNDLE_FORMAT_VERSION, ImportDocBundleDto } from './dto';
 import type { BundleRouteItemDto, CreateDocRouteDto } from './dto';
 // review-0831 任务 bbd175dc 子项 2：批量 per-item 错误提取唯一实现（本文件 errorOf
-// 已收敛至 doc-error.helper，与 doc.service.batchUpsert 共用同一 { message, code } 契约）
-import { errorOf } from './doc-error.helper';
+// 已收敛至 doc-error.helper，与 doc.service.batchUpsert 共用同一 { message, code } 契约）；
+// F4 项5 追加 batchErrorLogSummary / PER_ITEM_LOG_DETAIL_MAX（per-item 失败的服务端
+// 结构化摘要与明细条数上界，三处 catch 共用）
+import { batchErrorLogSummary, errorOf, PER_ITEM_LOG_DETAIL_MAX } from './doc-error.helper';
+// F4 项5：应用级 per-item 诊断的唯一标记类 + 文案单源。
+// 位置在 common/utils（不在本模块）：doc 段（本文件）与 media 段（attachment.service）
+// 都要识别它，放在任一业务模块里都会逼出反向 import（构造点白名单见 batch-error.util.spec.ts）
+import { PublicBatchError } from '../../common/utils/batch-error.util';
 import { AttachmentService } from '../attachments/attachment.service';
 // 跨模块形状用 import type（编译期擦除，不给运行时模块图再加一条边——双向 forwardRef 已够）
 import type {
@@ -934,9 +953,13 @@ export class DocBundleService {
         const existing = await this.categoryRepo.find({
           where: { spaceId, name: item.name, deletedAt: IsNull() },
         });
-        // 业务键歧义（库内无 name 唯一约束，理论上可重复）：不静默挑选，整条 failed
+        // 业务键歧义（库内无 name 唯一约束，理论上可重复）：不静默挑选，整条 failed。
+        // F4 项5：文案是应用自己构造的诊断（含业务键回显），故用可公开透出的
+        // PublicBatchError（原 message 经 errorOf 透出）；构造纪律见该类注释。
         if (existing.length > 1) {
-          throw new Error(`Ambiguous category name '${item.name}' (${existing.length} matches)`);
+          throw new PublicBatchError(
+            `Ambiguous category name '${item.name}' (${existing.length} matches)`,
+          );
         }
         // 类型说明：updateCategory/createCategory 的 dto 类型为可选 string，但 Service
         // 运行时语义是「字段出现即采用 + null = 清空」（update 用 `!== undefined` 判断）——
@@ -958,8 +981,25 @@ export class DocBundleService {
         }
       } catch (err: unknown) {
         summary.failed++;
+        // F4 项5 第 6 条：per-item 失败必须留服务端排障线索（构造名 + sqlstate + 消毒后
+        // 文案 + 业务键），但**只记摘要**——不记 stack、不记错误原文（理由见
+        // batchErrorLogSummary 头注：原文含用户输入回显，批量场景还会被按条重放）。
+        // 条数上界（复审 MAJOR-2）：categories 的 DTO **没有数组上限**，明细逐条打会让
+        // 单请求产生几十 MB 日志——前 PER_ITEM_LOG_DETAIL_MAX 条记明细，超出由循环后聚合行收口
+        if (summary.failed <= PER_ITEM_LOG_DETAIL_MAX) {
+          this.logger.warn(
+            `importCategories per-item failed: ${batchErrorLogSummary(err, `name=${item.name}`)}`,
+          );
+        }
         results.push({ name: item.name, status: 'failed', error: errorOf(err) });
       }
+    }
+
+    if (summary.failed > PER_ITEM_LOG_DETAIL_MAX) {
+      this.logger.warn(
+        `importCategories per-item failures truncated: total=${summary.failed} ` +
+          `(detail logged for the first ${PER_ITEM_LOG_DETAIL_MAX})`,
+      );
     }
 
     return { results, summary };
@@ -989,12 +1029,18 @@ export class DocBundleService {
     for (const item of items) {
       try {
         // ① 主文档解析（必填；null = 导出时即为孤儿路由）
+        // F4 项5：以下 4 处均为**应用级诊断**（文案由应用自己构造、含业务键回显、内容天然
+        // 可公开），统一用 PublicBatchError 以便经 errorOf 原样透出；⚠️ 参数只能是字面量 /
+        // 模板字面量——禁止把捕获到的错误原文传进来（会把 PG 原文重新带回响应面，
+        // 绕过消毒链，见 common/utils/batch-error.util.ts 的「唯一合法用法」）
         if (!item.primaryDocPath) {
-          throw new Error('primaryDocPath is null (route references a doc that no longer exists)');
+          throw new PublicBatchError(
+            'primaryDocPath is null (route references a doc that no longer exists)',
+          );
         }
         const primaryDocId = docIdByPath.get(item.primaryDocPath);
         if (!primaryDocId) {
-          throw new Error(
+          throw new PublicBatchError(
             `primaryDocPath '${item.primaryDocPath}' does not resolve to a doc in this space`,
           );
         }
@@ -1003,7 +1049,7 @@ export class DocBundleService {
         if (item.secondaryDocPath) {
           secondaryDocId = docIdByPath.get(item.secondaryDocPath) ?? null;
           if (!secondaryDocId) {
-            throw new Error(
+            throw new PublicBatchError(
               `secondaryDocPath '${item.secondaryDocPath}' does not resolve to a doc in this space`,
             );
           }
@@ -1013,7 +1059,7 @@ export class DocBundleService {
           where: { spaceId, intent: item.intent, primaryDocId },
         });
         if (existing.length > 1) {
-          throw new Error(
+          throw new PublicBatchError(
             `Ambiguous route (intent '${item.intent}' + primaryDocPath '${item.primaryDocPath}'): ` +
               `${existing.length} matches`,
           );
@@ -1058,6 +1104,16 @@ export class DocBundleService {
         }
       } catch (err: unknown) {
         summary.failed++;
+        // F4 项5 第 6 条：同 importCategories —— 只记结构化摘要，不记 stack / 原文；
+        // 条数上界同理由（routes 的 DTO 也没有数组上限）
+        if (summary.failed <= PER_ITEM_LOG_DETAIL_MAX) {
+          this.logger.warn(
+            `importRoutes per-item failed: ${batchErrorLogSummary(
+              err,
+              `intent=${item.intent} primaryDocPath=${item.primaryDocPath ?? '<null>'}`,
+            )}`,
+          );
+        }
         results.push({
           intent: item.intent,
           primaryDocPath: item.primaryDocPath ?? null,
@@ -1065,6 +1121,13 @@ export class DocBundleService {
           error: errorOf(err),
         });
       }
+    }
+
+    if (summary.failed > PER_ITEM_LOG_DETAIL_MAX) {
+      this.logger.warn(
+        `importRoutes per-item failures truncated: total=${summary.failed} ` +
+          `(detail logged for the first ${PER_ITEM_LOG_DETAIL_MAX})`,
+      );
     }
 
     return { results, summary };
@@ -1090,10 +1153,39 @@ export class DocBundleService {
     space.name = meta.name;
     space.description = meta.description ?? null;
     const existingVisibility = (space.settings?.visibility || Visibility.OPEN) as Visibility;
-    space.settings = {
+    const settings: Record<string, unknown> = {
       ...(meta.settings ?? {}),
       visibility: meta.visibility ?? existingVisibility,
     };
+
+    // ── 空间词表三键形状过滤（v1.92.0-dev，code-review F1）────────────────
+    // 本方法是**唯一绕过 DTO 的 settings 写口**（bundle 由外部文件提供，不经
+    // ValidationPipe）——三键必须过与读侧同一套解析器：异形元素剔除、整键无有效
+    // 元素则**删键**（= 无词表），并 warn 留痕。**不 422 阻断导入**——导入是灾备/
+    // 迁移通道，因一个脏词表键整体失败比丢该键更糟（fail-open + 可观测）。
+    const vocabularyKeys = [
+      ['docTypes', parseStringList],
+      ['canonicalTags', parseCanonicalTags],
+      ['pathTypes', parsePathTypes],
+      // hint 族开关（2 期，v1.92.0-dev）：与词表同款 fail-open 过滤——未知族键/非 boolean
+      // 值由 parseHintToggles 剔除（全剔除 → 删键）；PATCH 侧是 422，bundle 侧是 warn+丢键
+      ['hintToggles', parseHintToggles],
+    ] as const;
+    for (const [key, parse] of vocabularyKeys) {
+      if (!(key in settings)) continue;
+      const parsed = parse(settings[key]);
+      if (parsed === null) {
+        delete settings[key];
+        this.logger.warn(
+          `bundle space meta key 'settings.${key}' has an invalid shape and was dropped ` +
+            `(space ${space.id}); re-declare it via PATCH /doc-spaces/:id if intended`,
+        );
+      } else {
+        settings[key] = parsed;
+      }
+    }
+
+    space.settings = settings;
     await this.spaceRepo.save(space);
     return { applied: true, status: 'updated' };
   }

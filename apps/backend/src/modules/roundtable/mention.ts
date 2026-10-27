@@ -3,9 +3,9 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §6 (会话层规则: 路由与唤醒策略)
- *   - 补充: docs/roundtable-design.md §6 r5 (唤醒规则人机一致 + @all 显式广播令牌)
- *           docs/roundtable-design.md §6 r6 (mention 路由落地: system 不唤醒)
+ *   - 主文档: docs/modules/roundtable-design.md §6 (会话层规则: 路由与唤醒策略)
+ *   - 补充: docs/modules/roundtable-design.md §6 r5 (唤醒规则人机一致 + @all 显式广播令牌)
+ *           docs/modules/roundtable-design.md §6 r6 (mention 路由落地: system 不唤醒)
  *
  * [踩坑索引]
  *

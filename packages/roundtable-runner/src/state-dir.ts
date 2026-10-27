@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §4 r25 R3（每 runner 独占状态目录）
+ *   - 主文档: docs/modules/roundtable-design.md §4 r25 R3（每 runner 独占状态目录）
  *   - 补充: packages/roundtable-runner/README.md（启动参数表 --state-dir 行）
  *
  * [踩坑索引] R3STATE(裸CLI共享stateDir)
@@ -15,7 +15,7 @@
  *         互相覆盖对账游标（集成指南「三个不要」记录过真实事故）。修复：缺省按
  *         runner 名派生 ~/.roundtable-runner-<name>（`/` 全部转 `-`，与
  *         scripts/install-runner.sh 派生规则严格一致）；显式 --state-dir 仍最优先。
- *         见 docs/roundtable-design.md §4 R3
+ *         见 docs/modules/roundtable-design.md §4 R3
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图

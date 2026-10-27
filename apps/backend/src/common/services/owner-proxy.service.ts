@@ -18,6 +18,10 @@
  *         触发本服务查询（isOwnerProxy 内部同样自带 human / 直接 creator 短路）。
  *       - access-query.service.ts 的白名单 creator 查询与本服务 getOwnedAgentIds
  *         必须与 Policy read 规则严格同步（三处 policy 顶部有同步注释）。
+ *       - **批量变体 `getOwnedAgentIdsByOwners`（Notifications 二期）**：同一份语义、固定 1 次
+ *         查询（`owner_id IN (...)`），供 `AccessQueryService.buildAccessProfile` 对整批候选
+ *         做 owner-proxy 展开——那里若逐个调用会让"每次事件的查询数"随候选人数线性增长，
+ *         破坏通知路由"与 N 无关"的性能承诺。**规则改动必须两处同步**。
  *   OWNER-PROXY-GET-OWNER-ID(第二期新增，**当前无生产调用方**): getAgentOwnerId 的短路纪律
  *       **不同**于 isOwnerProxy——它服务的是"禁自审四态"的后两态（经验库 plan §0），触发
  *       条件 = reviewer 是 agent **且** creator 也是 agent（其余情况调用方先短路）；
@@ -34,7 +38,7 @@
  */
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Agent } from '../../database/entities/agent.entity';
 import { UnifiedActor } from '../types/actor.types';
 import { ActorType } from '@agent-chamber/shared';
@@ -106,6 +110,36 @@ export class OwnerProxyService {
       order: { actor: { createdAt: 'ASC', id: 'ASC' } },
     });
     return agents.map((agent) => agent.id);
+  }
+
+  /**
+   * 批量取多个人类 owner 各自拥有的 agent id（Notifications 二期：候选集合的 owner-proxy 展开）。
+   *
+   * 与 {@link getOwnedAgentIds} **同一份语义**（只读 `agents.owner_id`、不过滤 agent 软删
+   * 状态——遗产资源管理入口见 `isOwnerProxy` 的决策注释），差别只有**查询条数**：
+   * 逐用户调用是 O(N) 次查询（每个候选一次），本方法是**固定 1 次**（`owner_id IN (...)`）。
+   *
+   * 为什么必须存在（而不是让调用方循环 `getOwnedAgentIds`）：Notifications 二期的双层判据
+   * 对**整批候选**做一次剖面计算（`AccessQueryService.buildAccessProfile`），那里的循环调用
+   * 是"事件处理查询数随候选人数线性增长"的唯一来源——而该批的性能承诺是**与 N 无关**。
+   *
+   * @param ownerIds 人类 owner 的 actor id 列表（空数组 ⇒ 不查库）
+   * @returns ownerId → 其拥有的 agent id 数组（**无 agent 的 owner 不出现在 Map 里**）
+   */
+  async getOwnedAgentIdsByOwners(ownerIds: string[]): Promise<Map<string, string[]>> {
+    const result = new Map<string, string[]>();
+    const unique = [...new Set(ownerIds.filter((id) => typeof id === 'string' && id.length > 0))];
+    if (unique.length === 0) return result;
+
+    // 同 getOwnedAgentIds：Agent 实体带 eager actor relation，不做 partial select
+    // （避免 eager + partial select 的 TypeORM 兼容坑）；owner 数量级小，开销可忽略
+    const agents = await this.agentRepo.find({ where: { ownerId: In(unique) } });
+    for (const agent of agents) {
+      const owned = result.get(agent.ownerId);
+      if (owned) owned.push(agent.id);
+      else result.set(agent.ownerId, [agent.id]);
+    }
+    return result;
   }
 
   /**

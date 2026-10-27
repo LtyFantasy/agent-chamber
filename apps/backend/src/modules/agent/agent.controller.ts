@@ -9,7 +9,7 @@
  *     controller 层插桩决策 2，keyPrefix 缓解决策 9——create 的 status 是 actor 代理
  *     getter，TS spread 类实例不保留 getter 类型，须从 agent.actor.status 直取）
  *
- * [踩坑索引] D5(权限盲区) AGENT-VISIBILITY(Agent可见性) AGENT-FIELD-WHITELIST(白名单漏字段) A3-2(deletion-impact与DELETE同权)
+ * [踩坑索引] D5(权限盲区) AGENT-VISIBILITY(Agent可见性) AGENT-FIELD-WHITELIST(白名单漏字段) A3-2(deletion-impact与DELETE同权) BOLA-KEY(revokeKey跨agent越权)
  *
  * [铁律关联] #17(测试契约) #11(注释强制) #18(不变量检查)
  *
@@ -30,6 +30,11 @@
  *       descriptionSnippet（2026-07-25, 339b64d）上线一个月实际不返回。
  *       白名单是响应字段的最后一道裁剪：字段变更必须三处同改（service 产出 + 共享 DTO +
  *       controller 白名单），并配 controller 层 spec 断言（service 层单测测不出白名单裁剪）。
+ *   BOLA-KEY: `DELETE /agents/:id/keys/:keyId` 原只按 keyId 查行，`ensureCan` 校验的却是路径
+ *       `:id` 那个 agent——于是 agent A 知道 B 的 keyId 就能用自己的凭证吊销别人的 key
+ *       （越权对象级访问，现网 P0，2026-10-16 卡 72566c2e 修复）。
+ *       安全方向：对象级操作一律把**路径归属**并入 WHERE（`{id: keyId, agentId}`），
+ *       不匹配返回 404（与"不存在"同形，不做存在性 oracle）；审计写在收窄查询**之后**。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -60,6 +65,7 @@ import {
   UpdateAgentDto,
   AgentHeartbeatDto,
   CreateAgentKeyDto,
+  ResetAgentKeyDto,
   QueryAgentDto,
   AgentDirectoryQueryDto,
   BriefingQueryDto,
@@ -270,10 +276,15 @@ export class AgentController {
     description:
       'Unread message counts per topic for the current agent (cross-topic, plan forge-jubilee-robin.md WS-B). ' +
       'Semantics: only participation rows with status invited/active are counted (left rows excluded); ' +
-      'messages sent by myself are NOT counted (a send advances my own read cursor in the same transaction, ' +
-      'and the count query additionally excludes sender_id = participant_id to cover cursor-less/degraded paths); ' +
+      'messages sent by myself are NOT counted (the count query excludes sender_id = participant_id on every path, ' +
+      'and the per-topic read face excludes self-sent rows too — so sending does NOT clear your own unread); ' +
+      'the read cursor advances ONLY via POST /topics/:id/read or get_topic_digest(markRead=true); ' +
+      'when you enabled the per-topic notification setting mentionsOnly, only messages mentioning you (or @all) ' +
+      'are counted; ' +
       'topics with unreadCount=0 are omitted; at most 50 topics, ordered by unreadCount DESC then topic updatedAt DESC; ' +
-      'the result is a snapshot at call time — get_topic_digest(markRead=true) resets these counts.',
+      'the result is a snapshot at call time — get_topic_digest(markRead=true) drains these counts ' +
+      '(it advances the cursor only to the newest unread message it returned, so call it again when ' +
+      'unreadCount exceeded the page size; mark_topic_read with no messageId clears in one shot).',
   })
   @ApiResponse({ status: 200, description: 'Unread counts returned successfully' })
   async getMyUnread(@CurrentActor() actor: UnifiedActor) {
@@ -460,13 +471,30 @@ export class AgentController {
 
   @UseGuards(JwtOrApiKeyGuard)
   @Post(':id/reset-key')
-  @ApiOperation({ summary: 'Reset API key', description: 'Reset the primary API key for an agent' })
+  @ApiOperation({
+    summary: 'Reset API key',
+    description:
+      'Revoke all active API keys of the agent and issue a new one. The new key inherits the ' +
+      "strictest scopes of the revoked set (intersection) unless 'scopes' is given explicitly; " +
+      'it never widens.',
+  })
   @ApiParam({ name: 'id', description: 'Agent ID (UUID)', type: String })
   @ApiResponse({ status: 201, description: 'API key reset successfully' })
-  async resetKey(@Param('id', ParseUUIDPipe) id: string, @CurrentActor() actor: UnifiedActor) {
+  @ApiResponse({
+    status: 400,
+    description: "Invalid scopes value (allowed: 'read' | 'write', non-empty, unique)",
+  })
+  @ApiResponse({ status: 404, description: 'Agent not found' })
+  async resetKey(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentActor() actor: UnifiedActor,
+    // 可选 body（2026-10-16 卡 72566c2e）：显式指定新 key 的 scopes；缺省 = 被吊销集合交集。
+    // 无 body 的既有调用方完全不受影响（全字段可选 DTO）。
+    @Body() dto?: ResetAgentKeyDto,
+  ) {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
-    const result = await this.agentService.resetKey(id);
+    const result = await this.agentService.resetKey(id, dto?.scopes);
     // 审计（Phase 2）：RESET_API_KEY + agent；newData 带新 key 前缀（决策 9 缓解，
     // 前缀 = rawKey 前 8 字符，非明文；完整 apiKey 红线禁止入审计字段）
     await this.auditService.log({
@@ -618,7 +646,9 @@ export class AgentController {
       newData: {
         keyId: result.id,
         keyPrefix: result.keyPrefix,
-        agentId: result.agentId,
+        // agentId 取路径参数（响应已白名单化，不再回带 agentId；两值恒等——service 内部
+        // 即 findOne(id) 后取 agent.id）
+        agentId: id,
       },
       source: 'api',
     });
@@ -631,6 +661,10 @@ export class AgentController {
   @ApiParam({ name: 'id', description: 'Agent ID (UUID)', type: String })
   @ApiParam({ name: 'keyId', description: 'API Key ID', type: String })
   @ApiResponse({ status: 200, description: 'API key revoked successfully' })
+  @ApiResponse({
+    status: 404,
+    description: 'API key not found, or it does not belong to this agent (indistinguishable)',
+  })
   async revokeKey(
     @Param('id', ParseUUIDPipe) id: string,
     @Param('keyId', ParseUUIDPipe) keyId: string,
@@ -639,7 +673,8 @@ export class AgentController {
     const agent = await this.agentService.findOne(id);
     await this.permService.ensureCan(agent, actor, 'write');
     // 审计在 service 层（revokeKey 内部持有 key 实体 → keyId/keyPrefix/agentId 齐备；
-    // actor 从 controller 传入，决策 8 同构）
-    return this.agentService.revokeKey(keyId, actor.id);
+    // actor 从 controller 传入，决策 8 同构）。
+    // 路径 `:id` 作为 BOLA 收窄条件传入（2026-10-16 卡 72566c2e）：keyId 必须归属该 agent。
+    return this.agentService.revokeKey(keyId, id, actor.id);
   }
 }

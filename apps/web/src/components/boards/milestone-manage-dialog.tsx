@@ -14,7 +14,7 @@
  *
  * [权威文档]
  *   - 主文档: docs/api-definition.md — 里程碑端点与状态机（B1）
- *   - 补充: docs/frontend-architecture.md — 看板详情页 UI 结构
+ *   - 补充: docs/frontend/frontend-architecture.md — 看板详情页 UI 结构
  *
  * [关键不变量]
  *   - version 非空时 status 必须落在 release 组（创建态自动切 dev；编辑态 version 只读）

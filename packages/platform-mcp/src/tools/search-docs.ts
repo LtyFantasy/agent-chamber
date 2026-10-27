@@ -144,6 +144,12 @@ export const searchDocsTool: CustomTool = {
       'discard the page just because this hint is present. ' +
       `hintCode="positional_order" ⇒ the hint reads: "${DOC_SEARCH_POSITIONAL_ORDER_HINT}" ` +
       '— use a LONGER query (the opposite direction from zero_hit). ' +
+      'The same response may also carry hints[] — the unified hint envelope (v1.92.0-dev): ' +
+      '{code, status, message, data?} with status one of suggestion | normalized | check_skipped | ' +
+      'check_failed, at most 3 entries, only present when the space enabled the relevant hint family ' +
+      '(settings.hintToggles, default off). Branch on code, never parse message; check_skipped means ' +
+      'the check did NOT run (never read it as healthy). The legacy hint/hintCode keys are kept for ' +
+      'one migration cycle and carry the same trigger as the corresponding hints[] entry. ' +
       'Ranking may be model-assisted by the operator ("rerank"): for agent searches with ' +
       'sort="relevance" the page can be reordered by the configured judgment provider, which ' +
       'sends the query text and a byte-bounded excerpt (≈240B) of up to 50 candidate rows ' +
@@ -294,11 +300,14 @@ export const searchDocsTool: CustomTool = {
     try {
       // v1.86 起上游为信封 `{ hits, hint?, hintCode? }`（主脑裁决 #1）：取 body.hits 投影，
       // hint / hintCode 原样透传（三态引导文案 + 机器判别码——消费方 Agent 按 hintCode
-      // 分支，勿匹配文案；两个键同生命周期：无 hint 时 hintCode 也不出现）
+      // 分支，勿匹配文案；两个键同生命周期：无 hint 时 hintCode 也不出现）。
+      // 2 期（v1.92.0-dev）新增 `hints[]` 统一信封（四态/≤3）——同样**原样透传**：
+      // 旧两键保留一个迁移周期，消费方可先按 `hints[].code` 分支。
       const body = await client.request<{
         hits?: unknown[];
         hint?: string;
         hintCode?: DocSearchHintCode;
+        hints?: unknown[];
       }>('GET', `/doc-spaces/${spaceId}/search`, { params });
       const projected = projectDocHits(body.hits ?? []);
 
@@ -310,6 +319,7 @@ export const searchDocsTool: CustomTool = {
               hits: projected,
               ...(typeof body.hint === 'string' ? { hint: body.hint } : {}),
               ...(typeof body.hintCode === 'string' ? { hintCode: body.hintCode } : {}),
+              ...(Array.isArray(body.hints) && body.hints.length > 0 ? { hints: body.hints } : {}),
             }),
           },
         ],

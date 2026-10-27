@@ -99,7 +99,12 @@ const FORBIDDEN_COST = 1_000_000_000;
  * ⇒ 总代价恒加 `n·(n−1)²`（**常数**）⇒ argmin 与最优分配**逐字不变**（零行为变化），
  * 同时把全部合法元抬到非负。
  */
-function costOfPair(slot: number, rank: number, primaryScale: number, negativeOffset: number): number {
+function costOfPair(
+  slot: number,
+  rank: number,
+  primaryScale: number,
+  negativeOffset: number,
+): number {
   return Math.abs(slot - rank) * primaryScale - rank * slot + negativeOffset;
 }
 
@@ -192,7 +197,10 @@ export function solveAssignment(
   if (bands.some((band) => band.lo > band.hi)) return null;
   // 排名必须是 0..n-1 的排列（防御：非排列会让"意愿排名"失去意义）
   const seen = new Set(ranks);
-  if (seen.size !== count || ranks.some((rank) => !Number.isInteger(rank) || rank < 0 || rank >= count)) {
+  if (
+    seen.size !== count ||
+    ranks.some((rank) => !Number.isInteger(rank) || rank < 0 || rank >= count)
+  ) {
     return null;
   }
 
@@ -299,9 +307,7 @@ export function solveRerankPlacement(
   const count = candidates.length;
   if (count === 0) return [];
 
-  const bands = candidates.map((candidate) =>
-    placementBand(candidate.index, count, offset, limit),
-  );
+  const bands = candidates.map((candidate) => placementBand(candidate.index, count, offset, limit));
   // 意愿排名：模型最想放第一的候选排名 0（完整键序；与呈现层的平局键同源）
   const ranked = [...candidates].sort(compareRerankKey);
   const rankByIndex = new Map<number, number>();

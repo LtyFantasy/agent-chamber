@@ -4,10 +4,10 @@
  * 以 ACP 能力超集设计（流式块/工具事件/审批请求/用量 四样齐备），能力弱的厂商降级接入并挂风险注记。
  * 统一层是本接口而非 ACP（r4 明确）：ACP 是首选传输实现，不是前提。
  *
- * 全部字段出处：docs/roundtable-design.md §3（契约①：SeatDriver 接口，r4）。
+ * 全部字段出处：docs/modules/roundtable-design.md §3（契约①：SeatDriver 接口，r4）。
  */
 
-/** 已知座位厂商集合。已接入 'kimi' | 'codex'（M4a）| 'opencode'（M4b-2）| 'claude-code'（M4b-3）| 'dsh'（dsh ACP）；后续按序扩展（docs/roundtable-design.md §3） */
+/** 已知座位厂商集合。已接入 'kimi' | 'codex'（M4a）| 'opencode'（M4b-2）| 'claude-code'（M4b-3）| 'dsh'（dsh ACP）；后续按序扩展（docs/modules/roundtable-design.md §3） */
 export const SEAT_VENDORS = ['kimi', 'codex', 'opencode', 'claude-code', 'dsh'] as const;
 
 /**
@@ -17,7 +17,7 @@ export const SEAT_VENDORS = ['kimi', 'codex', 'opencode', 'claude-code', 'dsh'] 
  */
 export type SeatVendor = 'kimi' | 'codex' | 'opencode' | 'claude-code' | 'dsh' | (string & {});
 
-/** 权限模式枚举值（docs/roundtable-design.md §3 原文：'default' | 'plan' | 'auto' | 'yolo'） */
+/** 权限模式枚举值（docs/modules/roundtable-design.md §3 原文：'default' | 'plan' | 'auto' | 'yolo'） */
 export const PERMISSION_MODES = ['default', 'plan', 'auto', 'yolo'] as const;
 
 /**
@@ -27,7 +27,7 @@ export const PERMISSION_MODES = ['default', 'plan', 'auto', 'yolo'] as const;
  */
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
-/** 座位运行时状态枚举值（SeatEvent status variant 的 status 字段取值，docs/roundtable-design.md §3 原文） */
+/** 座位运行时状态枚举值（SeatEvent status variant 的 status 字段取值，docs/modules/roundtable-design.md §3 原文） */
 export const SEAT_RUNTIME_STATUSES = ['online', 'busy', 'offline'] as const;
 
 /** 座位运行时状态：online / busy / offline */
@@ -44,13 +44,13 @@ export const SEAT_RUNTIME_STATUS = {
 } as const;
 
 /**
- * 座位配置（seat.assign 下行下发，docs/roundtable-design.md §3 原文）
+ * 座位配置（seat.assign 下行下发，docs/modules/roundtable-design.md §3 原文）
  * 一个座位 = 一个运行时会话（单线程串行）
  */
 export interface SeatConfig {
   /** 座位 ID */
   seatId: string;
-  /** 座位展示名（身份模型见 docs/roundtable-design.md §6） */
+  /** 座位展示名（身份模型见 docs/modules/roundtable-design.md §6） */
   label: string;
   /** 厂商标识（'kimi'/'codex'/'opencode'/'claude-code'/'dsh' 已接入，M4 起扩展） */
   vendor: SeatVendor;
@@ -64,7 +64,7 @@ export interface SeatConfig {
 
 /**
  * 工具事件负载
- * 字段未在 docs/roundtable-design.md §3 冻结（原文仅声明 `tool: ToolEventPayload`），
+ * 字段未在 docs/modules/roundtable-design.md §3 冻结（原文仅声明 `tool: ToolEventPayload`），
  * 预留宽松形状，待厂商实测后收紧。
  */
 export type ToolEventPayload = Record<string, unknown>;
@@ -75,7 +75,7 @@ export type ToolBrief = Record<string, unknown>;
 /** 审批选项（字段未冻结，同上；§4 下行 seat.permission_verdict 的 optionId 即选项 id） */
 export type PermissionOption = Record<string, unknown>;
 
-/** SeatEvent 八 variant 的 type 取值（docs/roundtable-design.md §3 原文 + M3 阶段 5 追加 seat_info + 1.54.0 追加 activity） */
+/** SeatEvent 八 variant 的 type 取值（docs/modules/roundtable-design.md §3 原文 + M3 阶段 5 追加 seat_info + 1.54.0 追加 activity） */
 export const SEAT_EVENT_TYPES = [
   'message_chunk',
   'message_complete',
@@ -88,7 +88,7 @@ export const SEAT_EVENT_TYPES = [
 ] as const;
 
 /**
- * 座位事件（SeatDriver 事件出口，docs/roundtable-design.md §3 原文，八 variant）
+ * 座位事件（SeatDriver 事件出口，docs/modules/roundtable-design.md §3 原文，八 variant）
  * 上行全部走 onEvent → seat.event 透传。
  * - message_chunk：流式增量
  * - message_complete：turn 终结（含沉默判定输入 silent?）

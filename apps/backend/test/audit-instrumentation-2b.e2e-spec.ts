@@ -54,6 +54,7 @@ import { TaskService } from '../src/modules/task/task.service';
 import { MilestoneService } from '../src/modules/task/milestone.service';
 import { BoardService } from '../src/modules/board/board.service';
 import { DocSpaceService } from '../src/modules/docspace/docspace.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 import { AuditService } from '../src/modules/audit/audit.service';
 import { OwnerProxyService } from '../src/common/services/owner-proxy.service';
 import { ActorProfileService } from '../src/common/services/actor-profile.service';
@@ -199,6 +200,8 @@ describe('活动日志插桩（Phase 2 后半）— task/board/milestone/docspac
         MilestoneService,
         BoardService,
         DocSpaceService,
+        // hint 去重窗口（2 期）：DocSpaceService 的新依赖
+        HintDedupService,
         { provide: AuditService, useValue: auditService },
         { provide: getRepositoryToken(Task), useValue: ds.getRepository(Task) },
         { provide: getRepositoryToken(TaskComment), useValue: ds.getRepository(TaskComment) },

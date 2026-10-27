@@ -533,7 +533,8 @@ describe('AgentController', () => {
 
       expect(await controller.resetKey('agent-1', mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
-      expect(service.resetKey).toHaveBeenCalledWith('agent-1');
+      // 无 body 的既有调用路径：dto undefined → service 的 scopes 入参为 undefined
+      expect(service.resetKey).toHaveBeenCalledWith('agent-1', undefined);
       // 审计（Phase 2）：RESET_API_KEY + agent；newData 带新 key 前缀（非明文）
       expect(auditService.log).toHaveBeenCalledWith({
         action: AuditAction.RESET_API_KEY,
@@ -650,8 +651,19 @@ describe('AgentController', () => {
 
       expect(await controller.revokeKey('agent-1', 'key-1', mockActor)).toBe(true);
       expect(permService.ensureCan).toHaveBeenCalledWith(agent, mockActor, 'write');
-      // 审计在 service 层（key 实体字段 controller 不可得）→ actor 透传
-      expect(service.revokeKey).toHaveBeenCalledWith('key-1', 'user-1');
+      // 审计在 service 层（key 实体字段 controller 不可得）→ actor 透传；
+      // 路径 :id 作为 BOLA 收窄条件传入（2026-10-16 卡 72566c2e）
+      expect(service.revokeKey).toHaveBeenCalledWith('key-1', 'agent-1', 'user-1');
+    });
+
+    it('resetKey 带显式 scopes body → 透传给 service', async () => {
+      const agent = { id: 'agent-1' };
+      service.findOne.mockResolvedValue(agent);
+      service.resetKey.mockResolvedValue({ apiKey: 'ask_x' });
+
+      await controller.resetKey('agent-1', mockActor, { scopes: ['read'] });
+
+      expect(service.resetKey).toHaveBeenCalledWith('agent-1', ['read']);
     });
   });
 

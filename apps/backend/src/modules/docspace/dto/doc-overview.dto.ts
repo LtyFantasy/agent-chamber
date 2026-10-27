@@ -155,6 +155,8 @@ export class DocOverviewQueryDto {
    * 语义：缺省视为 true（默认内嵌 routes）；显式 false 时响应省略 routes 相关全部字段。
    * v1.55：内嵌 routes 截断到策展序前 50 条（routesTruncated/routesTotal 透出规模），
    * 全量获取走 GET /doc-spaces/:id/routes 分页端点或 list_doc_routes 工具。
+   * 截断时响应可能附挂 `docs_overview_routes_truncated` hint（指向 list_doc_routes；
+   * 该上限与 catalog 投影无关——catalog 只豁免文档条目截断）。
    */
   @IsOptional()
   @Transform(({ value }: { value: unknown }) => {
@@ -169,7 +171,10 @@ export class DocOverviewQueryDto {
       'Include the intent routes (doc_routes) in the response. Default true; ' +
       "pass 'false' to omit routes/routesTokenEstimate/routesTruncated/routesTotal. " +
       'Embedded routes are capped at the first 50 (curation order) with routesTruncated/routesTotal markers; ' +
-      'use GET /doc-spaces/:id/routes (paginated) for the full set.',
+      'use GET /doc-spaces/:id/routes (paginated) for the full set. ' +
+      'When that cap truncates routes, the response may carry a `docs_overview_routes_truncated` hint ' +
+      'pointing at the list_doc_routes tool (the cap is independent of catalog mode — catalog only ' +
+      'exempts the docs section).',
     example: 'true',
   })
   includeRoutes?: boolean;

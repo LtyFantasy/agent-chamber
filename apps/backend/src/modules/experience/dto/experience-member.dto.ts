@@ -10,7 +10,7 @@
  *     一律在 service（铁律 #21：DTO 管格式，service 管存在性与策略）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` §6/§11（角色语义与治理决策记录；
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` §6/§11（角色语义与治理决策记录；
  *     原 .kimi/plans/plan-experience-base-p2.md §0/§2.2 为历史 plan，四态已随 v1.81.0 退役）
  *   - 补充: 线上 DocSpace `docs/api-definition.md` — 经验库章 members 端点契约
  *

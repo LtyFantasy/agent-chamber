@@ -3,15 +3,15 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: plan .kimi/plans/unread-cursor-semantics.md（D1 发送即已读 / D2 join 初始化 / D3 邀请初始化）
- *   - 补充: docs/api-definition.md §6.11（topic 消息/未读契约）
+ *   - 主文档: plan .kimi/plans/unread-cursor-semantics.md（v1.69 历史：D1 发送即已读 / D2 join 初始化 / D3 邀请初始化）
+ *   - 主文档（现行）: docs/api-definition.md §6.11（topic 消息/未读契约）——v1.96.0-dev 未读语义批 D1/D2/D3/D4/D5 取代发送即已读
  *
  * [踩坑索引]
- *   - UNREAD-CURSOR: AUTO_JOIN_PARTICIPANT_SQL 的 ON CONFLICT CASE 语义（单调推进方向、
- *     旧锚点软删 NOT EXISTS 逃生口）mock 测不出 PG 真实执行（铁律 #23 精神），
- *     本套件直连真 PG 验证六场景（v1.85 增「降级路径排自发」行为锁）；历史消息
- *     created_at 显式 UPDATE 到 2024 年，
- *     新发送消息 now() 天然最新，无需调全序
+ *   - UNREAD-CURSOR: AUTO_JOIN_PARTICIPANT_SQL 的 INSERT 例外 + ON CONFLICT 不推进游标
+ *     （D1 行为变更）mock 测不出 PG 真实执行（铁律 #23 精神），本套件直连真 PG 验证；
+ *     历史消息 created_at 显式 UPDATE 到 2024 年，新发送消息 now() 天然最新，无需调全序
+ *   - MENTIONS: `mentions @> '["id"]'::jsonb` / `@> '"*"'::jsonb`（数组含标量特例）与
+ *     notification_settings @> 的语义只能在真 PG 上验（PG 15 实测，见 D4 用例）
  *
  * [铁律关联] #17(测试契约) #23(jsonb查询集成覆盖) #8(测试绑定)
  *
@@ -26,18 +26,30 @@
  */
 
 /**
- * 未读游标语义修正（v1.69，Kimi-Kairos 反馈采纳）—— 真实 PG 集成套件
+ * 未读游标语义 —— 真实 PG 集成套件
  *
- * 覆盖（plan unread-cursor-semantics.md §测试 五场景 + v1.85 未读语义收口 1 场景）：
- * ① D1 发送即已读：发送者游标推进到自己刚发的消息，自己消息不计入自己未读；
- *    其他参与者游标不动、未读 +1（ON CONFLICT CASE 比较方向实证）。
- * ② D2 新参与者 join → 游标初始化为当前最新消息，unread=0。
- * ③ D2 left→re-join 保留原游标 → 离开期间的消息仍计未读。
- * ④ D3 邀请建行游标 = 邀请时刻最新 → 邀请前历史不计，邀请后新消息计 1。
- * ⑤ D1 悬空锚点逃生口：游标锚定消息被软删后再发消息 → 游标正常推进、
- *    unread 不退化为全量（NOT EXISTS 分支方向实证）。
- * ⑥ v1.85 降级路径排自发：无游标 + 仅自发消息 → unreadCount=0 / messages=[]
- *    / hasMore=false（REST GET /topics/:id/messages/unread 的真实 PG 行为锁）。
+ * v1.96.0-dev 未读语义批（现行，取代 v1.69「发送即已读」）：
+ * ① **D1 发送不推进既有参与者行游标**（反向断言：发送前后游标不动、未读不被清零）；
+ * ② D2 新参与者 join → 游标初始化为当前最新消息，unread=0（**不受本批影响**）；
+ * ③ D2 left→re-join 保留原游标 → 离开期间的消息仍计未读（**不受本批影响**）；
+ * ④ D3 邀请建行游标 = 邀请时刻最新 → 邀请前历史不计，邀请后新消息计 1（**不受本批影响**）；
+ * ⑤ **D1 悬空锚点：发送不自愈 → 降级全量 → markAsRead 自愈 → 0**（行为变更，取代旧
+ *    「NOT EXISTS 逃生口在发送时推进」）；
+ * ⑥ v1.85 降级路径排自发：无游标 + 仅自发消息 → 0 / [] / false（**不受本批影响**）；
+ * ⑦ D1 INSERT 例外：无参与者行向 OPEN topic 首发 = auto-join，游标落本条（加入点即已读点）；
+ * ⑧ D1 顺序/hasMore：既有行的发送不改变未读，且 unreadCount 与 messages/hasMore 同口径；
+ * ⑨ D4 mentions_only 过滤：开启后只数提及我（或 @all）的消息；
+ * ⑩ D4 @all 命中：mentions 含标量 `"*"` 的消息对**所有人**计入；
+ * ⑪ D4 关闭模式不变：mentions_only=false → 全部消息照常计数（模式切换可逆）；
+ * ⑫ D4 双点同步：TopicService.getUnread 与 AgentService.findMyUnreadCounts 同口径
+ *    （同一 @ 消息两面都计 1，含锚点悬空变体）——**落点在 agent-unread.e2e-spec.ts ⑩**
+ *    （跨面对照需要同时构造 TopicService 与 AgentService 两个真例，故不在本文件）；
+ *   本文件只锁 TopicService 单面（⑨⑩⑪）。
+ * ⑬ D2/D3 send 响应字段：unreadCount 快照 + mentions 提取结果（真 PG 落库回读）；
+ * ⑭ D3 leave→@→rejoin：leave 期间被 @ 的消息在 rejoin 后进入未读；
+ * ⑮ D5 PATCH 契约锁：键名读回 / 重复 true 恒附同值 / mute 保留（jsonb 合并不整列覆盖）；
+ * ⑯ D3 replyTo 计入：回复某人 = 提及该父消息发送者；
+ * ⑰ D6 drain：markAsRead 到指定消息后，更新的消息仍计未读（多轮排空语义）。
  *
  * 环境约定与 agent-unread.e2e-spec.ts 同款：本地开发库 chamber-postgres
  * （localhost:8744），PG 不可达整套降级跳过；RUN 后缀隔离测试数据，
@@ -77,7 +89,7 @@ const DB_CONFIG = {
 /** 每次生成唯一后缀：隔离测试数据 */
 const runSuffix = (): string => `cur-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始化）— 真实 PG 集成', () => {
+describe('未读游标语义（v1.96.0-dev 未读语义批：发送不冲未读 + mentions_only）— 真实 PG 集成', () => {
   let ds: DataSource;
   let dbAvailable = false;
   let topicService: TopicService;
@@ -305,30 +317,37 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     return row?.lastReadMessageId ?? null;
   }
 
-  it('① D1 发送即已读：发送者游标推进到自己消息、自己未读=0；其他参与者游标不动、未读+1', async () => {
+  it('① D1 发送不推进既有参与者行游标：游标不动、未读不被清零（反向断言）', async () => {
     if (!dbAvailable) return;
 
     const sender = await createAgentWithOwner();
     const observer = await createAgentWithOwner();
     const topic = await createTopic(sender.id);
+    // msg1 作为双方共同起点；msg2 由 observer 发出（对 sender 是"别人发的新消息"）
     const [msg1] = await createHistoryMessages(topic.id, observer.id, 1);
     await createParticipant(topic.id, sender.id, { cursor: msg1.id });
     await createParticipant(topic.id, observer.id, { cursor: msg1.id });
+    const [msg2] = await createHistoryMessages(topic.id, observer.id, 1);
+    void msg2;
+
+    // 发送前：sender 有 1 条未读（observer 的 msg2）
+    const beforeSend = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
+    expect(beforeSend.unreadCount).toBe(1);
 
     const sent = await topicService.sendMessage(topic.id, sender.id, ActorType.AGENT, {
       content: `C d1 send ${runSuffix()}`,
     });
 
-    // 发送者游标推进到自己刚发的消息（ON CONFLICT CASE 比较方向实证）
-    expect(await getCursor(topic.id, sender.id)).toBe(sent.id);
-    // 其他参与者游标不动
+    // ① 反向断言：游标**不动**（旧 v1.69 行为会推进到 sent.id）
+    expect(await getCursor(topic.id, sender.id)).toBe(msg1.id);
+    expect(await getCursor(topic.id, sender.id)).not.toBe(sent.id);
+    // ② 行为变更核心：发送不冲未读——sender 的未读仍是 1（旧行为会被清零）
+    const afterSend = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
+    expect(afterSend.unreadCount).toBe(1);
+    // ③ 其他参与者同样不受影响
     expect(await getCursor(topic.id, observer.id)).toBe(msg1.id);
-
-    // 发送者自己未读=0（自己消息不计入）；观察者未读=1
-    const senderUnread = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
-    expect(senderUnread.unreadCount).toBe(0);
     const observerUnread = await topicService.getUnread(topic.id, {}, observer.id, ActorType.AGENT);
-    expect(observerUnread.unreadCount).toBe(1);
+    expect(observerUnread.unreadCount).toBe(1); // sender 的 sent（msg2 是 observer 自发，不计）
   }, 30000);
 
   it('② D2 新参与者 join → 游标初始化为当前最新消息，unread=0', async () => {
@@ -384,7 +403,7 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     expect(unread.unreadCount).toBe(1);
   }, 30000);
 
-  it('⑤ D1 悬空锚点逃生口：游标锚定消息被软删后再发消息 → 游标推进、unread 不退化全量', async () => {
+  it('⑤ D1 悬空锚点：发送不自愈（降级全量=1）→ markAsRead 自愈 → 0', async () => {
     if (!dbAvailable) return;
 
     const sender = await createAgentWithOwner();
@@ -399,12 +418,25 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
       content: `C dangling ${runSuffix()}`,
     });
 
-    // NOT EXISTS 逃生口：悬空游标仍推进到新消息（比较方向实证——
-    // 若逃生口缺失/写反，游标钉在已删 msg1，getUnread 降级真 COUNT=1 而非 0：
-    // 降级全量口径（v1.85）= 未软删 **且非自发**，本场景仅 other 的 msgs[1] 一条）
+    // ① 发送**不自愈**（D1 行为变更）：游标仍钉在已软删的 msg1 上，不推进到 sent.id
+    //    （旧 v1.69 的 NOT EXISTS 逃生口在发送时推进——本批把自愈窗口移到读到时）
+    expect(await getCursor(topic.id, sender.id)).toBe(msgs[0].id);
+    expect(await getCursor(topic.id, sender.id)).not.toBe(sent.id);
+
+    // ② 降级为全量未读（v1.85 口径 = 未软删 且非自发）：本场景只有 other 的 msgs[1]
+    const degraded = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
+    expect(degraded.unreadCount).toBe(1);
+    expect(degraded).not.toHaveProperty('lastReadMessageId'); // 降级分支不回带锚点
+
+    // ③ markAsRead 自愈：旧锚点已软删 → 「rows 空 → 允许推进」→ 游标跳到最新
+    const markResult = await topicService.markAsRead(topic.id, sender.id, ActorType.AGENT, {});
+    expect(markResult.advanced).toBe(true);
     expect(await getCursor(topic.id, sender.id)).toBe(sent.id);
-    const unread = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
-    expect(unread.unreadCount).toBe(0);
+
+    // ④ 自愈后未读归零（游标路径：sent 之后无新消息）
+    const healed = await topicService.getUnread(topic.id, {}, sender.id, ActorType.AGENT);
+    expect(healed.unreadCount).toBe(0);
+    expect(healed.lastReadMessageId).toBe(sent.id);
   }, 30000);
 
   it('⑥ v1.85 降级路径排自发：无游标 + 仅自发消息 → unreadCount=0 / messages=[] / hasMore=false', async () => {
@@ -413,7 +445,8 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     const agent = await createAgentWithOwner();
     const topic = await createTopic(agent.id);
     // 参与行存在但游标为 null（从未读过 → 走降级分支）；3 条消息全自己发
-    // （裸插绕过 sendMessage 的「发送即已读」游标推进——否则走游标路径而非降级路径）
+    // （裸插绕过 sendMessage 的 auto-join 游标初始化——否则 INSERT 分支会写入游标，
+    //  走游标路径而非本用例要锁的降级路径）
     await createParticipant(topic.id, agent.id);
     await createHistoryMessages(topic.id, agent.id, 3);
 
@@ -423,5 +456,334 @@ describe('未读游标语义修正（v1.69 发送即已读 + join/邀请初始�
     expect(unread.unreadCount).toBe(0);
     expect(unread.messages).toEqual([]);
     expect(unread.hasMore).toBe(false);
+  }, 30000);
+
+  /**
+   * 建带 mentions 的消息（直插绕过写路径提取，用于精确构造过滤场景）。
+   * 注意 created_at 与其它 helper 同规显式钉到 2024 递增，保证全序确定。
+   */
+  async function createMessageWithMentions(
+    topicId: string,
+    senderId: string,
+    mentions: string[],
+  ): Promise<Message> {
+    const msg = await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        topicId,
+        senderId,
+        type: MessageType.CHAT,
+        content: `C mention msg ${runSuffix()}`,
+        mentions,
+      }),
+    );
+    created.messageIds.push(msg.id);
+    historySeq += 1;
+    await ds.query(`UPDATE messages SET created_at = $2 WHERE id = $1`, [
+      msg.id,
+      new Date(Date.UTC(2024, 0, 1, 0, 0, historySeq)).toISOString(),
+    ]);
+    return msg;
+  }
+
+  /** 直接改参与行的 notification_settings（D4/D5 场景构造） */
+  async function setNotificationSettings(
+    topicId: string,
+    participantId: string,
+    settings: Record<string, unknown>,
+  ): Promise<void> {
+    await ds.query(
+      `UPDATE topic_participants SET notification_settings = $3::jsonb
+        WHERE topic_id = $1 AND participant_id = $2`,
+      [topicId, participantId, JSON.stringify(settings)],
+    );
+  }
+
+  it('⑦ D1 INSERT 例外：无参与者行向 OPEN topic 首发 = auto-join，游标落本条（加入点即已读点）', async () => {
+    if (!dbAvailable) return;
+
+    const creator = await createAgentWithOwner();
+    const newcomer = await createAgentWithOwner();
+    const topic = await createTopic(creator.id);
+    // 加入前已有 2 条历史（creator 发）——若 INSERT 例外缺失，新参与者会看到全量洪水
+    await createHistoryMessages(topic.id, creator.id, 2);
+    // 注意：**不建参与者行**（本次首发即 auto-join）
+
+    const sent = await topicService.sendMessage(topic.id, newcomer.id, ActorType.AGENT, {
+      content: `C first send ${runSuffix()}`,
+    });
+
+    // INSERT 分支的 $3 生效：游标 = 本条消息
+    expect(await getCursor(topic.id, newcomer.id)).toBe(sent.id);
+    // 加入点即已读点：加入前历史不计入 → 未读 0
+    const unread = await topicService.getUnread(topic.id, {}, newcomer.id, ActorType.AGENT);
+    expect(unread.unreadCount).toBe(0);
+    expect(unread.lastReadMessageId).toBe(sent.id);
+    // 与 join() 的初始化语义一致（② 用例同一契约）
+    const joined = await createAgentWithOwner();
+    await topicService.join(topic.id, joined.id, ActorType.AGENT);
+    expect(await getCursor(topic.id, joined.id)).toBe(sent.id);
+  }, 30000);
+
+  it('⑧ D1 顺序/hasMore：既有行的发送不改变未读，unreadCount 与 messages/hasMore 同口径', async () => {
+    if (!dbAvailable) return;
+
+    const reader = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(reader.id);
+    // reader 游标 = 话题开头（无游标）→ 走降级全量路径；writer 发 3 条
+    await createParticipant(topic.id, reader.id);
+    await createHistoryMessages(topic.id, writer.id, 3);
+
+    const before = await topicService.getUnread(topic.id, { limit: 2 }, reader.id, ActorType.AGENT);
+    expect(before.unreadCount).toBe(3);
+    expect(before.messages).toHaveLength(2);
+    expect(before.hasMore).toBe(true); // 3 未读 / 2 返回
+
+    // reader 发送一条（自己发的不计入）→ 未读数不变，顺序/分页口径不变
+    await topicService.sendMessage(topic.id, reader.id, ActorType.AGENT, {
+      content: `C own send ${runSuffix()}`,
+    });
+
+    const after = await topicService.getUnread(topic.id, { limit: 2 }, reader.id, ActorType.AGENT);
+    expect(after.unreadCount).toBe(3);
+    expect(after.messages).toHaveLength(2);
+    expect(after.hasMore).toBe(true);
+    // 消息列表恒按全序 ASC（最老优先），且不含自发消息
+    expect(after.messages.map((m) => m.id)).toEqual(before.messages.map((m) => m.id));
+    expect(after.messages.every((m) => m.senderId !== reader.id)).toBe(true);
+  }, 30000);
+
+  it('⑨ D4 mentions_only 过滤：开启后只数提及我（或 @all）的消息', async () => {
+    if (!dbAvailable) return;
+
+    const reader = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(reader.id);
+    await createParticipant(topic.id, reader.id); // 无游标 → 降级全量
+    // 3 条他人消息：1 条点名 reader、1 条 @all、1 条谁都没提
+    await createMessageWithMentions(topic.id, writer.id, [reader.id.toLowerCase()]);
+    await createMessageWithMentions(topic.id, writer.id, ['*']);
+    await createMessageWithMentions(topic.id, writer.id, []);
+
+    // 关闭模式：3 条全算
+    const off = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(off.unreadCount).toBe(3);
+    expect(off.mentionsOnly).toBe(false);
+
+    await setNotificationSettings(topic.id, reader.id, { mute: false, mentions_only: true });
+
+    // 开启模式：只剩「点名我」+「@all」两条
+    const on = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(on.mentionsOnly).toBe(true);
+    expect(on.unreadCount).toBe(2);
+    expect(on.messages).toHaveLength(2);
+    expect(on.hasMore).toBe(false);
+    // 未提及的那条确实不在列表里（谓词真的生效，而不是只改了计数）
+    const listed = on.messages.map((m) => m.content);
+    expect(listed.some((c) => c.includes('mention msg'))).toBe(true);
+  }, 30000);
+
+  it('⑩ D4 @all（mentions 含标量 "*"）对所有人计入', async () => {
+    if (!dbAvailable) return;
+
+    const a = await createAgentWithOwner();
+    const b = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(writer.id);
+    await createParticipant(topic.id, a.id);
+    await createParticipant(topic.id, b.id);
+    await createMessageWithMentions(topic.id, writer.id, ['*']);
+
+    // 两个不同 actor 都命中（'"*"'::jsonb 数组含标量特例的真 PG 实证）
+    for (const who of [a, b]) {
+      await setNotificationSettings(topic.id, who.id, { mentions_only: true });
+      const unread = await topicService.getUnread(topic.id, {}, who.id, ActorType.AGENT);
+      expect(unread.mentionsOnly).toBe(true);
+      expect(unread.unreadCount).toBe(1);
+    }
+  }, 30000);
+
+  it('⑪ D4 关闭模式不变：mentions_only=false → 全部消息照常计数（切换可逆）', async () => {
+    if (!dbAvailable) return;
+
+    const reader = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(reader.id);
+    await createParticipant(topic.id, reader.id);
+    await createMessageWithMentions(topic.id, writer.id, [reader.id.toLowerCase()]);
+    await createMessageWithMentions(topic.id, writer.id, []);
+
+    // 开 → 关：计数回到全量（模式切换非单向）
+    await setNotificationSettings(topic.id, reader.id, { mentions_only: true });
+    const on = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(on.unreadCount).toBe(1);
+
+    await setNotificationSettings(topic.id, reader.id, { mentions_only: false });
+    const off = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(off.mentionsOnly).toBe(false);
+    expect(off.unreadCount).toBe(2);
+  }, 30000);
+
+  it('⑬ D2/D3 send 响应字段：unreadCount 快照 + mentions 真 PG 落库回读', async () => {
+    if (!dbAvailable) return;
+
+    const sender = await createAgentWithOwner();
+    const target = await createAgentWithOwner();
+    const topic = await createTopic(sender.id);
+    const [anchor] = await createHistoryMessages(topic.id, target.id, 1);
+    await createParticipant(topic.id, sender.id, { cursor: anchor.id });
+    await createParticipant(topic.id, target.id, { cursor: anchor.id });
+    // 一条 target 发的、点名 sender 的消息 → sender 未读 1，且 target 名字可被 @
+    await createMessageWithMentions(topic.id, target.id, [sender.id.toLowerCase()]);
+
+    const sent = await topicService.sendMessage(topic.id, sender.id, ActorType.AGENT, {
+      content: `@${target.name} please take a look`,
+    });
+
+    // mentions：@target 的显示名 → target 的 id（真 PG 上 resolveProfiles 走真库）
+    expect(sent.mentions).toEqual([target.id.toLowerCase()]);
+    // unreadCount：sender 视角 = target 那 1 条（sent 本身是自发，不计入）
+    expect(sent.unreadCount).toBe(1);
+    // 落库回读：mentions 列真的写了
+    const row = await ds.getRepository(Message).findOne({ where: { id: sent.id } });
+    expect(row?.mentions).toEqual([target.id.toLowerCase()]);
+  }, 30000);
+
+  it('⑭ D3 leave→@→rejoin：leave 期间被 @ 的消息在 rejoin 后进入未读', async () => {
+    if (!dbAvailable) return;
+
+    const member = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(writer.id);
+    // member 处于 left（有行、非 invited/active）→ 不进未读汇总
+    await createParticipant(topic.id, member.id, { status: 'left', cursor: null });
+    const [anchor] = await createHistoryMessages(topic.id, writer.id, 1);
+    await ds
+      .getRepository(TopicParticipant)
+      .update({ topicId: topic.id, participantId: member.id }, { lastReadMessageId: anchor.id });
+    await setNotificationSettings(topic.id, member.id, { mentions_only: true });
+    // leave 期间被 @
+    await createMessageWithMentions(topic.id, writer.id, [member.id.toLowerCase()]);
+
+    // 写时提取**包含 left 行**（D3 全谱规则）：@ 被真的记进了 mentions 列
+    // ——若候选只取 active 行，这条 @ 会永久丢失（rejoin 后也无从恢复）
+    const mentionRow = await ds
+      .getRepository(Message)
+      .findOne({ where: { topicId: topic.id }, order: { createdAt: 'DESC' } });
+    expect(mentionRow?.mentions).toEqual([member.id.toLowerCase()]);
+
+    // 注：per-topic getUnread **没有** status 门槛（既有语义，本批不改），故 left 期间
+    // 该 @ 仍会出现在其 per-topic 未读里；「left 不进跨 topic 汇总（status IN
+    // invited/active）」由 agent-unread.e2e-spec.ts 锁。
+
+    // rejoin：游标保留（leave 期间消息仍算未读）→ 被 @ 的那条现在计入
+    await topicService.join(topic.id, member.id, ActorType.AGENT);
+    expect(await getCursor(topic.id, member.id)).toBe(anchor.id);
+    const after = await topicService.getUnread(topic.id, {}, member.id, ActorType.AGENT);
+    expect(after.mentionsOnly).toBe(true);
+    expect(after.unreadCount).toBe(1);
+  }, 30000);
+
+  it('⑮ D5 PATCH 契约锁：键名读回 / 重复 true 恒附同值 / mute 保留', async () => {
+    if (!dbAvailable) return;
+
+    const actor = await createAgentWithOwner();
+    const topic = await createTopic(actor.id);
+    await createParticipant(topic.id, actor.id);
+    // 预置 mute=true（未被接线的既有键——合并必须保留它，不能整列覆盖）
+    await setNotificationSettings(topic.id, actor.id, { mute: true, mentions_only: false });
+    const [m1] = await createHistoryMessages(topic.id, actor.id, 1);
+    void m1;
+    const other = await createAgentWithOwner();
+    await createParticipant(topic.id, other.id);
+    await createHistoryMessages(topic.id, other.id, 2); // 2 条他人消息（无提及）
+
+    const first = await topicService.updateNotificationSettings(topic.id, actor.id, {
+      mentionsOnly: true,
+    });
+    // 键名读回（库读回，不是内存推导）
+    expect(first.mentionsOnly).toBe(true);
+    // 模式为 true → hiddenUnreadCount 恒附（状态语义）；定义 = off − on = 2 − 0
+    expect(first.hiddenUnreadCount).toBe(2);
+    // mute 被保留（jsonb 合并，不是整列覆盖）
+    const row = await ds.getRepository(TopicParticipant).findOne({
+      where: { topicId: topic.id, participantId: actor.id },
+    });
+    expect(row?.notificationSettings).toEqual({ mute: true, mentions_only: true });
+
+    // 重复提交同一值 → 同结果（幂等；hiddenUnreadCount 恒附同值）
+    const second = await topicService.updateNotificationSettings(topic.id, actor.id, {
+      mentionsOnly: true,
+    });
+    expect(second).toEqual(first);
+
+    // 关闭 → 模式为 false 时**省略** hiddenUnreadCount（省略 ≠ 0）
+    const off = await topicService.updateNotificationSettings(topic.id, actor.id, {
+      mentionsOnly: false,
+    });
+    expect(off.mentionsOnly).toBe(false);
+    expect(off).not.toHaveProperty('hiddenUnreadCount');
+    // mute 仍在
+    const row2 = await ds.getRepository(TopicParticipant).findOne({
+      where: { topicId: topic.id, participantId: actor.id },
+    });
+    expect(row2?.notificationSettings).toEqual({ mute: true, mentions_only: false });
+  }, 30000);
+
+  it('⑯ D3 replyTo 计入：回复某人 = 提及该父消息发送者', async () => {
+    if (!dbAvailable) return;
+
+    const replier = await createAgentWithOwner();
+    const author = await createAgentWithOwner();
+    const topic = await createTopic(replier.id);
+    await createParticipant(topic.id, replier.id);
+    await createParticipant(topic.id, author.id);
+    const [parent] = await createHistoryMessages(topic.id, author.id, 1);
+
+    // 正文完全没有 @，只有 replyTo → 必须仍把 author 记进 mentions（闭环）
+    const sent = await topicService.sendMessage(topic.id, replier.id, ActorType.AGENT, {
+      content: 'replying without any at-sign',
+      replyTo: parent.id,
+    });
+
+    expect(sent.mentions).toEqual([author.id.toLowerCase()]);
+    // 对 author 而言：replier 的这条点名了他 → 未读可见（开静默后仍可见）
+    await setNotificationSettings(topic.id, author.id, { mentions_only: true });
+    const authorUnread = await topicService.getUnread(topic.id, {}, author.id, ActorType.AGENT);
+    expect(authorUnread.mentionsOnly).toBe(true);
+    expect(authorUnread.unreadCount).toBe(1);
+  }, 30000);
+
+  it('⑰ D6 drain：markAsRead 到指定消息后，更新的消息仍计未读（多轮排空语义）', async () => {
+    if (!dbAvailable) return;
+
+    const reader = await createAgentWithOwner();
+    const writer = await createAgentWithOwner();
+    const topic = await createTopic(reader.id);
+    await createParticipant(topic.id, reader.id, { cursor: null });
+    const msgs = await createHistoryMessages(topic.id, writer.id, 3);
+
+    // 只标到第 2 条（= digest 只看到前 2 条时的精确推进）
+    const marked = await topicService.markAsRead(topic.id, reader.id, ActorType.AGENT, {
+      messageId: msgs[1].id,
+    });
+    expect(marked.advanced).toBe(true);
+
+    // 第 3 条仍计未读 —— 这正是"多轮 drain"契约：取读之间新到/未返回的消息不被吞掉
+    const unread = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(unread.unreadCount).toBe(1);
+    expect(unread.messages.map((m) => m.id)).toEqual([msgs[2].id]);
+
+    // 再标到第 3 条 → 收敛为 0（drain 收敛）
+    await topicService.markAsRead(topic.id, reader.id, ActorType.AGENT, {
+      messageId: msgs[2].id,
+    });
+    const drained = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(drained.unreadCount).toBe(0);
+
+    // 排空后新到消息重新计入（"取读之间新到消息仍计未读"）
+    await createHistoryMessages(topic.id, writer.id, 1);
+    const fresh = await topicService.getUnread(topic.id, {}, reader.id, ActorType.AGENT);
+    expect(fresh.unreadCount).toBe(1);
   }, 30000);
 });

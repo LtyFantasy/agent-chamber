@@ -93,6 +93,7 @@ import { TopicController } from '../src/modules/topic/topic.controller';
 import { TopicService } from '../src/modules/topic/topic.service';
 import { DocService } from '../src/modules/docspace/doc.service';
 import { DocSpaceService } from '../src/modules/docspace/docspace.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 import { RouteHealthService } from '../src/modules/docspace/route-health.service';
 import { DiagramRendererService } from '../src/modules/docspace/diagram-renderer.service';
 import { AuditService } from '../src/modules/audit/audit.service';
@@ -294,6 +295,9 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
         // RouteHealthService/DiagramRendererService 是 DocService 的非触达注入点，空桩
         DocService,
         DocSpaceService,
+        // hint 去重窗口（2 期，v1.92.0-dev）：DocService/DocSpaceService 的新依赖（真实例，
+        // 内存 Map 无副作用；本套件不触发 hint 路径）
+        HintDedupService,
         { provide: RouteHealthService, useValue: {} },
         { provide: DiagramRendererService, useValue: {} },
         PermissionService,
@@ -1183,7 +1187,8 @@ describe('attachments e2e（真 PG + 真 MinIO）', () => {
       { create: async () => ({}) } as unknown as EventService,
       {} as never, // routeHealthService（未触达）
       ds.getRepository(IdempotencyRecord),
-      {} as never, // diagramRenderer（markdown 路径未触达）
+      {} as never, // diagramRenderer（markdown 路径未触达）,
+      new HintDedupService(),
     );
     const result = await docService.recalcSpaceLinkHealth(spaceId);
 

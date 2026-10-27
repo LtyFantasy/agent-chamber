@@ -30,6 +30,8 @@ import { Fragment, useCallback, useMemo, useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf } from '@/lib/error-message';
 import { useAuthStore } from '@/stores/auth.store';
 import { AuditAction, UserRole } from '@/types';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -146,6 +148,7 @@ function RowDetail({ log }: { log: { newData: unknown; oldData: unknown; diff: u
  */
 export default function LogsPage() {
   const t = useTranslations('logs');
+  const tRead = useTranslations('common');
   const locale = useLocale();
   const tFilter = useTranslations('logs.filter');
   const user = useAuthStore((state) => state.user);
@@ -228,10 +231,11 @@ export default function LogsPage() {
     page,
   });
 
-  const { data, isLoading } = useQuery({
+  const logsQuery = useQuery({
     queryKey: ['logs', 'list', query],
     queryFn: () => Api.logs.list(query),
   });
+  const { data, isLoading } = logsQuery;
 
   const handleReset = () => {
     setActor(null);
@@ -419,7 +423,28 @@ export default function LogsPage() {
           <CardTitle>{t('table.title')}</CardTitle>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {logsQuery.isError && data !== undefined && (
+            <QueryFeedback
+              compact={logsQuery.data !== undefined}
+              message={errorMessageOf(
+                logsQuery.error,
+                tRead(logsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void logsQuery.refetch()}
+              busy={logsQuery.isFetching}
+            />
+          )}
+          {logsQuery.isError && data === undefined ? (
+            <QueryFeedback
+              compact={logsQuery.data !== undefined}
+              message={errorMessageOf(
+                logsQuery.error,
+                tRead(logsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void logsQuery.refetch()}
+              busy={logsQuery.isFetching}
+            />
+          ) : isLoading ? (
             <Loading />
           ) : !data || data.items.length === 0 ? (
             <EmptyState title={t('noLogs')} description={t('noLogsDesc')} />

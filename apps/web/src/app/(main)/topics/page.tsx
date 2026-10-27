@@ -7,6 +7,8 @@ import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/rea
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { errorMessageOf } from '@/lib/error-message';
+import { toast } from '@/lib/notify';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -78,7 +80,7 @@ export default function TopicsPage() {
   } | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['topics', 'list'],
     queryFn: () => Api.topics.list({ pageSize: 100, status: 'all' }),
   });
@@ -95,6 +97,9 @@ export default function TopicsPage() {
       setNewMaxRounds('');
       setNewAttachmentTtl(TTL_DEFAULT);
     },
+    // 失败必须说话：此前无 onError，创建失败被静默吞掉（卡 240c74d6 的六枚之一）。
+    // 文案走 errorMessageOf：仅 4xx + 业务码透传服务端 message，断网时不再露出 axios 英文原文。
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('createError')) }),
   });
 
   const updateMutation = useMutation({
@@ -114,6 +119,7 @@ export default function TopicsPage() {
       void queryClient.invalidateQueries({ queryKey: ['topics'] });
       setEditTopic(null);
     },
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('updateError')) }),
   });
 
   const deleteMutation = useMutation({
@@ -122,6 +128,7 @@ export default function TopicsPage() {
       void queryClient.invalidateQueries({ queryKey: ['topics'] });
       setDeleteId(null);
     },
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('deleteError')) }),
   });
 
   const topics = data?.items ?? [];
@@ -173,14 +180,21 @@ export default function TopicsPage() {
     // 列表项只有 descriptionSnippet（截断值），编辑表单需完整描述，
     // 通过详情接口拉取避免数据截断风险（spec.md §7.4a）；settings 也只在详情
     // 响应里透出（列表刻意剔除）——附件有效期初值同源取自 detail.settings
-    const detail = await Api.topics.getById(topic.id);
-    setEditTopic({
-      id: topic.id,
-      title: topic.title,
-      description: detail.description ?? undefined,
-      visibility: topic.visibility,
-      attachmentTtl: detail.settings?.attachmentTtl ?? TTL_DEFAULT,
-    });
+    try {
+      const detail = await Api.topics.getById(topic.id);
+      setEditTopic({
+        id: topic.id,
+        title: topic.title,
+        description: detail.description ?? undefined,
+        visibility: topic.visibility,
+        attachmentTtl: detail.settings?.attachmentTtl ?? TTL_DEFAULT,
+      });
+    } catch (err: unknown) {
+      // 裸 await 会让「详情拉取失败」变成**未处理的 Promise 拒绝**：点铅笔毫无反应、
+      // 控制台一条未捕获错误（卡 240c74d6 顺手修）。失败必须说人话 + 指路（重试）。
+      // 复用 loadErrorDesc（"检查网络后重试"）而非新增键：这句话本身就是完整可行动作。
+      toast.error({ title: errorMessageOf(err, t('loadErrorDesc')) });
+    }
   };
 
   return (
@@ -196,8 +210,25 @@ export default function TopicsPage() {
         </Button>
       </div>
 
+      {/* 四态分支：加载 / 错误 / 空 / 列表。
+          错误态判据 = `isError && data === undefined`，**不能**写成 `topics.length === 0`：
+          TanStack v5 刷新失败会保留旧 data，零话题用户刷新失败时错误分支会把空态（含创建
+          CTA 与 Dialog）整棵卸载，而零话题用户恰是空态入口的主目标（memory 页 R-2 实证；
+          卡 240c74d6 三列表页同规）。 */}
       {isLoading ? (
         <Loading />
+      ) : isError && data === undefined ? (
+        <div data-testid="topics-list-error">
+          <EmptyState
+            title={t('loadErrorTitle')}
+            description={errorMessageOf(error, t('loadErrorDesc'))}
+            action={
+              <Button variant="outline" onClick={() => void refetch()}>
+                {tGlobal('common.retry')}
+              </Button>
+            }
+          />
+        </div>
       ) : topics.length === 0 ? (
         <EmptyState
           title={t('noTopics')}
@@ -260,6 +291,7 @@ export default function TopicsPage() {
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0"
+                          aria-label={tGlobal('common.edit')}
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
@@ -272,6 +304,7 @@ export default function TopicsPage() {
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0"
+                          aria-label={tGlobal('common.delete')}
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();

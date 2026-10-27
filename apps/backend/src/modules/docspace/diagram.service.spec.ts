@@ -13,11 +13,12 @@
 import {
   BadRequestException,
   InternalServerErrorException,
+  NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { ErrorCode, DOC_TYPE_DIAGRAM } from '@agent-chamber/shared';
 import { DiagramService } from './diagram.service';
-import type { DocService } from './doc.service';
+import { DocService } from './doc.service';
 import type { DiagramRendererService } from './diagram-renderer.service';
 import type { Doc } from '../../database/entities/doc.entity';
 import type { IdempotencyRecord } from '../../database/entities/idempotency-record.entity';
@@ -77,6 +78,7 @@ describe('DiagramService', () => {
   let service: DiagramService;
   let docService: {
     findById: jest.Mock;
+    findByIdInSpace: jest.Mock;
     getContent: jest.Mock;
     upsertCore: jest.Mock;
     upsert: jest.Mock;
@@ -105,6 +107,7 @@ describe('DiagramService', () => {
   beforeEach(() => {
     docService = {
       findById: jest.fn(),
+      findByIdInSpace: jest.fn(),
       getContent: jest.fn().mockResolvedValue({ content: CANONICAL }),
       upsertCore: jest.fn(),
       upsert: jest.fn(),
@@ -310,22 +313,59 @@ describe('DiagramService', () => {
     });
 
     it('mode (b) docId+patches：模拟 patch 后送渲染门（渲染器收到 patch 后 IR）', async () => {
-      docService.findById.mockResolvedValue(makeDoc());
+      docService.findByIdInSpace.mockResolvedValue(makeDoc());
       const result = await service.validateDiagram('space-1', {
         docId: '00000000-0000-4000-8000-0000000000d1',
         patches: [{ op: 'replace' as const, path: '/components/0/label', value: 'CDN' }],
       });
       expect(result.ok).toBe(true);
+      // 作用域解析必须带上 path spaceId（docId 通道不得回落到无空间过滤的 findById）
+      expect(docService.findByIdInSpace).toHaveBeenCalledWith(
+        'space-1',
+        '00000000-0000-4000-8000-0000000000d1',
+      );
+      expect(docService.findById).not.toHaveBeenCalled();
       const renderedIr = renderer.validateAndRender.mock.calls[0][0] as typeof IR;
       expect(renderedIr.components[0].label).toBe('CDN');
     });
 
     it('mode (b) 命中非 diagram doc → 400 DIAGRAM_DOC_TYPE_LOCKED（nit#5）', async () => {
-      docService.findById.mockResolvedValue(makeDoc({ docType: 'note', diagramType: null }));
+      docService.findByIdInSpace.mockResolvedValue(makeDoc({ docType: 'note', diagramType: null }));
       await expect(
         service.validateDiagram('space-1', { docId: '00000000-0000-4000-8000-0000000000d2' }),
       ).rejects.toMatchObject({ response: { code: ErrorCode.DIAGRAM_DOC_TYPE_LOCKED } });
       expect(renderer.validateAndRender).not.toHaveBeenCalled();
+    });
+
+    it('mode (b) docId 跨空间 → 404 DOC_NOT_FOUND，内容/渲染路径零触达', async () => {
+      // findByIdInSpace 在 DB 层就把跨空间与非存在折成同一个 404（此处模拟其语义）
+      docService.findByIdInSpace.mockRejectedValue(
+        new NotFoundException({ message: 'Document not found', code: ErrorCode.DOC_NOT_FOUND }),
+      );
+      const crossSpaceErr = await service
+        .validateDiagram('space-1', { docId: '00000000-0000-4000-8000-0000000000d5' })
+        .then(
+          () => {
+            throw new Error('expected cross-space docId to be rejected');
+          },
+          (e: unknown) => e as NotFoundException,
+        );
+      expect(crossSpaceErr).toBeInstanceOf(NotFoundException);
+      expect(crossSpaceErr.getStatus()).toBe(404);
+      expect(crossSpaceErr.getResponse()).toEqual({
+        message: 'Document not found',
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+      expect(docService.findByIdInSpace).toHaveBeenCalledWith(
+        'space-1',
+        '00000000-0000-4000-8000-0000000000d5',
+      );
+      // 越权收口：作用域解析失败即止——不回落到全局 findById、不读内容、不进渲染门、
+      // 不触 ensureDiagramDoc（否则跨空间非 diagram 会变成 400 + actual docType 泄露）
+      expect(docService.findById).not.toHaveBeenCalled();
+      expect(docService.getContent).not.toHaveBeenCalled();
+      expect(renderer.validateAndRender).not.toHaveBeenCalled();
+      expect(docService.upsertCore).not.toHaveBeenCalled();
     });
 
     it('模式互斥/缺失：ir+path 同传 → 400；全缺 → 400', async () => {
@@ -474,6 +514,106 @@ describe('DiagramService', () => {
       await expect(service.getDiagramHtml('doc-1', 'zh-CN')).rejects.toBeInstanceOf(
         BadRequestException,
       );
+    });
+  });
+
+  // ─── 同文同码机器契约（DocService 真实实现）───────────────────
+
+  describe('findById vs findByIdInSpace 未命中契约', () => {
+    /**
+     * 契约必须由**真实** DocService 钉住：mock 自证测不出实现漂移
+     * （单条 SQL 语义 / 异常体逐字段一致是本卡的安全不变量）。
+     */
+    function makeRealDocServiceReturningNull() {
+      const missRepo = {
+        createQueryBuilder: jest.fn(() => ({
+          addSelect: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue(null),
+        })),
+      } as unknown as Repository<Doc>;
+      // 只有 docRepo 被 findById/findByIdInSpace 触及，其余依赖以空桩满足构造
+      return new DocService(
+        missRepo,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+      );
+    }
+
+    async function captureRejection(p: Promise<unknown>): Promise<NotFoundException> {
+      return p.then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (e: unknown) => e as NotFoundException,
+      );
+    }
+
+    it('两条通道未命中：状态码 + 响应体逐字段深等（跨空间与不存在不可区分）', async () => {
+      const real = makeRealDocServiceReturningNull();
+      const docId = '00000000-0000-4000-8000-0000000000d6';
+
+      const byId = await captureRejection(real.findById(docId));
+      const byIdInSpace = await captureRejection(real.findByIdInSpace('space-1', docId));
+
+      expect(byId).toBeInstanceOf(NotFoundException);
+      expect(byIdInSpace).toBeInstanceOf(NotFoundException);
+      expect(byIdInSpace.getStatus()).toBe(byId.getStatus());
+      expect(byIdInSpace.getResponse()).toEqual(byId.getResponse());
+      // 显式锚定字面量（防两侧同时漂移时深等静默通过）
+      expect(byId.getStatus()).toBe(404);
+      expect(byId.getResponse()).toEqual({
+        message: 'Document not found',
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    });
+
+    it('作用域过滤在 SQL 层：查询条件含 space_id 且未软删（非事后比对）', async () => {
+      const missRepo = {
+        createQueryBuilder: jest.fn(() => {
+          const qb = {
+            addSelect: jest.fn().mockReturnThis(),
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            getOne: jest.fn().mockResolvedValue(null),
+          };
+          return qb;
+        }),
+      } as unknown as Repository<Doc>;
+      const real = new DocService(
+        missRepo,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+      );
+
+      await captureRejection(real.findByIdInSpace('space-1', 'doc-x'));
+
+      const qb = (missRepo.createQueryBuilder as jest.Mock).mock.results[0].value as {
+        where: jest.Mock;
+        andWhere: jest.Mock;
+      };
+      expect(qb.where).toHaveBeenCalledWith('d.id = :docId', { docId: 'doc-x' });
+      expect(qb.andWhere).toHaveBeenCalledWith('d.space_id = :spaceId', { spaceId: 'space-1' });
+      expect(qb.andWhere).toHaveBeenCalledWith('d.deleted_at IS NULL');
     });
   });
 });

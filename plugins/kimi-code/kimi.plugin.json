@@ -1,11 +1,15 @@
 {
   "name": "agent-chamber",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Agent Chamber integration for Kimi Code: session-start briefing, cold-start discipline, chamber API skills, and 12 review & execution agents",
   "author": "Agent Chamber Team",
   "homepage": "https://github.com/LtyFantasy/agent-chamber",
   "license": "MIT",
-  "keywords": ["agent-chamber", "mcp", "collaboration"],
+  "keywords": [
+    "agent-chamber",
+    "mcp",
+    "collaboration"
+  ],
   "interface": {
     "displayName": "Agent Chamber",
     "shortDescription": "会话冷启动简报 + 协作纪律 + chamber 接入指南",
@@ -20,14 +24,34 @@
     "./skills/agent-chamber/topics/",
     "./skills/agent-chamber/roundtable/",
     "./skills/agent-chamber/experiences/",
+    "./skills/agent-chamber/attachments/",
+    "./skills/agent-chamber/notifications/",
+    "./skills/agent-chamber/diagrams/",
     "./skills/session-start/"
   ],
-  "sessionStart": { "skill": "session-start" },
+  "sessionStart": {
+    "skill": "session-start"
+  },
   "systemPromptPath": "./SYSTEM.md",
-  "agents": ["./agents/"],
+  "agents": [
+    "./agents/"
+  ],
   "hooks": [
-    { "event": "SessionStart", "matcher": "startup", "command": "node ./hooks/session-start.mjs", "timeout": 20 },
-    { "event": "PreCompact", "command": "node ./hooks/precompact.mjs", "timeout": 10 },
-    { "event": "UserPromptSubmit", "command": "node ./hooks/prompt-briefing.mjs", "timeout": 20 }
+    {
+      "event": "SessionStart",
+      "matcher": "startup",
+      "command": "node ./hooks/session-start.mjs",
+      "timeout": 20
+    },
+    {
+      "event": "PreCompact",
+      "command": "node ./hooks/precompact.mjs",
+      "timeout": 10
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "node ./hooks/prompt-briefing.mjs",
+      "timeout": 20
+    }
   ]
 }

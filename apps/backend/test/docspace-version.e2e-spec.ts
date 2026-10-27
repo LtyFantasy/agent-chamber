@@ -50,6 +50,7 @@ import { Board } from '../src/database/entities/board.entity';
 import { AuditLog } from '../src/database/entities/audit-log.entity';
 import type { EventService } from '../src/modules/event/event.service';
 import type { RouteHealthService } from '../src/modules/docspace/route-health.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -120,6 +121,7 @@ describe('DocService doc history — 真实 PG 集成（版本插入/剪枝/读�
       ds.getRepository(IdempotencyRecord),
       // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
       { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
+      new HintDedupService(),
     );
 
     // ── 种子数据：一个空间 + 一篇文档（路径带 RUN 后缀隔离）──

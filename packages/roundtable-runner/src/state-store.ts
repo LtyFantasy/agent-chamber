@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §4 (契约② 可靠性: 双向对账游标/未确认队列/sessionId 落盘,
+ *   - 主文档: docs/modules/roundtable-design.md §4 (契约② 可靠性: 双向对账游标/未确认队列/sessionId 落盘,
  *           无逐条 ack)
  *
  * [踩坑索引] ④(sessionId 映射丢失→永远 new session) RT-DEBT-2(无界增长: 未确认队列靠对账游标裁剪, 不无条件清空)
@@ -38,7 +38,7 @@
  * - 损坏恢复：JSON 解析失败 → 坏文件备份为 state.json.corrupt-<ts> → 从空状态恢复（不 crash）
  * - 同步写（writeFileSync + renameSync）：每次状态变更即时落盘，kill -9 也不丢已记录游标
  *
- * 出处：docs/roundtable-design.md §4（可靠性：双向对账，无逐条 ack）/ M1 计划 §三。
+ * 出处：docs/modules/roundtable-design.md §4（可靠性：双向对账，无逐条 ack）/ M1 计划 §三。
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';

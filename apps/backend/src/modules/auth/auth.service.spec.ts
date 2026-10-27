@@ -12,7 +12,7 @@ import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
 import { RefreshToken } from '../../database/entities/refresh-token.entity';
 import { RegisterDto, LoginDto, RefreshTokenDto } from './dto';
-import { UserRole, ActorType, AuditAction } from '@agent-chamber/shared';
+import { UserRole, ActorType, AuditAction, ErrorCode } from '@agent-chamber/shared';
 import { AuditService } from '../audit/audit.service';
 
 jest.mock('bcrypt', () => ({
@@ -249,7 +249,11 @@ describe('AuthService', () => {
   describe('login', () => {
     const mockLoginQuery = (user: User | null) => {
       (mockUserRepo.createQueryBuilder as jest.Mock).mockReturnValue({
+        // login 走 innerJoinAndSelect（soft-deleted fail-open 修复，卡 e6926d73）；
+        // 两个都桩上：mock 只决定"查到哪一行"，join 方法名与 SQL 语义无关——
+        // 真 PG 语义由 test/soft-deleted-login.e2e-spec.ts 覆盖（铁律 #23）
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        innerJoinAndSelect: jest.fn().mockReturnThis(),
         addSelect: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
@@ -328,6 +332,40 @@ describe('AuthService', () => {
 
       await expect(service.login(dto)).rejects.toThrow(UnauthorizedException);
       expect(bcrypt.compare).toHaveBeenCalledWith(dto.password, user.passwordHash);
+    });
+
+    it('should reject login when the actor relation is missing (soft-deleted user shape, 卡 e6926d73)', async () => {
+      // 软删用户经 LEFT JOIN 漏回的形态：actor 行被 ORM 的软删过滤从 ON 子句淘汰
+      // → user.actor=null（真 PG 语义由 test/soft-deleted-login.e2e-spec.ts 覆盖）。
+      // 注意**不能** mock `{ actor: { deletedAt: X } }`——Actor.deletedAt 是
+      // @DeleteDateColumn({ select: false })，生产路径上恒 undefined，那是测空气。
+      const user = createMockUser();
+      user.actor = null as unknown as Actor;
+      mockLoginQuery(user);
+      jest.mocked(bcrypt.compare).mockResolvedValue(true as never);
+      mockRefreshTokenRepo.create.mockReturnValue(createMockRefreshToken());
+      mockRefreshTokenRepo.save.mockResolvedValue(createMockRefreshToken());
+
+      const dto: LoginDto = {
+        email: 'soft-deleted@example.com',
+        password: 'password123',
+      };
+
+      const err = await service.login(dto).then(
+        () => null,
+        (e: unknown) => e as UnauthorizedException,
+      );
+      expect(err).toBeInstanceOf(UnauthorizedException);
+      // 死代码哨兵：判据若落在 status getter（actor=null 时回落 'active'）上，
+      // 本用例必红——这正是修复前的 fail-open 路径
+      expect(err?.getResponse()).toEqual({
+        message: 'Invalid credentials',
+        code: ErrorCode.TOKEN_INVALID,
+      });
+      // 不得产生任何登录副作用（不写 last_login_at、不写审计、不签发 refresh token）
+      expect(mockUserRepo.save).not.toHaveBeenCalled();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+      expect(mockRefreshTokenRepo.save).not.toHaveBeenCalled();
     });
 
     it('should throw UnauthorizedException when user status is disabled', async () => {
@@ -462,6 +500,48 @@ describe('AuthService', () => {
       };
 
       await expect(service.refresh(dto)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('should reject refresh for a soft-deleted user WITHOUT revoking the old token (卡 e6926d73 顺序修正)', async () => {
+      // 软删用户经 eager 关系的 leftJoin 漏回：actor=null（真 PG 语义见
+      // test/soft-deleted-login.e2e-spec.ts ②）。旧实现先 revoke 旧 token 再查 user，
+      // 这条路径会把用户仅剩的 token 白烧掉——本用例锁死"门在 revoke 之前"。
+      mockJwtService.verify.mockReturnValue({ sub: 'user-1' });
+      const refreshToken = createMockRefreshToken();
+      mockRefreshTokenRepo.findOne.mockResolvedValue(refreshToken);
+      const softDeleted = createMockUser();
+      softDeleted.actor = null as unknown as Actor;
+      mockUserRepo.findOne.mockResolvedValue(softDeleted);
+
+      const dto: RefreshTokenDto = {
+        refreshToken: 'valid-refresh-token',
+      };
+
+      const err = await service.refresh(dto).then(
+        () => null,
+        (e: unknown) => e as UnauthorizedException,
+      );
+      expect(err).toBeInstanceOf(UnauthorizedException);
+      expect(err?.getResponse()).toEqual({
+        message: 'User not found',
+        code: ErrorCode.TOKEN_INVALID,
+      });
+      // 顺序断言：失败路径不得吊销、不得签发
+      expect(refreshToken.revokedAt).toBeNull();
+      expect(mockRefreshTokenRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('should reject refresh when the user actor is disabled (non-deleted)', async () => {
+      mockJwtService.verify.mockReturnValue({ sub: 'user-1' });
+      const refreshToken = createMockRefreshToken();
+      mockRefreshTokenRepo.findOne.mockResolvedValue(refreshToken);
+      mockUserRepo.findOne.mockResolvedValue(createMockUser({ status: 'disabled' }));
+
+      await expect(service.refresh({ refreshToken: 'valid-refresh-token' })).rejects.toThrow(
+        UnauthorizedException,
+      );
+      expect(refreshToken.revokedAt).toBeNull();
+      expect(mockRefreshTokenRepo.save).not.toHaveBeenCalled();
     });
   });
 

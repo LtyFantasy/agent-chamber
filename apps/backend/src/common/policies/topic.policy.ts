@@ -84,6 +84,9 @@ export class TopicPolicy {
   ) {}
 
   // 规则同步：AccessQueryService.computeAccessibleTopicIds — 修改 read 权限条件时必须同步更新 access-query.service.ts
+  // 规则同步（Notifications 二期）：topic **没有**剖面族对应方法——通知对 topic 的安全层刻意比
+  //   read 更严（"topic active 参与者"入口闸，见 plan §D3），故不共用 resolveBoardAccess /
+  //   resolveSpaceAccess 那一族；改 topic read 条件仍需同步 computeAccessibleTopicIds
   async can(
     actor: UnifiedActor | null,
     topic: Topic,

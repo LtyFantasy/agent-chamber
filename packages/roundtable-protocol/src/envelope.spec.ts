@@ -1,5 +1,5 @@
 /**
- * 信封构建与校验测试（docs/roundtable-design.md §4：信封格式 + 座位归属语义）
+ * 信封构建与校验测试（docs/modules/roundtable-design.md §4：信封格式 + 座位归属语义）
  */
 import {
   buildEnvelope,

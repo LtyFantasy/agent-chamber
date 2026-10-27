@@ -20,6 +20,10 @@
  *   - diagram.html 直出带 CSP/nosniff 头（直接访问场景的纵深防御；web 走 srcdoc）
  *   - PUT 在 space 级、GET/PATCH 在 doc 级的不对称符合既有分区惯例
  *     （doc.controller.ts "Space-scoped doc routes" vs "Global doc routes (by doc ID)"）
+ *   - **validate 的 path / docId 两条 locator 通道都受 path spaceId 约束**：controller
+ *     先对 path spaceId 做 ensureCan read，service 侧再用该 spaceId 做作用域解析
+ *     （path → findDocByPath；docId → DocService.findByIdInSpace）——跨空间 docId
+ *     一律 404 DOC_NOT_FOUND，与"不存在"同文同码（不泄露文档是否存在于别处）
  *
  * [关联代码]
  *   - diagram.service.ts — 业务服务
@@ -55,6 +59,7 @@ import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import type { UnifiedActor } from '../../common/types/actor.types';
 import { UpsertDiagramDto, PatchDiagramDto, ValidateDiagramDto, DiagramHtmlQueryDto } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AgentScope } from '../../common/decorators/agent-scope.decorator';
 
 /**
  * diagram.html 直出端点的 CSP（直接访问场景的纵深防御——web 实际走 iframe srcDoc
@@ -132,6 +137,9 @@ export class DiagramController {
     status: 200,
     description: 'Validation result (ok:false carries repair diagnostics)',
   })
+  // scope 豁免（清单单源 = config/agent-scope-exemptions.ts，机器强制 = 同名 spec）：
+  // dry-run 零副作用 + 内部独立读授权，故只需 read。理由见清单条目。
+  @AgentScope('read')
   async validateDiagram(
     @Param('id', ParseUUIDPipe) spaceId: string,
     @Body() dto: ValidateDiagramDto,

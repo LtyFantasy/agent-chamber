@@ -13,7 +13,7 @@
  *   - `countReturnedRows` / `safeErrorTag` / `judgmentActorKey`：落库与告警的分类原语
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判断日志/训练语料章
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判断日志/训练语料章
  *     （`stateRedacted` 行纪律、节选标记、"日志是正文第二副本"威胁面）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（redaction 基线 =
  *     两表并集，顺序照经验库现状；新标记名 `logRedacted`，经验库 `stateRedacted` 不动）

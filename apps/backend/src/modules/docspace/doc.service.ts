@@ -1,74 +1,43 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
- *   - 补充: plan §4.3 (文档读/文档写), plan §4.4 (chunking), plan §1.1-13 (sectionId 不稳定契约)
- *   - 补充: doc history MVP（doc_versions 表，2026-08-18）——所有内容变更写通道
- *     收口于本文件 upsert 事务：同事务插版本快照 + DOC_VERSION_KEEP 剪枝
- *   - 补充: plan patriot-cyclone-deadman.md §1.4（v1.61.0 批次 1：computeLinkHealth 三调用点
- *     sourcePath + recheckDocLinkHealth + recalcSpaceLinkHealth 批量 sections）
- *   - 补充: plan patriot-cyclone-deadman.md §2.1（v1.61.0 批次 2：patchMetadata
- *     metadata-only 写通道——不重切/不落版/不动 contentHash，游戏方 6 条契约）
- *   - 补充: v1.62.0（contentHash 读路径透传）：list/read outline/full/content 读路径
- *     统一返回原始写入 payload 的 SHA-256（乐观锁 token）；它与读出重建正文的
- *     SHA-256 **不可互算**——expectedContentHash 一律用响应返回的同源 token
- *   - 补充: plan fire-jericho-she-hulk.md（v1.63.0 Board 任务 7d918c7b）：写入口
- *     clientRequestId 幂等——upsert/patchSection/patchByMatch/patchMetadata 四入口，
- *     helper 见 common/services/idempotency.helper.ts；重放返回 response_snapshot 首次快照，
- *     同 key 不同 payload → 409 IDEMPOTENCY_KEY_CONFLICT；patch 借道 upsertCore
- *     事务登记（快照形状 = patch 入口响应），禁止把幂等包裹放进 upsert 内层
- *   - 补充: plan docspace-lazy-tree-v1.md（v1.70.0-dev：findTree/findFacets 只读端点）。
- *     SQL 形态硬约束（plan A1/A2）：WHERE 只用 LIKE 模式（索引友好），禁止 substring
- *     进 WHERE；substring/split_part 只允许在 SELECT/GROUP BY（narrowing 之后）；
- *     plen 由 JS 算好整数传入（归一化 prefix 含尾 / 时 plen = prefix.length + 1，
- *     PG 1-based）；folders total = 分组数子查询 COUNT；docs total = getManyAndCount
- *     双查；一律显式 d.deleted_at IS NULL。改 findTree 前先读 plan「SQL 形态硬约束」节
- *   - 补充: plan diagram-ir-v1-plan.md（Diagram IR v1）：upsertCore diagram 分支——
- *     parse/canonicalize 前置（computeHash 对规范化形态生效）→ R3 仓库证据前置拒绝 →
- *     R1 渲染门仅 hashChanged||forceRechunk 触发（unchanged 零渲染）→ 单节合成
- *     （headingPath=null 刻意差异，绕过 chunkMarkdown）→ title/summary 从 ir.meta
- *     派生 → 三列同事务写入/迁出置 null（不变量：docType='diagram' ⟺
- *     diagram_type/rendered_html 非空）。D9 三拒绝落点 = patchSection/patchByMatch/
- *     appendDocOnce 的 findById 之后；D10 patchMetadata docType 双向守卫在事务内
- *     变更面判定处。渲染门实现见 diagram-renderer.service.ts
- *
- * [踩坑索引]
- *   - headingPath-separator-v1.57.2：headingPath 结构分隔符必须是带空格的 ` § `；标题正文中的
- *     `§3.2` 不能按裸字符拆分，末段标题统一走 shared extractLastHeadingSegment()。
- *   - patch_doc MATCH 模式字节一致性（2026-08-17，Hument 同类事故在 match 面）：工具描述
- *     「read_doc 返回文本与 match 匹配面相同」曾经失实——full 丢首标题 / section 幻影标题
- *     （续 chunk 无标题行）/ 空正文尾部 \n\n 三处字节不一致，复制的 oldString 必 0 命中。
- *     修复：findOne full 分支改 skipDuplicateTitle=false（与 match 面/getContent(full=true)
- *     逐字节同形）；getSection/getSections/getSectionByHeadingQuery 新增 markdown 字段
- *     （renderSectionPart 口径的字节级子串）供 MCP 读侧直用。改渲染规则先跑 docspace 测试
- *   - 任务 e6eaf06d 第二张脸：chunker step 4 段落切分产生的兄弟 chunk 共用同一 headingPath，
- *     重建时若逐个插标题行，同一标题会重复 N 次（生产实证 12~180 次），且「全文读 + upsert
- *     回写」每轮固化重复标题，文档越往返越臃肿；v1.57.3 起 renderSectionPart 仅依据
- *     chunker 持久化的 isContinuation 事实去重，不能再用相邻 headingPath/headingLevel 猜测，
- *     否则合法同名 sibling 标题会被吞掉。修改该逻辑前先跑 docspace 测试验证往返幂等
- *     （长文 round-trip 用例 + docspace-patch.e2e-spec.ts 真实 PG 集成）
- *   - rundedup-continuation-v1.57.3：相邻同路径 section 可能是真实同名标题；chunker 直写
- *     isContinuation=true，renderer 只据事实去重，老服务端缺字段时保留标题、不静默吞正文。
- *   - 互斥查询参数（path= 与 q=）同传是请求格式错误：400 VALIDATION_ERROR，禁止用
- *     RESOURCE_CONFLICT（2026-08-09 修复 edad7a9，原误挂 RESOURCE_CONFLICT）
- *   - Hument 事故（topic msg 6dbc4da3）：patch_doc stale position 在 re-chunk 漂移后
- *     静默写错块（fail-open）→ fail-closed 改造（2026-08-16）：读通道派生 sectionHash
- *     （存储三元组 sha256，**非渲染片段**——渲染依赖 isContinuation 事实，禁止改口径）、
- *     patchSection expectedSectionHash / upsert expectedContentHash 前提校验
- *     （事务内 FOR UPDATE 锁行复核，TOCTOU 加固）、新增 patchByMatch match 模式写
- *     （操作面 = full=true 全文；0 命中 404 / 多命中 409+matchCount / 唯一命中替换）
- *
- * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
- *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   rundedup-continuation-v1.57.3: 相邻同 headingPath/headingLevel 可能是真实同名 sibling，旧启发式会吞标题。renderer 改为只依据 chunker 持久化的 isContinuation 去重。
- *
+ * [功能概念]
+ *   - DocSpace 正文与纯元数据写入、分节、版本、幂等快照与写侧 hints。
+ * [代码职责]
+ *   - upsertCore 收口普通正文、PATCH/APPEND 与 diagram 的持久化事务。
+ * [权威文档]
+ *   - 主文档: 线上 Agent Chamber docs/api-definition.md §16.14/§16.18 — 正文/纯元数据写入及 unchanged 契约。
+ *   - 补充: 线上 Agent Chamber docs/architecture.md §3.2.10 — DocSpace 模块与事务边界。
+ * [关键不变量]
+ *   - 现有正文替换先按 id/spaceId/path/未删除锁父 Doc，再写 sections/versions；
+ *     省略字段继承 locked fresh，expectedContentHash/source 在锁后复核。
+ *   - core 准备格式与 fresh 在 diagram/non-diagram 间漂移须重读；普通 Markdown
+ *     docType 变化继承 fresh。renderer、候选池与链接预读均不得进入持锁事务。
+ *   - hashChanged 基于 fresh；late unchanged 不重切/整 save/落版/hints/audit/event，
+ *     必要 sourceSha/linkHealth 补列及幂等登记仍使用同一事务连接。
+ *   - 内部 PATCH/APPEND 传入的 title/summary 是保留策展值快照，锁后以 fresh 为准；
+ *     普通 UPSERT/IMPORT 仍按本次输入派生。事件 title 必须与持久态一致。
+ *   - diagram 单节保留 canonical IR，迁出时清图列；forceRechunk 同 hash 不落版本。
+ *   - 幂等重放返回首次快照，tags 归一在指纹之后；正文 unchanged 不落 tags/不发 hints，
+ *     patchMetadata unchanged 则按 §16.18 返回 hints。
+ *   - patchMetadata 两出口的分类视图与幂等快照复用当前事务 manager，持锁时不得另借连接。
+ * [关联代码]
+ *   - doc.service.spec.ts / test/docspace.e2e-spec.ts — 分支及 HTTP 契约。
+ *   - test/docspace-content-consistency.e2e-spec.ts — 独立 PG 持久态/SQL/回滚证据。
+ *   - common/services/idempotency.helper.ts — 同事务登记与首次快照回放。
+ * [持久踩坑]
+ *   - DOC-PARENT-FIRST: 先删 sections 再 UPDATE 父行会让并发写交叉留节；先锁再合并。
+ *   - HINT-TX-ZERO-IO: 持锁时用外层仓储会申请第二连接；池/路由预读、事务内纯比对。
+ *   - HINT-REQUEST-SCOPE: 比较型 hint 闸门只看请求数据，禁止回退存量 tags；
+ *     patchMetadata 另有归一入口，两侧都须核对。词表脏形状须经 parse* 闸门。
+ *   - DOC-READ-BYTE-IDENTITY: sectionHash 来自存储三元组；首标题/续节/空节的
+ *     markdown 必须与全文匹配面一致，headingPath 只作寻址、标题读 headingText。
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 import {
@@ -82,9 +51,11 @@ import {
   Inject,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { createHash } from 'crypto';
 import { Doc } from '../../database/entities/doc.entity';
+// 引用清单类型（MAJOR-2：事务前取回、事务内纯比对）
+import type { DocRoute } from '../../database/entities/doc-route.entity';
 import { DocSection } from '../../database/entities/doc-section.entity';
 import { DocVersion } from '../../database/entities/doc-version.entity';
 import { DocCategory } from '../../database/entities/doc-category.entity';
@@ -124,6 +95,17 @@ import type {
   AppendDocInput,
   DocTreeResponse,
   DocFacetsResponse,
+  DocFacetCount,
+  // DocSpace 元数据治理 3 期：orphan 诊断面（findOrphans）
+  OrphanDocsQuery,
+  OrphanDocsResponse,
+  OrphanDocItem,
+  DocSpaceCanonicalTag,
+  DocSpaceHintToggles,
+  DocSpacePathType,
+  DocHint,
+  DocDeleteResult,
+  TagNormalization,
   DiagramType,
   DiagramRenderMeta,
   DiagramWriteRenderInfo,
@@ -133,14 +115,54 @@ import type {
 } from '@agent-chamber/shared';
 import { chunkMarkdown, estimateTokens } from './markdown-chunker';
 import type { ChunkResult } from './markdown-chunker';
-import { DOC_IDEMPOTENCY_ENTITY_TYPE, DOC_SOURCE_NATIVE } from './doc-constants';
+import {
+  DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
+  DOC_IDEMPOTENCY_ENTITY_TYPE,
+  DOC_SOURCE_NATIVE,
+} from './doc-constants';
 // review-0831 任务 bbd175dc 子项 1：slugify 唯一实现（本文件复制品已删，行为统一为
 // 带兜底版——中文分类名 slug 从 '' 变为 's-xxxxxxxx'，属预期修复：按 slug 匹配的
 // 分类查询对中文名不再必然不命中）
 import { slugify } from './doc-slug.helper';
+// 空间词表读侧形状解析单源（v1.92.0-dev，code-review F1）：jsonb 脏形状不得抛
+// 3 期补 expandTagQueryValues：findAll 的 tag 过滤经空间词表集合展开（alias 兼容）
+import {
+  expandTagQueryValues,
+  parseCanonicalTags,
+  parseHintToggles,
+  parseStringList,
+  parsePathTypes,
+} from './doc-vocabulary.helper';
+// hint 计算内核（2 期，v1.92.0-dev）：纯函数群 + 优先级/截尾编排；IO 全在本 service
+import {
+  buildCategoryNearDupHint,
+  buildMetadataHints,
+  buildPathTypeMismatchHint,
+  buildRouteAnchorBrokenHint,
+  buildRouteAnchorRecheckHint,
+  buildTagNearDupHints,
+  buildTagsNormalizedHint,
+  DOC_HINT_PROFILE,
+  HINT_ROUTE_ANCHOR_CHECK_CAP,
+  shouldLoadTagPool,
+  type HintCandidate,
+  type HintPoolEntry,
+} from './doc-hints.helper';
+// hint 候选池读取单源（tag 池 / category 池；族闸门内才调用）
+import { loadCategoryPool, loadTagPool } from './doc-hint-pools';
+// hint 基建（阶段一抽核到 modules/hints/）：去重窗口（@Global 提供的进程单例）、
+// 信封接线（emitHints 唯一实现）、埋点面标识
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
+import type { HintSurface } from '../hints/hint-log';
+// 凭证粘贴扫描（v1.94.0-dev）：批量通道的**逐条**挂点（batchUpsert 的状态机旁）——
+// 单文档 upsert / patch / append 三个挂点在 doc.controller（controller 层是它们的最外入口）
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
 // review-0831 任务 bbd175dc 子项 2：批量 per-item 错误提取唯一实现（batchUpsert
-// 内联复制品已删，与 doc-bundle.service 共用同一 { message, code } 契约）
-import { errorOf } from './doc-error.helper';
+// 内联复制品已删，与 doc-bundle.service 共用同一 { message, code } 契约）；
+// F4 项5 追加 batchErrorLogSummary / PER_ITEM_LOG_DETAIL_MAX（per-item 失败的服务端
+// 结构化摘要与明细条数上界，三处 catch 共用）
+import { batchErrorLogSummary, errorOf, PER_ITEM_LOG_DETAIL_MAX } from './doc-error.helper';
 import { computeLinkHealth } from './link-health';
 import { computeLineDiff } from './doc-version-diff';
 import { RouteHealthService } from './route-health.service';
@@ -203,11 +225,30 @@ function isDocContentConflictError(err: unknown): boolean {
   );
 }
 
+/**
+ * 空间写上下文（2 期，v1.92.0-dev）：一次 settings 读的产物，写路径（upsert /
+ * patchMetadata）共用——1 期词表 + 2 期 hint 闸门与 pathTypes。
+ *
+ * 各键 null 的语义 = 该配置缺省/形状非法（见 doc-vocabulary.helper 的形状闸门）：
+ * - `vocabulary === null` → 无 canonicalTags 词表（tag 归一短路）；
+ * - `hintToggles === null` → **全关**（消费方一律 `?.<family> === true` 判定）；
+ * - `pathTypes === null` → 未声明路径类型（path_type_mismatch 无判定依据）。
+ */
+export interface DocWriteSpaceContext {
+  /** 空间声明的 canonicalTags 词表（null = 未声明） */
+  vocabulary: DocSpaceCanonicalTag[] | null;
+  /** hint 族开关（null = 全关） */
+  hintToggles: DocSpaceHintToggles | null;
+  /** 空间声明的 pathTypes（null = 未声明） */
+  pathTypes: DocSpacePathType[] | null;
+  /** settings 原文（供消费方读其他键，如 overviewFilter；形状未经闸门，消费方自行防御） */
+  settings: Record<string, unknown>;
+}
+
 @Injectable()
 export class DocService {
   /** NestJS 内置 Logger（fire-and-forget 异步任务的错误只记日志不透出，对齐仓内惯例） */
   private readonly logger = new Logger(DocService.name);
-
   constructor(
     @InjectRepository(Doc)
     private readonly docRepo: Repository<Doc>,
@@ -239,6 +280,9 @@ export class DocService {
     // 失败即整单拒绝不落库）。markdown 文档路径零开销（仅 effectiveDocType==='diagram'
     // 时触及本依赖）。
     private readonly diagramRenderer: DiagramRendererService,
+    // hint 去重窗口（2 期，v1.92.0-dev）：内存 TTL Map 的 Nest provider（A5——不放模块级
+    // 单例，测试隔离与 mock 需要）。所有 hint 送达前的过滤/标记都经本依赖。
+    private readonly hintDedup: HintDedupService,
   ) {}
 
   // ─── Helpers ─────────────────────────────────────────────────
@@ -317,10 +361,20 @@ export class DocService {
   /**
    * Resolve category by name within a space.
    * Looks up by name or slug; creates it if not found (slug derived via slugify).
-   * Returns categoryId (or null if no category name given).
+   *
+   * 返回 `{ categoryId, created }`（2 期 A6 修订）：`created=true` 是「本次自动新建了
+   * 分类」的信号——category_near_dup hint 的唯一触发条件（只出候选，**不自动合并**，
+   * 自动建行为本身不变）。全部调用点必须同步消费该形状。
+   *
+   * @param spaceId 目标空间 ID
+   * @param categoryName 分类名（空/undefined → `{categoryId: null, created: false}`）
+   * @returns categoryId（命中或新建）与 created（是否本次新建）
    */
-  private async resolveCategory(spaceId: string, categoryName?: string): Promise<string | null> {
-    if (!categoryName) return null;
+  private async resolveCategory(
+    spaceId: string,
+    categoryName?: string,
+  ): Promise<{ categoryId: string | null; created: boolean }> {
+    if (!categoryName) return { categoryId: null, created: false };
 
     // Services-only existence check: find category by name or slug in this space
     const existing = await this.categoryRepo
@@ -333,7 +387,7 @@ export class DocService {
       })
       .getOne();
 
-    if (existing) return existing.id;
+    if (existing) return { categoryId: existing.id, created: false };
 
     // Auto-create category (slug derived from name, aligned with W2 category logic)
     const slug = slugify(categoryName);
@@ -345,7 +399,7 @@ export class DocService {
       sortOrder: 0,
     });
     const saved = await this.categoryRepo.save(cat);
-    return saved.id;
+    return { categoryId: saved.id, created: true };
   }
 
   /**
@@ -376,6 +430,218 @@ export class DocService {
     return existing?.id ?? null;
   }
 
+  /**
+   * 读空间**写上下文**（2 期，v1.92.0-dev）：一次 settings 读拿到写路径需要的全部
+   * 空间级配置——canonicalTags 词表（1 期归一）、hintToggles 族开关（2 期闸门）、
+   * pathTypes 声明（2 期 path_type_mismatch 依据）。
+   *
+   * 为什么合并成一次读：族开关本身也是 settings 里的键，**不读就无法判定是否要算
+   * hint**——把词表读与闸门读合成一次 PK select，避免同请求两次查空间行；batchUpsert
+   * 逐 batch 提升本上下文（与 1 期词表提升同款，见 batchUpsert 注释）。
+   *
+   * 形状解析一律收口于 doc-vocabulary.helper 的 parse* 纯函数（元素级闸门，永不抛——
+   * 异形键按「无配置」处理，见该文件 [持久踩坑] VOCAB-SHAPE-1）。
+   *
+   * @param spaceId 目标空间 ID
+   * @returns 三键均已解析的写上下文（各键 null = 该配置缺省/形状非法）
+   */
+  async getSpaceWriteContext(spaceId: string): Promise<DocWriteSpaceContext> {
+    const space = await this.docSpaceRepo.findOne({
+      where: { id: spaceId },
+      select: ['id', 'settings'],
+    });
+    const settings = (space?.settings ?? {}) as Record<string, unknown>;
+    return {
+      vocabulary: parseCanonicalTags(settings.canonicalTags),
+      hintToggles: parseHintToggles(settings.hintToggles),
+      pathTypes: parsePathTypes(settings.pathTypes),
+      settings,
+    };
+  }
+
+  /**
+   * 读分类 slug（2 期：route_target_excluded 的 category 维度判定用）。
+   *
+   * 只读单列轻查；分类不存在/已软删 → null。
+   */
+  async findCategorySlug(categoryId: string | null): Promise<string | null> {
+    if (!categoryId) return null;
+    const cat = await this.categoryRepo
+      .createQueryBuilder('dc')
+      .select(['dc.id', 'dc.slug'])
+      .where('dc.id = :id', { id: categoryId })
+      .andWhere('dc.deleted_at IS NULL')
+      .getOne();
+    return cat?.slug ?? null;
+  }
+
+  /**
+   * 按空间词表归一 tag 列表（v1.92.0-dev，DocSpace 元数据治理 1 期）。
+   *
+   * 归一语义（**仅限显式声明的词表**，其余字节不动）：
+   * ① 逐 tag 做 trim + 大小写不敏感匹配——先匹配 canonical 值，再匹配各条目 aliases；
+   * ② 命中 → 写 canonical 声明形态；未命中 → **原样落库**（不 trim 不改动，重复项也保留）；
+   * ③ **仅对命中的归一值**去重（保留首个出现位置），如 `["NPC","npc"]`（canonical=npc）→
+   *    `["npc"]`；未命中项不参与去重判定（`["foo","foo"]` → `["foo","foo"]`，忠于
+   *    「未命中即原样落库」契约）；
+   * ④ 空间未声明 canonicalTags（vocabulary 为 null/空）→ 短路返回原值（零行为变化）。
+   *
+   * 归一确定性：同一输入恒得同一输出 → 幂等指纹可保持 caller 原始输入不受影响
+   * （调用方在幂等 replay 检查**之后**才归一，见 upsert/patchMetadata 注释）。
+   *
+   * @param tags 调用方原始 tags（undefined = 未携带，原样返回）
+   * @param vocabulary 空间声明的 canonicalTags（null/空 = 无词表，短路）
+   * @returns tags = 归一后落库值；normalizations = 实际发生的归一映射（仅命中且值变化时记录）
+   */
+  private resolveTags(
+    tags: string[] | undefined,
+    vocabulary: DocSpaceCanonicalTag[] | null | undefined,
+  ): { tags: string[] | undefined; normalizations: TagNormalization[] } {
+    if (!tags || tags.length === 0 || !vocabulary || vocabulary.length === 0) {
+      return { tags, normalizations: [] };
+    }
+
+    // 建索引：canonical(ci) → 声明形态；alias(ci) → 归属条目（先到先得，与写侧校验口径一致）
+    const canonicalByKey = new Map<string, string>();
+    const aliasToCanonical = new Map<string, string>();
+    for (const entry of vocabulary) {
+      const ownKey = entry.value.toLowerCase();
+      canonicalByKey.set(ownKey, entry.value);
+      for (const alias of entry.aliases ?? []) {
+        const key = alias.toLowerCase();
+        if (key === ownKey) continue; // 同条目内 alias == 自身 canonical → 等价，跳过
+        if (!aliasToCanonical.has(key)) aliasToCanonical.set(key, entry.value);
+      }
+    }
+
+    const normalizations: TagNormalization[] = [];
+    const out: string[] = [];
+    const seenNormalized = new Set<string>();
+    for (const raw of tags) {
+      const key = raw.trim().toLowerCase();
+      // 先匹配 canonical 值，再匹配 aliases
+      const resolved = canonicalByKey.get(key) ?? aliasToCanonical.get(key) ?? null;
+      if (resolved === null) {
+        // 未命中 → 原样落库（不 trim / 不去重——含重复项，忠于「原样」契约）
+        out.push(raw);
+        continue;
+      }
+      // 命中 → 归一为声明形态；去重**只作用于归一值**（保留首个出现位置）
+      if (seenNormalized.has(resolved)) continue;
+      seenNormalized.add(resolved);
+      if (raw !== resolved) normalizations.push({ from: raw, to: resolved });
+      out.push(resolved);
+    }
+    return { tags: out, normalizations };
+  }
+
+  /**
+   * 组装 doc 写路径（upsertCore / patchMetadata）的 hint 候选并落信封
+   * （2 期，v1.92.0-dev）。
+   *
+   * 调用点在各自**事务内**（hints 随响应快照进幂等记录，见各处注释）。族闸门
+   * （`spaceCtx.hintToggles`）在此收口：未开的族连候选都不构造；**池类与引用清单 IO
+   * 全部由调用方在事务前完成**（MAJOR-2：事务内用独立连接查 `doc_routes` 会申请第二条
+   * 连接 → **连接饥饿**；机制与池上限的完整说明见 upsertCore 池注释）。
+   * **本函数零 IO（结构约束）**：函数体无 `await`、不注入任何仓储——事务内调用它不会
+   * 触碰第二条连接。改回 `async` / 加 IO 前先读 upsertCore 池注释。
+   *
+   * @param params.surface 埋点面标识（upsert / batch_upsert / patch_metadata）
+   * @param params.doc 事务内已保存的 doc 实体（**落库后**状态才是判定基准）
+   * @param params.headingPaths 本次写入的 headingPath 集合（A4 in-memory chunks）；
+   *   **null = 本次不重切 sections**（patchMetadata）→ routes 族整段跳过
+   * @param params.routeRefs 事务前取回的**引用本文档的路由清单**（族关 / 本次不评估
+   *   routes 时为 null）；比对在本方法内用纯函数完成（零 IO）
+   * @param params.tagPool tags 族池（null = 族关/无需池）
+   * @param params.precomputedCandidates 事务前算好的候选（category_near_dup）
+   * @returns ≤3 条 DocHint；空 → undefined（信封不变量：禁空数组）
+   */
+  private buildDocWriteHints(params: {
+    surface: HintSurface;
+    spaceId: string;
+    doc: Doc;
+    spaceCtx: DocWriteSpaceContext;
+    normalizations: TagNormalization[];
+    headingPaths: Set<string> | null;
+    routeRefs: DocRoute[] | null;
+    tagPool: HintPoolEntry[] | null;
+    precomputedCandidates: HintCandidate[];
+    actorId: string;
+  }): DocHint[] | undefined {
+    const { spaceId, doc, spaceCtx, normalizations, headingPaths, tagPool, actorId } = params;
+    const toggles = spaceCtx.hintToggles;
+    const candidates: HintCandidate[] = [...params.precomputedCandidates];
+
+    // tags_normalized（**无族、不去重**）：本请求实际发生归一的事实回显，与
+    // tagNormalizations 字段双通道并存。**族关也照发**（它是「动作已发生」的事实，
+    // 不是建议）——唯一不挂族闸门的 hint（D1 定形）。
+    const normalizedHint = buildTagsNormalizedHint(normalizations, doc.id);
+    if (normalizedHint) candidates.push(normalizedHint);
+
+    if (toggles?.metadata === true) {
+      candidates.push(
+        ...buildMetadataHints(
+          { categoryId: doc.categoryId, tags: doc.tags, summary: doc.summary },
+          doc.id,
+        ),
+      );
+    }
+
+    if (toggles?.pathType === true) {
+      const hint = buildPathTypeMismatchHint(doc.path, doc.docType, spaceCtx.pathTypes, doc.id);
+      if (hint) candidates.push(hint);
+    }
+
+    // **不变量（批 1，铁律 #18）**：`tagPool` **已加载（非 null）** ⟺ 本请求携带了「词表外
+    // ∧ 非实体锚点」tags。注意判据是「非 null」而**不是「非空」**——零文档空间的首篇 upsert
+    // 闸门为 true 而池恰为 `[]`（已加载但无内容），这属正常态，不得据此跳过近义判定。
+    // 闸门输入 = `resolvedTags`（**请求面**），比较输入 = `doc.tags`（**落库面**）
+    // ——两者刻意不同源，**禁止再给闸门加 `?? doc.tags` 回退**（那就是「未携带 tags 时
+    // 对存量 tags 跑近义比对」的失效模式）。闸门的锚点预判与 `buildTagNearDupHints` 的
+    // 输入过滤共用 `isEntityAnchorTag` 单源（闸门宽 = 白付池聚合；闸门窄 = 静默丢 hint）。
+    if (toggles?.tags === true && tagPool) {
+      candidates.push(...buildTagNearDupHints(doc.tags, spaceCtx.vocabulary, tagPool, doc.id));
+    }
+
+    if (toggles?.routes === true && headingPaths !== null && params.routeRefs !== null) {
+      // **纯比对**（零 IO，MAJOR-2）：引用清单已在事务前取回，headingPaths = 本事务刚
+      // 插入的同一份 in-memory 数据（A4 的两条硬要求都保持：同源数据 + hints 随快照）
+      const { routeCount, brokenRouteIds, anchors } = this.routeHealthService.analyzeRouteAnchors(
+        params.routeRefs,
+        doc.id,
+        headingPaths,
+      );
+      if (routeCount > HINT_ROUTE_ANCHOR_CHECK_CAP) {
+        // 影响面超 cap → 改发 check_skipped（**未检查 ≠ 健康**，plan D4）
+        const skipped = buildRouteAnchorRecheckHint([], doc.id, {
+          skipped: true,
+          total: routeCount,
+        });
+        if (skipped) candidates.push(skipped);
+      } else if (brokenRouteIds.length > 0) {
+        const broken = buildRouteAnchorBrokenHint(brokenRouteIds, anchors, doc.id);
+        if (broken) candidates.push(broken);
+      }
+    }
+
+    return this.emitHints(candidates, { surface: params.surface, spaceId, actorId });
+  }
+
+  /**
+   * hint 落信封（委托 `hint-emit.emitHints` 的唯一接线实现——排序 → 去重过滤 →
+   * ≤3 截尾 → 标记 + 埋点；本方法只补 surface/spaceId/actorId 上下文）。
+   *
+   * @returns ≤3 条 DocHint；无存活候选 → undefined（信封不变量：禁空数组）
+   */
+  private emitHints(
+    candidates: HintCandidate[],
+    context: { surface: HintSurface; spaceId: string; actorId: string },
+  ): DocHint[] | undefined {
+    return emitHints(this.logger, this.hintDedup, candidates, context, {
+      profile: DOC_HINT_PROFILE,
+    });
+  }
+
   /** Build a DocSummary from a Doc entity. */
   private toSummary(doc: Doc): DocSummary {
     return {
@@ -402,6 +668,25 @@ export class DocService {
     };
   }
 
+  /**
+   * 纯组装 unchanged 首次响应：共用于事务外快路和锁后的 late unchanged，无 IO。
+   * @param doc 当前出口确认的文档快照
+   * @returns 新响应对象，diagram 信息仅从该快照派生
+   */
+  private buildUnchangedResult(doc: Doc): UpsertDiagramResult {
+    return {
+      id: doc.id,
+      path: doc.path,
+      sectionCount: doc.sectionCount,
+      tokenEstimate: doc.tokenEstimate,
+      unchanged: true,
+      contentHash: doc.contentHash ?? undefined,
+      ...(doc.docType === DOC_TYPE_DIAGRAM
+        ? { diagramType: doc.diagramType, render: this.diagramRenderInfoFromMeta(doc.renderMeta) }
+        : {}),
+    };
+  }
+
   // ─── CRUD ────────────────────────────────────────────────────
 
   /** Raw find by ID, no permission check. Throws DOC_NOT_FOUND if missing or soft-deleted. */
@@ -409,6 +694,45 @@ export class DocService {
     const doc = await this.docRepo
       .createQueryBuilder('d')
       .where('d.id = :id', { id })
+      .andWhere('d.deleted_at IS NULL')
+      .getOne();
+
+    if (!doc) {
+      throw new NotFoundException({
+        message: 'Document not found',
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    }
+    return doc;
+  }
+
+  /**
+   * Space-scoped find by ID：`id + space_id + 未软删` 三条件**单条 SQL**定位。
+   *
+   * 语义（刻意设计，勿"优化"）：
+   * - 404 = 文档不存在**或**不属于本空间，二者**不可区分**——异常体与
+   *   `findById` 未命中逐字节同文同码（`Document not found` + `DOC_NOT_FOUND`），
+   *   调用方与攻击者都拿不到"它存在但你没权限"的信号。
+   * - **不变量：禁止改成「先 findById 再比对 doc.spaceId」**。两次行返回 = 可区分
+   *   时延差 + 跨空间文档内容进内存，会把 404 变成时延/内容侧信道；本方法存在的
+   *   全部意义就是让跨空间与不存在走同一 SQL 形状、单次往返、结果零行同形。
+   * - **仅用于 space-scoped 端点**（path 里带 spaceId 的路由，如
+   *   `POST /doc-spaces/:id/diagrams/validate` 的 docId 通道）。全局 doc 路由
+   *   （`/docs/:id`）继续 `findById` + `doc.spaceId` 反向鉴权——那里按 docId 定位
+   *   是产品语义，不是越权面。
+   * - **upsert / create-if-missing 流程禁用本方法**：那条路径需要区分"不存在"与
+   *   "存在但换空间"，本方法的 404 折叠语义会把它变成静默新建/静默 409。
+   *
+   * @param spaceId 路径作用域空间（controller 已对该空间做 ensureCan read）
+   * @param docId   目标文档 ID
+   * @returns 命中且属于该空间的未软删 Doc
+   * @throws NotFoundException 404 DOC_NOT_FOUND（不存在/不属本空间/已软删，不可区分）
+   */
+  async findByIdInSpace(spaceId: string, docId: string): Promise<Doc> {
+    const doc = await this.docRepo
+      .createQueryBuilder('d')
+      .where('d.id = :docId', { docId })
+      .andWhere('d.space_id = :spaceId', { spaceId })
       .andWhere('d.deleted_at IS NULL')
       .getOne();
 
@@ -431,7 +755,7 @@ export class DocService {
    *   快照插入 + 剪枝（版本契约 = contentHash 变化才落版，见 hashChanged 守卫）；
    *   doc 元数据照常刷新（updatedAt bump 是预期语义）；响应带 `rechunked: true`
    *   （unchanged 恒不出现）；DOC_UPDATED 事件携带 rechunked 上下文。
-   * - changed → transaction: delete old sections, insert new, update metadata
+   * - changed → transaction: lock parent Doc, delete old sections, insert new, update metadata
    * - category by name resolution (auto-create if not found)
    * - summary defaults to first section's first paragraph (≤500 chars)
    * - source isolation: existing doc with non-matching source → 409
@@ -444,8 +768,9 @@ export class DocService {
    *   **不**早退（强制重建），前提校验通过即正常执行重建。
    * - versionSource（内部写通道标记，doc history MVP）：区分版本来源
    *   'upsert'（缺省，直接 upsert 端点）/ 'patch'（patchSection/patchByMatch 转调）/
-   *   'import'（batchUpsert 批量导入转调）。不进 DTO 校验层——纯 Service 内部
-   *   传参，controller 直调不传即 'upsert'。
+   *   'import'（batchUpsert 批量导入转调）/ 'append'（appendDocOnce 转调）。
+   *   PATCH/APPEND 的策展字段来自旧保留快照，锁后继承 fresh；UPSERT/IMPORT 按本次输入。
+   *   不进 DTO 校验层——纯 Service 内部传参，controller 直调不传即 'upsert'。
    * - 23505 concurrent catch → re-query existing doc (idempotency)
    * - v1.63.0 幂等（Board 任务 7d918c7b）：可选 clientRequestId——重放返回首次响应
    *   快照 + idempotentReplay:true（零副作用）；同 key 不同 payload → 409
@@ -470,6 +795,18 @@ export class DocService {
     },
     actor?: UnifiedActor,
     clientRequestId?: string,
+    /**
+     * 内部参数（v1.92.0-dev，不进 DTO/幂等指纹）：batchUpsert 逐 batch 提升的
+     * **空间写上下文**（1 期词表 + 2 期 hint 闸门/pathTypes 三合一，一次 settings 读）
+     * ——undefined = 由 upsertCore 自行读取。
+     */
+    spaceContext?: DocWriteSpaceContext,
+    /**
+     * 内部参数（2 期 m1，不进 DTO/幂等指纹）：hint 埋点的面标识——batchUpsert 传
+     * `'batch_upsert'` 以便日志区分「批量导入的一条」与「单条 upsert」。
+     * 缺省 `'upsert'`。
+     */
+    surface?: HintSurface,
   ): Promise<UpsertDocResult> {
     // 幂等包裹（最外层写入口）：无键零开销旁路；有键先查重放——命中直接返回首次
     // 快照（跳过 unchanged 短路等一切后续逻辑，保证重放响应与首次逐字段一致）。
@@ -491,7 +828,7 @@ export class DocService {
       const replay = await tryIdempotentReplay<UpsertDocResult>(this.idempotencyRepo, ctx);
       if (replay) return { ...replay, idempotentReplay: true };
     }
-    return this.upsertCore(spaceId, dto, actor, ctx);
+    return this.upsertCore(spaceId, dto, actor, ctx, spaceContext, surface);
   }
 
   /**
@@ -524,8 +861,31 @@ export class DocService {
     },
     actor?: UnifiedActor,
     ctx?: WriteIdempotencyContext | null,
+    /** 内部参数（见 upsert 同名参数注释）：undefined = 自行读取空间写上下文 */
+    spaceContext?: DocWriteSpaceContext,
+    /** 内部参数（见 upsert 同名参数注释）：hint 埋点面标识，缺省 'upsert' */
+    surface?: HintSurface,
   ): Promise<UpsertDocResult> {
     const source = dto.source || DOC_SOURCE_NATIVE;
+    // hint 埋点面（m1）：批量导入逐条 → 'batch_upsert'，其余（单条 upsert / patch /
+    // append / diagram patch 直调）统一 'upsert'
+    const hintSurface: HintSurface = surface ?? 'upsert';
+    // hint 去重窗口的 actor 维度（未认证写归 'system'，与 audit/version 的 actor 兜底同源）
+    const hintActorId = actor?.id ?? 'system';
+
+    // ── 空间写上下文（2 期，v1.92.0-dev）───────────────────────────────────
+    // 一次 settings 读拿到：canonicalTags 词表（1 期归一）+ hintToggles 族开关
+    // （2 期闸门）+ pathTypes（path_type_mismatch 依据）。**族开关本身也是 settings
+    // 键——不读无法判定是否要算 hint**，故本读不是「族开才有」的额外 IO，而是闸门
+    // 本身的读；batchUpsert 逐 batch 提升经 spaceContext 透传（不重复查）。
+    // ⚠️ unchanged 早退（下方）发生在 tags 落库之前——tags 属「内容键」语义，
+    // 内容未变则 tags 不落库也不归一（A2，非回归）；纯标签调整走 patch_doc_metadata。
+    const spaceCtx: DocWriteSpaceContext =
+      spaceContext ?? (await this.getSpaceWriteContext(spaceId));
+    const { tags: resolvedTags, normalizations } = this.resolveTags(dto.tags, spaceCtx.vocabulary);
+    // 归一映射仅在成功出口挂载（unchanged/23505 败者出口零归一）
+    const normalizationPatch =
+      normalizations.length > 0 ? { tagNormalizations: normalizations } : {};
 
     // Check existing doc
     const existing = await this.docRepo
@@ -578,7 +938,8 @@ export class DocService {
         throw new ConflictException({
           message:
             `expectedContentHash mismatch: document was modified since the caller's read ` +
-            `(expected ${dto.expectedContentHash}, current ${existing.contentHash}); re-read the document and retry`,
+            `(expected ${dto.expectedContentHash}, current ${existing.contentHash}); re-read the document and retry` +
+            DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
           code: ErrorCode.DOC_CONTENT_CONFLICT,
           data: { currentContentHash: existing.contentHash },
         });
@@ -628,22 +989,7 @@ export class DocService {
             .where('id = :id', { id: existing.id })
             .execute();
         }
-        const unchangedResult: UpsertDiagramResult = {
-          id: existing.id,
-          path: existing.path,
-          sectionCount: existing.sectionCount,
-          tokenEstimate: existing.tokenEstimate,
-          unchanged: true,
-          contentHash: existing.contentHash ?? undefined,
-          // Diagram IR v1：diagram doc 的 unchanged 早退同样携带图信息（库存快照元数据，
-          // 不触发重渲染）——upsert_diagram 响应形状在各出口一致
-          ...(existing.docType === DOC_TYPE_DIAGRAM
-            ? {
-                diagramType: existing.diagramType,
-                render: this.diagramRenderInfoFromMeta(existing.renderMeta),
-              }
-            : {}),
-        };
+        const unchangedResult = this.buildUnchangedResult(existing);
         // 幂等登记（plan 设计决定：unchanged 也写幂等记录——重放返回 unchanged 快照，
         // 语义一致）。此出口在主事务外早退 → 独立单插；并发同 key 抢先时改用对方快照。
         if (ctx) {
@@ -663,7 +1009,8 @@ export class DocService {
       throw new ConflictException({
         message:
           `expectedContentHash provided but document does not exist at path '${dto.path}'; ` +
-          `re-read the document and retry`,
+          `re-read the document and retry` +
+          DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
         code: ErrorCode.DOC_CONTENT_CONFLICT,
         data: { currentContentHash: null },
       });
@@ -672,10 +1019,10 @@ export class DocService {
     // Track whether this is a create (for created flag in result)
     const isCreate = !existing;
 
-    // 债 B 版本守卫：内容 hash 是否真的变化（新建 = 恒 true）。
+    // 事务前值仅用于渲染准备；现有文档锁后重新计算，版本/响应/事件共用 fresh 判定。
     // forceRechunk 时 hash 可能相同（内容未变但强制重建），版本契约 = 「contentHash
     // 变化才落版」——hash 未变的重切**不写** doc_versions 版本行（见事务内守卫）。
-    const hashChanged = existing ? existing.contentHash !== computedHash : true;
+    let hashChanged = existing ? existing.contentHash !== computedHash : true;
 
     // ── Diagram IR v1 渲染门（plan §3.3 R1 修订顺序）──────────────────────
     // 渲染只发生在内容真变更（hashChanged）或 forceRechunk（派生数据修复入口，
@@ -692,7 +1039,10 @@ export class DocService {
     }
 
     // Pre-compute category, title, summary
-    const categoryId = await this.resolveCategory(spaceId, dto.category);
+    // resolveCategory 返回 { categoryId, created }（2 期 A6）：created=true 是
+    // category_near_dup 的唯一触发信号；**自动建行为本身不变**（合法性不变原则）。
+    const resolvedCategory = await this.resolveCategory(spaceId, dto.category);
+    const categoryId = resolvedCategory.categoryId;
 
     // 分块策略（plan §1.1）：diagram → 单节合成（position=0, headingLevel=0,
     // headingPath=null, headingText=null, content=规范化 IR 全文, isContinuation=false,
@@ -717,6 +1067,55 @@ export class DocService {
         ]
       : chunkMarkdown(dto.content, dto.title || dto.path);
     const totalTokens = chunks.reduce((sum, c) => sum + c.tokenEstimate, 0);
+
+    // ── hint 候选池与锚集合（2 期，v1.92.0-dev；全部族闸门内）────────────────
+    // ⚠️ **池读与引用清单读全部放在事务之前**：事务内用独立连接（`this.xxxRepo` 而非
+    // 事务 manager）查任何东西都要**申请第二条连接**——pg 池 max=10 且无获取超时，
+    // ≥10 并发写即整库挂起（**连接饥饿**，不是「自死锁」：READ COMMITTED 下普通 SELECT
+    // 不会被 FOR UPDATE 阻塞，但连接的**获取**本身会排队）。事务内只允许零 IO 的纯比对
+    // （见 buildDocWriteHints）。
+    // 事务前读还带来一个语义好处：池反映**写入前**的空间取值，本文档刚写入的 tag
+    // 不会成为自己的近义候选（否则会出现「你的 tag 与你的 tag 相似」的纯噪音）。
+    // 闸门（批 1 收口为共享单源 shouldLoadTagPool）：族关 / 请求未携带 tags / 全部
+    // tag 已命中词表 / 其余皆为实体锚点 → 零查询。**传入的必须是请求面 resolvedTags**
+    // （写语义），不是落库面 doc.tags——后者会让「请求未携带 tags」也去查池（本批
+    // 修掉的失效模式，见 patchMetadata 同款闸门）。
+    // **本通道的行为变更（批 1 明写）**：旧条件只查「存在词表外 tag」，故「请求 tags
+    // 全为实体锚点」时仍会白付一次全空间 `unnest(docs.tags)` 聚合，而 buildTagNearDupHints
+    // 必然过滤掉它们 ⇒ 输出**等价**（本就该零产出），只是少一次池查询。既有 upsert
+    // 语料（npc / openviking / openvikings / x / t1）全不命中锚点模式，无回归。
+    const hintToggles = spaceCtx.hintToggles;
+    let tagPool: HintPoolEntry[] | null = null;
+    if (shouldLoadTagPool(resolvedTags, hintToggles, spaceCtx.vocabulary)) {
+      tagPool = await loadTagPool(this.docRepo, spaceId);
+    }
+    // category 池：仅在「本次自动新建了分类」时才有意义（排除刚建的那条，不进自己的池）
+    let categoryNearDupCandidate: HintCandidate | null = null;
+    if (
+      hintToggles?.categories === true &&
+      resolvedCategory.created &&
+      categoryId &&
+      dto.category
+    ) {
+      const pool = await loadCategoryPool(this.categoryRepo, spaceId, categoryId);
+      categoryNearDupCandidate = buildCategoryNearDupHint(dto.category, pool, categoryId);
+    }
+    // 事务内 in-memory chunks 的 headingPath 集合（A4：锚校验对象 = 本事务刚插入的
+    // 同一份数据，零额外查询且与幂等快照同事务——绝不可改查已提交的 sections）
+    const chunkHeadingPaths = new Set<string>();
+    for (const chunk of chunks) {
+      if (chunk.headingPath !== null) chunkHeadingPaths.add(chunk.headingPath);
+    }
+    // 引用本文档的路由清单：**事务前读**（MAJOR-2）——事务内用独立连接查 doc_routes 会
+    // 申请第二条连接（pg 池 max=10 无获取超时 → ≥10 并发写整库挂起）；比对留在事务内
+    // 用纯函数做（RouteHealthService.analyzeRouteAnchors，零 IO）。routes 不被本事务写
+    // ⇒ 读一致性不受影响。新建文档不可能被任何路由引用 → 零查询短路。
+    let routeRefs: DocRoute[] | null = null;
+    if (hintToggles?.routes === true) {
+      routeRefs = existing
+        ? await this.routeHealthService.routesReferencingDoc(spaceId, existing.id)
+        : [];
+    }
     // title 派生：diagram → dto.title ?? ir.meta.title（截 200）?? path——IR 无 ATX
     // 标题，不拦截会把 title 写成 path（extractHeadingFromContent 对 JSON 恒 null）
     const irMetaTitle = diagramIr ? this.extractIrMetaTitle(diagramIr.irObj) : null;
@@ -768,33 +1167,70 @@ export class DocService {
         let doc: Doc;
 
         if (existing) {
-          let target = existing;
+          // 父行是正文/sections/versions 的串行化入口；完整定位防移动/删除后回写旧快照。
+          // 这是现有文档分支的首项事务 DB 操作，无 hash 调用也必须在删节前持锁。
+          const target = await docRepo
+            .createQueryBuilder('d')
+            .setLock('pessimistic_write')
+            .where('d.id = :id', { id: existing.id })
+            .andWhere('d.space_id = :spaceId', { spaceId })
+            .andWhere('d.path = :path', { path: dto.path })
+            .andWhere('d.deleted_at IS NULL')
+            .getOne();
 
-          // TOCTOU 加固（fail-closed 改造，架构评审拍板）：expectedContentHash 携带时，
-          // 事务内对 doc 行 SELECT ... FOR UPDATE 锁行后重读比对——事务外的 existing
-          // 查询与事务写入之间有并发窗口，两个并发写可双双通过事务外校验再互相覆盖
-          // （乐观锁失效，Hument 事故的多 agent 变体）。锁行后复核，不符即抛 409 回滚。
-          // 仅在携带前提校验时加锁：缺省调用保持现状行为（行锁本就会在 UPDATE 时获取，
-          // 这里只是提前到写前并附加重读比对），不改变无前提请求的执行路径。
-          if (dto.expectedContentHash !== undefined) {
-            const locked = await docRepo
-              .createQueryBuilder('d')
-              .setLock('pessimistic_write')
-              .where('d.id = :id', { id: existing.id })
-              .andWhere('d.deleted_at IS NULL')
-              .getOne();
-
-            if (!locked || locked.contentHash !== dto.expectedContentHash) {
-              throw new ConflictException({
-                message:
-                  `expectedContentHash mismatch (in-transaction recheck): document was modified ` +
-                  `concurrently (expected ${dto.expectedContentHash}, current ${locked?.contentHash ?? '<deleted>'}); ` +
-                  `re-read the document and retry`,
-                code: ErrorCode.DOC_CONTENT_CONFLICT,
-                data: { currentContentHash: locked?.contentHash ?? null },
-              });
+          if (
+            !target ||
+            (dto.expectedContentHash !== undefined &&
+              target.contentHash !== dto.expectedContentHash)
+          ) {
+            throw new ConflictException({
+              message:
+                `Document changed, moved or was deleted (in-transaction recheck); re-read the document and retry` +
+                DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
+              code: ErrorCode.DOC_CONTENT_CONFLICT,
+              data: { currentContentHash: target?.contentHash ?? null },
+            });
+          }
+          if (target.source !== source) {
+            throw new ConflictException({
+              message: `Document source '${target.source}' does not match request source '${source}'`,
+              code: ErrorCode.DOC_SOURCE_MISMATCH,
+            });
+          }
+          // 准备阶段的解析/渲染策略只受 diagram 分界影响；普通 Markdown 类型漂移可继承。
+          if (
+            dto.docType === undefined &&
+            (effectiveDocType === DOC_TYPE_DIAGRAM) !== (target.docType === DOC_TYPE_DIAGRAM)
+          ) {
+            throw new ConflictException({
+              message:
+                `Document format changed during content preparation; re-read the document and retry` +
+                DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
+              code: ErrorCode.DOC_CONTENT_CONFLICT,
+              data: { currentContentHash: target.contentHash },
+            });
+          }
+          hashChanged = target.contentHash !== computedHash;
+          if (!hashChanged && !dto.forceRechunk) {
+            // 另一写入已提交同正文：只补必要验证列，禁止整 save 覆盖 fresh 的策展元数据。
+            const backfill: Partial<Doc> = {};
+            if (!target.linkHealth) {
+              backfill.linkHealth = linkHealth as unknown as Record<string, unknown>;
             }
-            target = locked;
+            if (dto.sourceSha !== undefined && target.sourceSha !== dto.sourceSha) {
+              backfill.sourceSha = dto.sourceSha;
+            }
+            if (Object.keys(backfill).length > 0) {
+              await docRepo
+                .createQueryBuilder()
+                .update('Doc')
+                .set(backfill)
+                .where('id = :id', { id: target.id })
+                .execute();
+            }
+            const unchanged = this.buildUnchangedResult(target);
+            if (ctx) await insertIdempotencyInTx(manager, ctx, target.id, unchanged);
+            return { doc: target, assembled: unchanged };
           }
 
           // Delete old sections (CASCADE handles FK, but we delete explicitly for clarity)
@@ -805,8 +1241,13 @@ export class DocService {
             .execute();
 
           // Update metadata
-          target.title = autoTitle;
-          target.summary = summary;
+          // PATCH/APPEND（含 diagram patch）的 title/summary 是 wrapper 旧策展快照，
+          // 其内部来源表达“保留”意图；UPSERT/IMPORT 则表达本次输入/正文派生意图。
+          const preserveCuration =
+            dto.versionSource === DOC_VERSION_SOURCE.PATCH ||
+            dto.versionSource === DOC_VERSION_SOURCE.APPEND;
+          target.title = preserveCuration ? target.title : autoTitle;
+          target.summary = preserveCuration ? target.summary : summary;
           // Diagram IR v1 三列维护（不变量：docType='diagram' ⟺ diagram_type/rendered_html
           // 非空，铁律 #18 断言点）——先捕获迁出前状态，再赋新 docType
           const wasDiagram = target.docType === DOC_TYPE_DIAGRAM;
@@ -825,7 +1266,7 @@ export class DocService {
             target.renderedHtml = null;
             target.renderMeta = null;
           }
-          target.tags = dto.tags ?? target.tags;
+          target.tags = resolvedTags ?? target.tags;
           target.categoryId = categoryId ?? target.categoryId;
           target.contentHash = computedHash;
           // 内容变更时刷新 last-verified sha（sync 携带则覆盖；native 编辑不带 sha 保留旧值——
@@ -848,7 +1289,7 @@ export class DocService {
             diagramType: diagramIr?.diagramType ?? null,
             renderedHtml: diagramArtifacts?.html ?? null,
             renderMeta: (diagramArtifacts?.meta as unknown as Record<string, unknown>) ?? null,
-            tags: dto.tags ?? [],
+            tags: resolvedTags ?? [],
             source,
             contentHash: computedHash,
             sourceSha: dto.sourceSha ?? null,
@@ -924,9 +1365,26 @@ export class DocService {
 
         // ── v1.63.0 幂等：最终响应在事务内组装并落快照 ────────────────────
         // 「业务提交 ⟺ 快照可查」原子性：快照与业务写同事务，crash/回滚不留半状态。
-        // rechunked 判断沿用事务前算好的 hashChanged（实体已被原地改写，见上）。
+        // rechunked 使用锁后、改写实体前重算的 hashChanged。
         // Diagram IR v1：diagram 写携带 diagramType + render（本次渲染产物元数据）——
         // upsert_diagram/patch_diagram 响应形状的权威来源（含幂等重放快照）
+        //
+        // 2 期 hints：**同样在事务内组装**（随 assembled 进幂等快照）——挪到事务后会
+        // 让重放响应丢失 hints，且 route_anchor_broken 会改查已提交的 sections
+        // （与本次写入不同源）。锚校验数据源 = 事务前算好的 in-memory chunks 集合（A4）
+        // + 事务前取回的路由引用清单（MAJOR-2：事务内零 IO）。
+        const hints = this.buildDocWriteHints({
+          surface: hintSurface,
+          spaceId,
+          doc,
+          spaceCtx,
+          normalizations,
+          headingPaths: chunkHeadingPaths,
+          routeRefs,
+          tagPool,
+          precomputedCandidates: categoryNearDupCandidate ? [categoryNearDupCandidate] : [],
+          actorId: hintActorId,
+        });
         const assembled: UpsertDiagramResult = {
           id: doc.id,
           path: doc.path,
@@ -935,6 +1393,9 @@ export class DocService {
           created: isCreate,
           contentHash: doc.contentHash ?? undefined,
           rechunked: !hashChanged && dto.forceRechunk ? true : undefined,
+          // tag 归一映射（v1.92.0-dev）：仅实际发生归一时出现；与幂等快照同引用
+          ...normalizationPatch,
+          ...(hints ? { hints } : {}),
           ...(diagramIr
             ? {
                 diagramType: diagramIr.diagramType,
@@ -955,6 +1416,9 @@ export class DocService {
 
         return { doc, assembled };
       });
+
+      // late unchanged 的响应与幂等快照已在锁内完成；此处早退隔断所有更新观测副作用。
+      if (assembled.unchanged) return assembled;
 
       // Audit hook
       if (actor) {
@@ -979,16 +1443,14 @@ export class DocService {
           actorId: actor?.id ?? undefined,
           topicId: eventCtx.topicId ?? undefined,
           boardId: eventCtx.boardId ?? undefined,
-          payload: { spaceId, docId: result.id, path: result.path, title: autoTitle },
+          payload: { spaceId, docId: result.id, path: result.path, title: result.title },
         });
       } else {
-        // Unchanged content already early-returned above; reaching here with an
-        // existing doc always means the content changed. NOTE: do not re-check
-        // `existing.contentHash !== computedHash` here — the transaction above
-        // mutates the entity in place, so that comparison is always false.
+        // 两种 unchanged 出口均已早退。禁止用事务外 existing 重新判断内容变化：
+        // 它是旧读快照；版本/响应/事件必须共用锁后、改写 target 前捕获的 hashChanged。
         // 债 B（决策 #9）：forceRechunk 且 hash 未变的纯重切也走此分支——payload
         // 携带 rechunked:true 上下文，订阅方可区分「内容变更」与「元数据纯重切」。
-        // ⚠️ wasRechunk 必须用事务前算好的 hashChanged 判断（实体被原地改写，见上）
+        // wasRechunk 与版本守卫共用锁后重算的 hashChanged，禁止再读已改写实体。
         const wasRechunk = !hashChanged && !!dto.forceRechunk;
         const eventCtx = await this.getSpaceEventContext(spaceId);
         await this.eventService.create({
@@ -1002,7 +1464,7 @@ export class DocService {
             spaceId,
             docId: result.id,
             path: result.path,
-            title: autoTitle,
+            title: result.title,
             ...(wasRechunk ? { rechunked: true } : {}),
           },
         });
@@ -1056,6 +1518,12 @@ export class DocService {
           tokenEstimate: winner.tokenEstimate,
           created: false,
           contentHash: winner.contentHash ?? undefined,
+          // **并发败者标记**（v1.94.0-dev）：本请求写入的 content 未落库——返回的数据
+          // 全来自胜者那一行。领域侧据此跳过「未写入却 emit」的观测面（`doc.upserted`
+          // 事实 + 凭证扫描，见 doc.controller 的挂点门控），与 unchanged / rechunked /
+          // idempotentReplay 同一族。**缺了这个标记**会让本请求未写入的正文被扫描、并把
+          // 告警/hint 的 resourceId 指向胜者的 docId（评审 P2-1，真 bug）。
+          concurrentWinner: true,
         };
         // 幂等登记（败者出口同样留痕；并发同 key 抢先则改用对方快照）
         if (ctx) {
@@ -1092,6 +1560,12 @@ export class DocService {
     const results: BatchUpsertItemResult[] = [];
     const summary = { total: docs.length, created: 0, updated: 0, unchanged: 0, failed: 0 };
 
+    // 空间写上下文逐 batch 一次读取（2 期 v1.92.0-dev；1 期词表提升的推广）：经内部
+    // 参数透传逐条 upsert，避免 N 次重复查询空间 settings。上下文含 canonicalTags 词表
+    // + hintToggles 族开关 + pathTypes 三键——族开关本身也在 settings 里，**必须读**
+    // 才能判定是否要算 hint，故本读无条件（每 batch 一次，不是每文档一次）。
+    const spaceContext = await this.getSpaceWriteContext(spaceId);
+
     for (const dto of docs) {
       try {
         // versionSource='import'：批量导入通道（PUT /docs/batch，MCP import_docs /
@@ -1108,6 +1582,9 @@ export class DocService {
           { ...upsertItem, versionSource: DOC_VERSION_SOURCE.IMPORT },
           actor,
           upsertItem.clientRequestId,
+          spaceContext,
+          // m1：批量通道的埋点面标识（日志可区分「导入的一条」与「单条 upsert」）
+          'batch_upsert',
         );
 
         let status: BatchUpsertItemResult['status'];
@@ -1123,17 +1600,53 @@ export class DocService {
           summary.updated++;
         }
 
-        results.push({ path: dto.path, status, id: r.id });
+        // 凭证扫描（v1.94.0-dev）：**逐条**扫本 item 写入的正文——与单文档 upsert 同门控：
+        // 跳过 unchanged（内容未变）、幂等 replay 与 **23505 并发败者**（三者都没发生真实
+        // 写入；败者的 r.id 是胜者 docId，扫本 item 的正文会把告警指到别人的文档上）；
+        // failed 走下方 catch 分支（根本没有 r），天然不扫。见 credential-scan.ts 的 [关键不变量]。
+        if (status !== 'unchanged' && !r.idempotentReplay && !r.concurrentWinner) {
+          emitCredentialScanFactIfHit(upsertItem.content, {
+            resourceKind: 'doc',
+            resourceId: r.id,
+            actorId: actor?.id ?? null,
+          });
+        }
+
+        results.push({
+          path: dto.path,
+          status,
+          id: r.id,
+          // tag 归一映射（v1.92.0-dev）：仅该条实际发生归一时出现（含幂等重放快照原样）
+          ...(r.tagNormalizations ? { tagNormalizations: r.tagNormalizations } : {}),
+          // hint 信封（2 期）：逐条结果提升，仅该条命中时出现（含幂等重放快照原样）
+          ...(r.hints ? { hints: r.hints } : {}),
+        });
       } catch (err: unknown) {
         summary.failed++;
         // 错误形状统一走 doc-error.helper.errorOf（review-0831 任务 bbd175dc 子项 2，
         // 与 doc-bundle.service 共用同一 { message, code } 契约）
+        // F4 项5 第 6 条：只记结构化摘要——构造名 + sqlstate + 消毒后文案 + 本条 path，
+        // 不记 stack、不记错误原文（原文含用户输入回显，批量场景会被按条重放）；
+        // 条数上界（复审 MAJOR-2）与 doc-bundle 两侧同口径——本端点 DTO 有
+        // @ArrayMaxSize(50) 兜着，统一口径是为了「新加批量端点照抄即可」
+        if (summary.failed <= PER_ITEM_LOG_DETAIL_MAX) {
+          this.logger.warn(
+            `batchUpsert per-item failed: ${batchErrorLogSummary(err, `path=${dto.path}`)}`,
+          );
+        }
         results.push({
           path: dto.path,
           status: 'failed',
           error: errorOf(err),
         });
       }
+    }
+
+    if (summary.failed > PER_ITEM_LOG_DETAIL_MAX) {
+      this.logger.warn(
+        `batchUpsert per-item failures truncated: total=${summary.failed} ` +
+          `(detail logged for the first ${PER_ITEM_LOG_DETAIL_MAX})`,
+      );
     }
 
     return { results, summary };
@@ -1346,6 +1859,12 @@ export class DocService {
       updatedAfter?: string;
       sort?: DocListSort;
     },
+    /**
+     * 空间 settings（v1.92.0-dev 3 期，plan D3/A1）：仅用于 tag 过滤的**词表 alias
+     * 集合展开**。controller 权限校验时已持有 space，透传零额外查询；不传 = 不展开
+     * （内部调用方零影响，行为逐字节不变）。
+     */
+    settings?: unknown,
   ): Promise<PaginatedResponse<DocSummary>> {
     const {
       category,
@@ -1407,9 +1926,15 @@ export class DocService {
       qb.andWhere('dc.slug = :catSlug', { catSlug: category });
     }
 
-    // Tag filter (array contains)
+    // Tag filter（数组重叠；v1.92.0-dev 3 期 plan D3/A1：先经空间词表集合展开，
+    // 使 rename 前写入的存量旧值在 canonical/alias 任一形态查询下都被召回。
+    // 未命中词表 / 未传 settings ⇒ 单元素 ⇒ 与旧 `:tag = ANY(d.tags)` 逐字节等价）
     if (tag) {
-      qb.andWhere(':tag = ANY(d.tags)', { tag });
+      const tagValues = expandTagQueryValues(
+        parseCanonicalTags((settings as Record<string, unknown> | null | undefined)?.canonicalTags),
+        tag,
+      );
+      qb.andWhere('d.tags && CAST(:tagValues AS text[])', { tagValues });
     }
 
     // Type filter
@@ -1534,11 +2059,11 @@ export class DocService {
       .setParameter('plen', plen)
       .offset(foldersOffset)
       .limit(foldersLimitC);
-    // 目录排序：recent = 最近更新 DESC（MAX(updated_at)）；name = 段名 ASC
+    // 目录排序：recent = 最近更新 DESC、段名 ASC（同时间稳定分页）；name = 段名 ASC
     if (sort === 'name') {
       folderQb.orderBy('name', 'ASC');
     } else {
-      folderQb.orderBy('MAX(d.updated_at)', 'DESC');
+      folderQb.orderBy('MAX(d.updated_at)', 'DESC').addOrderBy('name', 'ASC');
     }
     const folderRows = await folderQb.getRawMany();
 
@@ -1615,9 +2140,15 @@ export class DocService {
    * tie-break（确定性输出）。
    *
    * @param spaceId 目标空间 ID
-   * @returns DocFacetsResponse（types/tags/categories 三组聚合计数）
+   * @param settings 空间 settings（v1.92.0-dev；controller 已持有 space，透传免二次查询）。
+   *   携带词表时逐项标 vocabStatus（types: declared/undeclared；tags: canonical/alias/
+   *   undeclared + canonicalValue）并回显 vocabulary；未配置该族词表则整字段省略。
+   * @returns DocFacetsResponse（types/tags/categories 三组聚合计数 + 词表状态/回显）
    */
-  async findFacets(spaceId: string): Promise<DocFacetsResponse> {
+  async findFacets(
+    spaceId: string,
+    settings?: Record<string, unknown> | null,
+  ): Promise<DocFacetsResponse> {
     // types：GROUP BY doc_type（非空 = IS NOT NULL AND <> ''）
     const typeRows = await this.docRepo
       .createQueryBuilder('d')
@@ -1662,16 +2193,227 @@ export class DocService {
       .addOrderBy('slug', 'ASC')
       .getRawMany();
 
-    return {
-      types: typeRows.map((r) => ({ value: r.value, count: Number(r.count) })),
-      tags: tagRows.map((r) => ({ value: r.value, count: Number(r.count) })),
+    // ── 词表状态与回显（v1.92.0-dev，DocSpace 元数据治理 1 期）──────────────
+    // 三键统一过 doc-vocabulary.helper 的形状解析器（元素级闸门，永不抛——jsonb 可被
+    // 直改库 / bundle 回导写脏，见该文件 VOCAB-SHAPE-1）；null = 该族无有效词表 →
+    // 逐项 vocabStatus 整字段省略（区分「没配词表」与「词表外」）。
+    const declaredDocTypes = parseStringList(settings?.docTypes);
+    const declaredCanonicalTags = parseCanonicalTags(settings?.canonicalTags);
+    const declaredPathTypes = parsePathTypes(settings?.pathTypes);
+    // hint 族开关现状（2 期 P1）：与三词表键并列回显——一词调用 = 词表 + 开关 + 分布
+    const declaredHintToggles = parseHintToggles(settings?.hintToggles);
+
+    // 索引（大小写不敏感；CJK 无大小写不受影响）
+    const docTypeKeys = declaredDocTypes
+      ? new Set(declaredDocTypes.map((t) => t.toLowerCase()))
+      : null;
+    const canonicalExact = declaredCanonicalTags
+      ? new Set(declaredCanonicalTags.map((e) => e.value))
+      : null;
+    // ci 索引：alias(ci) 与 canonical(ci) → 声明 canonical 形态。stored 值不等于声明
+    // 形态（含大小写变体）时归为 alias，并给出 canonicalValue 指向声明值（喂 3 期 rename/merge）。
+    const aliasToCanonical = new Map<string, string>();
+    if (declaredCanonicalTags) {
+      for (const entry of declaredCanonicalTags) {
+        const ownKey = entry.value.toLowerCase();
+        if (!aliasToCanonical.has(ownKey)) aliasToCanonical.set(ownKey, entry.value);
+        for (const alias of entry.aliases ?? []) {
+          const key = alias.toLowerCase();
+          if (!aliasToCanonical.has(key)) aliasToCanonical.set(key, entry.value);
+        }
+      }
+    }
+
+    const types: DocFacetCount[] = typeRows.map((r) => {
+      const item: DocFacetCount = { value: r.value, count: Number(r.count) };
+      if (docTypeKeys) {
+        item.vocabStatus = docTypeKeys.has(String(r.value).toLowerCase())
+          ? 'declared'
+          : 'undeclared';
+      }
+      return item;
+    });
+
+    const tags: DocFacetCount[] = tagRows.map((r) => {
+      const item: DocFacetCount = { value: r.value, count: Number(r.count) };
+      if (canonicalExact) {
+        if (canonicalExact.has(String(r.value))) {
+          // stored 值 === 声明 canonical 形态（精确，区分大小写）→ canonical
+          item.vocabStatus = 'canonical';
+        } else {
+          // 非声明形态但 ci 命中 alias 或 canonical（大小写变体）→ alias + 指向声明值
+          const canonicalValue = aliasToCanonical.get(String(r.value).toLowerCase());
+          if (canonicalValue !== undefined) {
+            item.vocabStatus = 'alias';
+            item.canonicalValue = canonicalValue;
+          } else {
+            item.vocabStatus = 'undeclared';
+          }
+        }
+      }
+      return item;
+    });
+
+    const response: DocFacetsResponse = {
+      types,
+      tags,
       categories: catRows.map((r) => ({ slug: r.slug, name: r.name, count: Number(r.count) })),
     };
+    // vocabulary 回显：四键全未声明时省略（与逐项状态省略口径一致）；只回显词表与
+    // hint 开关，内部键（repoManifest 等）不外泄。
+    if (declaredDocTypes || declaredCanonicalTags || declaredPathTypes || declaredHintToggles) {
+      response.vocabulary = {
+        docTypes: declaredDocTypes ?? null,
+        canonicalTags: declaredCanonicalTags ?? null,
+        pathTypes: declaredPathTypes ?? null,
+        hintToggles: declaredHintToggles,
+      };
+    }
+    return response;
   }
 
   /**
-   * Get document detail: metadata + section outline (no content by default).
-   * QB select explicitly excludes section content.
+   * orphan 文档清单（GET /doc-spaces/:id/docs/orphans，v1.92.0-dev DocSpace 元数据治理 3 期）。
+   *
+   * 语义（plan D10）：`deleted_at IS NULL` 且 id ∉ routes(primary ∪ secondary) 的文档。
+   * **「route 指向已删 doc」是断链面**（RouteHealthService），不算 orphan——两个维度不混。
+   * 「叶子文档无路由 ≠ 错误」（Hument 边界）：本面是**诊断清单**，不是缺陷判定。
+   *
+   * 口径与实现：
+   * - route 引用集 + 文档集两次查询后在内存做差集（plan F9 仓内惯例，500+300 量级无压力）；
+   * - 默认应用 `settings.overviewFilter` 的 excludeTypes/excludeCategories（与 overview 的
+   *   「导航面」语义同源——日记/归档本就不该上 routes，默认不淹清单）；`includeExcluded=true`
+   *   关闭；响应回显 appliedFilters；
+   * - `stats.byTopDir` 按 path 第一段分组（无 `/` 的顶层文件归 `(root)`），维护者一眼分辨
+   *   「结构性叶子群」vs「可行动孤儿」；分组基于**过滤后**清单（调用方可见的那一份）；
+   * - `pathPrefix` 过滤复用 `escapeLikePrefix` 单源（字面前缀语义）；分页 page/pageSize(max 100)。
+   *
+   * 纯读现算，不落库、无调度——「周期性产出」= 维护者按需调用（plan D10 边界）。
+   *
+   * @param spaceId 目标空间 ID
+   * @param settings 空间 settings（controller 已持有 space，透传免二次查询）
+   * @param query { page?, pageSize?, includeExcluded?, pathPrefix? }
+   * @returns OrphanDocsResponse（items + total + appliedFilters + stats）
+   */
+  async findOrphans(
+    spaceId: string,
+    settings: Record<string, unknown> | null | undefined,
+    query: OrphanDocsQuery,
+  ): Promise<OrphanDocsResponse> {
+    const { page = 1, pageSize = 20, includeExcluded = false, pathPrefix } = query;
+    const effectivePage = Math.max(page, 1);
+    // 分页硬上限 100（DTO 已拦，Service 直调兜底——对齐 findAll 惯例）
+    const effectivePageSize = Math.min(Math.max(pageSize, 1), 100);
+
+    // ① route 引用集（primary ∪ secondary；裸 uuid 无 FK——doc 软删后路由行仍保留）
+    const routeRows: Array<{ primary_doc_id: string; secondary_doc_id: string | null }> =
+      await this.docRepo.manager.query(
+        `SELECT primary_doc_id, secondary_doc_id FROM doc_routes WHERE space_id = $1`,
+        [spaceId],
+      );
+    const routedIds = new Set<string>();
+    for (const row of routeRows) {
+      routedIds.add(row.primary_doc_id);
+      if (row.secondary_doc_id) routedIds.add(row.secondary_doc_id);
+    }
+
+    // ② 空间内未软删文档（含分类 slug；分类软删后 slug 视同无分类——照抄 findAll join 条件）
+    const params: unknown[] = [spaceId];
+    let pathClause = '';
+    if (pathPrefix) {
+      params.push(`${escapeLikePrefix(pathPrefix)}%`);
+      // 转义单源 = common/utils/sql-like.ts escapeLikePrefix（字面前缀语义）
+      pathClause = ` AND d.path LIKE $${params.length} ESCAPE '\\'`;
+    }
+    const docs: Array<{
+      id: string;
+      path: string;
+      title: string;
+      docType: string | null;
+      categorySlug: string | null;
+      updatedAt: Date | string;
+    }> = await this.docRepo.manager.query(
+      `SELECT d.id, d.path, d.title, d.doc_type AS "docType", dc.slug AS "categorySlug",
+              d.updated_at AS "updatedAt"
+         FROM docs d
+         LEFT JOIN doc_categories dc ON dc.id = d.category_id AND dc.deleted_at IS NULL
+        WHERE d.space_id = $1 AND d.deleted_at IS NULL${pathClause}
+        ORDER BY d.path ASC`,
+      params,
+    );
+
+    const routedDocs = docs.filter((doc) => routedIds.has(doc.id)).length;
+    const orphans = docs.filter((doc) => !routedIds.has(doc.id));
+
+    // ③ overviewFilter 默认排除（脏数据防御：非数组 → 无默认过滤，对齐 B4 先例）
+    const overviewFilter = settings?.overviewFilter as
+      | { excludeTypes?: unknown; excludeCategories?: unknown }
+      | undefined;
+    const excludeTypes = includeExcluded ? null : parseStringList(overviewFilter?.excludeTypes);
+    const excludeCategories = includeExcluded
+      ? null
+      : parseStringList(overviewFilter?.excludeCategories);
+    const visible = orphans.filter((doc) => {
+      if (excludeTypes && doc.docType !== null && excludeTypes.includes(doc.docType)) return false;
+      if (
+        excludeCategories &&
+        doc.categorySlug !== null &&
+        excludeCategories.includes(doc.categorySlug)
+      ) {
+        return false;
+      }
+      return true;
+    });
+    const excludedOrphanDocs = orphans.length - visible.length;
+
+    // ④ byTopDir：path 第一段分组（无 `/` 的顶层文件归 `(root)`）；count DESC + dir ASC
+    const dirCounts = new Map<string, number>();
+    for (const doc of visible) {
+      const slash = doc.path.indexOf('/');
+      const dir = slash >= 0 ? doc.path.slice(0, slash) : '(root)';
+      dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
+    }
+    const byTopDir = [...dirCounts.entries()]
+      .map(([dir, count]) => ({ dir, count }))
+      .sort((a, b) => b.count - a.count || (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0));
+
+    // ⑤ 分页（过滤后清单；path ASC 全序 ⇒ 页间稳定）
+    const total = visible.length;
+    const start = (effectivePage - 1) * effectivePageSize;
+    const items: OrphanDocItem[] = visible.slice(start, start + effectivePageSize).map((doc) => ({
+      id: doc.id,
+      path: doc.path,
+      title: doc.title,
+      docType: doc.docType ?? null,
+      categorySlug: doc.categorySlug ?? null,
+      updatedAt: new Date(doc.updatedAt).toISOString(),
+    }));
+
+    // ⑥ appliedFilters 回显（只回显实际生效的维度）
+    const appliedFilters: OrphanDocsResponse['appliedFilters'] = {};
+    if (excludeTypes) appliedFilters.excludeTypes = excludeTypes;
+    if (excludeCategories) appliedFilters.excludeCategories = excludeCategories;
+    if (pathPrefix) appliedFilters.pathPrefix = pathPrefix;
+    if (includeExcluded) appliedFilters.includeExcluded = true;
+
+    return {
+      items,
+      total,
+      page: effectivePage,
+      pageSize: effectivePageSize,
+      appliedFilters,
+      stats: {
+        totalDocs: docs.length,
+        routedDocs,
+        orphanDocs: orphans.length,
+        excludedOrphanDocs,
+        byTopDir,
+      },
+    };
+  }
+  /**
+   * Get document detail: metadata + section outline (sectionHash 派生，正文不进响应)。
+   * QB select 含 content 列**仅为派生 sectionHash**（见下），不进响应体。
    *
    * 小文档全文内联（v1.39.x）：无定位调用时，tokenEstimate > 0 且 ≤ 阈值（缺省
    * FULL_CONTENT_TOKEN_THRESHOLD，可 maxFullTokens 覆盖，0 = 强制 outline）→ 额外
@@ -1683,6 +2425,11 @@ export class DocService {
    * 可直接作 patch_doc MATCH 模式 oldString 来源（字节一致性保证）；首标题去重只剩
    * web 渲染侧（getContent full=false）使用。
    *
+   * outline 的 sectionHash（v1.93.0 批 2，任务 59cb21e6）：与 DocSectionContent /
+   * DocSectionItem 同口径（computeSectionHash，输入 = 存储三元组），为复核/对账场景
+   * 提供「一次 outline 调用完成全篇比对」的能力；写前提校验（patch expectedSectionHash）
+   * 的取数通道仍是 positions[] / 单节读——口径相同可混用。
+   *
    * @param maxFullTokens 覆盖阈值（≥0；0 = 强制 outline；非法值由 controller 双层校验拦截，不达此层）
    */
   async findOne(id: string, maxFullTokens?: number): Promise<DocDetail> {
@@ -1690,10 +2437,24 @@ export class DocService {
 
     // 用 getMany 走实体 hydration 取大纲字段，规避 getRawMany 的 raw-key 命名陷阱
     // （该版本下 select 用 DB 列名或属性名都映射不到 headingPath，导致 outline 全空）。
-    // select 指定属性名以排除 content 大字段；hydration 按属性名填充，未选字段为 undefined。
+    // hydration 按属性名填充，未选字段为 undefined。
+    //
+    // v1.93.0 批 2：额外 select content —— **只为在 Node 侧派生 sectionHash**（哈希输入
+    // 是存储三元组，没有 content 算不出来）。派生后 content 即随 map 丢弃、不进响应体。
+    // 代价：本查询每次 outline 调用都会把整篇正文搬进进程内存（最坏即一次全量正文读，
+    // 与 full 分支同量级），响应体则**不因正文膨胀**——每节只多一个哈希字段（≈85B）。
+    // 若日后 outline 成为热路径，再评估物化 hash 列——当前 YAGNI，PG 侧 digest 会造成
+    // 「口径双实现」漂移（明确否决）。
     const sections = await this.sectionRepo
       .createQueryBuilder('s')
-      .select(['s.position', 's.headingPath', 's.headingText', 's.headingLevel', 's.tokenEstimate'])
+      .select([
+        's.position',
+        's.headingPath',
+        's.headingText',
+        's.headingLevel',
+        's.tokenEstimate',
+        's.content',
+      ])
       .where('s.docId = :docId', { docId: id })
       .orderBy('s.position', 'ASC')
       .getMany();
@@ -1708,6 +2469,8 @@ export class DocService {
       headingText: s.headingText,
       headingLevel: s.headingLevel,
       tokenEstimate: s.tokenEstimate,
+      // 与 positions[] / getSection / headingQuery 同口径（computeSectionHash 单源）
+      sectionHash: this.computeSectionHash(s),
     }));
 
     const base = this.toSummary(doc);
@@ -1729,7 +2492,10 @@ export class DocService {
       doc.tokenEstimate > 0 &&
       doc.tokenEstimate <= threshold
     ) {
-      // full 分支独立第二次查询（全量 sections 含 content 大字段）——outline 分支零额外开销。
+      // full 分支独立第二次查询（全量 sections 列）——**不复用**上面那次 outline 查询：
+      // outline 投影即便 select 了 content，也缺 reconstructContent / renderSectionPart
+      // 依赖的 isContinuation（run-dedup 判据）等列，复用得先把 outline 查询拖回全列，
+      // 反而不如两次窄查询清晰（且 outline 分支的响应面无额外开销，代价只在多取一列）。
       // 复用 reconstructContent 保真渲染（skipDuplicateTitle=false：与 match 写面
       // patchByMatch 操作面 / getContent(full=true) 通道逐字节同形——read_doc full 输出
       // 可直接作 patch_doc oldString 来源）。首标题去重只剩 web 渲染侧（getContent full=false）。
@@ -2302,7 +3068,8 @@ export class DocService {
           message:
             `expectedSectionHash mismatch for position ${position}: the section changed since ` +
             `the caller's read (stale position/anchor); re-fetch the outline and retry ` +
-            `(current sectionCount=${sections.length})`,
+            `(current sectionCount=${sections.length})` +
+            DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
           code: ErrorCode.DOC_CONTENT_CONFLICT,
           data: { sectionCount: sections.length },
         });
@@ -2420,7 +3187,9 @@ export class DocService {
       throw new NotFoundException({
         message:
           `oldString not found in the document's full content (0 matches); ` +
-          `re-read the full content (GET /docs/:id/content?full=true or read_doc) and retry`,
+          `re-read the full content (GET /docs/:id/content?full=true or read_doc) and retry; ` +
+          `matching is byte-exact including leading whitespace/indentation — copy oldString ` +
+          `verbatim from read_doc / full=true output instead of hand-typing it`,
         code: ErrorCode.DOC_NOT_FOUND,
       });
     }
@@ -2771,6 +3540,19 @@ export class DocService {
     // ① 404：文档不存在/已软删（findById fail-closed，铁律 #22）
     const doc = await this.findById(docId);
 
+    // ①.4 空间写上下文（2 期，v1.92.0-dev）：一次 settings 读拿到 canonicalTags 词表
+    // （1 期归一）+ hintToggles 族开关（2 期闸门）+ pathTypes。与 upsertCore 同源同读法。
+    const spaceCtx = await this.getSpaceWriteContext(doc.spaceId);
+    const hintToggles = spaceCtx.hintToggles;
+    const hintActorId = actor?.id ?? 'system';
+
+    // ①.5 tag 归一（v1.92.0-dev，挂点 ② metadata-only 通道）——本通道自有事务 +
+    // 自有幂等包裹，**不经 upsertCore**（A1 主脑复核：归一必须双挂点）。幂等 replay
+    // 检查已在上方完成（指纹用 caller 原始 tags，归一确定性保证重放语义不变），此处
+    // 归一后的值参与下方 changedFields 比较与落库。
+    const { tags: resolvedTags, normalizations } = this.resolveTags(dto.tags, spaceCtx.vocabulary);
+    const tagNormalizations = normalizations.length > 0 ? normalizations : undefined;
+
     // ② 409 DOC_SOURCE_MISMATCH：native-only（与 upsert/patch 一致——ingest 文档
     // 元数据由适配器管，平台侧直改会撕裂 sync 语义）
     if (doc.source !== DOC_SOURCE_NATIVE) {
@@ -2788,7 +3570,8 @@ export class DocService {
       throw new ConflictException({
         message:
           `expectedContentHash mismatch: document was modified since the caller's read ` +
-          `(expected ${dto.expectedContentHash}, current ${doc.contentHash}); re-read the document and retry`,
+          `(expected ${dto.expectedContentHash}, current ${doc.contentHash}); re-read the document and retry` +
+          DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
         code: ErrorCode.DOC_CONTENT_CONFLICT,
         data: { currentContentHash: doc.contentHash },
       });
@@ -2799,10 +3582,15 @@ export class DocService {
     // 事务外解析与 move/upsert 先例同款（创建分类后若事务内 hash 复核失败，
     // 可能留下孤立新分类——既有 upsert 路径同语义，不额外加复杂度）
     let resolvedCategoryId: string | null | undefined;
+    let categoryCreated = false;
     if (dto.category !== undefined) {
-      resolvedCategoryId = dto.allowCreateCategory
-        ? await this.resolveCategory(doc.spaceId, dto.category)
-        : await this.findCategoryByName(doc.spaceId, dto.category);
+      if (dto.allowCreateCategory) {
+        const resolved = await this.resolveCategory(doc.spaceId, dto.category);
+        resolvedCategoryId = resolved.categoryId;
+        categoryCreated = resolved.created;
+      } else {
+        resolvedCategoryId = await this.findCategoryByName(doc.spaceId, dto.category);
+      }
       if (!resolvedCategoryId) {
         throw new NotFoundException({
           message:
@@ -2812,6 +3600,26 @@ export class DocService {
         });
       }
     }
+
+    // ── hint 候选池（2 期，族闸门内；事务前读——连接饥饿规避见 upsertCore 池注释）──────
+    // tags 族池：闸门 = `shouldLoadTagPool(resolvedTags, …)`——与 upsertCore 同源。
+    // **输入必须是请求面 resolvedTags（未携带 = undefined），禁止回退到 doc.tags**：
+    // `resolvedTags ?? doc.tags` 是**写语义的 Partial 回退**（同表达式在 upsertCore 的
+    // `target.tags = resolvedTags ?? target.tags` 是合法的），把它当作「评估作用域闸门」
+    // 会让「本请求压根没提 tags」的 metadata patch 对**全量存量 tags** 跑近义比对
+    // （批 1 修掉的失效模式：客户连发五次改 docType 就收五次 tag 建议）。
+    // 比较输入仍是落库面 doc.tags（buildDocWriteHints 侧），两者**刻意不同源**。
+    let tagPool: HintPoolEntry[] | null = null;
+    if (shouldLoadTagPool(resolvedTags, hintToggles, spaceCtx.vocabulary)) {
+      tagPool = await loadTagPool(this.docRepo, doc.spaceId);
+    }
+    // categories 族：仅本次自动新建分类时才有意义（排除刚建的那条，不进自己的池）
+    let categoryNearDupCandidate: HintCandidate | null = null;
+    if (hintToggles?.categories === true && categoryCreated && resolvedCategoryId && dto.category) {
+      const pool = await loadCategoryPool(this.categoryRepo, doc.spaceId, resolvedCategoryId);
+      categoryNearDupCandidate = buildCategoryNearDupHint(dto.category, pool, resolvedCategoryId);
+    }
+    const precomputedCandidates = categoryNearDupCandidate ? [categoryNearDupCandidate] : [];
 
     // ── 事务：锁行 → hash 复核 → 对锁行值算变更面 → 仅 UPDATE 变更列 ──────────
     // v1.63.0 幂等：事务内登记幂等记录；并发同 key 撞 uq_idempotency_actor_key →
@@ -2848,7 +3656,8 @@ export class DocService {
             message:
               `expectedContentHash mismatch (in-transaction recheck): document was modified ` +
               `concurrently (expected ${dto.expectedContentHash}, current ${locked.contentHash}); ` +
-              `re-read the document and retry`,
+              `re-read the document and retry` +
+              DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
             code: ErrorCode.DOC_CONTENT_CONFLICT,
             data: { currentContentHash: locked.contentHash },
           });
@@ -2889,12 +3698,13 @@ export class DocService {
           updates.docType = dto.docType;
         }
         if (
-          dto.tags !== undefined &&
-          (dto.tags.length !== locked.tags.length || dto.tags.some((t, i) => t !== locked.tags[i]))
+          resolvedTags !== undefined &&
+          (resolvedTags.length !== locked.tags.length ||
+            resolvedTags.some((t, i) => t !== locked.tags[i]))
         ) {
           changedFields.push('tags');
           before.tags = [...locked.tags];
-          updates.tags = dto.tags;
+          updates.tags = resolvedTags;
         }
         if (resolvedCategoryId !== undefined && resolvedCategoryId !== locked.categoryId) {
           changedFields.push('category');
@@ -2905,15 +3715,34 @@ export class DocService {
         // unchanged 短路：零变更 → 不产生任何写操作（无 UPDATE/audit/事件）。
         // 响应在事务内组装（v1.63.0 幂等：unchanged 快照同样登记，重放语义一致）
         if (changedFields.length === 0) {
+          // 2 期 hints：unchanged 出口**同样发**（镜像 1 期「零变更也回显归一」语义：
+          // 零写操作 ≠ 零建议）。headingPaths=null → routes 族跳过（本通道不重切
+          // sections，锚必然不变）。
+          const hints = this.buildDocWriteHints({
+            surface: 'patch_metadata',
+            spaceId: doc.spaceId,
+            doc: locked,
+            spaceCtx,
+            normalizations,
+            headingPaths: null,
+            // 本通道不重切 sections（headingPaths=null）→ routes 族整段跳过，无需引用清单
+            routeRefs: null,
+            tagPool,
+            precomputedCandidates,
+            actorId: hintActorId,
+          });
           const result: PatchDocMetadataResult = {
             docId,
             path: locked.path,
             contentHash: locked.contentHash,
             changedFields: [],
             unchanged: true,
-            // buildMetadataView 在事务内调用安全：locked 行来自事务连接（可见未提交值）；
-            // category 行不被本事务修改，经独立连接读取已提交数据正确
-            metadata: await this.buildMetadataView(locked),
+            // tag 归一映射（v1.92.0-dev）：归一后与现值相同也回显（说明 caller 输入
+            // 已被词表纠偏；写操作零发生）
+            ...(tagNormalizations ? { tagNormalizations } : {}),
+            ...(hints ? { hints } : {}),
+            // 分类视图与首次幂等快照共用当前事务连接，避免持锁时再申请池连接。
+            metadata: await this.buildMetadataView(locked, manager),
           };
           if (ctx) {
             await insertIdempotencyInTx(manager, ctx, docId, result);
@@ -2945,13 +3774,29 @@ export class DocService {
 
         // 最终响应在事务内组装并落幂等快照——「业务提交 ⟺ 快照可查」原子性；
         // 并发同 key 撞 uq_idempotency_actor_key → 异常上抛使整个事务回滚（零副作用）
+        // 2 期 hints：同样在事务内组装（随快照进幂等记录），基准 = 落库后的 fresh 行
+        const hints = this.buildDocWriteHints({
+          surface: 'patch_metadata',
+          spaceId: doc.spaceId,
+          doc: fresh,
+          spaceCtx,
+          normalizations,
+          headingPaths: null,
+          // 本通道不重切 sections（headingPaths=null）→ routes 族整段跳过，无需引用清单
+          routeRefs: null,
+          tagPool,
+          precomputedCandidates,
+          actorId: hintActorId,
+        });
         const result: PatchDocMetadataResult = {
           docId,
           path: fresh.path,
           contentHash: fresh.contentHash,
           changedFields,
           unchanged: false,
-          metadata: await this.buildMetadataView(fresh),
+          ...(tagNormalizations ? { tagNormalizations } : {}),
+          ...(hints ? { hints } : {}),
+          metadata: await this.buildMetadataView(fresh, manager),
         };
         if (ctx) {
           await insertIdempotencyInTx(manager, ctx, docId, result);
@@ -3023,11 +3868,15 @@ export class DocService {
    *
    * categoryId 非空时查分类名（轻量单查，select name）；null 时 categoryName 亦 null。
    * 供 patchMetadata 的 changed/unchanged 两分支共用。
+   * @param doc 当前事务锁定或更新后重读的文档。
+   * @param manager 当前事务 manager；分类读取必须复用持锁连接，不得退回全局仓储。
+   * @returns 与同事务幂等快照一致的最终元数据视图。
    */
-  private async buildMetadataView(doc: Doc): Promise<PatchDocMetadataView> {
+  private async buildMetadataView(doc: Doc, manager: EntityManager): Promise<PatchDocMetadataView> {
     let categoryName: string | null = null;
     if (doc.categoryId) {
-      const cat = await this.categoryRepo
+      const cat = await manager
+        .getRepository(DocCategory)
         .createQueryBuilder('dc')
         .select(['dc.id', 'dc.name'])
         .where('dc.id = :id', { id: doc.categoryId })
@@ -3050,11 +3899,7 @@ export class DocService {
    * Source isolation: non-native (ingest) docs only deletable by matching source.
    * Native docs deletable by any authorized actor (creator/editor gate in controller).
    */
-  async remove(
-    docId: string,
-    source?: string,
-    actor?: UnifiedActor,
-  ): Promise<{ deleted: boolean; path: string }> {
+  async remove(docId: string, source?: string, actor?: UnifiedActor): Promise<DocDeleteResult> {
     const doc = await this.findById(docId);
 
     // Source isolation (强制校验): non-native docs can only be deleted by a
@@ -3120,7 +3965,47 @@ export class DocService {
         });
     });
 
-    return { deleted: true, path: doc.path };
+    // hint（2 期，v1.92.0-dev）：docId 锚断 = **语义判定**（文档消失 → 指向它的路由
+    // 全部失效），无逐锚成本故不受 upsert 侧的 20 条 cap 限制。族关 → 零查询零 hints。
+    const hints = await this.buildDeleteHints({
+      spaceId: doc.spaceId,
+      docId,
+      actorId: actor?.id ?? 'system',
+    });
+
+    return { deleted: true, path: doc.path, ...(hints ? { hints } : {}) };
+  }
+
+  /**
+   * 组装 delete 路径的 hint（2 期，v1.92.0-dev）。
+   *
+   * 唯一 code = `route_anchor_broken`（check_failed）：指向被删文档的路由锚点全部失效
+   * ——docId 锚断是语义判定（读面消失），数据源 = RouteHealthService 的引用清单查询
+   * （A2 收口，不复制锚校验逻辑）。
+   *
+   * @returns ≤3 条 DocHint；族关/无引用路由 → undefined
+   */
+  private async buildDeleteHints(params: {
+    spaceId: string;
+    docId: string;
+    actorId: string;
+  }): Promise<DocHint[] | undefined> {
+    const spaceCtx = await this.getSpaceWriteContext(params.spaceId);
+    if (spaceCtx.hintToggles?.routes !== true) return undefined;
+
+    const { brokenRouteIds, anchors } = await this.routeHealthService.analyzeDocRouteAnchors(
+      params.spaceId,
+      params.docId,
+      null,
+    );
+    const candidate = buildRouteAnchorBrokenHint(brokenRouteIds, anchors, params.docId);
+    if (!candidate) return undefined;
+
+    return this.emitHints([candidate], {
+      surface: 'delete',
+      spaceId: params.spaceId,
+      actorId: params.actorId,
+    });
   }
 
   /**

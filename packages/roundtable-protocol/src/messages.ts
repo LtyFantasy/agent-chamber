@@ -4,7 +4,7 @@
  * 上行（runner → chamber）：hello / seat.event / pong；
  * 下行（chamber → runner）：seat.assign / seat.inject / seat.permission_verdict / seat.cancel / seat.revoke / ping。
  *
- * 出处：docs/roundtable-design.md §4（上行/下行消息表）。
+ * 出处：docs/modules/roundtable-design.md §4（上行/下行消息表）。
  */
 import type { RoundtableMessageType, ValidationResult } from './envelope';
 import { PERMISSION_MODES, SEAT_EVENT_TYPES, SEAT_RUNTIME_STATUSES } from './seat';

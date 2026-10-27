@@ -24,12 +24,14 @@ import {
   Priority,
 } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
-import { NotFoundException, ConflictException } from '@nestjs/common';
+import { NotFoundException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { SelectQueryBuilder } from 'typeorm';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { TaskService } from '../task/task.service';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+// hint 去重窗口（阶段三：digest 截断续读码走统一窗口）
+import { HintDedupService } from '../hints/hint-dedup.service';
 import { FindListTasksQueryDto } from './dto';
 
 describe('BoardService', () => {
@@ -152,6 +154,9 @@ describe('BoardService', () => {
 
     taskService = {
       findAll: jest.fn(),
+      // F4-2/V2-N2 跨板写族门：board 侧 removeList.moveTasksTo / reorderTasks 委托它。
+      // 默认 resolved false = 同板短路（既有用例零改动）。
+      assertCrossBoardPlacement: jest.fn().mockResolvedValue(false),
     } as unknown as jest.Mocked<TaskService>;
 
     eventService = {
@@ -273,6 +278,8 @@ describe('BoardService', () => {
       seatRepo,
       messageRepo,
       mockActorProfileService as unknown as ActorProfileService,
+      // 阶段三：digest 截断续读码的去重窗口（真实实例——本 spec 不校验窗口行为）
+      new HintDedupService(),
     );
   });
 
@@ -1170,6 +1177,143 @@ describe('BoardService', () => {
       await expect(service.removeList('list-1', 'list-missing')).rejects.toMatchObject({
         response: { code: ErrorCode.LIST_NOT_FOUND },
       });
+    });
+
+    // ── F4-2 / V2-N2 跨板写族：moveTasksTo 指向别的 board 时必须过目标板 write 门 ──
+    const actor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+    it('跨板 moveTasksTo 被门拒绝 → 不转移任何任务（注入越权拦截）', async () => {
+      const list = {
+        id: 'list-1',
+        tasks: [{ id: 'task-1' }, { id: 'task-2' }],
+      } as unknown as BoardList;
+      listRepo.findOne.mockResolvedValue(list);
+      resourceValidator.exists.mockResolvedValue({} as never);
+      const denied = new ForbiddenException({
+        message: 'Access denied: write on Board',
+        code: ErrorCode.PERMISSION_DENIED,
+      });
+      (taskService.assertCrossBoardPlacement as jest.Mock).mockRejectedValue(denied);
+
+      await expect(service.removeList('list-1', 'list-other-board', actor)).rejects.toBe(denied);
+      // 门在批量转移**之前**：一条都不许先落库（否则拒绝只挡住了"剩下的一半"）
+      expect(taskRepo.update).not.toHaveBeenCalled();
+      // 「当前列」传被删列自身、目标列传 moveTasksTo（同板由门内部短路）
+      expect(taskService.assertCrossBoardPlacement).toHaveBeenCalledWith(
+        actor,
+        'list-other-board',
+        'list-1',
+      );
+    });
+
+    it('同板 moveTasksTo：门短路（返回 false）且任务照常转移', async () => {
+      const list = {
+        id: 'list-1',
+        tasks: [{ id: 'task-1' }],
+      } as unknown as BoardList;
+      listRepo.findOne.mockResolvedValue(list);
+      resourceValidator.exists.mockResolvedValue({} as never);
+      listRepo.remove = jest.fn().mockResolvedValue(undefined);
+
+      await service.removeList('list-1', 'list-2', actor);
+
+      expect(taskRepo.update).toHaveBeenCalledWith('task-1', { listId: 'list-2', position: 0 });
+    });
+  });
+
+  describe('reorderTasks（F4-2 / V2-N2：批量跨板搬运的外泄门）', () => {
+    const actor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.EDITOR };
+    it('跨板 item：按 item 的**当前列**过门（去重后每列一次）', async () => {
+      listRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      taskRepo.find
+        .mockResolvedValueOnce([
+          { id: 'task-1', listId: 'list-other' },
+          { id: 'task-2', listId: 'list-other' },
+          { id: 'task-3', listId: 'list-1' },
+        ] as never)
+        .mockResolvedValueOnce([] as never);
+
+      await service.reorderTasks(
+        'list-1',
+        {
+          tasks: [
+            { id: 'task-1', position: 0 },
+            { id: 'task-2', position: 1 },
+          ],
+        },
+        actor,
+      );
+
+      // 同一来源列去重 → 每个**不同**的当前列只过一次门（task-1/task-2 同源 = 1 次）；
+      // task-3 的当前列 == 目标列，仍交给门（跨板判定的唯一所在地），由门内部同板短路。
+      expect(taskService.assertCrossBoardPlacement).toHaveBeenCalledTimes(2);
+      expect(taskService.assertCrossBoardPlacement).toHaveBeenCalledWith(
+        actor,
+        'list-other',
+        'list-1',
+      );
+      expect(taskService.assertCrossBoardPlacement).toHaveBeenCalledWith(actor, 'list-1', 'list-1');
+    });
+
+    it('门拒绝 → 不写任何 item（外泄拦截，且无部分成功）', async () => {
+      listRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      taskRepo.find.mockResolvedValueOnce([{ id: 'task-1', listId: 'list-private' }] as never);
+      const denied = new ForbiddenException({
+        message: 'Access denied: write on Board',
+        code: ErrorCode.PERMISSION_DENIED,
+      });
+      (taskService.assertCrossBoardPlacement as jest.Mock).mockRejectedValue(denied);
+
+      await expect(
+        service.reorderTasks('list-1', { tasks: [{ id: 'task-1', position: 0 }] }, actor),
+      ).rejects.toBe(denied);
+      expect(taskRepo.update).not.toHaveBeenCalled();
+    });
+
+    it('未知 task id：跳过（update 对不存在行是 no-op，无数据可泄露）', async () => {
+      listRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      taskRepo.find.mockResolvedValueOnce([] as never).mockResolvedValueOnce([] as never);
+
+      await service.reorderTasks(
+        'list-1',
+        { tasks: [{ id: '00000000-0000-4000-8000-000000000099', position: 0 }] },
+        actor,
+      );
+
+      expect(taskService.assertCrossBoardPlacement).not.toHaveBeenCalled();
+    });
+
+    // ── 复审 C1：门判据集合必须覆盖写入集合（软删任务不得漏门）──
+    it('C1：行查询必须 withDeleted（否则软删任务 id 漏门、update 照改其 list_id）', async () => {
+      listRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      taskRepo.find.mockResolvedValueOnce([{ id: 'task-soft', listId: 'list-private' }] as never);
+
+      await service.reorderTasks('list-1', { tasks: [{ id: 'task-soft', position: 0 }] }, actor);
+
+      // 写入循环是 taskRepo.update（TypeORM 的 UPDATE **不追加 deleted_at IS NULL**），
+      // 故被判据必须**含软删行**，两侧集合才相等；少这个 flag 就会出现
+      // "软删任务 id → find 查不到 → 不过门 → update 仍改写 list_id → 200 绕过门"。
+      expect(taskRepo.find).toHaveBeenCalledWith(expect.objectContaining({ withDeleted: true }));
+      // 软删行真的被带进了判定：其当前列（跨板）照常过门
+      expect(taskService.assertCrossBoardPlacement).toHaveBeenCalledWith(
+        actor,
+        'list-private',
+        'list-1',
+      );
+    });
+
+    it('门以 404 拒绝（item 当前列解析不到）→ 原样透传、不写任何 item', async () => {
+      listRepo.findOne.mockResolvedValue({ id: 'list-1', boardId: 'board-1' } as BoardList);
+      taskRepo.find.mockResolvedValueOnce([{ id: 'task-1', listId: 'ghost-list' }] as never);
+      const notFound = new NotFoundException({
+        message: 'Board list not found',
+        code: ErrorCode.LIST_NOT_FOUND,
+      });
+      (taskService.assertCrossBoardPlacement as jest.Mock).mockRejectedValue(notFound);
+
+      await expect(
+        service.reorderTasks('list-1', { tasks: [{ id: 'task-1', position: 0 }] }, actor),
+      ).rejects.toBe(notFound);
+      expect(taskRepo.update).not.toHaveBeenCalled();
     });
   });
 
@@ -2402,6 +2546,159 @@ describe('BoardService', () => {
       // 断言 service 以 status='active' 作为计数条件（active/paused/parked/offline 四态中只数启用座）
       await service.getDigest('board-1');
       expect(seatRepo.count).toHaveBeenCalledWith({ where: { status: 'active' } });
+    });
+
+    // ─── 阶段三：截断续读码（决策 9）─────────────────────────────────
+
+    /** 造 3 条 open 任务（配 openLimit=2 ⇒ nextUp 截断且**调用方显式传了 openLimit**） */
+    const threeOpenTasks = () => [
+      makeTaskRow({ id: 't1', title: 'A', priority: Priority.P0 }),
+      makeTaskRow({ id: 't2', title: 'B', priority: Priority.P1 }),
+      makeTaskRow({ id: 't3', title: 'C', priority: Priority.P2 }),
+    ];
+    /** 造 n 条 open 任务（配**不传 query** ⇒ 缺省 openLimit=10，n>10 即截断且参数缺省） */
+    const manyOpenTasks = (n: number) =>
+      Array.from({ length: n }, (_v, i) =>
+        makeTaskRow({ id: `t${i}`, title: `Task ${i}`, priority: Priority.P1 }),
+      );
+
+    it('nextUp 被截断 ∧ 调用方**未传** openLimit → 附挂 board_digest_truncated（data 四字段）', async () => {
+      setupDigestMocks({ openTasks: manyOpenTasks(12) });
+
+      // 不传 query：openLimit 落缺省 10 ⇒ 12 条被截断，且 `query?.openLimit === undefined`
+      const result = await service.getDigest('board-1', {}, 'agent-1');
+
+      expect(result.truncated).toBe(true);
+      const hints = (result as { hints?: Array<Record<string, unknown>> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0]).toMatchObject({
+        code: 'board_digest_truncated',
+        status: 'suggestion',
+        data: {
+          section: 'nextUp',
+          returnedCount: 10,
+          totalCount: 12,
+          suggestedTool: 'get_board_digest',
+          suggestedParams: { openLimit: 12 },
+        },
+      });
+    });
+
+    it('**参数存在性判据**：同一截断形态但调用方显式传了该段 limit → 不附挂（自己管预算）', async () => {
+      setupDigestMocks({ openTasks: manyOpenTasks(12) });
+
+      const result = await service.getDigest('board-1', { openLimit: 11 }, 'agent-1');
+
+      expect(result.truncated).toBe(true); // 确实截断了（12 > 11）
+      expect((result as { hints?: unknown[] }).hints).toBeUndefined(); // 但不教学
+    });
+
+    it('limit=0（显式要求空段）不参与截断判定 → 无 hint 且 truncated=false', async () => {
+      setupDigestMocks({ openTasks: threeOpenTasks() });
+
+      const result = await service.getDigest('board-1', { openLimit: 0 }, 'agent-1');
+
+      expect(result.truncated).toBe(false);
+      expect((result as { hints?: unknown[] }).hints).toBeUndefined();
+    });
+
+    it('docs 段截断 ∧ 未传 docsLimit → section=docs（段身份与参数映射）', async () => {
+      setupDigestMocks({
+        // 缺省 docsLimit = 5 ⇒ 6 条被截断，且调用方未传 docsLimit
+        docs: Array.from({ length: 6 }, (_v, i) => ({
+          id: `d${i}`,
+          path: `docs/${i}.md`,
+          title: `Doc ${i}`,
+          updatedAt: new Date(`2024-01-0${i + 1}`),
+        })),
+        space: { id: 'sp-1', name: 'Docs', description: null },
+      });
+
+      const result = await service.getDigest('board-1', {}, 'agent-1');
+
+      const hints = (result as { hints?: Array<Record<string, unknown>> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0]).toMatchObject({
+        code: 'board_digest_truncated',
+        data: {
+          section: 'docs',
+          returnedCount: 5,
+          totalCount: 6,
+          suggestedParams: { docsLimit: 6 },
+        },
+      });
+    });
+
+    it('多段同时截断 → **只附挂一条**（去重键 = (actor, code, boardId)，多造候选只会污染观测）', async () => {
+      setupDigestMocks({
+        openTasks: manyOpenTasks(12),
+        riskRows: Array.from({ length: 12 }, (_v, i) =>
+          makeTaskRow({ id: `r${i}`, labels: ['bug'] }),
+        ),
+      });
+
+      const result = await service.getDigest('board-1', {}, 'agent-1');
+
+      const hints = (result as { hints?: Array<Record<string, unknown>> }).hints;
+      expect(hints).toHaveLength(1);
+      // 段优先级：nextUp（下一步做什么）排在 risks 之前
+      expect((hints?.[0].data as { section: string }).section).toBe('nextUp');
+    });
+
+    it('actorId 缺省 → 去重键落 system（controller 必须透传；缺省只是防御，且第二次即被压制）', async () => {
+      setupDigestMocks({ openTasks: manyOpenTasks(12) });
+
+      const first = await service.getDigest('board-1', {});
+      expect((first as { hints?: unknown[] }).hints).toHaveLength(1);
+      const second = await service.getDigest('board-1', {});
+      expect((second as { hints?: unknown[] }).hints).toBeUndefined();
+    });
+
+    it('同一 actor 同看板第二次调用被窗口压制（窗口长度单源 = 注册表 24h）', async () => {
+      setupDigestMocks({ openTasks: manyOpenTasks(12) });
+
+      const first = await service.getDigest('board-1', {}, 'agent-1');
+      expect((first as { hints?: unknown[] }).hints).toHaveLength(1);
+
+      const second = await service.getDigest('board-1', {}, 'agent-1');
+      expect((second as { hints?: unknown[] }).hints).toBeUndefined();
+
+      // 换 actor ⇒ 不受他人窗口影响（去重键含 actor 维度）
+      const other = await service.getDigest('board-1', {}, 'agent-2');
+      expect((other as { hints?: unknown[] }).hints).toHaveLength(1);
+    });
+
+    it('**运行期**窗口 = 注册表声明的 24h（P1-1：profile.ttlOf 接线后 23h 仍压制、25h 放行）', async () => {
+      setupDigestMocks({ openTasks: manyOpenTasks(12) });
+
+      jest.useFakeTimers();
+      try {
+        const first = await service.getDigest('board-1', {}, 'agent-1');
+        expect((first as { hints?: unknown[] }).hints).toHaveLength(1);
+
+        // +23h：仍在 24h 窗口内 ⇒ 压制。**若 profile.ttlOf 缺钩子（落 6h 缺省）这里会放行**
+        // —— 这正是 P1-1 的回归锁（元数据断言抓不到它：声明值写对了但没接线）
+        jest.advanceTimersByTime(23 * 60 * 60 * 1000);
+        const second = await service.getDigest('board-1', {}, 'agent-1');
+        expect((second as { hints?: unknown[] }).hints).toBeUndefined();
+
+        // +25h（累计）：越过 24h ⇒ 放行
+        jest.advanceTimersByTime(2 * 60 * 60 * 1000);
+        const third = await service.getDigest('board-1', {}, 'agent-1');
+        expect((third as { hints?: unknown[] }).hints).toHaveLength(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('未截断 → 键不出现（信封不变量：禁空数组）', async () => {
+      setupDigestMocks({ openTasks: threeOpenTasks() });
+
+      const result = await service.getDigest('board-1', {}, 'agent-1');
+
+      // 缺省 openLimit=10 > 3 条 ⇒ 不截断
+      expect(result.truncated).toBe(false);
+      expect(result).not.toHaveProperty('hints');
     });
   });
 

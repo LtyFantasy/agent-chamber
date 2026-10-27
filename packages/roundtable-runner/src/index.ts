@@ -2,7 +2,7 @@
  * @agent-chamber/roundtable-runner —— 桶导出
  *
  * 圆桌模式 runner 独立可执行进程：
- * - SeatDriver 接口（契约①，docs/roundtable-design.md §3）
+ * - SeatDriver 接口（契约①，docs/modules/roundtable-design.md §3）
  * - AcpDriver 传输基座（厂商差异收口 AcpVendorProfile；M4a 由 kimi-acp.ts 提取）
  * - KimiAcpDriver（ACP stdio 驱动 kimi，行为档案 8 条落地 §8）
  * - CodexAcpDriver（ACP stdio 驱动 codex-acp 桥，quirk 薄壳 §8）

@@ -15,6 +15,12 @@
  *   - 本批次（v1.62.0）: outline 模式 JSON 投影增 contentHash（maxFullTokens=0 即 token
  *     获取通道）；description 的 BYTE-IDENTITY 修正为「仅读路径间一致」，并明示
  *     contentHash = 原始写入 payload 的 SHA-256，禁止对读出文本自算（乐观锁一律用响应 token）
+ *   - 本批次（v1.93.0 批 2，任务 59cb21e6）: outline 模式每节自动带派生 sectionHash——
+ *     后端 DocSectionOutline 加字段，本工具 `sections: doc.sections` 整体透传故**零投影改动**，
+ *     只更新 description 契约（outline 一次调用可完成全篇对账；写前前提可用 positions[]/outline
+ *     的 sections[].sectionHash，或后端 HTTP 单节读的 DocSectionContent.sectionHash——三者
+ *     口径一致可混用）。踩坑：不要再给 sections 手写字段投影——整体透传是「后端加字段自动
+ *     带出」这一保证的唯一来源
  *
  * [踩坑索引]
  *   - headingPath-separator-v1.57.2：末段标题必须通过 shared extractLastHeadingSegment() 提取，
@@ -26,8 +32,9 @@
  *     full=true 全文的字节级子串），本工具三条 section 通道优先取用；本地渲染降级为
  *     兼容 fallback（仅在旧服务端无 markdown 字段时生效，勿从降级输出构造 oldString）
  *   - fail-closed 改造（2026-08-16）：positions[] 批量通道每项透传 sectionHash
- *     （patch_doc expectedSectionHash 唯一取数通道——单节通道是纯文本 markdown 挂不了
- *     元数据）；position "stable cross-update" 失实措辞已修正（position 会漂移）
+ *     （patch_doc expectedSectionHash 的取数通道之一；本工具的单节 markdown 通道不投影
+ *     元数据、挂不了 hash——v1.93.0 批 2 起 outline 亦是取数通道）；position
+ *     "stable cross-update" 失实措辞已修正（position 会漂移）
  *   - rundedup-continuation-v1.57.3：fallback 渲染仅在 isContinuation === true 时去掉标题；
  *     老服务端缺字段时保留标题，避免启发式吞掉真实同名 sibling。
  *
@@ -183,8 +190,9 @@ export const readDocTool: CustomTool = {
       '{docId, docPath, sections[{position, headingPath, isContinuation, sectionHash, markdown}], missing[]}; duplicates ' +
       'deduped, out-of-range positions go to missing instead of failing the whole request; ' +
       'each section item carries sectionHash — copy it into patch_doc expectedSectionHash ' +
-      'for a fail-closed section write (this batch channel is THE way to obtain sectionHash; ' +
-      'the single-section channels return raw markdown without metadata); ' +
+      'for a fail-closed section write (this batch channel and the outline channel are the ' +
+      'two sources of sectionHash; the single-section markdown channels return raw markdown ' +
+      'without metadata); ' +
       "each item's markdown is a byte-faithful fragment of the full text (oldString-safe); " +
       '(2) position or headingPath: returns that section markdown — a byte-faithful fragment ' +
       'of the full-fidelity text (heading line included exactly as in the full text; ' +
@@ -194,7 +202,12 @@ export const readDocTool: CustomTool = {
       'picks one), zero hits return an error suggesting the outline channel; ' +
       '(4) neither: small documents (tokenEstimate ≤ maxFullTokens threshold, default 2000) ' +
       'return the full content as raw markdown plain text; large documents return a compact ' +
-      'outline JSON — metadata + summary + section map with positions (linkHealth only here). ' +
+      'outline JSON — metadata + summary + section map with positions (linkHealth only here); ' +
+      'each outline section carries a derived sectionHash (same formula as the positions[] ' +
+      'channel), so ONE outline call gives you the whole-document reconciliation view (pass ' +
+      'maxFullTokens=0 when the doc would otherwise inline as full) — for a write, either ' +
+      "channel's hash works as patch_doc expectedSectionHash (identical derivation, freely " +
+      'interchangeable). ' +
       'Does NOT accept sectionId (unstable — changes on every content update). ' +
       'Full text and section bodies are raw markdown, never JSON-escaped. ' +
       'BYTE-IDENTITY GUARANTEE (read paths only): full text and section markdown are ' +

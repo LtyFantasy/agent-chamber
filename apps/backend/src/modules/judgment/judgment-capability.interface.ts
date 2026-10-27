@@ -16,7 +16,7 @@
  *   - DI token `JUDGMENT_PROVIDER`（字符串值不变——e2e `overrideProvider` 的替换点）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（provider 值域 / 失败标签 /
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（provider 值域 / 失败标签 /
  *     "启用 = 文本出境"声明）
  *   - 补充: 线上 DocSpace `docs/spec.md` — `JudgmentCapability` 终稿形状
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（内核抽取边界：可抽 =

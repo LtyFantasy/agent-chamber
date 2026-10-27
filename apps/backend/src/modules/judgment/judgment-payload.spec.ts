@@ -59,6 +59,40 @@ describe('judgment-payload · redaction 基线', () => {
     expect(serialized).toContain('[redacted]');
   });
 
+  /**
+   * 评审 M2：长形态同样带左边界 `(?<![A-Za-z0-9])`。
+   * 无边界时判别日志里的 `background-task-timeout` 会被改写成
+   * `background-ta[redacted]`——日志是训练语料/复核事实源，误伤即静默数据污染。
+   */
+  it('词中前缀不被改写（评审 M2）：kebab/snake 运维词原样保留', () => {
+    const input = {
+      a: 'background-task-timeout',
+      b: 'task_retry',
+      c: 'risk-assessment',
+      d: 'disk_usage',
+      e: 'flask_error',
+    };
+    const result = redactJudgmentPayload(input);
+    expect(result.redacted).toBe(false);
+    expect(result.payload).toEqual(input);
+  });
+
+  it('真实 key 在各前置边界仍被**完整**掩码（评审 M2）', () => {
+    const { payload, redacted } = redactJudgmentPayload({
+      atStart: 'sk-abcdef123456',
+      afterSpace: 'Bearer ask_abcdef123456',
+      afterEquals: 'KEY=apikey_abcdef123456',
+      quoted: '"sk-abcdef123456"',
+    });
+    expect(redacted).toBe(true);
+    const serialized = JSON.stringify(payload);
+    for (const leaked of ['abcdef123456', 'sk-abc', 'ask_abc', 'apikey_abc']) {
+      expect(serialized).not.toContain(leaked);
+    }
+    // 无半掩码残留（掩码必须吃掉整个值，不能留下原值尾巴）
+    expect(serialized).not.toContain('[redacted]abcdef');
+  });
+
   it('深扫描：数组元素与嵌套对象里的密钥同样被掩（不是只扫顶层字符串）', () => {
     const { redacted, payload } = redactJudgmentPayload({
       state: { signals: ['ask_aaaabbbb', 'ok'], nested: { deep: 'password=s3cret' } },

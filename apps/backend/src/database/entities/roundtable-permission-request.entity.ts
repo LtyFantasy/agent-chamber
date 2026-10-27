@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §5 (数据模型) + §6 (审批可见性/裁决)
- *   - 补充: docs/roundtable-design.md §3 (契约① permission_request) / §4 (seat.permission_verdict)
+ *   - 主文档: docs/modules/roundtable-design.md §5 (数据模型) + §6 (审批可见性/裁决)
+ *   - 补充: docs/modules/roundtable-design.md §3 (契约① permission_request) / §4 (seat.permission_verdict)
  *
  * [踩坑索引]
  *

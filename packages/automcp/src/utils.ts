@@ -93,6 +93,20 @@ export function convertSchemaToInternal(schema: unknown): JSONSchema {
     result.nullable = true;
   }
 
+  // Draft-07 约束关键字透传（长度/数量/数值边界）。只透传数值型，缺省/畸形值不猜。
+  for (const key of [
+    'minLength',
+    'maxLength',
+    'minItems',
+    'maxItems',
+    'minimum',
+    'maximum',
+  ] as const) {
+    const value = s[key];
+    if (typeof value === 'number') result[key] = value;
+  }
+  if ('default' in s) result.default = s.default;
+
   // required
   if (Array.isArray(s.required)) {
     result.required = s.required.filter((r): r is string => typeof r === 'string');

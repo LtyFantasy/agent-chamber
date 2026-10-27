@@ -50,6 +50,7 @@ import {
   experiencePagination,
   type ExperienceListFilters,
 } from '@/lib/experience';
+import { parseEnumParam, parseUuidParam } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -673,44 +674,6 @@ export default function ExperiencesPage() {
       />
     </div>
   );
-}
-
-/**
- * searchParams 值 → 白名单枚举（评审 minor 6）
- *
- * 非法值返回 null 由调用方回落缺省：直接把任意字符串当过滤值发给后端会撞 `@IsIn`
- * 400，把整页打进错误态（旧链接、手输、外部分享的参数都可能带脏值）。
- *
- * @param raw - URL 参数原值（null = 未提供）
- * @param allowed - 该参数的合法值域（shared 单源常量）
- * @returns 合法值或 null
- */
-function parseEnumParam<T extends string>(raw: string | null, allowed: readonly T[]): T | null {
-  if (!raw) return null;
-  return (allowed as readonly string[]).includes(raw) ? (raw as T) : null;
-}
-
-/**
- * searchParams 值 → UUID（v1.81.0：`?createdById=` 直达）
- *
- * 与 `parseEnumParam` 同一理由，只是值域不是有限枚举：后端该参数是 `@IsUUID()`，脏值
- * 会被 400 **把整页打进错误态**（旧链接/手输/外部分享都可能带脏值）。这里做**形状**校验
- * （只放到后端的一定是 UUID 形态的串），合法性与存在性仍由后端裁决（铁律 #21：格式在
- * 边界层拦，业务存在性在服务层判）。
- *
- * @param raw - URL 参数原值（null = 未提供）
- * @returns 合法 UUID 或 null（调用方回落"不过滤"）
- */
-function parseUuidParam(raw: string | null): string | null {
-  if (!raw) return null;
-  // 与后端 @IsUUID()（validator `all` 模式）等价：版本位 [1-8] + variant 位 [89ab]，
-  // 外加 nil / max 两个例外——比后端宽会让形状像 UUID 的脏值漏过去吃 400 把整页打进错误态，
-  // 比后端严会误杀合法值
-  return /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/i.test(
-    raw,
-  )
-    ? raw
-    : null;
 }
 
 /**

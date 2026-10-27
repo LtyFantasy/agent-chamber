@@ -44,7 +44,21 @@ jest.mock('axios', () => {
   };
 });
 
+/**
+ * 拦截器的回跳地址构造改由受控 spy 观测——jsdom 的 location 赋值不可断言（见下方 401 用例注），
+ * 而「是否构造回跳」正是 P1-1「401 发生在 /login 上会冲掉 ?next=」的判据。
+ * 只替换函数引用、保留真实实现（jest.requireActual），行为零偏移。
+ */
+jest.mock('./login-redirect', () => {
+  const actual = jest.requireActual<typeof import('./login-redirect')>('./login-redirect');
+  return { ...actual, buildLoginRedirect: jest.fn(actual.buildLoginRedirect) };
+});
+
 import { Api, setAuthHooks } from './api';
+import { buildLoginRedirect } from './login-redirect';
+
+/** 受控 spy（jest.mock 已替换为 jest.fn，保留真实实现） */
+const redirectSpy = buildLoginRedirect as unknown as jest.Mock;
 
 /** 从 listDocs 返回类型推导，fixture 与真实 DocSummary 保持同步，不硬编码形状 */
 type PaginatedDocs = Awaited<ReturnType<typeof Api.docs.listDocs>>;
@@ -202,6 +216,9 @@ describe('Api 拦截器（authHooks 注入，review-0831 任务 04e8d744 拆环�
   afterEach(() => {
     // setAuthHooks 是模块级变量，注入后跨用例残留——重置回默认空钩子（铁律 #17）
     setAuthHooks({ getToken: () => null, onUnauthorized: () => {} });
+    // 地址栏是全局态：还原到根，避免跨用例污染 401 分支的 pathname 判据
+    window.history.pushState({}, '', '/');
+    redirectSpy.mockClear();
   });
 
   it('请求拦截器经 authHooks.getToken 注入 Authorization', () => {
@@ -228,9 +245,47 @@ describe('Api 拦截器（authHooks 注入，review-0831 任务 04e8d744 拆环�
     await expect(responseErrorHandler(error)).rejects.toBe(error);
 
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
-    // 注：handler 内 window.location.href='/login' 的跳转断言不可测——jsdom 的 location
+    // 注：handler 内 `window.location.href = ...` 的**导航**断言不可测——jsdom 的 location
     // 不可 redefine（defineProperty 抛 TypeError），赋值仅触发虚拟控制台 jsdomError 不抛错、
-    // URL 不实际变化；跳转行为由 e2e/手测覆盖，此用例只钉死 onUnauthorized 契约。
+    // URL 不实际变化；此用例只钉死 onUnauthorized 契约。
+    // 回跳地址构造由下方专用 spy 用例覆盖（P2-4），白名单矩阵由 lib/login-redirect.test.ts
+    // 覆盖，AuthGuard 接线由 components/auth/auth-guard.test.tsx 覆盖。
+  });
+
+  it('401 非登录页：以当前 pathname + search + hash 构造回跳地址', async () => {
+    window.history.pushState({}, '', '/tasks/abc?tab=desc#comment-2');
+    setAuthHooks({ getToken: () => null, onUnauthorized: jest.fn() });
+    const responseErrorHandler = mockResponseUse.mock.calls[0][1] as (
+      error: unknown,
+    ) => Promise<never>;
+    const error = {
+      response: { status: 401, data: { message: 'unauthorized', code: 'AUTH_EXPIRED' } },
+    };
+
+    await expect(responseErrorHandler(error)).rejects.toBe(error);
+
+    // 三段地址原样传入：query 与 fragment 都不得丢（fragment 丢了深链锚点就漂回页首）
+    expect(redirectSpy).toHaveBeenCalledWith('/tasks/abc', '?tab=desc', '#comment-2');
+  });
+
+  /**
+   * P1-1 回归：登录失败本身就是 401（POST /auth/login）——若在 /login 上照常整页导航，
+   * 会同时冲掉 URL 上的 `?next=`（深链丢失）与用户已输入的邮箱/错误文案。
+   * 判据 = 不以当前地址构造回跳（jsdom 无法断言 location 赋值，故观测构造动作）。
+   */
+  it('401 发生在登录页：不构造回跳（保住 ?next= 与已输入内容/错误文案）', async () => {
+    window.history.pushState({}, '', '/login?next=%2Ftasks%2Fabc');
+    setAuthHooks({ getToken: () => null, onUnauthorized: jest.fn() });
+    const responseErrorHandler = mockResponseUse.mock.calls[0][1] as (
+      error: unknown,
+    ) => Promise<never>;
+    const error = {
+      response: { status: 401, data: { message: 'invalid credentials', code: 'AUTH_FAILED' } },
+    };
+
+    await expect(responseErrorHandler(error)).rejects.toBe(error);
+
+    expect(redirectSpy).not.toHaveBeenCalled();
   });
 });
 

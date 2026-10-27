@@ -62,7 +62,7 @@ export class TopicConfigDto implements TopicConfigInput {
   invitedAgentIds?: string[];
 
   /**
-   * 话题类型（设计 docs/roundtable-design.md §5，M2 阶段 1 落地）：
+   * 话题类型（设计 docs/modules/roundtable-design.md §5，M2 阶段 1 落地）：
    * 'normal'（缺省）/ 'roundtable'。仅创建时生效——创建后不可变，update 忽略
    * （互转在 M2 推迟清单）。写 entity 列，不进 settings。
    */

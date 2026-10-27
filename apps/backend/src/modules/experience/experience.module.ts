@@ -31,7 +31,8 @@
  *     方法级声明（见 controller 文件头不变量 1）；usage stats 拦截器零接线自动覆盖
  *
  * [关联代码]
- *   - experience.controller.ts — 12 端点（8 条目端点 + 4 成员端点；方法级守卫在此声明）
+ *   - experience.controller.ts — **14 端点**（8 条目端点 + 4 成员端点 + 1 判断日志 + 1 判定
+ *     补跑；方法级守卫在此声明）
  *   - experience.service.ts — 条目业务规则
  *   - experience-member.service.ts — 成员表与终审资格（第二期批 2；两个 service 均在此注册）
  *   - modules/judgment/judgment.module.ts — 判别内核（本模块 import 它取 token 与配额服务）

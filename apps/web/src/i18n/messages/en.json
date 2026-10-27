@@ -19,7 +19,9 @@
     "close": "Close",
     "retry": "Retry",
     "noData": "No data",
-    "emptyList": "List is empty"
+    "emptyList": "List is empty",
+    "loadFailed": "Could not load this data. Please try again.",
+    "refreshFailed": "Refresh failed. Showing the last successful data."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -29,6 +31,8 @@
     "boards": "Boards",
     "docs": "Docs",
     "experiences": "Experiences",
+    "memory": "Memory",
+    "usage": "Usage",
     "search": "Search",
     "settings": "Settings",
     "monitoring": "Monitoring",
@@ -42,6 +46,11 @@
     "pendingExperienceReviews": "{count} experiences awaiting final review"
   },
   "settings": {
+    "tabs": {
+      "profile": "Profile",
+      "security": "Security",
+      "notifications": "Notifications"
+    },
     "language": {
       "title": "Language",
       "description": "Choose your preferred display language"
@@ -53,7 +62,8 @@
       "description": "View and update your profile",
       "username": "Username",
       "usernamePlaceholder": "Your username",
-      "saveChanges": "Save changes"
+      "saveChanges": "Save changes",
+      "saveFailed": "Failed to save your profile. Your changes are kept; please try again."
     },
     "role": {
       "admin": "Admin",
@@ -90,6 +100,217 @@
       "mismatch": "Passwords do not match",
       "tooShort": "New password must be at least 6 characters",
       "changeFailed": "Failed to change password"
+    },
+    "notifications": {
+      "loadFailed": "Couldn't load your notification settings",
+      "retry": "Retry",
+      "upgradeBanner": {
+        "title": "Notifications are per-person now",
+        "description": "Bind your Feishu account to receive the notifications that concern you: topics you take part in, tasks assigned to you, and docs you created or can read.",
+        "dismiss": "Dismiss banner"
+      },
+      "envSeedNotice": {
+        "title": "This channel came from the deployment config",
+        "description": "An administrator imported your Feishu address during deployment. It can already receive notifications, but it has not been verified under your account — send a test message to confirm it works.",
+        "dismiss": "Got it"
+      },
+      "empty": {
+        "title": "No notification channel yet",
+        "description": "Once Feishu is bound, changes to the tasks, topics and docs you are involved in are delivered to your Feishu direct messages.",
+        "action": "Bind a channel"
+      },
+      "channel": {
+        "sectionTitle": "Channels",
+        "sectionDescription": "Notifications only go to a bound and verified address; changing the address requires verifying it again.",
+        "feishuName": "Feishu",
+        "feishuDescription": "Receive notifications as Feishu direct messages",
+        "statusBar": {
+          "pending": "One step left: send a test message to finish verification. Delivery only starts after it passes.",
+          "seeded": "Imported from the deployment config — sending a test message is recommended."
+        },
+        "unconfigured": "This deployment has no Feishu app configured. Please contact an administrator.",
+        "badgeLabel": {
+          "unbound": "Not bound",
+          "unverified": "Not verified",
+          "seeded": "Imported · unverified",
+          "verified": "Verified",
+          "failed": "Verification failed"
+        },
+        "openIdLabel": "Feishu open_id",
+        "openIdPlaceholder": "ou_xxxxxxxxxxxxxxxxxxxx",
+        "openIdHint": "Your Feishu open_id starts with ou_ (you can find it in the Feishu developer console or the bot logs).",
+        "openIdInvalid": "Invalid open_id: it must start with ou_ followed by letters, digits, underscores or dashes.",
+        "save": "Save",
+        "test": "Send test message",
+        "testSending": "Sending",
+        "testHint": "This really sends one message to your Feishu; on success notifications are enabled automatically.",
+        "testNeedsSave": "Save the new open_id first — otherwise the test would target the old address.",
+        "muteLabel": "Notifications enabled",
+        "muteHint": "Turning this off mutes the channel temporarily and keeps the binding and its verification state. Unlike unbinding below, you can switch it back on any time.",
+        "muteRequiresVerified": "Send a test message to finish verification before enabling notifications.",
+        "unbind": "Unbind",
+        "unbindConfirmTitle": "Unbind Feishu notifications?",
+        "unbindConfirmDescription": "Notifications stop immediately. Re-binding the same address keeps its verification state — no re-verification needed.",
+        "unbindConfirm": "Unbind",
+        "unbindCancel": "Cancel",
+        "savedToast": "Channel saved",
+        "savedToastDescription": "After an address change, send a test message to verify it again.",
+        "testSuccessToast": "Test message sent",
+        "testSuccessToastDescription": "Verified — notifications are now on.",
+        "unboundToast": "Feishu notifications unbound",
+        "mutedToast": "Notifications muted",
+        "unmutedToast": "Notifications turned back on",
+        "errors": {
+          "addressTaken": {
+            "title": "That Feishu account is bound to another account",
+            "description": "If it is yours, use the original account — or ask an administrator to unbind it."
+          },
+          "channelExists": {
+            "title": "Couldn't save",
+            "description": "Your account already has a binding for this channel. Refresh and try again."
+          },
+          "invalidAddress": {
+            "title": "Invalid open_id",
+            "description": "Check that the open_id starts with ou_ and was copied completely."
+          },
+          "notVerified": {
+            "title": "Not verified yet",
+            "description": "Send a test message to verify the address before enabling notifications."
+          },
+          "missingAddress": {
+            "title": "Enter an open_id",
+            "description": "Binding a channel for the first time requires a Feishu open_id."
+          },
+          "noBinding": {
+            "title": "No active binding",
+            "description": "This channel is not bound (or was unbound). Save an open_id first."
+          },
+          "rateLimited": {
+            "title": "Too many attempts",
+            "description": "Please try again in {seconds} seconds."
+          },
+          "unknown": {
+            "title": "Operation failed",
+            "description": "Please try again; contact an administrator if it keeps failing."
+          }
+        },
+        "testFailures": {
+          "noProvider": {
+            "title": "No Feishu app configured",
+            "description": "Ask an administrator to finish the Feishu app configuration, then retry."
+          },
+          "notifyDisabled": {
+            "title": "Platform notifications are off",
+            "description": "Ask an administrator to enable notifications, then retry."
+          },
+          "categoryDisabled": {
+            "title": "Test notifications are disabled",
+            "description": "Ask an administrator to enable them in the deployment config, then retry."
+          },
+          "deliveryFailed": {
+            "title": "Delivery failed",
+            "description": "Check that the open_id is correct and that the Feishu app is authorized for that user."
+          },
+          "rateLimited": {
+            "title": "Too many attempts",
+            "description": "Just try again shortly."
+          },
+          "other": {
+            "title": "The test message was not delivered",
+            "description": "Please try again; contact an administrator if it keeps failing."
+          }
+        }
+      },
+      "moreChannels": {
+        "summary": "More channels (coming soon)",
+        "soon": "Coming soon",
+        "dingtalk": "DingTalk",
+        "wecom": "WeCom",
+        "slack": "Slack",
+        "description": "Not implemented yet — tell us which one you need most."
+      },
+      "prefs": {
+        "sectionTitle": "Notification preferences",
+        "sectionDescription": "Choose which notifications you want. Two more filters apply on top of these switches: whether the platform enables the category, and whether the message concerns you (only resources you take part in or can read).",
+        "unverifiedHint": "With no channel bound, these switches produce no notifications.",
+        "disabledBadge": "Platform off",
+        "topicEmptyHint": "You are currently in 0 topics — this kind of notification will not occur yet.",
+        "saved": "Saved",
+        "saveFailed": {
+          "title": "Couldn't save",
+          "description": "Your previous setting has been restored. Please try again."
+        },
+        "resetDefaults": "Reset to default",
+        "resetConfirmTitle": "Reset notification preferences?",
+        "resetConfirmDescription": "This clears your category preferences and returns to the platform default (task done, agent direct messages).",
+        "resetConfirm": "Reset",
+        "resetCancel": "Cancel",
+        "resetDone": "Notification preferences reset",
+        "resetFailed": {
+          "title": "Couldn't reset",
+          "description": "Please try again shortly."
+        },
+        "groups": {
+          "tasks": {
+            "title": "Tasks",
+            "description": "Events about board tasks"
+          },
+          "topics": {
+            "title": "Topics",
+            "description": "New messages in topics you take part in"
+          },
+          "docs": {
+            "title": "Docs",
+            "description": "Doc changes in spaces you can read"
+          },
+          "direct": {
+            "title": "Direct",
+            "description": "Messages your agents send to you"
+          }
+        },
+        "categories": {
+          "task_done": {
+            "name": "Task done",
+            "description": "A task you created or were assigned is completed"
+          },
+          "task_created": {
+            "name": "Task created",
+            "description": "A new task is added to a board you take part in"
+          },
+          "task_updated": {
+            "name": "Task updated",
+            "description": "A task's content, status or priority changed"
+          },
+          "task_assigned": {
+            "name": "Task assigned",
+            "description": "A task is assigned to you or your agent"
+          },
+          "topic": {
+            "name": "Topic messages",
+            "description": "New messages in topics you take part in"
+          },
+          "doc_created": {
+            "name": "Doc created",
+            "description": "A doc is created in a space you can read"
+          },
+          "doc_updated": {
+            "name": "Doc updated",
+            "description": "A doc you can read was modified"
+          },
+          "doc_deleted": {
+            "name": "Doc deleted",
+            "description": "A doc you can read was deleted"
+          },
+          "doc_moved": {
+            "name": "Doc moved",
+            "description": "A doc's path or space changed"
+          },
+          "direct": {
+            "name": "Agent direct messages",
+            "description": "Messages your agents send to you"
+          }
+        }
+      }
     }
   },
   "api": {
@@ -161,6 +382,11 @@
     "edit": "Edit Topic",
     "noTopics": "No topics",
     "noTopicsDesc": "Create your first topic",
+    "loadErrorTitle": "Failed to load topics",
+    "loadErrorDesc": "Check your connection and try again.",
+    "createError": "Failed to create the topic. Please try again.",
+    "updateError": "Failed to update the topic. Please try again.",
+    "deleteError": "Failed to delete the topic. Please try again.",
     "noDescription": "No description",
     "viewDetail": "View details",
     "notFound": "Topic not found",
@@ -455,7 +681,8 @@
     "comment": {
       "count": "{count, plural, one {# comment} other {# comments}}",
       "empty": "No comments",
-      "placeholder": "Add a comment..."
+      "placeholder": "Add a comment...",
+      "addFailed": "Failed to add the comment. Your draft is kept; please try again."
     },
     "activity": {
       "count": "{count, plural, one {# activity} other {# activities}}",
@@ -476,14 +703,16 @@
       "dependsOn": "Depends on",
       "remove": "Remove dependency",
       "searchPlaceholder": "Search tasks...",
-      "noResults": "No matching tasks"
+      "noResults": "No matching tasks",
+      "removeFailed": "Failed to remove the dependency. Please try again."
     },
     "docs": {
       "title": "Linked Docs",
       "empty": "No linked docs",
       "remove": "Remove doc link",
       "addFailed": "Failed to link doc",
-      "openFailed": "Failed to open the linked document"
+      "openFailed": "Failed to open the linked document",
+      "removeFailed": "Failed to remove the document link. Please try again."
     },
     "attributes": {
       "title": "Attributes",
@@ -506,7 +735,21 @@
     "delete": {
       "confirm": "Are you sure you want to delete this task?"
     },
-    "deleteTitle": "Delete task"
+    "deleteTitle": "Delete task",
+    "saveFailed": "Failed to save the task. Your changes are kept; please try again.",
+    "deleteFailed": "Failed to delete the task. Please try again.",
+    "milestoneFailed": "Failed to change the milestone. Please try again.",
+    "editor": {
+      "conflict": "This task changed while you were editing. Your changes are kept. Read the latest version before saving again.",
+      "readFailed": "The latest task version could not be read or verified. Your changes are kept; read it again before saving.",
+      "savedNeedsRead": "Your changes were saved, but the new version could not be confirmed. Read the latest version before making another save.",
+      "invalidBaseline": "A valid task version is required before saving. Read the latest version; your changes will be kept.",
+      "review": "The latest version is loaded. Review your retained changes, then click Save to apply them over the corresponding server fields.",
+      "readLatest": "Read latest version",
+      "latestValues": "Latest server values for your retained changes",
+      "emptyValue": "(empty)",
+      "milestoneHint": "Milestone changes are saved with the rest of this form. Click Save to apply them."
+    }
   },
   "boards": {
     "title": "Boards",
@@ -514,13 +757,19 @@
     "create": "Create Board",
     "noBoards": "No boards",
     "noBoardsDesc": "Create your first board",
+    "loadErrorTitle": "Failed to load boards",
+    "loadErrorDesc": "Check your connection and try again.",
+    "createError": "Failed to create the board. Please try again.",
+    "updateError": "Failed to update the board. Please try again.",
+    "deleteError": "Failed to delete the board. Please try again.",
     "noDescription": "No description",
     "taskProgress": "{completed} / {total} tasks",
     "viewBoard": "View board",
     "notFound": "Board not found",
     "backToList": "Back to board list",
     "loadingTasks": "Loading tasks...",
-    "unsavedConfirm": "You have unsaved changes. Close anyway?",
+    "unsavedConfirm": "Leave this task and discard unsaved changes?",
+    "unsavedDescription": "Unsubmitted changes will be discarded. A save already in progress will continue; leaving does not cancel that request.",
     "visibility": {
       "public": "Public",
       "private": "Private",
@@ -566,7 +815,14 @@
       "deleteConfirmSimple": "Are you sure you want to delete list \"{name}\"?",
       "cannotDelete": "This list has {count} tasks and cannot be deleted. Please create another list and transfer the tasks first.",
       "noLists": "No lists",
-      "noListsDesc": "This board has no lists yet"
+      "noListsDesc": "This board has no lists yet",
+      "createTaskFailed": "Failed to create the task. Your draft is kept; please try again.",
+      "updateFailed": "Failed to update the list. Please try again.",
+      "deleteFailed": "Failed to delete the list. Please try again.",
+      "createFailed": "Failed to create the list. Please try again.",
+      "reorderFailed": "Failed to reorder lists. The previous order has been restored; please try again.",
+      "reorderTasksFailed": "Failed to reorder tasks. The previous order has been restored; please try again.",
+      "moveTaskFailed": "Failed to move the task. Its previous position has been restored; please try again."
     },
     "milestone": {
       "button": "Milestones",
@@ -620,14 +876,16 @@
       "editor": "Editor",
       "member": "Member",
       "setEditor": "Set as editor",
-      "inviteFailed": "Invite result: {succeeded} succeeded, {failed} failed"
+      "inviteFailed": "Invite result: {succeeded} succeeded, {failed} failed",
+      "actionFailed": "Failed to update this member. Please try again."
     },
     "docs": {
       "bind": "Docs",
       "docCount": "{count} docs",
       "createTitle": "Create Doc Space",
       "createDesc": "Create a doc space bound to this board",
-      "namePlaceholder": "Space name"
+      "namePlaceholder": "Space name",
+      "createFailed": "Failed to create the doc space. Please try again."
     },
     "settings": {
       "title": "Board Settings",
@@ -647,6 +905,8 @@
     "create": "New Space",
     "noSpaces": "No doc spaces",
     "noSpacesDesc": "Create your first doc space to organize project knowledge",
+    "loadErrorTitle": "Failed to load doc spaces",
+    "loadErrorDesc": "Check your connection and try again.",
     "noDescription": "No description",
     "docCount": "{count, plural, one {# doc} other {# docs}}",
     "boundTopic": "Topic",
@@ -1037,7 +1297,9 @@
       "entityId": "Entity ID",
       "actor": "Actor",
       "ipAddress": "IP Address"
-    }
+    },
+    "previousPage": "Previous page",
+    "nextPage": "Next page"
   },
   "logs": {
     "title": "Activity Logs",
@@ -1131,6 +1393,9 @@
     "passwordPlaceholder": "••••••••",
     "loginButton": "Login",
     "loginFailed": "Login failed",
+    "loginErrorInvalidCredentials": "Incorrect email or password. If your account has been deactivated, please contact an administrator.",
+    "loginErrorAccountDisabled": "This account has been deactivated. Please contact an administrator.",
+    "loginErrorRateLimited": "Too many login attempts. Please wait a moment and try again.",
     "viewAgentGuide": "View Agent Integration Guide",
     "passwordMismatch": "Passwords do not match",
     "passwordMinLength": "Password must be at least 6 characters",
@@ -1198,12 +1463,14 @@
     "resetKey": {
       "title": "Reset and View API Key",
       "description": "A new Key will be generated upon reset. The old Key will become invalid immediately. Continue?",
-      "confirm": "Confirm Reset"
+      "confirm": "Confirm Reset",
+      "scopesHint": "The new Key inherits the strictest permissions of the Keys being revoked (if every current Key is read-only, the new Key is read-only too). It never gains more permissions."
     },
     "newKey": {
       "title": "New API Key",
       "description": "Save it now. This Key is only shown once.",
-      "saved": "I have saved it"
+      "saved": "I have saved it",
+      "scopes": "Permissions"
     },
     "detail": {
       "notFound": "Agent not found",
@@ -1259,8 +1526,13 @@
       "nameLabel": "Name",
       "namePlaceholder": "Production Key",
       "revokeTitle": "Revoke API Key",
-      "revokeWarning": "This action is irreversible. Agents using this Key will stop working immediately."
-    }
+      "revokeWarning": "This action is irreversible. Agents using this Key will stop working immediately.",
+      "scopes": "Permissions"
+    },
+    "toggleFailed": "Failed to change the Agent status. Please try again.",
+    "updateFailed": "Failed to update the Agent. Please try again.",
+    "deleteFailed": "Failed to delete the Agent. Please try again.",
+    "resetKeyFailed": "Failed to reset the API Key. Please try again."
   },
   "users": {
     "title": "User Management",
@@ -1304,7 +1576,8 @@
     "delete": {
       "title": "Confirm deletion",
       "description": "Are you sure you want to delete user '{name}'? This will soft-delete the user (data is retained but the account becomes unusable)."
-    }
+    },
+    "deleteFailed": "Failed to delete the user. Please try again."
   },
   "skills": {
     "title": "Skill Library",
@@ -1593,5 +1866,806 @@
     },
     "clearFilters": "Clear all filters",
     "backToFirstPage": "Back to page 1"
+  },
+  "memory": {
+    "title": "Memory",
+    "description": "What this platform remembers: claims an agent nominated and the engine formed. Read-only — memories are written by agents through the API.",
+    "filterAll": "All",
+    "project": {
+      "label": "Memory project",
+      "aria": "Select a memory project",
+      "loading": "Loading projects…",
+      "emptyTitle": "No memory projects yet",
+      "emptyDesc": "Bind a topic, board or doc space you can read — that is all it takes to create one.",
+      "errorTitle": "Failed to load memory projects",
+      "retry": "Retry",
+      "metadataOnlyBadge": "no content access",
+      "metadataOnlyHint": "You can read this project's ledger metadata, but not the content of its memories.",
+      "create": "New project",
+      "createTitle": "Create a memory project",
+      "createDesc": "A binding is also this project's permission source — bind a topic, board or doc space you can read.",
+      "form": {
+        "name": "Project name",
+        "namePlaceholder": "e.g. Chamber main",
+        "nameRequired": "Give this project a name.",
+        "slug": "Project slug",
+        "slugHint": "Starts with a lowercase letter or digit; only lowercase letters, digits and . _ - afterwards.",
+        "slugRequired": "A slug is required.",
+        "slugInvalid": "The slug must start with a lowercase letter or digit and contain only lowercase letters, digits and . _ -",
+        "slugIrreversible": "This slug is registered as a workspace on the engine side and cannot be unregistered later.",
+        "engine": "Engine",
+        "engineHument": "Connect an engine (semantic search; needs Hub registration)",
+        "engineNone": "No engine (local ledger only; search unavailable)",
+        "provisioningAuto": "Leave blank to auto-register on the Hub — nothing to fill in.",
+        "provisioningUnavailable": "Needs the engine binding info from your operator.",
+        "provisioningTimeNote": "The first registration on this Hub can take around 30 seconds.",
+        "advancedSummary": "Specify the engine binding manually (advanced) | only when reusing an existing Hub workspace",
+        "engineWorkspaceId": "Engine workspace id",
+        "engineActorId": "Engine actor id",
+        "engineCredentialRef": "Credential reference name",
+        "engineCredentialRefHint": "This is a reference NAME, not the secret itself (the secret is resolved on the engine side).",
+        "credentialLooksReal": "This looks like a real secret (sk_/apikey_ prefix) — enter the reference name instead.",
+        "engineTripleRequired": "Auto-registration is unavailable right now: all three engine fields are required — fill them in, or choose \"No engine\".",
+        "engineTriplePartial": "The three engine binding fields must be all filled or all blank — a partial fill cannot be created.",
+        "bindingType": "Resource type",
+        "bindingTypeTopic": "Topic",
+        "bindingTypeBoard": "Board",
+        "bindingTypeDocSpace": "Doc space",
+        "bindingSelected": "{count}/{max} bindings selected",
+        "bindingAdd": "Add",
+        "bindingRemove": "Remove {type} binding {name}",
+        "bindingDuplicate": "This resource is already in the list.",
+        "bindingEmpty": "Bind at least one resource.",
+        "bindingMaxReached": "Up to {max} bindings.",
+        "bindingTarget": "Binding target",
+        "targetPlaceholder": "Select…",
+        "targetLoading": "Loading…",
+        "targetEmpty": "You have no topic / board / doc space you can bind.",
+        "targetEmptyHint": "A binding is also this project's permission source — only resources you can read can be bound.",
+        "targetError": "Failed to load the candidates.",
+        "targetRetry": "Retry",
+        "targetCapNote": "Only the first 100 candidates are listed (known limitation).",
+        "targetRequired": "Choose a binding target.",
+        "cancel": "Cancel",
+        "submit": "Create",
+        "submitting": "Creating…",
+        "submittingProvisioning": "Registering with the engine…"
+      },
+      "createError": {
+        "slugTaken": "That slug is already taken — pick another one.",
+        "targetForbidden": "You do not have read access to this resource.",
+        "engineField": "The engine binding is incomplete: fill all three fields, or leave all three blank to auto-register.",
+        "provisionUnavailable": "Auto-registration is temporarily unavailable (the Hub was never reached) and nothing was saved — keep the slug and project name as they are and try again.",
+        "provisionTimeout": "Registering with the Hub timed out and it may already have landed. Keep the slug and project name unchanged and try again (the Hub replays it by idempotency key).",
+        "provisionConflict": "The Hub refused the registration with a conflict: this slug may already exist in a different shape. Pick another slug, or fill in the existing engine binding explicitly in the advanced section.",
+        "provisionFailed": "Registration failed on the Hub side. Fill in the engine binding explicitly in the advanced section to bypass auto-registration, or fix the reported cause and retry.",
+        "generic": "Creating the project failed."
+      },
+      "created": "Memory project created",
+      "refreshFailedAfterCreate": "The project was created, but refreshing the project list failed — reload the page and select it manually."
+    },
+    "hub": {
+      "label": "Engine",
+      "ok": "Engine connected",
+      "degraded": "Engine unavailable"
+    },
+    "engine": {
+      "reason": {
+        "notConfigured": "This deployment has no memory engine configured. Memory is optional: the ledger below still works, only search needs the engine.",
+        "projectUnbound": "This project has no engine bound. Its ledger still works; an admin has to bind an engine before search can run.",
+        "engineUnavailable": "The memory engine is temporarily unavailable. The ledger below still works; try search again later."
+      },
+      "runtimeNote": "The last search hit the engine while it was unavailable — search stays disabled until it answers again.",
+      "cost": "Semantic search spends engine quota."
+    },
+    "tabs": {
+      "aria": "Memory ledger views",
+      "committed": "Remembered",
+      "nominations": "Nominations",
+      "inactive": "Retired"
+    },
+    "formationState": {
+      "submitted": "Pending",
+      "committed": "Formed",
+      "no_memory": "Nothing to remember",
+      "rejected": "Rejected",
+      "failed": "Failed",
+      "unknown": "Unknown",
+      "conflict": "Conflict"
+    },
+    "status": {
+      "active": "In effect",
+      "superseded": "Corrected",
+      "withdrawn": "Withdrawn",
+      "hint": {
+        "active": "This is the claim currently in effect.",
+        "superseded": "A correction replaced this claim — it is kept for the record.",
+        "withdrawn": "This correction was withdrawn and never became an in-effect claim."
+      }
+    },
+    "card": {
+      "excerptEmpty": "No excerpt was stored for this entry.",
+      "sourceCount": "{count, plural, one {# source} other {# sources}}",
+      "metadataOnly": "Metadata only",
+      "deferred": "Forming later",
+      "recordedAt": "Nominated {time}",
+      "authorship": "No sources (self-authored)"
+    },
+    "nominator": {
+      "label": "Nominator",
+      "system": "System",
+      "deletedHint": "This nominator's account has been deleted — the name is kept from their profile.",
+      "orphanHint": "This nominator's profile can no longer be resolved — showing the first 8 characters of the id.",
+      "type": {
+        "human": "Human",
+        "agent": "Agent",
+        "system": "System"
+      }
+    },
+    "search": {
+      "placeholder": "Ask what it remembers…",
+      "modeAria": "Search mode",
+      "mode": {
+        "semantic": "Semantic",
+        "literal": "Literal"
+      },
+      "semanticNote": "Asks the engine — up to {max} results, and every run spends engine quota.",
+      "literalNote": "Matches text across the {count} entries already loaded here — instant, and spends no quota.",
+      "submit": "Search",
+      "searching": "Searching…",
+      "clear": "Back to the ledger",
+      "restoredHint": "A previous query was restored into the box. Press Search to run it again — opening a shared link never spends quota on its own.",
+      "errorTitle": "The search failed",
+      "retry": "Try again",
+      "forbidden": "You can read this project's ledger metadata, but not the content of its memories — semantic search needs content access.",
+      "literalEmpty": "Nothing in the loaded entries matches “{query}”.",
+      "maxItemsNote": "At most {max} results",
+      "relevance": "Relevance {score}",
+      "orderNote": "Ranking and scores come from the engine: the number is a lexical-matching weight for this one search only (not comparable across searches or projects), and it is not a confidence score — a higher number does not mean more likely to be true.",
+      "trustNote": "This is what the engine associates by meaning, not a conclusion. The body is a snapshot from when it was formed, and its sources may have changed since.",
+      "recallId": "Recall {id}",
+      "filteredByPermission": "Some entries were withheld because their sources are not visible to you.",
+      "engineDataSuspect": "The engine returned entries this project cannot map to a ledger row — treat them with caution.",
+      "resultCount": "{count} results",
+      "debug": {
+        "summary": "Raw trust envelope",
+        "trustLevel": "trustLevel",
+        "decisionAuthority": "decisionAuthority",
+        "usageNote": "usageNote"
+      },
+      "empty": {
+        "noMatches": "The engine found nothing for that wording. Try asking it differently — or this project may not remember anything about it yet.",
+        "allFiltered": "The engine did find matches, but every one of them was filtered out because you lack access to its sources. Request access to those sources to see them."
+      },
+      "staleResults": "This refresh did not go through — the results below are from the previous run and may be out of date."
+    },
+    "empty": {
+      "committedTitle": "It has not remembered anything yet",
+      "committedDesc": "Memories are formed by the engine after an agent nominates a claim.",
+      "committedRoadmap": "There are {count} nominations still in flight — open the Nominations tab to follow them.",
+      "committedRoadmapLink": "Open nominations",
+      "nominationsTitle": "No nominations to show",
+      "nominationsDesc": "Nominations land here while the engine is still working on them, or when a run failed and needs another look.",
+      "inactiveTitle": "Nothing has been retired",
+      "inactiveDesc": "Entries move here once a correction replaces them, or when a correction attempt is withdrawn."
+    },
+    "listError": "Failed to load the memory ledger",
+    "retry": "Retry",
+    "tabError": "This tab failed to load: {message}",
+    "pagination": "Page {page} / {totalPages} · {total} total",
+    "paginationPrev": "Previous page",
+    "paginationNext": "Next page",
+    "truncated": "Showing the newest {shown} · {total} in total",
+    "degraded": {
+      "pageBanner": "You can see this project's ledger metadata, but not the content of its memories. Everything below is the metadata projection — ask for content access to read claims, excerpts and sources.",
+      "rowLocked": "Content hidden",
+      "rowLockedHint": "This entry's sources are no longer visible to you, so its body was withheld.",
+      "compactCategory": "Category",
+      "compactState": "State",
+      "compactTime": "Time"
+    },
+    "recovery": {
+      "label": "Next step",
+      "sameKeyResend": "Still in flight — it can be resumed with the same idempotency key.",
+      "inspectBackfill": "Backfilled from a read-only inspection of the engine.",
+      "hubManualRequired": "The engine rejected this, or its outcome is unknown — an operator has to step in.",
+      "configInvalid": "This project's engine binding or credentials are invalid; retrying will not help.",
+      "paramInvalid": "The request parameters were rejected — resubmit with a new idempotency key.",
+      "unknown": "No next step was recorded for this row.",
+      "copyLedgerId": "Copy ledger id",
+      "copied": "Ledger id copied"
+    },
+    "nomination": {
+      "ledgerId": "Ledger id",
+      "reviewAt": "Review at",
+      "reviewDue": "Review due",
+      "createdAt": "Created",
+      "updatedAt": "Updated"
+    },
+    "detail": {
+      "back": "Back to memory",
+      "notFound": "This ledger row is not visible",
+      "notFoundDesc": "It may have been removed, or it may belong to a project you cannot read.",
+      "notFoundBack": "Back to memory",
+      "errorTitle": "Failed to load this ledger row",
+      "retry": "Retry",
+      "metadataOnlyTitle": "Metadata only",
+      "metadataOnlyDesc": "You can see this ledger row's metadata, but not its content. Content access to this project is required to read the claim, its rationale and its sources.",
+      "metadataOnlyBack": "Back to the ledger",
+      "metadataOnlyHint": "Row {id}",
+      "content": "Content",
+      "noContent": "No content was stored for this row.",
+      "subject": "Subject",
+      "scope": "Scope",
+      "effectiveNote": "Effective / revocation note",
+      "none": "—",
+      "sources": "Sources",
+      "sourcesEmpty": "No sources — this claim was authored, not sourced.",
+      "sourceHeading": "Source {index}",
+      "sourceMoved": "changed since this memory was formed",
+      "sourceReadTool": "Re-read with {tool}",
+      "noEngineMemory": "An engine memory appears only after a correction or a nomination has been formed — this row does not have one yet.",
+      "noEngineMemoryMetadata": "This row is a metadata-only projection — its engine projection needs the same content read access, so it is hidden too.",
+      "engineViewUnavailable": "This memory's engine projection is not readable right now."
+    },
+    "timeline": {
+      "title": "Correction chain",
+      "loading": "Loading the chain…",
+      "unavailable": "The correction chain could not be loaded — the row above is still shown as fetched.",
+      "retry": "Reload the chain",
+      "chainIncomplete": "This chain may be incomplete — the project has more than {cap} pages of ledger rows.",
+      "current": "In effect",
+      "backToCurrent": "Back to the current version",
+      "selectVersion": "Show this version",
+      "metadataNode": "metadata only",
+      "outsideChain": "This row is not part of the chain view shown below.",
+      "withdrawnTitle": "Attempts that did not land",
+      "withdrawnHint": "Withdrawn corrections stay visible for the audit trail, but they never became an in-effect claim.",
+      "nodeAria": "Version {index} of {total}: {label}"
+    },
+    "usage": {
+      "open": "Usage",
+      "openTitle": "Open this project's recorded model usage"
+    },
+    "graph": {
+      "title": "Memory graph",
+      "description": "Nodes and relations as the engine sees them. The graph only shows engine-side memories — ledger rows that have no engine memory yet do not appear here.",
+      "back": "Back to the memory ledger",
+      "open": "Graph",
+      "openTitle": "See this project's memories as a graph (needs an ≥xl viewport)",
+      "openNarrow": "needs an ≥xl viewport",
+      "narrowTitle": "Not enough width for the graph",
+      "narrowDesc": "The memory graph needs an ≥xl viewport (this version has no narrow-screen graph). Open a wider window, or go back to the ledger.",
+      "loading": "Loading the graph…",
+      "errorTitle": "The graph could not be loaded",
+      "retry": "Retry",
+      "unavailableTitle": "This project's graph is not readable",
+      "unavailableDesc": "Reading it needs content read access to this project, or the engine memories are currently all invisible.",
+      "skipCanvas": "Skip the graph",
+      "canvas": {
+        "noNodesTitle": "No engine memories yet",
+        "noNodesDesc": "This project has no engine memories yet. Memories are formed by the engine after an agent nominates them.",
+        "noEdgesNote": "Edges come from corrections (supersedes) or engine relations; having no edge is normal.",
+        "orphanGroup": "Unconnected ({count})",
+        "hint": "Scroll to zoom · drag to pan · click a node for details",
+        "fit": "Fit to view",
+        "zoomIn": "Zoom in",
+        "zoomOut": "Zoom out",
+        "reset": "Reset view",
+        "loadMore": "Load more",
+        "loadingMore": "Loading…",
+        "roleStatus": "Showing {nodes, plural, one {# node} other {# nodes}} / {edges, plural, one {# edge} other {# edges}}{truncated}",
+        "roleStatusTruncated": ", truncated"
+      },
+      "legend": {
+        "title": "Relation types",
+        "collapse": "Collapse legend",
+        "expand": "Expand legend",
+        "arrowNote": "Arrow points to the superseded version"
+      },
+      "filters": {
+        "label": "Filter",
+        "kind": "Kind",
+        "kindAll": "All kinds",
+        "status": "Status",
+        "statusAll": "All statuses",
+        "relation": "Relation",
+        "relationAll": "All relations"
+      },
+      "governance": {
+        "summary": "Showing {nodes, plural, one {# node} other {# nodes}} · {edges, plural, one {# edge} other {# edges}}",
+        "hiddenNodes": " · {count, plural, one {# node hidden} other {# nodes hidden}} because a source is not visible",
+        "omittedEdges": " · {count, plural, one {# edge} other {# edges}} omitted",
+        "toggle": "Details",
+        "omittedDetail": "Omitted edges cover two cases: one endpoint still sits on a page that has not been loaded (loading more may fill it in), and endpoints that fall on different pages — browse only returns edges whose two endpoints are on the same page, so those will never be filled in by loading more. No edge on the graph does not mean no relation in the engine.",
+        "scopeNote": "The graph only shows engine-side memories; ledger rows that have no engine memory yet do not appear.",
+        "permissionNote": "Hidden nodes have two possible causes: the source's read permission is missing (ask the source's owner), or the source has been deleted (check the ledger). The engine's count does not separate them, so both are possible.",
+        "suspectNote": "The engine returned nodes that this project cannot map — treat them with care.",
+        "truncatedNote": "The engine truncated this page, so the graph may be incomplete.",
+        "partialNote": "The engine returned only part of the data, so the graph may be incomplete."
+      },
+      "status": {
+        "resetStale": "The engine's data changed; the first page has been reloaded.",
+        "resetOther": "The engine returned an error ({code}); the first page has been reloaded — you can retry later.",
+        "cleared": "The selection was cleared.",
+        "outOfView": "{count, plural, one {# new node is} other {# new nodes are}} outside the view — use \"Fit to view\" at the bottom right to see them all."
+      },
+      "node": {
+        "aria": "Memory node {index} of {total}: {label}, {kind}, {status}",
+        "contradictions": "{count, plural, one {# contradiction} other {# contradictions}}",
+        "supersessions": "{count, plural, one {# supersession} other {# supersessions}}"
+      },
+      "drawer": {
+        "title": "Node details",
+        "close": "Close",
+        "openDetail": "Open full details",
+        "noLedger": "This engine memory has no matching ledger row, so its details cannot be opened.",
+        "kind": "Kind",
+        "status": "Status",
+        "scope": "Scope",
+        "resolution": "Resolution",
+        "anchor": "Source anchor",
+        "boundary": "Boundary",
+        "confidence": "Confidence",
+        "confidencePresent": "present (the graph does not show the value)",
+        "confidenceAbsent": "absent",
+        "preview": "Preview",
+        "relations": "Relations",
+        "relationsEmpty": "This memory has no loaded relation edges.",
+        "relationsPartial": "Relations may be incomplete (the engine returned only part of the data).",
+        "yes": "Yes",
+        "no": "No",
+        "resolutionValue": "current {active} · available {available}"
+      },
+      "kind": {
+        "observation": "observation",
+        "episode": "episode",
+        "concept": "concept",
+        "belief": "belief",
+        "procedure": "procedure"
+      },
+      "statusLabel": {
+        "active": "in effect",
+        "superseded": "superseded",
+        "archived": "archived"
+      },
+      "relation": {
+        "derived_from": "derived from",
+        "supports": "supports",
+        "contradicts": "contradicts",
+        "supersedes": "supersedes",
+        "part_of": "part of"
+      },
+      "anchor": {
+        "fresh": "verifiable",
+        "stale": "source changed",
+        "unknown": "not checked",
+        "failed": "check failed",
+        "none": "no anchor"
+      },
+      "scope": {
+        "actorPrivate": "This project only",
+        "workspaceShared": "Workspace shared",
+        "ownerShared": "Owner shared"
+      }
+    },
+    "resolution": {
+      "title": "Resolution ladder",
+      "subtitle": "This memory's state at each level",
+      "legend": "R0 is what formation produces by default; higher levels need an engine promotion — an empty slot is not lost data.",
+      "active": "default view",
+      "historicalCount": "{count, plural, one {# older version} other {# older versions}}",
+      "openCurrent": "Read the {resolution} body",
+      "openHistorical": "See older {resolution} versions",
+      "openDisabled": "This level has no content yet, so it cannot be opened.",
+      "historyJump": "See older {resolution} versions in version history ({count})",
+      "mappedCount": "This ledger row maps to {count} engine memories; the first one is shown here.",
+      "label": {
+        "R0": "Label / locator",
+        "R1": "Gist",
+        "R2": "Overview",
+        "R3": "Working model",
+        "R4": "Deep memory"
+      },
+      "state": {
+        "current": "has content",
+        "historical": "older versions only",
+        "missing": "engine-side data is incomplete — hand to ops",
+        "beyond": "not promoted yet"
+      }
+    },
+    "representations": {
+      "title": "Version history",
+      "subtitle": "Older versions of this memory at one resolution",
+      "loading": "Loading older versions…",
+      "retry": "Retry",
+      "expand": "Show older versions",
+      "collapse": "Hide older versions",
+      "resolutionLabel": "Resolution",
+      "emptyTitle": "No older versions",
+      "emptyDesc": "Older versions appear only when the same memory is re-formed at the same resolution. A correction does not produce one — it is a supersedes chain across memories (see the correction chain block below).",
+      "entryAria": "Older version {index} of {total}: {createdAt}",
+      "previewTruncated": "preview truncated",
+      "bytes": "{bytes, plural, one {# byte} other {# bytes}} original",
+      "dialog": {
+        "titleCurrent": "Current body ({resolution})",
+        "titleHistorical": "Historical version · {createdAt}",
+        "close": "Close",
+        "loading": "Loading the body…",
+        "unavailable": "This memory's engine projection is not readable right now.",
+        "errorOther": "The body could not be loaded.",
+        "retry": "Retry",
+        "bodyTruncated": "The engine truncated this body ({bytes} bytes original)."
+      }
+    }
+  },
+  "usage": {
+    "title": "Usage",
+    "description": "Platform API/MCP call statistics and the model work recorded by a project's Hument engine identity. These are two separate ledgers — they are never summed together.",
+    "platformDescription": "Platform API and MCP call statistics.",
+    "tabs": {
+      "aria": "Usage views",
+      "platform": "Platform API / MCP",
+      "hument": "Hument model usage"
+    },
+    "state": {
+      "loading": "Loading…",
+      "retry": "Retry",
+      "unknown": "Unknown",
+      "unknownHint": "Unknown value — not zero",
+      "debug": "Machine details",
+      "debugStatus": "HTTP status",
+      "debugCode": "Error code",
+      "debugReason": "Reason",
+      "debugEngineCode": "Engine code",
+      "debugHintCode": "Hint code",
+      "debugRequestId": "Request id",
+      "retryAfter": "Rate limited: wait {seconds}s before retrying.",
+      "retryWait": "Retry in {seconds}s"
+    },
+    "platform": {
+      "adminOnlyTitle": "Platform usage is admin-only",
+      "adminOnlyDesc": "This view aggregates platform-wide API/MCP call statistics. Ask an admin if you need access.",
+      "filters": {
+        "groupBy": "Aggregate by",
+        "metric": "Tool metric",
+        "range": "Window",
+        "actorType": "Actor type",
+        "limit": "Top N",
+        "refresh": "Refresh",
+        "jumpNow": "Jump to now"
+      },
+      "groupBy": {
+        "tool": "MCP tool",
+        "route": "REST route",
+        "actor": "Caller"
+      },
+      "metric": {
+        "invocations": "Invocations",
+        "rest_calls": "Fan-out REST calls"
+      },
+      "actorType": {
+        "all": "All identities",
+        "agent": "Agents",
+        "human": "Humans",
+        "system": "System (MCP fallback auth)",
+        "anonymous": "Anonymous"
+      },
+      "range": {
+        "7": "Last 7 days",
+        "28": "Last 28 days",
+        "90": "Last 90 days",
+        "custom": "Custom window"
+      },
+      "table": {
+        "caption": "Top-N {groupBy} usage in the selected window",
+        "key": {
+          "tool": "Tool",
+          "route": "Route",
+          "actor": "Caller"
+        },
+        "calls": "Calls",
+        "actors": "Distinct actors",
+        "avg": "Avg ms",
+        "errorRate": "Error rate",
+        "type": "Actor type",
+        "details": "Details",
+        "expand": "Expand {key}",
+        "max": "Max ms",
+        "actorName": "Actor name",
+        "actorType": "Actor type",
+        "anonymous": "Anonymous",
+        "deletedActor": "Deleted actor",
+        "groupKey": "Raw key",
+        "actorTypeValue": {
+          "agent": "Agent",
+          "human": "Human",
+          "system": "System (MCP fallback auth)",
+          "anonymous": "Anonymous"
+        }
+      },
+      "note": {
+        "window": "Window {from} → {to} (UTC, end exclusive).",
+        "coverage": "Data starts {start} · {days} day(s) covered.",
+        "noTableData": "No usage data exists in this deployment yet.",
+        "coverageWarn": "Less than 28 days of data — do not read short-window differences as a trend.",
+        "topN": "Top {limit} only — this is not a full total and must not be summed.",
+        "noSum": "Top-N rows are ranked keys, not a complete partition; totals are intentionally not shown.",
+        "mixedUnits": "Caller rows mix invocation rows and fan-out REST rows (different units). Use them for activity ranking only.",
+        "coverageUnknown": "Data starts {start} · coverage is unknown.",
+        "coverageUnknownWarn": "Coverage is unknown — the “less than 28 days” warning cannot be ruled out.",
+        "ledgerScope": "These are platform API/MCP call counts — a separate ledger from model usage and cost totals.",
+        "raw": "Raw ISO values"
+      },
+      "empty": {
+        "noTableDataTitle": "No usage data at all",
+        "noTableDataDesc": "The usage table is empty — no API/MCP call has been recorded in this deployment yet.",
+        "windowTitle": "No calls in this window",
+        "windowDesc": "The table has data, but none in the selected window. Widen the window.",
+        "filteredTitle": "No calls match this filter",
+        "filteredDesc": "The window has data, but the actor-type filter excludes all of it. Clear the filter to see the window."
+      },
+      "error": {
+        "title": "Failed to load platform usage"
+      },
+      "stale": "Refresh failed — showing the previous result."
+    },
+    "hument": {
+      "project": {
+        "label": "Memory project",
+        "aria": "Select a memory project",
+        "search": "Search this page",
+        "searchPlaceholder": "Name or slug",
+        "searchHint": "Search filters the 100 projects loaded on this page; use pagination for the rest.",
+        "prev": "Previous project page",
+        "next": "Next project page",
+        "page": "Page {page} / {total}",
+        "outsidePage": "Selected project (not on this page)",
+        "disabledUsage": "usage disabled — needs all bindings readable or admin",
+        "noEngine": "no engine bound",
+        "unavailable": "engine unavailable",
+        "emptyTitle": "No memory projects",
+        "emptyDesc": "Usage is per memory project. Create or join one first.",
+        "listErrorTitle": "Failed to load memory projects",
+        "notFoundTitle": "Project not found",
+        "notFoundDesc": "This project does not exist, is soft-deleted, or is not visible to you.",
+        "loading": "Loading projects…",
+        "browseAll": "Browse all projects",
+        "selectTitle": "Select a memory project",
+        "selectDesc": "Pick a project above to read its recorded Hument usage.",
+        "emptyAction": "Go to Memory",
+        "filteredOut": "Selected project (filtered out by search)"
+      },
+      "filters": {
+        "operation": "Operation",
+        "provider": "Provider operation",
+        "model": "Model",
+        "modelHint": "The model filter is an exact match on the requested OR resolved model. It is sent only when you apply the filters.",
+        "limit": "Trace page size",
+        "time": "Window (UTC)",
+        "preset7": "Last 7 days",
+        "preset28": "Last 28 days",
+        "preset90": "Last 90 days",
+        "from": "Since",
+        "to": "Until",
+        "apply": "Apply filters",
+        "reset": "Reset",
+        "windowHint": "Absolute UTC [since, until). Maximum {max} days; both ends are required.",
+        "windowError": {
+          "sinceRequired": "A start time is required.",
+          "untilRequired": "An end time is required.",
+          "invalid": "Both times must be valid timestamps.",
+          "order": "The end time must be after the start time.",
+          "span": "The window must not exceed 90 days."
+        },
+        "advanced": "Advanced filters",
+        "advancedActive": "Advanced filters ({count})"
+      },
+      "permission": {
+        "title": "Usage is closed for this project",
+        "desc": "Usage is a project-level engine aggregate and cannot be filtered per source. It requires admin or read access on ALL of this project's bindings. Ask a binding owner to grant the remaining access, or ask an admin."
+      },
+      "shared": {
+        "title": "Usage is disabled for this project",
+        "desc": "The engine identity is shared with another memory project, or its permanent ownership claim is missing / owned elsewhere. No engine call was made. An operator must audit the identity claim; self-service release is unavailable."
+      },
+      "engine": {
+        "projectUnboundTitle": "This project has no engine",
+        "projectUnboundDesc": "Recorded model usage comes from the project's current Hument engine identity. Bind an engine before usage can be read.",
+        "notConfiguredTitle": "No memory engine on this deployment",
+        "notConfiguredDesc": "This deployment has no memory engine configured, so there is no engine usage to read.",
+        "engineUnavailableTitle": "The memory engine is unavailable",
+        "engineUnavailableDesc": "The engine cannot be reached right now. Usage will be readable again once it answers; no numbers are shown to avoid guessing."
+      },
+      "summary": {
+        "stale": "Refresh failed — showing the last successful snapshot ({asOf}). Retry for a fresh one.",
+        "asOf": "As of {asOf}",
+        "window": "Window {since} → {until} (UTC, end exclusive).",
+        "totalsNote": "Totals cover the full matching set; trace page size does not change them.",
+        "target": "Engine identity: workspace {workspace} · actor {actor} · scope {scope}",
+        "caveat": "Model work recorded for the current binding/actor — not the project total or a complete bill. Unknown is not zero.",
+        "details": "Identity and raw window details",
+        "ledgerScope": "Hument engine usage ledger — not platform API/MCP calls."
+      },
+      "cards": {
+        "logicalCalls": "Logical calls",
+        "evidenceRows": "{count} evidence row(s)",
+        "totalTokens": "Total tokens",
+        "tokensUnknown": "{unknown} row(s) unknown · {known} known tokens",
+        "tokensKnown": "{known} known tokens",
+        "physicalCalls": "Physical calls",
+        "physicalUnknown": "{unknown} unit(s) unknown · {known} known calls",
+        "physicalKnown": "{known} known calls",
+        "cost": "Cost (micros)",
+        "actualCost": "Actual",
+        "estimatedCost": "Estimated",
+        "currencyNote": "Micros are the raw unit recorded by the engine (one millionth of its cost unit). Currency is not declared; no conversion or USD assumption.",
+        "duration": "Physical duration: {physical} ms · known {known} ms · {unknown} unknown row(s)",
+        "unknown": "unknown",
+        "estimatedCoverage": "{unknown} row(s) unknown · {known} known micros",
+        "nonAddable": "Actual and estimated are separate measures — do not add them together."
+      },
+      "coverage": {
+        "label": "Coverage",
+        "status": "Status {status}",
+        "scope": "Scope {scope}",
+        "excluded": "{count} untimed row(s) excluded",
+        "excludedHint": "Rows without a physical start time are excluded from a time-windowed total. This is not zero usage.",
+        "sources": "Sources",
+        "noSources": "No coverage sources were reported.",
+        "statusValue": {
+          "complete": "complete",
+          "partial": "partial",
+          "unknown": "unknown"
+        },
+        "scopeValue": {
+          "actor_private": "current identity only"
+        }
+      },
+      "groups": {
+        "title": "Groups",
+        "description": "Top {shown} of {total} group(s) by operation, provider operation and model",
+        "caption": "Usage by operation, provider operation and model",
+        "operation": "Operation",
+        "providerModel": "Provider op / model",
+        "basis": "Model basis",
+        "logicalCalls": "Logical calls",
+        "tokens": "Tokens",
+        "estimated": "Est. micros",
+        "details": "Details",
+        "expand": "Expand group {operation}",
+        "empty": "No groups match this window and filter.",
+        "collapse": "Show top 10",
+        "unknownModel": "(model not reported)",
+        "basisValue": {
+          "requested": "requested",
+          "resolved": "resolved",
+          "unknown": "unknown"
+        },
+        "showMore": "Show {count} more"
+      },
+      "detail": {
+        "evidenceRows": "Evidence rows",
+        "generations": "Generations",
+        "batches": "Batches",
+        "physicalCalls": "Physical calls",
+        "knownPhysical": "Known physical",
+        "unknownPhysical": "Unknown units",
+        "retries": "Retries",
+        "http429": "HTTP 429",
+        "cacheReuses": "Cache reuses",
+        "replayCount": "Replay count",
+        "knownInputTokens": "Known input tokens",
+        "knownOutputTokens": "Known output tokens",
+        "knownTotalTokens": "Known total tokens",
+        "actualCost": "Actual micros",
+        "estimatedCost": "Estimated micros",
+        "costStatus": "Cost status",
+        "duration": "Physical ms",
+        "unknownInputRows": "Unknown input-token rows",
+        "unknownOutputRows": "Unknown output-token rows",
+        "unknownTotalRows": "Unknown total-token rows",
+        "unknownEstimatedRows": "Unknown estimated rows",
+        "costStatusValue": {
+          "known": "known",
+          "partial": "partial",
+          "unknown": "unknown"
+        },
+        "nonAddable": "Actual and estimated are separate — do not add them."
+      },
+      "trace": {
+        "title": "Trace",
+        "description": "Lazy-loaded recorded usage rows for the same absolute window as the summary.",
+        "loaded": "Loaded {loaded} of {total} total rows",
+        "resetting": "The data snapshot changed — reloading the first page while keeping the rows below.",
+        "firstError": "Failed to load the trace",
+        "emptyTitle": "No trace rows",
+        "emptyDesc": "No usage rows match this window and filter.",
+        "loadMore": "Load more",
+        "loadingMore": "Loading…",
+        "end": "All matching rows are loaded.",
+        "loadMoreError": "This page failed to load — the rows below are kept.",
+        "retryLoadMore": "Retry this page",
+        "resetExhausted": "The cursor was invalidated again after a reset",
+        "resetExhaustedHint": "Stopped to avoid a loop. Apply the filters again (or widen the window) to restart from page 1.",
+        "collapse": "Hide trace",
+        "open": "Load trace",
+        "caption": "Recorded usage rows for the current window",
+        "stale": "Refresh failed — showing the previously loaded rows.",
+        "columns": {
+          "time": "Time",
+          "operation": "Operation",
+          "provider": "Provider op",
+          "model": "Model",
+          "tokens": "Tokens",
+          "elapsed": "Elapsed ms",
+          "cost": "Est. micros"
+        },
+        "expand": "Expand trace row {id}",
+        "detail": {
+          "id": "Row id",
+          "evidenceKind": "Evidence kind",
+          "source": "Source",
+          "usageSource": "Usage source",
+          "tokenBasis": "Token basis",
+          "modelBasis": "Model basis",
+          "requestedModel": "Requested model",
+          "resolvedModel": "Resolved model",
+          "inputTokens": "Input tokens",
+          "outputTokens": "Output tokens",
+          "actualCost": "Actual micros",
+          "costStatus": "Cost status",
+          "physicalUnknown": "Physical calls unknown",
+          "cacheReuses": "Cache reuses",
+          "requestBytes": "Request bytes",
+          "responseBytes": "Response bytes",
+          "responseComplete": "Response complete",
+          "httpStatus": "HTTP status",
+          "state": "State",
+          "invocationId": "Invocation id",
+          "logicalCallId": "Logical call id",
+          "generationId": "Generation id",
+          "requestDigest": "Request digest",
+          "yes": "Yes",
+          "no": "No",
+          "startedAt": "Started at (raw)",
+          "finishedAt": "Finished at (raw)"
+        },
+        "restartFirstPage": "Reload from page 1",
+        "disabledBlocked": "Trace is closed while the summary is blocked by permissions, sharing, version or identity errors.",
+        "disabledEmpty": "Trace is disabled because the summary already shows this window/filter has no rows.",
+        "limit": "Trace page size"
+      },
+      "empty": {
+        "filterTitle": "No rows match this filter",
+        "filterDesc": "The window has data, but the operation / provider operation / model filter excludes every row.",
+        "allExcludedTitle": "Every row was excluded for having no time",
+        "allExcludedDesc": "All matching evidence rows lack a physical start time, so a time-windowed total cannot include them. This is coverage debt, not zero usage.",
+        "windowTitle": "No usage in this window",
+        "windowDesc": "The engine recorded nothing for this project's current identity in the selected window."
+      },
+      "error": {
+        "versionTitle": "The engine does not support usage yet",
+        "versionDesc": "Upgrade the Hub to a version with the usage routes (alpha.19 or a contract-fix build). Retrying will not help.",
+        "dataTitle": "The engine's data cannot be read",
+        "dataDesc": "The Hub's existing ledger or receipts could not be interpreted (schema incompatible / conflicting evidence). This is a data issue, not a version issue. An operator must inspect the Hub data; do not retry blindly.",
+        "identityTitle": "The engine identity is not authorized",
+        "identityDesc": "The project's current binding is missing, ambiguous, or lacks inspect_read. Fix the project identity / binding grant; retrying and upgrading will not help.",
+        "unreachableTitle": "The memory engine is unreachable",
+        "unreachableDesc": "The request never reached the engine. Check the project endpoint and retry later.",
+        "rateLimitedTitle": "Usage is rate limited",
+        "rateLimitedDesc": "Wait for the Retry-After window, then retry the same request.",
+        "timeoutTitle": "The memory engine timed out",
+        "timeoutDesc": "The request may still be running on the engine. Retry later; do not assume it failed.",
+        "networkTitle": "Network error",
+        "networkDesc": "The browser could not reach the platform. Check your connection and retry.",
+        "notFoundTitle": "Project not found",
+        "notFoundDesc": "This project does not exist, is soft-deleted, or is not visible to you.",
+        "unauthorizedTitle": "Sign-in required",
+        "unauthorizedDesc": "Your session is no longer valid. Sign in again.",
+        "genericTitle": "Usage could not be loaded",
+        "genericDesc": "The request failed. Retry; if it keeps failing, check the machine details."
+      }
+    }
   }
 }

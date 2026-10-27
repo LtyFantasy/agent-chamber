@@ -10,9 +10,13 @@
  *   - patch_doc MATCH 模式字节一致性（2026-08-17）：oldString 匹配面 = full=true 保真全文，
  *     read_doc 全文与每节 markdown 均为其字节级保真片段（BYTE-IDENTITY）——从默认 web
  *     渲染（去首标题）或降级本地渲染（续 chunk 幻影标题）复制 oldString 必 0 命中
+ *   - 手写缩进 0 命中（2026-10-04）：match 全链路字节精确、服务端从不 trim——LLM 手写/
+ *     凭记忆重建的行首缩进与全文真实字节不符是 0 命中 404 最常见原因；锚点一律从
+ *     read_doc / full=true 输出逐字复制（同族通道 patch_task_description 同此契约）
  *   - Hument 事故（topic msg 6dbc4da3）：stale position fail-open → fail-closed
  *     （2026-08-16）：双模式改造（section / match 互斥），section 模式劝退缺省、
- *     引导 expectedSectionHash（取数通道 = read_doc positions:[n] 的 sectionHash）
+ *     引导 expectedSectionHash（取数通道 = read_doc positions:[n] 的 sectionHash，
+ *     v1.93.0 批 2 起 outline 的 sections[].sectionHash 同口径可用——两者同源派生）
  *
  * [铁律关联] #9(代理层透传) #11(注释强制)
  *
@@ -120,14 +124,18 @@ export const patchDocTool: CustomTool = {
       'empty content deletes the section. ⚠️ FAIL-CLOSED: positions DRIFT after any re-chunk ' +
       '(structural edits re-number sections) and a stale position otherwise writes the WRONG ' +
       'block SILENTLY. Always pass expectedSectionHash — copy it from read_doc positions:[n] ' +
-      '(each item carries sectionHash): mismatch → 409 DOC_CONTENT_CONFLICT instead of a ' +
+      '(each item carries sectionHash) or from the outline sections (maxFullTokens=0), same ' +
+      'derived value in both: mismatch → 409 DOC_CONTENT_CONFLICT instead of a ' +
       'silent wrong-block write; re-read the outline and retry on 409. ' +
       'MATCH MODE (oldString + newString): replace an exact substring in the document ' +
       'full content. oldString is matched against the full=true faithful content ' +
       '(== GET /docs/:id/content?full=true). BYTE-IDENTITY: read_doc full text and every ' +
       'section markdown are byte-faithful fragments of this same text — copy any of them ' +
       'verbatim as oldString and it matches (NOT the default web rendering, which drops ' +
-      'the first title heading). 0 matches → 404 (re-read first); ' +
+      'the first title heading). Byte-EXACT: the comparison is byte-precise, leading ' +
+      'whitespace/indentation included (the server never trims) — do NOT hand-type the ' +
+      'anchor; LLM-built indentation is unreliable and fails with 0 matches, so always ' +
+      'copy it verbatim from read_doc / full=true output. 0 matches → 404 (re-read first); ' +
       'multiple matches → 409 + matchCount (expand oldString with more surrounding context ' +
       'and retry); exactly 1 match → replaced. ' +
       'Both modes: concurrent modification between your read and the write is detected ' +
@@ -177,6 +185,9 @@ export const patchDocTool: CustomTool = {
             'content (== GET /docs/:id/content?full=true). read_doc output is byte-faithful ' +
             'to this text: the full text equals it exactly and each section markdown is an ' +
             'exact substring — both are valid oldString sources (copy verbatim). ' +
+            'Byte-EXACT including leading whitespace/indentation — do NOT hand-type the ' +
+            'anchor: LLM-built indentation is unreliable and fails with 0 matches, so always ' +
+            'copy it verbatim from read_doc / full=true output. ' +
             '0 matches → 404; multiple matches → 409 + matchCount (expand context and retry). ' +
             'Must be paired with newString; mutually exclusive with position/content.',
         },

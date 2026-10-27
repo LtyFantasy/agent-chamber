@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §8.5（/docs 板块编辑/新建约定）
+ *   - 主文档: docs/frontend/frontend-architecture.md §8.5（/docs 板块编辑/新建约定）
  *   - 补充: docs/api-definition.md §16（upsert 语义：未传字段保留、contentHash no-op、source 隔离）
  *
  * [踩坑索引]

@@ -6,11 +6,20 @@
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
  *   - 补充: plan §4.1-§4.3 (W2 空间/分类/成员 API)
 
- * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误) B52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create补齐)
+ * [踩坑索引] B4(jsonb脏数据防御) B5(互斥参数=格式错误) B52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create补齐) V1(空间词表业务校验)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #11(注释) #21(双层校验) #22(findOne必须判空)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   V1: 空间词表三键（settings.docTypes/canonicalTags/pathTypes，v1.92.0-dev）业务校验
+ *      在 service 层（DTO 只保证格式/长度/数组上限）——重名与冲突是语义错误，抛 422
+ *      DOC_SPACE_VOCABULARY_INVALID 带 data.conflicts 冲突对；**校验先于 save**（422 零写入）。
+ *      易漏点：canonical 值 ci 唯一 + alias 跨条目冲突是两套独立检查；同条目内 alias == 自身
+ *      canonical 不算错。**声明侧一律 trim 后落库**（docTypes 项/value/aliases/pathPrefix/docType，
+ *      与匹配侧对齐），trim 后为空 → kind:'empty_value'；conflict kind 取值 = duplicate /
+ *      duplicate_canonical / alias_conflict / alias_canonical_conflict / duplicate_prefix /
+ *      empty_value，且带 index/conflictingIndex 供自修正。改校验规则时同步改
+ *      docs/api-definition.md §16.4 与 e2e 词表矩阵。
  *   A2.5b: 拦截只针对"新增引用"——uninviteAgent/removeEditor 回退
  *       resourceValidator.exists（软删 agent 的 agents 行永在，移除=清理动作必须可用，
  *       否则已删成员行永远无法清理）；create invitedAgentIds 补齐 assertActorUsable
@@ -42,9 +51,11 @@
  */
 import {
   Injectable,
+  Logger,
   NotFoundException,
   ConflictException,
   BadRequestException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, IsNull } from 'typeorm';
@@ -89,10 +100,29 @@ import type {
   DocCategoryOverviewCatalog,
   DocRouteNav,
   DocSpaceOverviewFilter,
+  DocSpaceCanonicalTag,
+  DocSpaceHintToggles,
+  DocSpacePathType,
+  DocCategoryWriteResult,
+  DocHint,
+  DocHintFamily,
   DocSpaceOverviewAppliedFilters,
   RepoManifest,
   PaginatedResponse,
 } from '@agent-chamber/shared';
+import { DOC_HINT_FAMILIES } from '@agent-chamber/shared';
+import { parseHintToggles } from './doc-vocabulary.helper';
+import {
+  buildCategoryNearDupHint,
+  buildDocsOverviewRoutesTruncatedHint,
+  buildDocsOverviewTruncatedHint,
+  DOC_HINT_PROFILE,
+  type HintCandidate,
+} from './doc-hints.helper';
+import { loadCategoryPool } from './doc-hint-pools';
+// hint 基建（阶段一抽核到 modules/hints/）：去重窗口 + 信封接线
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
 import { DocOverviewQueryDto } from './dto';
 import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
@@ -385,7 +415,12 @@ export class DocSpaceService {
     private readonly eventService: EventService,
     private readonly actorProfileService: ActorProfileService,
     private readonly auditService: AuditService,
+    // hint 去重窗口（2 期，v1.92.0-dev）：内存 TTL Map 的 Nest provider（A5）
+    private readonly hintDedup: HintDedupService,
   ) {}
+
+  /** NestJS 内置 Logger（hint 埋点落行归属本 service 日志源） */
+  private readonly logger = new Logger(DocSpaceService.name);
 
   // ─── Actor helpers ──────────────────────────────────────────
 
@@ -754,6 +789,10 @@ export class DocSpaceService {
       topicId?: string | null;
       boardId?: string | null;
       overviewFilter?: DocSpaceOverviewFilter | null;
+      docTypes?: string[] | null;
+      canonicalTags?: DocSpaceCanonicalTag[] | null;
+      pathTypes?: DocSpacePathType[] | null;
+      hintToggles?: DocSpaceHintToggles | null;
     },
   ): Promise<DocSpace> {
     const space = await this.findById(id);
@@ -798,7 +837,311 @@ export class DocSpaceService {
       space.settings = settings;
     }
 
+    // 空间词表三键（v1.92.0-dev，DocSpace 元数据治理 1 期）：与 overviewFilter 同款
+    // 「字段出现即采用 / 显式 null 删键 / 未传保留」语义。校验 + trim 归一在写入前执行
+    // ——422 时零写入（铁律 #21：DTO 管格式，service 管业务一致性）；落库用**归一后**
+    // 形态（trim 后，与匹配侧对齐，见 validateVocabulary）。
+    if (
+      dto.docTypes !== undefined ||
+      dto.canonicalTags !== undefined ||
+      dto.pathTypes !== undefined
+    ) {
+      const normalized = this.validateVocabulary(dto);
+      const settings = { ...space.settings };
+      for (const key of ['docTypes', 'canonicalTags', 'pathTypes'] as const) {
+        const value = dto[key];
+        if (value === undefined) continue;
+        if (value === null) {
+          delete settings[key];
+          continue;
+        }
+        settings[key] = normalized[key];
+      }
+      space.settings = settings;
+    }
+
+    // hint 族开关（settings.hintToggles，2 期 v1.92.0-dev）：与词表三键同款
+    // 「字段出现即采用 / 显式 null 删键 / 未传保留」语义；**校验先于写入**（422 零写入）。
+    // 校验在 service 层而非 DTO：未知族键/非 boolean 是**配置语义错误**（422 + 修复凭据），
+    // 不是格式错误（400）——拼错的族名静默忽略会让「开关看起来开了却没生效」。
+    if (dto.hintToggles !== undefined) {
+      const settings = { ...space.settings };
+      if (dto.hintToggles === null) {
+        delete settings.hintToggles;
+      } else {
+        settings.hintToggles = this.validateHintToggles(dto.hintToggles);
+      }
+      space.settings = settings;
+    }
+
     return this.spaceRepo.save(space);
+  }
+
+  /**
+   * hint 族开关业务校验 + 归一（2 期，v1.92.0-dev；铁律 #21 双层校验）。
+   *
+   * DTO 层只保证「是个对象」（`@IsObject`，格式层）；本方法负责**配置语义**：
+   * - **未知族键 → 422**（`DOC_HINT_FAMILIES` 白名单外的一切键：拼错的族名/未来族名——
+   *   fail-fast，同部署同版本无前向兼容问题）；
+   * - **非 boolean 值 → 422**（`"true"` 这类字符串真值化猜测会让闸门语义分叉）；
+   * - 通过后按白名单归一（只留合法键，值为原 boolean）——空对象 = 全关。
+   *
+   * @param raw DTO 传入的原始对象（unknown——jsonb 与 DTO 双入口）
+   * @returns 归一后的族开关（仅合法键）
+   * @throws UnprocessableEntityException DOC_SPACE_HINT_TOGGLES_INVALID（带修复凭据）
+   */
+  private validateHintToggles(raw: unknown): DocSpaceHintToggles {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new UnprocessableEntityException({
+        message: 'settings.hintToggles must be an object mapping family names to booleans',
+        code: ErrorCode.DOC_SPACE_HINT_TOGGLES_INVALID,
+        data: { invalidKeys: [], unknownKeys: [] },
+      });
+    }
+
+    const source = raw as Record<string, unknown>;
+    const allowed = new Set<string>(DOC_HINT_FAMILIES);
+    const unknownKeys: string[] = [];
+    const invalidKeys: string[] = [];
+    const normalized: DocSpaceHintToggles = {};
+
+    for (const [key, value] of Object.entries(source)) {
+      if (!allowed.has(key)) {
+        unknownKeys.push(key);
+        continue;
+      }
+      if (typeof value !== 'boolean') {
+        invalidKeys.push(key);
+        continue;
+      }
+      normalized[key as DocHintFamily] = value;
+    }
+
+    if (unknownKeys.length > 0 || invalidKeys.length > 0) {
+      throw new UnprocessableEntityException({
+        message: `settings.hintToggles validation failed: ${unknownKeys.length + invalidKeys.length} invalid key(s)`,
+        code: ErrorCode.DOC_SPACE_HINT_TOGGLES_INVALID,
+        data: {
+          unknownKeys,
+          invalidKeys,
+          allowedFamilies: [...DOC_HINT_FAMILIES],
+        },
+      });
+    }
+
+    return normalized;
+  }
+
+  /**
+   * 空间词表业务校验 + 归一（v1.92.0-dev，DocSpace 元数据治理 1 期；铁律 #21 双层校验）
+   *
+   * DTO 层已保证格式（类型/长度/数组上限/元素非空串），本方法负责**业务一致性**与
+   * **声明侧归一**，并把归一后的形态交给调用方落库：
+   * - **trim 归一**（code-review F4）：docTypes 项 / canonicalTags 的 value 与 aliases /
+   *   pathTypes 的 pathPrefix 与 docType 一律 trim 后**存储 trim 形态**——与匹配侧
+   *   `resolveTags`（`raw.trim()`）及读侧 `docTypeKeys` 对齐，避免「声明带空白 →
+   *   永远匹配不上」的静默失配；trim 后为空 → 422（声明了一个实质为空的词）；
+   * - 重名与冲突是语义错误而非格式错误，抛 422 `DOC_SPACE_VOCABULARY_INVALID` 并带
+   *   `conflicts` 冲突对凭据（含 index/conflictingIndex 供 agent 精确定位自修正，
+   *   非裸 500）。
+   *
+   * 规则（大小写不敏感；CJK 无大小写不受影响）：
+   * - `docTypes`：同值重复 → 冲突；
+   * - `canonicalTags`：canonical 值重复 → 冲突；alias 命中**其他** canonical 或
+   *   **其他条目**的 alias → 冲突；同条目内 alias 与自身 canonical 重复 → 剔除不算错
+   *   （归一时本就等价）；
+   * - `pathTypes`：pathPrefix **精确**重复 → 冲突（路径区分大小写，POSIX 语义）；
+   *   **不**校验 docType ∈ docTypes（避免字段更新顺序耦合，词表是 advisory 不是闸门）。
+   *
+   * @returns 三键的 trim 后形态（仅包含 dto 中**非 null** 出现的键；null = 删键，
+   *   由调用方处理，不进本返回值）
+   */
+  private validateVocabulary(dto: {
+    docTypes?: string[] | null;
+    canonicalTags?: DocSpaceCanonicalTag[] | null;
+    pathTypes?: DocSpacePathType[] | null;
+  }): {
+    docTypes?: string[];
+    canonicalTags?: DocSpaceCanonicalTag[];
+    pathTypes?: DocSpacePathType[];
+  } {
+    const conflicts: Array<Record<string, unknown>> = [];
+    const normalized: {
+      docTypes?: string[];
+      canonicalTags?: DocSpaceCanonicalTag[];
+      pathTypes?: DocSpacePathType[];
+    } = {};
+
+    // ── docTypes：trim → 空值 422 → ci 去重 ──
+    if (dto.docTypes) {
+      const seen = new Map<string, string>();
+      const values: string[] = [];
+      dto.docTypes.forEach((raw, index) => {
+        const value = raw.trim();
+        if (value === '') {
+          conflicts.push({ field: 'docTypes', kind: 'empty_value', value: raw, index });
+          return;
+        }
+        const key = value.toLowerCase();
+        if (seen.has(key)) {
+          conflicts.push({
+            field: 'docTypes',
+            kind: 'duplicate',
+            value,
+            conflictsWith: seen.get(key),
+            index,
+          });
+          return;
+        }
+        seen.set(key, value);
+        values.push(value);
+      });
+      normalized.docTypes = values;
+    }
+
+    // ── canonicalTags：trim → canonical 唯一 + alias 跨条目冲突检测 ──
+    if (dto.canonicalTags) {
+      const canonicalByKey = new Map<string, string>();
+      /** trim 后的条目 + 其**原始下标**（冲突凭据里的 index 必须指向调用方入参位置） */
+      const entries: Array<{ entry: DocSpaceCanonicalTag; index: number }> = [];
+
+      dto.canonicalTags.forEach((rawEntry, index) => {
+        const value = rawEntry.value.trim();
+        if (value === '') {
+          conflicts.push({
+            field: 'canonicalTags',
+            kind: 'empty_value',
+            value: rawEntry.value,
+            index,
+          });
+          return;
+        }
+
+        const aliases: string[] = [];
+        (rawEntry.aliases ?? []).forEach((rawAlias, aliasIndex) => {
+          const alias = rawAlias.trim();
+          if (alias === '') {
+            conflicts.push({
+              field: 'canonicalTags',
+              kind: 'empty_value',
+              value: rawAlias,
+              index,
+              aliasIndex,
+            });
+            return;
+          }
+          aliases.push(alias);
+        });
+
+        const key = value.toLowerCase();
+        if (canonicalByKey.has(key)) {
+          conflicts.push({
+            field: 'canonicalTags',
+            kind: 'duplicate_canonical',
+            value,
+            conflictsWith: canonicalByKey.get(key),
+            index,
+          });
+        } else {
+          canonicalByKey.set(key, value);
+        }
+        entries.push({ entry: { value, aliases }, index });
+      });
+
+      const aliasOwner = new Map<string, { owner: string; alias: string; index: number }>();
+      for (const { entry, index } of entries) {
+        const ownKey = entry.value.toLowerCase();
+        const seenInEntry = new Set<string>();
+        for (const alias of entry.aliases ?? []) {
+          const aliasKey = alias.toLowerCase();
+          // 同条目内 alias 与自身 canonical 重复 → 剔除不算错
+          if (aliasKey === ownKey) continue;
+          // 同条目内重复 alias → 归一时去重，不算错
+          if (seenInEntry.has(aliasKey)) continue;
+          seenInEntry.add(aliasKey);
+
+          // 命中其他条目的 canonical → 冲突
+          const otherCanonical = canonicalByKey.get(aliasKey);
+          if (otherCanonical !== undefined) {
+            conflicts.push({
+              field: 'canonicalTags',
+              kind: 'alias_canonical_conflict',
+              value: alias,
+              conflictsWith: otherCanonical,
+              index,
+            });
+            continue;
+          }
+
+          // 命中其他条目的 alias → 冲突
+          const prev = aliasOwner.get(aliasKey);
+          if (prev && prev.owner.toLowerCase() !== ownKey) {
+            conflicts.push({
+              field: 'canonicalTags',
+              kind: 'alias_conflict',
+              value: alias,
+              conflictsWith: prev.alias,
+              index,
+              conflictingIndex: prev.index,
+              otherOwner: prev.owner,
+              owner: entry.value,
+            });
+          } else if (!prev) {
+            aliasOwner.set(aliasKey, { owner: entry.value, alias, index });
+          }
+        }
+      }
+
+      normalized.canonicalTags = entries.map(({ entry }) => entry);
+    }
+
+    // ── pathTypes：trim → pathPrefix 精确重复 ──
+    if (dto.pathTypes) {
+      const seen = new Map<string, { docType: string; index: number }>();
+      const values: DocSpacePathType[] = [];
+      dto.pathTypes.forEach((pt, index) => {
+        const pathPrefix = pt.pathPrefix.trim();
+        const docType = pt.docType.trim();
+        if (pathPrefix === '' || docType === '') {
+          conflicts.push({
+            field: 'pathTypes',
+            kind: 'empty_value',
+            value: pathPrefix === '' ? pt.pathPrefix : pt.docType,
+            index,
+          });
+          return;
+        }
+        const prev = seen.get(pathPrefix);
+        if (prev) {
+          // code-review F6：冲突对带**可自修正信息**（双方下标 + 双方 docType）——
+          // 仅给重复字符串无法判断该改哪一条
+          conflicts.push({
+            field: 'pathTypes',
+            kind: 'duplicate_prefix',
+            value: pathPrefix,
+            conflictsWith: pathPrefix,
+            index,
+            conflictingIndex: prev.index,
+            docType,
+            conflictingDocType: prev.docType,
+          });
+          return;
+        }
+        seen.set(pathPrefix, { docType, index });
+        values.push({ pathPrefix, docType });
+      });
+      normalized.pathTypes = values;
+    }
+
+    if (conflicts.length > 0) {
+      throw new UnprocessableEntityException({
+        message: `Space vocabulary validation failed: ${conflicts.length} conflict(s) found`,
+        code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+        data: { conflicts },
+      });
+    }
+
+    return normalized;
   }
 
   /**
@@ -1119,7 +1462,7 @@ export class DocSpaceService {
     spaceId: string,
     dto: { name: string; slug?: string; description?: string; sortOrder?: number },
     operatorActorId?: string,
-  ): Promise<DocCategory> {
+  ): Promise<DocCategoryWriteResult> {
     const space = await this.findById(spaceId);
 
     const baseSlug = dto.slug || slugify(dto.name);
@@ -1143,7 +1486,45 @@ export class DocSpaceService {
       newData: { categoryId: saved.id, spaceId: space.id, name: saved.name },
       source: 'api',
     });
-    return saved;
+
+    // hint（2 期，v1.92.0-dev）：category_near_dup——新建分类与空间既有分类 trigram 近义
+    // （**只出候选不判同**，自动建行为不变）。族关 → 零查询零 hints。
+    const hints = await this.buildCreateCategoryHints(space, saved, operatorActorId);
+    return { ...saved, ...(hints ? { hints } : {}) };
+  }
+
+  /**
+   * 组装 createCategory 的 hint（2 期，v1.92.0-dev）。
+   *
+   * 唯一 code = `category_near_dup`（suggestion）：候选池 = 空间既有分类（**排除刚建的
+   * 这条**，否则自己和自己比）。族闸门 = `settings.hintToggles.categories === true`
+   * ——族关时零查询。
+   *
+   * @returns ≤3 条 DocHint；族关 / 无近义候选 → undefined
+   */
+  private async buildCreateCategoryHints(
+    space: DocSpace,
+    saved: DocCategory,
+    operatorActorId?: string,
+  ): Promise<DocHint[] | undefined> {
+    const toggles = parseHintToggles(space.settings?.hintToggles);
+    if (toggles?.categories !== true) return undefined;
+
+    const pool = await loadCategoryPool(this.categoryRepo, space.id, saved.id);
+    const candidate = buildCategoryNearDupHint(saved.name, pool, saved.id);
+    if (!candidate) return undefined;
+
+    return emitHints(
+      this.logger,
+      this.hintDedup,
+      [candidate],
+      {
+        surface: 'category_write',
+        spaceId: space.id,
+        actorId: operatorActorId ?? 'system',
+      },
+      { profile: DOC_HINT_PROFILE },
+    );
   }
 
   /**
@@ -1190,12 +1571,32 @@ export class DocSpaceService {
   /**
    * Delete a category.
    * Does NOT delete docs — sets their categoryId to null (uncategorized) in the same transaction.
+   *
+   * ⚠️ **锁序纪律（评审 M2）**：事务内**先 `SELECT ... FOR UPDATE` 锁目标 category 行**，
+   * 再 bulk UPDATE docs，最后软删 category 行。此前是「先改 docs 再软删 category」——
+   * 与 `DocRenameService.mergeCategory` 的 categories→docs 顺序相反，同分类并发
+   * merge/remove 存在死锁窗（40P01）。锁序约定单源见
+   * `doc-rename.service.ts` 的 [关键不变量]（space → categories → docs）。语义不变：
+   * docs 仍置 null、category 仍软删，仅加锁顺序对齐。
    */
   async removeCategory(id: string): Promise<void> {
     await this.findCategoryById(id);
 
     await this.categoryRepo.manager.transaction(async (manager) => {
-      // Set doc.categoryId to null for docs in this category
+      // ① 先锁 category 行（锁序第一步；与 mergeCategory 的 categories→docs 同序）。
+      //    `.withDeleted()` 对齐 doc-rename.service 的 lockCategoryRows 形态——锁序不变量
+      //    必须覆盖**含软删行**（并发 merge 刚软删同一行时，不带 withDeleted 会跳过该行，
+      //    锁就白加了）。行若已被并发删/软删，锁定结果为 null —— 后续 UPDATE 影响 0 行，
+      //    语义与既有「findCategoryById 通过后被并发删」一致（不额外抛错）
+      await manager
+        .getRepository(DocCategory)
+        .createQueryBuilder('dc')
+        .withDeleted()
+        .setLock('pessimistic_write')
+        .where('dc.id = :id', { id })
+        .getOne();
+
+      // ② Set doc.categoryId to null for docs in this category
       await manager
         .createQueryBuilder()
         .update('Doc')
@@ -1205,7 +1606,7 @@ export class DocSpaceService {
         .andWhere('deleted_at IS NULL')
         .execute();
 
-      // Soft-delete the category
+      // ③ Soft-delete the category
       await manager
         .createQueryBuilder()
         .update('DocCategory')
@@ -1254,6 +1655,7 @@ export class DocSpaceService {
   async getOverview(
     spaceId: string,
     query?: DocOverviewQueryDto,
+    actorId?: string,
   ): Promise<DocSpaceOverview | DocSpaceOverviewSlim | DocSpaceOverviewCatalog> {
     const space = await this.findById(spaceId);
 
@@ -1451,6 +1853,42 @@ export class DocSpaceService {
     const docsReturned =
       categoryOverviews.reduce((sum, c) => sum + c.docs.length, 0) + uncategorized.length;
 
+    // ── 截断续读 hint（阶段三决策 9 + routes 段补口）：**教学定位**，不是每次提醒 ──
+    // 两个截断段**触发条件互相独立**，合并进同一次 emitHints（同一产出面 / 同一份去重
+    // 窗口 / 同一 ≤3 槽位语义；拆成两次调用会让两条码看不见对方的占位，槽位语义漂移）：
+    // ① docs 段：被 maxTokens 截断 **且调用方未显式传 maxTokens**（参数**存在性**判断，
+    //    且用**原始 query** 而不是合并后的生效值——后者含空间级 `settings.overviewFilter`，
+    //    拿它判定会把「空间默认导致的截断」误算成「调用方自己选的预算」，反过来静默吞掉
+    //    教学）。catalog 模式豁免截断（`skipTruncation`）⇒ `truncated` 恒 false ⇒ 天然不触发。
+    // ② routes 段：内嵌条数被 `OVERVIEW_ROUTES_LIMIT` 防爆闸截断（与预算/投影无关）⇒
+    //    catalog 模式下照常触发（判据 = `routesTruncated === true`；`includeRoutes=false`
+    //    时该标记为 undefined ⇒ 不触发）。
+    const candidates: HintCandidate[] = [];
+    if (truncated && query?.maxTokens === undefined) {
+      candidates.push(buildDocsOverviewTruncatedHint(space.id, docsReturned, docsTotal));
+    }
+    if (routesTruncated === true && routes && routesTotal !== undefined) {
+      // 截断态 ⇒ routes / routesTotal 必已装配（同一 `if (includeRoutes)` 块内），
+      // 这里的窄化守卫是 TS 形状收窄，不是第二重业务判定
+      candidates.push(buildDocsOverviewRoutesTruncatedHint(space.id, routes.length, routesTotal));
+    }
+    let hints: DocHint[] | undefined;
+    if (candidates.length > 0) {
+      hints = emitHints(
+        this.logger,
+        this.hintDedup,
+        candidates,
+        {
+          surface: 'docs_overview',
+          spaceId: space.id,
+          // 身份形状单源 = controller 透传的 actor.id；未认证路径归 'system'
+          // （**必须透传**：否则去重键退化成全局 'system'，一个 actor 看过就把所有人压掉）
+          actorId: actorId ?? 'system',
+        },
+        { profile: DOC_HINT_PROFILE },
+      );
+    }
+
     return {
       spaceId: space.id,
       spaceName: space.name,
@@ -1474,6 +1912,8 @@ export class DocSpaceService {
       ...(Object.keys(filters.appliedFilters).length > 0
         ? { appliedFilters: filters.appliedFilters }
         : {}),
+      // 截断续读 hint（缺省不落键——信封不变量：禁空数组）
+      ...(hints ? { hints } : {}),
       // 条目形状由投影模式（catalog/slim/缺省全字段）决定且同一响应内一致
       // （categories/uncategorized 同为同一种投影），内部以联合类型装配避免双分支重复代码，
       // 此处收窄到联合返回类型

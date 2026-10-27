@@ -1,5 +1,5 @@
 /**
- * 逐类型 payload 校验测试（docs/roundtable-design.md §4：上行/下行消息表）
+ * 逐类型 payload 校验测试（docs/modules/roundtable-design.md §4：上行/下行消息表）
  */
 import { validatePayload } from './messages';
 import { buildEnvelope, validateEnvelope } from './envelope';

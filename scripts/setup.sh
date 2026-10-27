@@ -173,7 +173,7 @@ unset TYPESAFE_KEY KEY_SOURCE PROVIDER_IN_ENV
 # ${APK_MIRROR:-}/${NPM_REGISTRY:-} 插值拾取）。用户显式设置（shell env 或 .env
 # 已有非空值）时绝不覆盖；官方源通畅则保持默认零注入。
 # 背景：2026-08-28 v1.69.0 从零冒烟实测官方源 1-73KB/s 反复超时挂死，
-# aliyun apk 2.5MB/s / npmmirror 可用（详见线上 docs/oss-dual-repo.md §9.3）
+# aliyun apk 2.5MB/s / npmmirror 可用（详见线上 docs/integrations/oss-dual-repo.md §9.3）
 mirror_probe() { # mirror_probe URL → 0=通畅(≥100KiB/s) 1=不可达或过慢
   local speed
   speed="$(curl -sfL -o /dev/null -m 10 -w '%{speed_download}' "$1" 2>/dev/null)" || return 1

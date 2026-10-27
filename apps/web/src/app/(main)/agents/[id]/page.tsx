@@ -5,6 +5,8 @@ import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -39,23 +41,26 @@ export default function AgentDetailPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('agents.detail');
+  const tRead = useTranslations('common');
   const locale = useLocale();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tGlobal = useTranslations() as any;
 
-  const { data: agent, isLoading: agentLoading } = useQuery({
+  const agentQuery = useQuery({
     queryKey: ['agents', 'detail', id],
     queryFn: () => Api.agents.getById(id),
     enabled: !!id,
   });
+  const { data: agent, isLoading: agentLoading } = agentQuery;
 
-  const { data: stats, isLoading: statsLoading } = useQuery({
+  const statsQuery = useQuery({
     queryKey: ['agents', 'stats', id],
     queryFn: () => Api.agents.getStats(id),
     enabled: !!id,
   });
+  const { data: stats } = statsQuery;
 
-  const isLoading = agentLoading || statsLoading;
+  const isLoading = agentLoading;
 
   if (isLoading) {
     return (
@@ -65,7 +70,7 @@ export default function AgentDetailPage() {
     );
   }
 
-  if (!agent) {
+  if (!agent && httpStatusOf(agentQuery.error) === 404) {
     return (
       <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
@@ -75,6 +80,19 @@ export default function AgentDetailPage() {
       </div>
     );
   }
+
+  if (!agent)
+    return (
+      <QueryFeedback
+        compact={agentQuery.data !== undefined}
+        message={errorMessageOf(
+          agentQuery.error,
+          tRead(agentQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void agentQuery.refetch()}
+        busy={agentQuery.isFetching}
+      />
+    );
 
   const statusLabel =
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -113,6 +131,17 @@ export default function AgentDetailPage() {
 
   return (
     <div className="space-y-6">
+      {agentQuery.isError && (
+        <QueryFeedback
+          compact={agentQuery.data !== undefined}
+          message={errorMessageOf(
+            agentQuery.error,
+            tRead(agentQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void agentQuery.refetch()}
+          busy={agentQuery.isFetching}
+        />
+      )}
       {/* Header */}
       <div className="flex items-start gap-4">
         <Link href="/agents">
@@ -136,25 +165,37 @@ export default function AgentDetailPage() {
         </div>
       </div>
 
+      {statsQuery.isError && (
+        <QueryFeedback
+          compact={statsQuery.data !== undefined}
+          message={errorMessageOf(
+            statsQuery.error,
+            tRead(statsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void statsQuery.refetch()}
+          busy={statsQuery.isFetching}
+        />
+      )}
       {/* Stats Cards */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {statCards.map((card) => (
-          <Card key={card.title}>
-            <CardContent className="p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-medium text-muted-foreground">{card.title}</p>
-                  <p className="text-2xl font-bold mt-1">{card.value}</p>
+      {stats !== undefined && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {statCards.map((card) => (
+            <Card key={card.title}>
+              <CardContent className="p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">{card.title}</p>
+                    <p className="text-2xl font-bold mt-1">{card.value}</p>
+                  </div>
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+                    <card.icon className="h-5 w-5 text-primary" />
+                  </div>
                 </div>
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
-                  <card.icon className="h-5 w-5 text-primary" />
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
       <div className="grid gap-6 lg:grid-cols-3">
         {/* Description */}
         <div className="lg:col-span-2">
@@ -182,7 +223,11 @@ export default function AgentDetailPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {dailyActivity.length === 0 ? (
+              {stats === undefined ? (
+                statsQuery.isLoading ? (
+                  <Loading />
+                ) : null
+              ) : dailyActivity.length === 0 ? (
                 <p className="text-sm text-muted-foreground">{t('noActivity')}</p>
               ) : (
                 <div className="space-y-3">

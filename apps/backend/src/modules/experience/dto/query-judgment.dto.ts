@@ -4,9 +4,11 @@
  * =============================================================================
  * [功能概念]
  *   - 经验库判断日志查询请求 DTO（`GET /experiences/judgments`，第二期 plan §4）
+ *   - 判定补跑请求 DTO（`POST /experiences/judgments/backfill`）：单批条数 `limit`
  *
  * [代码职责]
  *   - operation / status / experienceId / from / to 时间窗 / page / pageSize 的格式校验
+ *   - 补跑单批条数 `limit`（缺省 20 / 上限 100）的格式校验
  *
  * [权威文档]
  *   - 主文档: .kimi/plans/plan-experience-base-p2.md §2.2（端点参数表）/§4（导出姿势）
@@ -26,8 +28,10 @@
  *
  * [关联代码]
  *   - experience-judgment.service.ts listJudgments() — 过滤谓词与全序分页的构造点
+ *   - experience.service.ts backfillJudgments() — 补跑编排（`limit` 的消费点，含缺省值）
  *   - experience.controller.ts — 端点声明（字面量路由须在 `:id` 之前）
  *   - packages/shared/src/dto/experience-response.dto.ts — ExperienceJudgmentLog（响应形状）
+ *     / ExperienceJudgmentsBackfillResponse（补跑响应形状）
  *
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
@@ -45,6 +49,8 @@ import {
   type ExperienceJudgmentStatus,
 } from '@agent-chamber/shared';
 import {
+  EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT,
+  EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT,
   EXPERIENCE_JUDGMENT_DEFAULT_PAGE_SIZE,
   EXPERIENCE_JUDGMENT_MAX_PAGE_SIZE,
 } from '../experience.constants';
@@ -125,4 +131,34 @@ export class QueryJudgmentDto {
     default: EXPERIENCE_JUDGMENT_DEFAULT_PAGE_SIZE,
   })
   pageSize?: number;
+}
+
+/**
+ * 判定补跑参数（`POST /experiences/judgments/backfill`，人类 admin 专属）。
+ *
+ * `limit` = 单批条数（缺省 20，上限 100）。**上限是墙钟契约不是数量契约**：补跑是严格
+ * 串行的（单条 ≤8s 判定 + 每条一次全表 trgm），100 条的最坏墙钟 ≈13 分钟。
+ *
+ * ⚠️ **`@Type(() => Number)` 不可省**：全局 ValidationPipe 未开 `enableImplicitConversion`
+ * （main.ts 只开 whitelist/forbidNonWhitelisted/transform），而 query 串来的值恒是
+ * `string`——缺了它 `?limit=50` 会被 `@IsInt` 判成 400（本仓先例 = 同文件 page/pageSize）。
+ */
+export class BackfillJudgmentsDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT)
+  @ApiPropertyOptional({
+    description:
+      'How many entries to backfill in this batch (default ' +
+      `${EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT}, max ` +
+      `${EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT}). **This is a QUERY parameter, not a body ` +
+      'field** — the route is a POST, but the JSON body is not read, so a limit sent in the body ' +
+      'is silently ignored and the default applies. The upper bound is a WALL-CLOCK contract, ' +
+      'not just a count: judgments run strictly serially (up to 8s each plus one full-table ' +
+      'similarity scan per entry), so a max batch is ≈13 minutes worst case.',
+    default: EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT,
+  })
+  limit?: number;
 }

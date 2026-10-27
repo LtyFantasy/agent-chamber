@@ -10,7 +10,7 @@
  *   - 终审取值（verified / suspect）与**必填理由**的格式校验
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` §7（终审纪律）/§11（威胁模型 + 退役决策记录）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` §7（终审纪律）/§11（威胁模型 + 退役决策记录）
  *     与 `docs/api-definition.md` — 经验库章（13004 动作表）
  *   - 历史: .kimi/plans/plan-experience-base-p2.md §2（成员与终审守卫）/§7（密钥/权限文案面）
  *     ——其中「禁自审四态」已于 2026-09-24 退役（v1.81.0）

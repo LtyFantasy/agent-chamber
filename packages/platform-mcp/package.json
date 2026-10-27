@@ -7,9 +7,10 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "lint": "eslint \"src/**/*.ts\" --fix --max-warnings 100",
+    "lint": "eslint \"src/**/*.ts\" --max-warnings 100",
     "test": "jest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:fix": "eslint \"src/**/*.ts\" --fix --max-warnings 100"
   },
   "dependencies": {
     "@agent-chamber/automcp": "workspace:*",

@@ -16,7 +16,7 @@
  *     /§4（MCP 工具契约）
  *   - 补充: apps/backend/src/modules/experience/experience.controller.ts — REST 真值
  *     （守卫布局 / 错误码语义 / 各字段约束的唯一裁判）
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` + `docs/api-definition.md` 经验库章后，
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` + `docs/api-definition.md` 经验库章后，
  *     权威文档指针应改为该线上文档（含 doc_routes 条目）；本文件暂以 plan 为准
  *
  * [关键不变量]

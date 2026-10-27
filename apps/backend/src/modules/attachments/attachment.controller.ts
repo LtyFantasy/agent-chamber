@@ -101,6 +101,7 @@ import {
 import { encodeFilenameStar, buildThumbnailFilename } from './filename-sanitize';
 import { CurrentActor } from '../../common/decorators/current-actor.decorator';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+import { AgentScope } from '../../common/decorators/agent-scope.decorator';
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
 import { UnifiedActor } from '../../common/types/actor.types';
 
@@ -389,6 +390,9 @@ export class AttachmentController {
     description: 'Attachment not found / access denied (12000), or thumbnail unavailable (12008)',
   })
   @ApiResponse({ status: 429, description: 'Mint rate limit exceeded' })
+  // scope 豁免（清单单源 = config/agent-scope-exemptions.ts，机器强制 = 同名 spec）：
+  // mint 内部含独立读授权，授出的恰是调用方已有读权限；理由（含已接受的时间窗）见清单条目。
+  @AgentScope('read')
   async mintSignedUrl(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentActor() actor: UnifiedActor,

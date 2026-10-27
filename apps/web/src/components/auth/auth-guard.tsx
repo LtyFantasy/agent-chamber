@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/stores/auth.store';
+import { buildLoginRedirect } from '@/lib/login-redirect';
 import { Loading } from '@/components/ui/loading';
 
 export function AuthGuard({ children }: { children: React.ReactNode }) {
@@ -21,7 +22,10 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (isReady && !isAuthenticated && !accessToken) {
-      router.push('/login');
+      // 带上当前地址（含 hash，与消费侧放行的 #anchor 对称）：深链如通知里的
+      // /tasks/xxx#comment-2 登录后可回跳（与 api.ts 401 分支同款构造）
+      const { pathname, search, hash } = window.location;
+      router.push(buildLoginRedirect(pathname, search, hash));
     }
   }, [isReady, isAuthenticated, accessToken, router]);
 

@@ -536,7 +536,9 @@ describe('ImportBundleDialog 请求失败与关闭守卫', () => {
   });
 
   it('请求失败 → error 态保留 bundle 与勾选状态，重试重发同一 bundle', async () => {
-    mockImport.mockRejectedValueOnce({ response: { data: { message: 'server boom' } } });
+    mockImport.mockRejectedValueOnce({
+      response: { status: 422, data: { code: 10016, message: 'server boom' } },
+    });
     const { container } = renderDialog({ spaceDocCount: 1 });
     await pickBundle(container, bundleFixture);
     fireEvent.click(screen.getByRole('button', { name: 'Confirm import' }));
@@ -610,3 +612,23 @@ describe('ImportBundleDialog 请求失败与关闭守卫', () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });
+
+it.each([
+  new Error('Network Error'),
+  { response: { status: 500, data: { code: 500, message: 'internal SQL stack' } } },
+])(
+  'transport or server failures use the import fallback while keeping a retryable bundle',
+  async (error) => {
+    jest.clearAllMocks();
+    mockListDocs.mockResolvedValue(paginated([{ path: 'a.md' }]));
+    mockImport.mockRejectedValueOnce(error);
+    const { container } = renderDialog({ spaceDocCount: 1 });
+    await pickBundle(container, bundleFixture);
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm import' }));
+    expect(await screen.findByText('Import request failed')).toBeInTheDocument();
+    mockImport.mockResolvedValueOnce(doneResult);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(mockImport).toHaveBeenCalledTimes(2));
+    expect(mockImport.mock.calls[1][1]).toEqual(bundleFixture);
+  },
+);

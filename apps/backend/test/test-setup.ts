@@ -60,7 +60,8 @@ function createMockRepo<T extends ObjectLiteral = any>(EntityClass?: any, manage
     count: jest.fn(),
     countBy: jest.fn(),
     query: jest.fn(),
-    update: jest.fn(),
+    /** 对齐 Repository.update 的 Promise 合同，支持认证遥测的异步 catch。 */
+    update: jest.fn().mockResolvedValue({ affected: 1, raw: [], generatedMaps: [] }),
     upsert: jest.fn(),
     findByIds: jest.fn(),
     createQueryBuilder: jest.fn(() => {

@@ -1,6 +1,6 @@
 import { DataSource } from 'typeorm';
 import { SnakeNamingStrategy } from './snake-naming.strategy';
-import { PG_CONNECTION_EXTRA } from './pg-session-defaults';
+import { PG_CONNECTION_EXTRA, PG_POOL_SIZE } from './pg-session-defaults';
 
 /**
  * TypeORM CLI / 真库 e2e 的事实源。
@@ -20,6 +20,9 @@ export const AppDataSource = new DataSource({
   // 必须在建连时下发：事后 SET/set_limit 会随连接归还污染连接池，SET LOCAL 无事务
   // 时不生效（静默收窄召回）。详见 pg-session-defaults.ts 文件头。
   extra: PG_CONNECTION_EXTRA,
+  // 连接池容量：与生产运行时（typeorm-options.ts）**同源同值**——两个装配点是互不继承的
+  // 事实源，只改一处 = 测试与生产行为分叉（见 pg-session-defaults.ts 的 PGCONN-DUAL-ASSEMBLY）。
+  poolSize: PG_POOL_SIZE,
   namingStrategy: new SnakeNamingStrategy(),
   entities: [__dirname + '/entities/*.entity{.ts,.js}'],
   migrations: [__dirname + '/migrations/*{.ts,.js}'],

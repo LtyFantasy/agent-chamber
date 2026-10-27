@@ -588,7 +588,9 @@ export class DocSpaceController {
   ) {
     const space = await this.docSpaceService.findById(id);
     await this.permService.ensureCan(space, actor, 'read');
-    return this.docSpaceService.getOverview(id, query);
+    // actor.id 透传下 service（阶段三决策 9）：截断续读码的**去重键** = (actor, code, spaceId)
+    // ——不透传会退化成全局 'system'（一个 actor 看过就把所有人压掉），观测面直接失真。
+    return this.docSpaceService.getOverview(id, query, actor.id);
   }
 
   // ─── 空间级全量导出 / 回导（任务 T6）────────────────────────

@@ -33,10 +33,14 @@
  * mock 单测只能验证拼接逻辑，测不出 ORM SQL 生成与 chunk 往返（铁律 #23 教训）。
  *
  * DB 目标 = 本地开发库 chamber-postgres（docker-compose 默认参数，env 可覆盖）。
- * PG 不可达时整套降级跳过（warn 提示）——保持 test:e2e 在无库环境仍可全绿。
+ * PG 不可达时本套件绝大多数用例降级跳过（warn 提示），保持 test:e2e 在无库环境仍可全绿。
+ * **例外：凭证型用例不静默跳过**——v1.93.0 批 2 的 outline sectionHash 用例自带
+ * `expect(dbAvailable).toBe(true)` 硬断言：静默跳过的凭证不可能红、没有判别力，故 PG
+ * 不可达时该用例直接红（与 docspace-hints.e2e-spec.ts「写侧 hint 作用域收窄」节同款）。
  * 所有测试数据带 RUN 后缀隔离，afterAll 硬删兜底清理。
  */
 import { DataSource } from 'typeorm';
+import { createHash } from 'crypto';
 import { ActorType, ErrorCode } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
@@ -51,6 +55,7 @@ import { Board } from '../src/database/entities/board.entity';
 import { AuditLog } from '../src/database/entities/audit-log.entity';
 import type { EventService } from '../src/modules/event/event.service';
 import type { RouteHealthService } from '../src/modules/docspace/route-health.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -128,6 +133,7 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
       ds.getRepository(IdempotencyRecord),
       // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
       { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
+      new HintDedupService(),
     );
 
     // ── 种子数据：一个空间 + 四个文档（路径带 RUN 后缀隔离）──
@@ -482,6 +488,98 @@ describe('DocService.patchSection — 真实 PG 集成（section 重建管线）
 
     const fuzzy = await service.getSectionByHeadingQuery(docD.id, '文档 D');
     expect(fuzzy.sectionHash).toBe(single.sectionHash);
+  });
+
+  it('v1.93.0 批 2：outline 每节 sectionHash 与 positions[] 逐项相等（同口径派生，真实 PG）', async () => {
+    // 本用例**不写 `if (!dbAvailable) return;`**：静默跳过的用例不可能红，凭证没有判别力
+    // （批 1 惯例，见 docspace-hints.e2e-spec.ts「写侧 hint 作用域收窄」节）——PG 不可达时直接红
+    // （本机 chamber-postgres 在 8744，正常可用）。
+    expect(dbAvailable).toBe(true);
+
+    // 多节文档（5 节，level 分布 [0,1,2,3,2]）：文首无标题前言段（level-0——chunker
+    // step 3 契约：headingPath=文档 title（非 null）、headingText=null）+ H1 + H2 +
+    // 嵌套 H3 + 尾部 H2，覆盖 level-0 与嵌套 headingPath 两类边界哈希输入。
+    // 自建自清理，不依赖本套件其余用例的执行顺序。
+    const upserted = await service.upsert(
+      spaceId,
+      {
+        path: `tmp/${RUN}-outline-hash.md`,
+        content: [
+          '简介段落。',
+          '',
+          '# outline hash 文档',
+          '文首正文。',
+          '',
+          '## 第一节',
+          '第一节正文。',
+          '',
+          '### 嵌套子节',
+          '子节正文。',
+          '',
+          '## 第二节',
+          '第二节正文。',
+        ].join('\n'),
+      },
+      testActor,
+    );
+    const id = upserted.id;
+
+    try {
+      // maxFullTokens=0 强制 outline（本用例要验的正是 outline 通道）
+      const outline = await service.findOne(id, 0);
+      expect(outline.mode).toBe('outline');
+      const outlineSections = outline.sections ?? [];
+      expect(outlineSections.map((s) => s.position)).toEqual([0, 1, 2, 3, 4]);
+      // level-0 文首段确实进了投影（headingPath=文档 title，故非 null）
+      expect(outlineSections[0]).toMatchObject({ headingLevel: 0, headingText: null });
+      expect(outlineSections[0].headingPath).toBeTruthy();
+
+      // ① outline 每节都带 64-hex sectionHash（内存派生生效，非 undefined，也未外泄 content）
+      for (const s of outlineSections) {
+        expect(s.sectionHash).toMatch(/^[0-9a-f]{64}$/);
+        expect((s as { content?: unknown }).content).toBeUndefined();
+      }
+
+      // ② 与 positions[] 批量通道同节**逐项**相等（任务验收第 1 条：口径一致 = 同一个
+      //    computeSectionHash；两通道各自独立派生，相等即证明口径未漂移）
+      const batch = await service.getSections(
+        id,
+        outlineSections.map((s) => s.position),
+      );
+      expect(batch.missing).toEqual([]);
+      expect(batch.sections.map((s) => s.sectionHash)).toEqual(
+        outlineSections.map((s) => s.sectionHash),
+      );
+
+      // ③ 单节通道（DocSectionContent.sectionHash）逐节同口径——level-0 与嵌套两层边界一并覆盖
+      for (const s of outlineSections) {
+        const single = await service.getSection(id, s.position);
+        expect(single.sectionHash).toBe(s.sectionHash);
+      }
+
+      // ④ 可复算：hash 输入 = 存储三元组（headingPath\nheadingLevel\ncontent），
+      //    不是渲染片段——直读 DB 行**逐节**复算，锁死「同一公式」而非「同一常量」
+      const rows = (await ds.query(
+        `SELECT position, heading_path, heading_level, content FROM doc_sections
+         WHERE doc_id = $1 ORDER BY position ASC`,
+        [id],
+      )) as Array<{
+        position: number;
+        heading_path: string | null;
+        heading_level: number;
+        content: string;
+      }>;
+      expect(rows).toHaveLength(outlineSections.length);
+      rows.forEach((row, i) => {
+        const recomputed = createHash('sha256')
+          .update(`${row.heading_path ?? ''}\n${row.heading_level}\n${row.content}`)
+          .digest('hex');
+        expect(outlineSections[i].sectionHash).toBe(recomputed);
+      });
+    } finally {
+      await ds.getRepository(DocSection).delete({ docId: id });
+      await ds.getRepository(Doc).delete({ id });
+    }
   });
 
   it('match 模式端到端：唯一命中替换生效，响应 contentHash 与落库一致', async () => {

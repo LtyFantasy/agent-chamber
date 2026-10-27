@@ -9,6 +9,7 @@
 
 import { render, screen, act, fireEvent, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MEMORY_FEATURE_ENABLED } from '@agent-chamber/shared';
 import { Sidebar } from './sidebar';
 import { Api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth.store';
@@ -22,6 +23,7 @@ const messages: Record<string, string> = {
   'nav.boards': 'Boards',
   'nav.docs': 'Docs',
   'nav.experiences': 'Experiences',
+  'nav.memory': 'Memory',
   'nav.search': 'Search',
   'nav.settings': 'Settings',
   'nav.monitoring': 'Monitoring',
@@ -302,6 +304,24 @@ describe('Sidebar 经验库导航与待终审角标', () => {
 
     const link = (await screen.findByText('Experiences')).closest('a');
     expect(link).toHaveAttribute('href', '/experiences');
+  });
+
+  /**
+   * 记忆导航项（Memory 二期只读视图）。
+   *
+   * 与经验库同档：**无 adminOnly 门**——可见性由服务端按项目绑定判定（治理观察者也能
+   * 看到自己项目的元数据），web 只决定"给不给入口"，不做第二套权限逻辑。
+   */
+  it('记忆入口随发行能力可见；开启时无 admin 门，editor 也可见', async () => {
+    signIn('editor');
+    renderSidebar();
+
+    await screen.findByText('Experiences');
+    if (MEMORY_FEATURE_ENABLED) {
+      expect(screen.getByText('Memory').closest('a')).toHaveAttribute('href', '/memory');
+    } else {
+      expect(screen.queryByText('Memory')).not.toBeInTheDocument();
+    }
   });
 
   it('admin + 待终审 > 0：显示数字角标，且导航项直达待终审面（minor 7）', async () => {

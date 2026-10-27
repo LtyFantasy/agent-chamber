@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { useAuthStore } from '@/stores/auth.store';
+import { resolveSafeNext } from '@/lib/login-redirect';
+import { loginErrorKeyOf } from '@/lib/error-message';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,6 +20,7 @@ const LAST_EMAIL_KEY = 'auth:last-email';
 
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { login, isLoading } = useAuthStore();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -36,10 +39,15 @@ export default function LoginPage() {
     try {
       await login(email, password);
       localStorage.setItem(LAST_EMAIL_KEY, email);
-      router.push('/');
+      // 回跳目标来自 `?next=`（api.ts 401 / AuthGuard 写入）——先过同源白名单再跳，
+      // 防 `?next=//evil.com` 之类的开放重定向；不合格一律回首页
+      router.push(resolveSafeNext(searchParams.get('next')));
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : t('loginFailed');
-      setError(message);
+      // 后端 401 的 message 是英文（'Invalid credentials'），旧写法取 `err.message` 更糟——
+      // 断网时那是 axios 的 'Network Error' 原文。改为 **code → i18n key 映射**（单源 =
+      // `lib/error-message.ts` 的 `loginErrorKeyOf`）：401+1008 邮箱或密码错误 / 401+1001
+      // 账号停用 / 429 限流 / 其余通用失败文案。文案与判定同处一份，避免两处漂移。
+      setError(t(loginErrorKeyOf(err)));
     }
   };
 

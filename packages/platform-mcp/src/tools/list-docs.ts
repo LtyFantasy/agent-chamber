@@ -16,6 +16,8 @@
  * [铁律关联] #9(代理层透传) #11(注释强制)
  *
  * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ *   - v1.92.0-dev：三层匹配 / 失败信封构造已收敛到同目录 `_resolve-space.ts`（与
+ *     list-doc-tree / get-doc-facets 共用）——改解析语义改单源，勿在本文件重加拷贝。
  *   -
  *
  * [修改检查]（固定模板，不逐文件定制）
@@ -29,32 +31,12 @@ import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamb
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 import { DOC_LIST_SORT_VALUES } from '@agent-chamber/shared';
-
-/** list_docs 的参数白名单（inputSchema 的全部键）——未知参数硬护栏的判据单源 */
-const LIST_DOCS_KNOWN_ARGS = new Set([
-  'spaceName',
-  'pathPrefix',
-  'category',
-  'docType',
-  'tag',
-  'q',
-  'page',
-  'pageSize',
-  'slim',
-  'updatedAfter',
-  'sort',
-]);
+// v1.92.0-dev：三层匹配与失败信封构造收敛到单源（同目录 _resolve-space.ts）
+import { matchByLayers, resolutionFailureBody, type DocSpaceListItem } from './_resolve-space';
 
 // ---------------------------------------------------------------------------
 // 类型定义
 // ---------------------------------------------------------------------------
-
-interface DocSpaceListItem {
-  id: string;
-  name: string;
-  slug: string;
-  [key: string]: unknown;
-}
 
 /** 后端 docs 列表条目（仅声明 slim 投影与透传所需字段） */
 interface DocListItem {
@@ -76,54 +58,8 @@ interface DocListResponse {
 }
 
 // ---------------------------------------------------------------------------
-// 工具函数（照抄 get-docs-overview.ts 的 matchByLayers / resolutionFailureBody）
+// 工具函数：三层匹配 / 失败信封构造（v1.92.0-dev 起单源 = ./_resolve-space.ts）
 // ---------------------------------------------------------------------------
-
-/**
- * 三层匹配（大小写不敏感）：
- * ① 精确匹配（ci）
- * ② 前缀匹配（ci）
- * ③ 子串匹配（ci）
- *
- * 取最先产生匹配的那一层。该层内 0 个 → 返回 []，>1 个 → 返回该层全部。
- */
-function matchByLayers<T>(
-  needle: string,
-  candidates: T[],
-  keyFn: (c: T) => string,
-): { layer: number; matches: T[] } {
-  const lower = needle.toLowerCase();
-
-  const exact = candidates.filter((c) => keyFn(c).toLowerCase() === lower);
-  if (exact.length > 0) return { layer: 1, matches: exact };
-
-  const prefix = candidates.filter((c) => keyFn(c).toLowerCase().startsWith(lower));
-  if (prefix.length > 0) return { layer: 2, matches: prefix };
-
-  const substring = candidates.filter((c) => keyFn(c).toLowerCase().includes(lower));
-  return { layer: 3, matches: substring };
-}
-
-function resolutionFailureBody(err: unknown): Record<string, unknown> {
-  if (!(err instanceof Error)) {
-    return { message: String(err) };
-  }
-  const failure = err as Error & {
-    candidates?: unknown[];
-    options?: unknown[];
-    availableNames?: string[];
-    isAmbiguous?: boolean;
-    layer?: string;
-  };
-  return {
-    message: failure.message,
-    candidates: failure.candidates,
-    options: failure.options,
-    availableNames: failure.availableNames,
-    isAmbiguous: failure.isAmbiguous,
-    layer: failure.layer,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // 工具定义
@@ -164,9 +100,9 @@ export const listDocsTool: CustomTool = {
       'Each item carries contentHash (SHA-256 of the original upsert payload — the optimistic-' +
       'lock token used as expectedContentHash on upsert/patch/move; NOT the hash of the returned ' +
       'summary text, never self-compute). ' +
-      'UNKNOWN PARAMETERS ARE REJECTED: any argument outside this schema that carries a value ' +
-      'returns {error:true, failedStep:"validate_args"} instead of being silently dropped — ' +
-      'check the parameter name rather than assuming it took effect. ' +
+      'UNKNOWN PARAMETERS ARE REJECTED: any key outside this schema fails the call before the ' +
+      'handler runs (automcp central argument validation) with an error naming the unknown keys ' +
+      'and the allowed ones — check the parameter name rather than assuming it took effect. ' +
       'slim=true projects each item to {path,title,updatedAt} only (summaries are the token bulk ' +
       'in inventory scenarios). Use get_docs_overview for the categorized map, read_doc for content.',
     inputSchema: {
@@ -237,34 +173,8 @@ export const listDocsTool: CustomTool = {
   },
 
   async handler(args: Record<string, unknown>, ctx: CustomToolContext): Promise<ToolCallResult> {
-    // ── 未知参数硬护栏（v1.89.0-dev 批次 A；**本批仅 list_docs，不推广**）──
-    // automcp 运行时零参数校验，原始 arguments 直交 handler（mcp-server.ts:552-564）——
-    // 白名单外的键此前会被静默丢弃（"猜错参数却以为生效"）。这里显式响亮拒绝，
-    // failedStep 取 validate_* 同族（对齐 import-docs / get-my-briefing 先例）。
-    // 判定口径与下面的 filterKeys 一致：**非空值**才算传参（undefined/null/'' 视为未传）。
-    const unknownKeys = Object.keys(args).filter(
-      (key) =>
-        !LIST_DOCS_KNOWN_ARGS.has(key) &&
-        args[key] !== undefined &&
-        args[key] !== null &&
-        args[key] !== '',
-    );
-    if (unknownKeys.length > 0) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: true,
-              failedStep: 'validate_args',
-              message: `unknown parameter ${unknownKeys[0]}`,
-            }),
-          },
-        ],
-        isError: true,
-      };
-    }
-
+    // 未知参数由 automcp 中央校验（mcp-server.ts executeToolCall → validateToolArguments）
+    // 在进入 handler 前 fail-closed 拒绝；本工具不再自建白名单（v1.89 的内联护栏已删除）
     const spaceName = args.spaceName as string;
     const client = new PlatformApiClient(ctx.baseUrl, ctx.auth);
 

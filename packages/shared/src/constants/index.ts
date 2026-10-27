@@ -1,3 +1,5 @@
+export * from './distribution';
+
 export const API_PREFIX = '/api/v1';
 
 /**
@@ -9,6 +11,33 @@ export const API_PREFIX = '/api/v1';
  * 及测试统一引用本常量，禁止散落裸 uuid 字面量。migration 播种值为冻结历史，不改。
  */
 export const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * 话题参与行通知设置的 **mentions_only** 键名（v1.96.0-dev 未读语义批 D4）。
+ *
+ * `topic_participants.notification_settings` 是 jsonb（DB default
+ * `{"mute": false, "mentions_only": false}`），本常量是**全仓唯一**键名事实源——
+ * 三处消费点必须同源，禁止散落字符串字面量：
+ *  1. 读谓词（topic.service `buildUnreadMessageQb` / `getUnread` 的模式判定）；
+ *  2. 裸 SQL 模板插值（agent.service `findMyUnreadCounts` 的 LEFT JOIN ON 子句）；
+ *  3. 写侧合并（topic.service `updateNotificationSettings` 的
+ *     `jsonb_build_object(<本键>, $v::boolean)`）。
+ *
+ * ⚠️ 判定语义 = PG `notification_settings @> '{"mentions_only": true}'::jsonb`
+ * （DB 实测：脏值零抛错；**禁用** `::boolean` cast——非法值会 22P02 报错）。
+ * JS 侧对应判定是严格 `=== true`（两边同口径，不允许 truthy 放宽）。
+ */
+export const NOTIFY_KEY_MENTIONS_ONLY = 'mentions_only';
+
+/**
+ * 话题参与行通知设置的 **mute** 键名（v1.96.0-dev）。
+ *
+ * ⚠️ **未接线（D8 明确不做）**：`mute` 已存在于 jsonb 默认值与 `PATCH
+ * /topics/:id/notification-settings` 的读回中，但**没有任何读路径消费它**——
+ * 静音不改变未读计数、不改变投递。写成常量而不是字面量，是为了让"键名已登记、
+ * 语义未落地"这件事在代码里可检索；接线时从本常量出发，勿另起字面量。
+ */
+export const NOTIFY_KEY_MUTE = 'mute';
 export const JWT_EXPIRES_IN = '15m';
 export const REFRESH_TOKEN_EXPIRES_IN = '7d';
 export const SSE_HEARTBEAT_INTERVAL_MS = 30000;
@@ -59,3 +88,21 @@ export const ATTACHMENT_TTL_VALUES = ['1d', '7d', '30d', 'never'] as const;
 
 /** 附件有效期档位（'1d' | '7d' | '30d' | 'never'） */
 export type AttachmentTtl = (typeof ATTACHMENT_TTL_VALUES)[number];
+
+/**
+ * API Key 权限范围值域（**单一事实源**，2026-10-16 卡 72566c2e）。
+ *
+ * 落库位置 = `api_keys.permissions` jsonb 的 `scopes` 数组（默认 `["read","write"]`）。
+ * 语义（docs/api-definition.md §2.1）：
+ * - `read`  — 只读通道：GET/HEAD，以及显式标注 `@AgentScope('read')` 的读语义端点；
+ * - `write` — 其余全部方法（POST/PATCH/PUT/DELETE）。**write 不蕴含 read**（对齐
+ *   `task 写不蕴含读` 的既有判定，见 F4 登记），持 write-only key 的 GET 会被拒。
+ *
+ * 提升到 shared 的 rationale：后端 DTO 校验（`@IsIn(API_KEY_SCOPE_VALUES, {each:true})`）、
+ * 运行时收窄（`common/utils/api-key-scope.ts` 逐元素白名单）与 web 展示必须同源，
+ * 新增档位只应改这一行。**禁止**在仓库其他位置硬编码 `['read','write']`。
+ */
+export const API_KEY_SCOPE_VALUES = ['read', 'write'] as const;
+
+/** API Key 权限范围（'read' | 'write'） */
+export type ApiKeyScope = (typeof API_KEY_SCOPE_VALUES)[number];

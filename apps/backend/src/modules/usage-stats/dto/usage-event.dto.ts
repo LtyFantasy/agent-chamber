@@ -35,12 +35,9 @@
  *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
-import { IsBoolean, IsIn, IsOptional, IsString, MaxLength, Min, IsInt } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional, IsString, Max, MaxLength, Min, IsInt } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import {
-  USAGE_SURFACE_VALUES,
-  USAGE_TOOL_NAME_MAX_LENGTH,
-} from '../usage-stats.constants';
+import { USAGE_SURFACE_VALUES, USAGE_TOOL_NAME_MAX_LENGTH } from '../usage-stats.constants';
 
 /**
  * `POST /system/usage-events` 请求体 DTO（D4b：MCP invocation 上报通道）。
@@ -85,20 +82,40 @@ export class UsageEventDto {
   @IsBoolean()
   ok: boolean;
 
-  /** 工具调用耗时（ms，≥0；非整数由 buffer 侧四舍五入，列是 int） */
-  @ApiProperty({ description: 'Tool call latency in milliseconds (≥0)', minimum: 0, example: 42 })
+  /**
+   * 工具调用耗时（ms，≥0；非整数由 buffer 侧四舍五入，列是 int）。
+   *
+   * 上界 `@Max(86_400_000)`（= 24h）是 F4 项4 / S-M3 加的安全阀：`latency_ms` 是
+   * **int4** 列，无界值（如 1e12）会被 PG 报 `22003 numeric value out of range`，
+   * 而入库是**整批 flush**——一行超界 ⇒ 整个 flush 失败 ⇒ mergeBack 把批次塞回
+   * 缓冲循环重放 ⇒ 遥测**恒为零直到重启**（只读 key 即可触发，且失败面静默）。
+   * 24h 远高于任何真实工具调用耗时，不会误伤。
+   */
+  @ApiProperty({
+    description: 'Tool call latency in milliseconds (≥0, ≤86400000 = 24h)',
+    minimum: 0,
+    maximum: 86_400_000,
+    example: 42,
+  })
   @IsInt()
   @Min(0)
+  @Max(86_400_000)
   latencyMs: number;
 
   /**
    * 是否走 fallbackAuth（共享 `--api-key`）→ 该行 `actor_type='system'`。
    * 语义 = "身份不可信"归因标记：distinctActors 在这种调用上会失真，用它可过滤。
+   *
+   * **仅 API Key 认证时生效**（F4 项4）：bearer/JWT 通道下服务端把它强制为 false
+   * （无 Agent 身份不得铸造 system 行，usage-events.controller.ts）。它是上报方的
+   * **自报归因提示，不构成身份结论**——不要拿它做授权或审计判据。
    */
   @ApiPropertyOptional({
     description:
-      "true when the call used the shared --api-key fallback → the row is stored with " +
-      "actor_type='system' (identity not trustworthy; distinctActors would be skewed)",
+      'true when the call used the shared --api-key fallback → the row is stored with ' +
+      "actor_type='system' (identity not trustworthy; distinctActors would be skewed). " +
+      'Only effective with API Key auth (forced false on the bearer/JWT channel); ' +
+      'a self-reported attribution hint, NOT an identity conclusion.',
   })
   @IsOptional()
   @IsBoolean()

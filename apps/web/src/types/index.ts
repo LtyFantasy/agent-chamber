@@ -156,6 +156,7 @@ export type {
   TopicDetail,
   TopicParticipant,
   Message,
+  SendMessageResponse,
   UnreadSummary,
   Board,
   BoardDetail,

@@ -12,6 +12,8 @@
  *     ALS 上下文建立（toolName / surface）、每次调用恰好一次 fire-and-forget 上报
  *   - `fallbackAuth`（server 默认认证）与 `extractClientAuth`（client 头透传）共同
  *     决定生效凭据，也决定上报走哪条凭据、是否标 viaFallbackAuth
+ *   - tools/call 入参白名单校验（`validateToolArguments`）——映射工具与 custom tool
+ *     同一口径，未知键 fail-closed
  *
  * [权威文档]
  *   - 主文档: docs/api-definition.md §Usage Stats — 上报契约 + 统计口径专章
@@ -26,11 +28,29 @@
  *   - `viaFallbackAuth = clientAuth 缺失且存在服务端默认认证`：后端据此落
  *     actor_type='system'（共享 --api-key 时 distinctActors 失真，此标记是其过滤器）
  *   - 上报失败绝不影响工具响应（fail-open，实现见 usage-reporter）
+ *   - **tools/call 的 arguments 只接受 inputSchema.properties 声明的键**（fail-closed）：
+ *     未知键 → isError 结果且**不发上游请求**；properties 缺失/为空即"无参工具"。
+ *     理由——请求按 paramLocations 逐名装配，未声明键会被静默丢弃（"看似成功、
+ *     输入被吃掉"）；REST 侧 ValidationPipe 的 forbidNonWhitelisted 是同一语义
+ *   - **唯一例外是 `additionalProperties: true`**（作者显式 opt-in 自由参数）：
+ *     运行时整条键校验跳过、注册期不覆盖成 false。不得把该例外删掉"统一收紧"——
+ *     那是破坏 author 声明的合同
+ *   - advertised schema 与运行时校验必须说同一件事：映射工具的
+ *     additionalProperties:false 由 tool-mapper 产出；custom tool 由
+ *     `registerCustomTools` **仅在作者未声明时**补 false（且构造新对象，不改写调用方的
+ *     schema——同一模块可能被多个 server 实例挂载）
  *
  * [关联代码]
  *   - server/tool-context.ts — ALS 上下文与头名常量的单一定义点
  *   - server/usage-reporter.ts — 上报发送（本文件只做认证解析与出口挂载）
  *   - proxy/http-proxy.ts — 原子映射工具执行 + 头注入点 ①
+ *   - mapper/tool-mapper.ts — 映射工具 inputSchema 产出（含 additionalProperties:false）
+ *   - packages/platform-mcp/src/tools/* — custom tool handler；只允许读取 schema 声明的键
+ *
+ * [持久踩坑]
+ *   - MCP-ARG-1(未知参数静默丢弃): memory_controller_nominate 误传 `content`（正确键
+ *     `contentOverride`），键被静默丢弃、记忆建成但正文为空。安全方向：保持未知键
+ *     fail-closed 并给出合法键清单，禁止回退成"原样透传"
  *
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
@@ -44,6 +64,7 @@ import type { Application, Request, Response } from 'express';
 import type {
   JsonRpcRequest,
   JsonRpcResponse,
+  JSONSchema,
   ToolMapping,
   ToolCallParams,
   InitializeResult,
@@ -56,6 +77,26 @@ import type {
 import { HttpProxy } from '../proxy/http-proxy';
 import { INVALID_TOOL_NAME, normalizeToolName, runWithToolContext } from './tool-context';
 import { reportToolInvocation } from './usage-reporter';
+
+/**
+ * 未声明参数的去向（决定报错文案里"此前会怎样"的分支）
+ *
+ * - `'upstream-request'`：自动映射工具——请求按 paramLocations 逐名装配，未声明的键
+ *   根本不进 REST 请求
+ * - `'tool-handler'`：custom tool——原始 arguments 原样进 handler，但 handler 只读
+ *   声明过的键，其余键被忽略
+ *
+ * 两者的事故形态相同（"看似成功、输入被吃掉"），机制不同，文案不能混用。
+ */
+type ToolArgumentConsumer = 'upstream-request' | 'tool-handler';
+
+/**
+ * 错误文案里最多列出的未知键个数
+ *
+ * 超过则折叠为 `… and N more`：一轮误传十几个键（如整段 DSL 被当参数塞进来）时，
+ * 完整清单会淹没"合法键"提示本身。
+ */
+const MAX_LISTED_UNKNOWN_ARGS = 10;
 
 /**
  * 尝试把 text 解析为结构化内容
@@ -211,7 +252,27 @@ export class McpServer {
         );
       }
 
-      this.customTools.push(ct);
+      // 只补齐"作者没写"的 additionalProperties，绝不覆盖显式声明：
+      // - 省略（手写 schema 的常态）→ 补 false，与运行时 fail-closed 一致（否则客户端
+      //   没有任何依据知道"多传的键会被拒"）
+      // - 显式 true → 作者 opt-in 自由参数，运行时随之放行（validateToolArguments 见 true 即跳过）
+      // - 显式 false → 原样保留
+      // advertised 与运行时必须说同一件事；单点归一化优于逐个改 50 个 custom tool 文件
+      // （custom tools 来自 --custom-tools 动态模块，可能是仓库外代码）。
+      // 注意构造新对象而非原地改写：入参 ct.tool.inputSchema 属于调用方（模块导出对象），
+      // 注册不得污染它（同一模块可能被两个 server 实例以不同策略挂载）。
+      this.customTools.push({
+        ...ct,
+        tool: {
+          ...ct.tool,
+          inputSchema: {
+            ...ct.tool.inputSchema,
+            ...(ct.tool.inputSchema.additionalProperties === undefined
+              ? { additionalProperties: false }
+              : {}),
+          },
+        },
+      });
     }
 
     // 只在显式传入时更新默认认证：省略该参数不应清空既有配置——serve 入口先
@@ -545,14 +606,32 @@ export class McpServer {
     // ── 1. 先查自动映射 tool ──
     const mapping = this.toolMappings.find((m) => m.tool.name === toolName);
     if (mapping !== undefined) {
-      const args = (toolParams.arguments as Record<string, unknown>) ?? {};
-      return this.proxy.execute(mapping, args, clientAuth);
+      // 未知键 fail-closed：不发 REST（此前的静默丢弃链路见 validateToolArguments 注释）
+      const checked = this.resolveToolArguments(
+        toolParams.arguments,
+        toolName,
+        mapping.tool.inputSchema,
+        'upstream-request',
+      );
+      if ('errorResult' in checked) {
+        return checked.errorResult;
+      }
+      return this.proxy.execute(mapping, checked.args, clientAuth);
     }
 
     // ── 2. 再查 custom tool ──
     const customTool = this.customTools.find((ct) => ct.tool.name === toolName);
     if (customTool !== undefined) {
-      const args = (toolParams.arguments as Record<string, unknown>) ?? {};
+      // 与自动映射工具同一口径：handler 只接收 schema 声明过的键
+      const checked = this.resolveToolArguments(
+        toolParams.arguments,
+        toolName,
+        customTool.tool.inputSchema,
+        'tool-handler',
+      );
+      if ('errorResult' in checked) {
+        return checked.errorResult;
+      }
 
       // 构造上下文：client auth 优先，否则 fallback 到 server 默认 auth
       const ctx: CustomToolContext = {
@@ -561,7 +640,7 @@ export class McpServer {
       };
 
       try {
-        return await customTool.handler(args, ctx);
+        return await customTool.handler(checked.args, ctx);
       } catch (handlerError) {
         // handler 抛异常 → 返回 isError:true 文本结果，不冒泡为 JSON-RPC -32603
         const message = handlerError instanceof Error ? handlerError.message : String(handlerError);
@@ -577,6 +656,140 @@ export class McpServer {
       content: [{ type: 'text', text: `Tool not found: ${toolName}` }],
       isError: true,
     };
+  }
+
+  /**
+   * 归一化并校验 tools/call 的 arguments（键集合 fail-closed 白名单）
+   *
+   * 自动映射工具与 custom tool 共用同一口径：只有 `inputSchema.properties` 声明过的键
+   * 才被接受。未知键**不落任何上游请求**——映射工具由 `paramLocations` 按名装配请求，
+   * 未声明的键会被静默丢弃，历史上造成过"记忆建成但正文为空"的事故（MCP-ARG-1；
+   * REST 侧 ValidationPipe 的 forbidNonWhitelisted 是同一语义）。
+   *
+   * 只校验"键是否存在"：required 缺失与类型错误仍由下游（proxy / handler / 后端 DTO）
+   * 负责，本方法不重复那一层，避免两处口径漂移。
+   *
+   * @param rawArguments - JSON-RPC `params.arguments` 原值（可能缺失 / 非对象）
+   * @param toolName - 已命中的工具名（错误文案定位用）
+   * @param inputSchema - 该工具的 inputSchema（缺失 → 视为无参工具）
+   * @param consumer - 未声明键的去向，决定错误文案的"此前会怎样"分支：
+   *                   `'upstream-request'` = 不进 REST 请求体/路径（映射工具）；
+   *                   `'tool-handler'` = 原样进了 handler，但 handler 只读声明过的键（custom tool）
+   * @returns `{ args }` 为可透传给 proxy / handler 的对象；
+   *          `{ errorResult }` 为可直接返回的 isError 信封（不发任何上游请求）
+   */
+  private resolveToolArguments(
+    rawArguments: unknown,
+    toolName: string,
+    inputSchema: JSONSchema | undefined,
+    consumer: ToolArgumentConsumer,
+  ): { args: Record<string, unknown> } | { errorResult: ToolCallResult } {
+    const isPlainObject =
+      rawArguments !== undefined &&
+      rawArguments !== null &&
+      typeof rawArguments === 'object' &&
+      !Array.isArray(rawArguments);
+
+    // 非对象（数组 / 字符串 / 数字…）：先于键校验拦下，否则 Object.keys 会造出 "0"、"1"
+    // 这类假未知键，错误文案反而更难懂
+    if (rawArguments !== undefined && rawArguments !== null && !isPlainObject) {
+      return {
+        errorResult: {
+          content: [
+            {
+              type: 'text',
+              text: `Invalid arguments for tool "${toolName}": "arguments" must be a JSON object`,
+            },
+          ],
+          isError: true,
+        },
+      };
+    }
+
+    // arguments 缺失 / null → 空对象（等价于"不传参"）
+    const args = (isPlainObject ? rawArguments : {}) as Record<string, unknown>;
+
+    const unknownKeysError = this.validateToolArguments(toolName, args, inputSchema, consumer);
+    if (unknownKeysError !== null) {
+      return {
+        errorResult: {
+          content: [{ type: 'text', text: unknownKeysError }],
+          isError: true,
+        },
+      };
+    }
+
+    return { args };
+  }
+
+  /**
+   * 校验 arguments 的键是否全部在 `inputSchema.properties` 中声明过
+   *
+   * properties 缺失 / 为空 → 视为 `{}`，即任何键都是未知键（无参工具传参同样报错）。
+   * 判定口径是"键存在与否"，与值无关：显式写 `key: undefined` 也算传了该键。
+   *
+   * **`additionalProperties === true` → 直接放行**（整条校验跳过）：该值是作者显式
+   * opt-in 的自由参数，advertised schema 承诺了"任意键可传"，运行时必须说同一件事；
+   * fail-closed 只适用于"未声明 additionalProperties"的默认情形。
+   *
+   * 错误文案必须可行动：工具名 + 未知键清单（JSON.stringify 转义，超 10 个截断）+
+   * 合法键清单 + 该工具的未声明键此前去向（映射工具 = 不进 REST；custom = handler 只读
+   * 声明键，两者都不许描述成对方的形态）。
+   *
+   * @param toolName - 工具名（错误文案定位用）
+   * @param args - 已归一化的 arguments 对象
+   * @param inputSchema - 该工具的 inputSchema（缺失 → 无任何声明键）
+   * @param consumer - 未声明键的实际去向（决定"此前会怎样"的文案分支）
+   * @returns 键集合合法（或作者 opt-in）时 null；否则返回 isError 文本的英文错误消息
+   */
+  private validateToolArguments(
+    toolName: string,
+    args: Record<string, unknown>,
+    inputSchema: JSONSchema | undefined,
+    consumer: ToolArgumentConsumer,
+  ): string | null {
+    // 作者显式声明 additionalProperties: true = 允许任意键（自定义工具的自由表单场景）
+    if (inputSchema?.additionalProperties === true) {
+      return null;
+    }
+
+    const declaredKeys = Object.keys(inputSchema?.properties ?? {});
+    const declaredKeySet = new Set(declaredKeys);
+
+    const unknownKeys = Object.keys(args).filter((key) => !declaredKeySet.has(key));
+    if (unknownKeys.length === 0) {
+      return null;
+    }
+
+    // JSON.stringify 而非手拼引号：键名可能含引号/换行/反斜杠，手拼会打散错误文案本身
+    const listedUnknown = unknownKeys
+      .slice(0, MAX_LISTED_UNKNOWN_ARGS)
+      .map((key) => JSON.stringify(key))
+      .join(', ');
+    const overflowCount = unknownKeys.length - MAX_LISTED_UNKNOWN_ARGS;
+    const unknownClause =
+      overflowCount > 0 ? `${listedUnknown} … and ${overflowCount} more` : listedUnknown;
+
+    const allowedClause =
+      declaredKeys.length > 0
+        ? `Allowed arguments: ${declaredKeys.map((key) => JSON.stringify(key)).join(', ')}.`
+        : 'This tool takes no arguments.';
+
+    // 未知键此前去向按工具类型分支：两套文案各自为真，禁止用同一句概括（会误导排查方向）
+    const previousBehaviorClause =
+      consumer === 'upstream-request'
+        ? 'Unknown arguments were previously dropped silently before the upstream REST request ' +
+          'was assembled (only declared argument names are sent), so the call could succeed while ' +
+          'your input was ignored.'
+        : 'Unknown arguments were previously passed through to the tool handler untouched; the ' +
+          'handler only reads its declared argument names, so the call could succeed while your ' +
+          'input was ignored.';
+
+    return (
+      `Invalid arguments for tool "${toolName}": unknown argument(s) ${unknownClause}. ` +
+      `${allowedClause} ${previousBehaviorClause} ` +
+      'Retry with only the allowed argument names above.'
+    );
   }
 
   /**

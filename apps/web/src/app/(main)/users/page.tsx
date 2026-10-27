@@ -4,6 +4,9 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { toast } from '@/lib/notify';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf } from '@/lib/error-message';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
@@ -60,6 +63,7 @@ function UserAvatar({ name }: { name: string }) {
 export default function UsersPage() {
   const queryClient = useQueryClient();
   const t = useTranslations('users');
+  const tRead = useTranslations('common');
   const locale = useLocale();
   const tCommon = useTranslations('common');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -91,7 +95,7 @@ export default function UsersPage() {
   const [editError, setEditError] = useState<string | null>(null);
 
   // ── Data ──
-  const { data, isLoading } = useQuery({
+  const usersQuery = useQuery({
     queryKey: ['users', 'list', { q: searchQuery }],
     queryFn: () =>
       Api.users.list({
@@ -99,6 +103,7 @@ export default function UsersPage() {
         pageSize: 100,
       }),
   });
+  const { data, isLoading } = usersQuery;
 
   // Debounce search input
   useEffect(() => {
@@ -121,10 +126,7 @@ export default function UsersPage() {
       handleCloseCreate();
     },
     onError: (err: unknown) => {
-      setCreateError(
-        (err as { response?: { data?: { message?: string } }; message?: string }).response?.data
-          ?.message || t('createFailed'),
-      );
+      setCreateError(errorMessageOf(err, t('createFailed')));
     },
   });
 
@@ -136,10 +138,7 @@ export default function UsersPage() {
       handleCloseEdit();
     },
     onError: (err: unknown) => {
-      setEditError(
-        (err as { response?: { data?: { message?: string } }; message?: string }).response?.data
-          ?.message || t('updateFailed'),
-      );
+      setEditError(errorMessageOf(err, t('updateFailed')));
     },
   });
 
@@ -149,6 +148,7 @@ export default function UsersPage() {
       void queryClient.invalidateQueries({ queryKey: ['users'] });
       setDeleteUser(null);
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('deleteFailed')) }),
   });
 
   // ── Handlers ──
@@ -229,7 +229,28 @@ export default function UsersPage() {
       </div>
 
       {/* Table */}
-      {isLoading ? (
+      {usersQuery.isError && data !== undefined && (
+        <QueryFeedback
+          compact={usersQuery.data !== undefined}
+          message={errorMessageOf(
+            usersQuery.error,
+            tRead(usersQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void usersQuery.refetch()}
+          busy={usersQuery.isFetching}
+        />
+      )}
+      {usersQuery.isError && data === undefined ? (
+        <QueryFeedback
+          compact={usersQuery.data !== undefined}
+          message={errorMessageOf(
+            usersQuery.error,
+            tRead(usersQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void usersQuery.refetch()}
+          busy={usersQuery.isFetching}
+        />
+      ) : isLoading ? (
         <Loading />
       ) : users.length === 0 ? (
         <EmptyState
@@ -304,7 +325,12 @@ export default function UsersPage() {
                           <Button variant="ghost" size="sm" onClick={() => openEdit(user)}>
                             <Pencil className="h-4 w-4" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => openDelete(user)}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={tCommon('delete')}
+                            onClick={() => openDelete(user)}
+                          >
                             <Trash2 className="h-4 w-4 text-destructive" />
                           </Button>
                         </div>

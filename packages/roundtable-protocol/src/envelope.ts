@@ -4,7 +4,7 @@
  * 全部消息统一外壳，字段一旦上线冻结，只增不改。
  * 传输：runner 主动拨出 `wss://<platform>/ws/runner`（Header 携带 X-API-Key），断线指数退避重连。
  *
- * 出处：docs/roundtable-design.md §4（契约②：控制面协议）。
+ * 出处：docs/modules/roundtable-design.md §4（契约②：控制面协议）。
  */
 
 /** 上行消息类型（runner → chamber） */
@@ -32,7 +32,7 @@ export type DownlinkMessageType = (typeof DOWNLINK_MESSAGE_TYPES)[number];
 
 /**
  * 无座位归属消息类型：不带 seatId，seq 固定 0
- * （docs/roundtable-design.md §4：无座位归属的消息（hello/ping/pong/error）不带 seatId，seq=0；
+ * （docs/modules/roundtable-design.md §4：无座位归属的消息（hello/ping/pong/error）不带 seatId，seq=0；
  * hello_ack 与 hello 对称——payload 内按 seatId 携带全部座位游标，信封本身无座位归属）
  */
 export const SEATLESS_MESSAGE_TYPES = ['hello', 'ping', 'pong', 'error', 'hello_ack'] as const;
@@ -52,7 +52,7 @@ export type RoundtableMessageType = (typeof MESSAGE_TYPES)[number];
 
 /**
  * 信封（全部消息统一外壳；字段一旦上线冻结，只增不改）
- * `{ v, type, seatId?, seq, ts, payload }`（docs/roundtable-design.md §4）
+ * `{ v, type, seatId?, seq, ts, payload }`（docs/modules/roundtable-design.md §4）
  */
 export interface Envelope {
   /** 协议版本（当前固定 1；版本字段预留演进，见 §4/§11 风险对策「信封字段上线后难改」） */

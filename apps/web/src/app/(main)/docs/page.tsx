@@ -6,6 +6,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { errorMessageOf } from '@/lib/error-message';
+import { toast } from '@/lib/notify';
 import { formatRelativeTime } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -52,14 +54,20 @@ export default function DocsPage() {
     docCount: number;
   } | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['docs', 'spaces'],
     queryFn: () => Api.docs.listSpaces({ pageSize: 100 }),
   });
 
   /** 绑定对象候选：选了 topic/board 类型才拉对应列表 */
   const { data: topicsData } = useQuery({
-    queryKey: ['topics', 'list'],
+    // ⚠️ 键**不能**与 topics 列表页同键（卡 240c74d6 实证的撞车 bug）：
+    // 旧写法 `['topics','list']` + `Api.topics.list({pageSize:100})`（后端 status 缺省 ≠ 'all'）
+    // 与 topics 页的 `['topics','list']` + `{status:'all'}` **同键不同 queryFn** ⇒ 谁先写谁赢，
+    // 两页互相喂脏数据（绑定下拉少话题 / 话题列表少已归档话题）。
+    // 键名对齐兄弟文件 `docs/[id]/page.tsx` 的 `['topics','binding-options']`（同一请求共享缓存，
+    // 避免两处各拉一遍）；'topics' 首段让 `invalidateQueries({queryKey:['topics']})` 按前缀连带刷新本键。
+    queryKey: ['topics', 'binding-options'],
     queryFn: () => Api.topics.list({ pageSize: 100 }),
     enabled: createOpen && bindType === ResourceType.TOPIC,
   });
@@ -68,12 +76,6 @@ export default function DocsPage() {
     queryFn: () => Api.boards.list({ pageSize: 100 }),
     enabled: createOpen && bindType === ResourceType.BOARD,
   });
-
-  /** mutation 错误统一提示：优先透传服务端 message（范式照抄 task-detail-panel.tsx），兜底领域文案 */
-  const alertMutationError = (fallback: string) => (err: unknown) => {
-    const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-    alert(axiosErr?.response?.data?.message || axiosErr?.message || fallback);
-  };
 
   const createMutation = useMutation({
     mutationFn: Api.docs.createSpace,
@@ -86,7 +88,9 @@ export default function DocsPage() {
       setBindType('none');
       setBindTargetId('');
     },
-    onError: alertMutationError(t('form.createError')),
+    // 原为 `alert()`（阻塞式系统弹窗，卡 240c74d6 的 alert 族）：改既有 toast 通道，
+    // 文案走 errorMessageOf（仅 4xx + 业务码透传服务端 message，断网不再露 axios 英文原文）。
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('form.createError')) }),
   });
 
   const deleteMutation = useMutation({
@@ -95,7 +99,7 @@ export default function DocsPage() {
       void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
       setDeleteSpace(null);
     },
-    onError: alertMutationError(t('delete.error')),
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('delete.error')) }),
   });
 
   /** 删除确认详情：打开 Dialog 时按 spaceId 拉详情拿 linkedTaskCount（B2：确认文案展示关联任务数） */
@@ -131,8 +135,25 @@ export default function DocsPage() {
         </Button>
       </div>
 
+      {/* 四态分支：加载 / 错误 / 空 / 列表。
+          错误态判据 = `isError && data === undefined`，**不能**写成 `spaces.length === 0`：
+          TanStack v5 刷新失败会保留旧 data，零空间用户刷新失败时错误分支会把空态（含创建
+          CTA 与 Dialog）整棵卸载，而零空间用户恰是空态入口的主目标（memory 页 R-2 实证；
+          卡 240c74d6 三列表页同规）。 */}
       {isLoading ? (
         <Loading />
+      ) : isError && data === undefined ? (
+        <div data-testid="docs-list-error">
+          <EmptyState
+            title={t('loadErrorTitle')}
+            description={errorMessageOf(error, t('loadErrorDesc'))}
+            action={
+              <Button variant="outline" onClick={() => void refetch()}>
+                {tGlobal('common.retry')}
+              </Button>
+            }
+          />
+        </div>
       ) : spaces.length === 0 ? (
         <EmptyState
           title={t('noSpaces')}
@@ -166,6 +187,7 @@ export default function DocsPage() {
                         variant="ghost"
                         size="sm"
                         className="h-8 w-8 p-0"
+                        aria-label={tGlobal('common.delete')}
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();

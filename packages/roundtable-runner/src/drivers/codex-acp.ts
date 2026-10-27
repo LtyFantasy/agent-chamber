@@ -3,13 +3,13 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
- *   - 补充: docs/roundtable-design.md §8 (codex ACP 行为档案: 桥 1.1.14 / codex 0.147.0
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
+ *   - 补充: docs/modules/roundtable-design.md §8 (codex ACP 行为档案: 桥 1.1.14 / codex 0.147.0
  *           实测 2026-08-10——quirk① approvals_reviewer 钉死、quirk② model 钉死、
  *           configOptions {id,currentValue} 形状、审批 options 带 _meta、反向 RPC id 从 0 起)
  *
  * [踩坑索引] ④(resume 失败无降级→楔死) ⑤(fs caps 声明→turn 静默死亡)
- *              ⑥(RT-PERM-1: kind 命名不可信→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
+ *              ⑥(RT-PERM-1: 执行选项不按 kind 猜测→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
  *              R1(审批缓存裸 requestId 跨座位撞键——codex 反向 RPC id 从 0 起) R2(reasoning_effort 解析)
  *              R3(CODEX_PATH 探测不到不静默兜底)
  *
@@ -27,9 +27,9 @@
  *       三件套缺一角。见 memory/2026-08-10.md §R2
  *   ⑤: client 声明 fs caps 后 turn 静默死亡 → 基座一律不声明 fs caps（kimi 0.34.0 实测；
  *       codex 沿用同一安全线）。见 memory/2026-08-07.md §4
- *   ⑥: RT-PERM-1 —— 审批 optionId 才是稳定键（与 request_permission params 同源），
- *       kind 是厂商自由命名不可信；codex 审批 options 与 kimi 同命名空间
- *       （allow_once/allow_always/reject_once，带 _meta），精确匹配逻辑基座直接复用。
+ *   ⑥: RT-PERM-1 —— optionId 是不透明选择键，基座精确匹配并原样透传，禁止按
+ *       kind 猜执行 ID。kind 标准值为 allow_once/allow_always/reject_once/reject_always，
+ *       平台仅用它记录结果；codex 观测样本 allow_once/allow_always/reject_once 带 _meta。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图

@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页消息流——输入区提示）
- *   - 补充: docs/roundtable-design.md §6（路由与唤醒策略：mention 默认省钱语义）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页消息流——输入区提示）
+ *   - 补充: docs/modules/roundtable-design.md §6（路由与唤醒策略：mention 默认省钱语义）
  *
  * [踩坑索引]
  *   - wakePolicy 是详情视图派生字段（topic.service findOneWithParticipants，

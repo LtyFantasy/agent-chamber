@@ -32,7 +32,11 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { PG_CONNECTION_EXTRA, PG_TRGM_SIMILARITY_THRESHOLD } from './pg-session-defaults';
+import {
+  PG_CONNECTION_EXTRA,
+  PG_POOL_SIZE,
+  PG_TRGM_SIMILARITY_THRESHOLD,
+} from './pg-session-defaults';
 import { buildTypeOrmOptions } from './typeorm-options';
 
 describe('buildTypeOrmOptions（生产运行时 TypeORM 装配）', () => {
@@ -55,6 +59,15 @@ describe('buildTypeOrmOptions（生产运行时 TypeORM 装配）', () => {
     expect(typeof options.namingStrategy).toBe('object'); // SnakeNamingStrategy（snake_case 列名）
     expect(Array.isArray(options.entities)).toBe(true);
     expect((options.entities as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it('poolSize 与 PG_POOL_SIZE 同源装配（删掉那一行即回落到 pg 隐式 10 → 锁路径挂死阈值腰斩）', () => {
+    const options = buildTypeOrmOptions();
+
+    expect(options.poolSize).toBe(PG_POOL_SIZE);
+    // 反向守卫：extra.max 会**覆盖**顶层 poolSize（TypeORM: max: options.poolSize 再 merge extra），
+    // 故 extra 里不许出现 max —— 否则同一份容量出现两处取值
+    expect(PG_CONNECTION_EXTRA).not.toHaveProperty('max');
   });
 
   it('migrations glob 的基准目录真实存在且含迁移（防 __dirname 搬运出错）', () => {

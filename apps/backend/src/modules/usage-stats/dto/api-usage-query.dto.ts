@@ -162,7 +162,8 @@ export class ApiUsageQueryDto {
 
   /** 单调用者过滤（UUID 形态；统计表无 FK，已删除的 actor 仍可查） */
   @ApiPropertyOptional({
-    description: 'Single actor filter (UUID). The stats table has no FK — deleted actors stay queried.',
+    description:
+      'Single actor filter (UUID). The stats table has no FK — deleted actors stay queried.',
   })
   @IsOptional()
   @IsUUID()
@@ -196,7 +197,10 @@ export class ApiUsageQueryDto {
   tool?: string;
 
   /** HTTP method 过滤（大写，如 GET/POST/TOOL；`TOOL` = 上报行） */
-  @ApiPropertyOptional({ description: 'HTTP method filter (uppercase; TOOL = reported rows)', maxLength: API_USAGE_METHOD_MAX_LENGTH })
+  @ApiPropertyOptional({
+    description: 'HTTP method filter (uppercase; TOOL = reported rows)',
+    maxLength: API_USAGE_METHOD_MAX_LENGTH,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(API_USAGE_METHOD_MAX_LENGTH)

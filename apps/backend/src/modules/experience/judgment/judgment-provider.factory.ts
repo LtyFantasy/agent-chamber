@@ -12,7 +12,7 @@
  *     **零逻辑、零类型定义**
  *
  * [权威文档]
- *   - 线上 DocSpace `docs/experience-base.md` — 判别服务章（provider 值域 / 生效自检）
+ *   - 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（provider 值域 / 生效自检）
  *
  * [关键不变量]
  *   - **`JUDGMENT_CONFIG` 字符串值不变**：e2e 按它 `overrideProvider` 注入内联额度配置，

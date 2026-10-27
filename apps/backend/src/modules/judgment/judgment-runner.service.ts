@@ -13,7 +13,7 @@
  *   - `isEnabled(capabilityName)`：调用点据此**在构造输入之前**决定要不要走判别路径
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（三级闸 / skip taxonomy /
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（三级闸 / skip taxonomy /
  *     两个分母口径：失败率排除 skipped、fail-open 率含 skipped 全 reason）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（内核抽取）/§批次 3（rerank 落行）
  *

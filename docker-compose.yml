@@ -10,7 +10,9 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-chamber_password}
       POSTGRES_DB: ${DB_DATABASE:-agent_chamber}
     ports:
-      - "8744:5432"
+      # 端口恒绑 127.0.0.1（对齐 minio 先例：带默认口令的服务绝不绑 0.0.0.0；
+      # 容器内 backend 走服务名 postgres 直连不受影响，宿主机 localhost:8744 不变）
+      - "127.0.0.1:8744:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -84,7 +86,7 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minio_root_user}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-me-minio-secret}
       MINIO_BUCKET: ${MINIO_BUCKET:-agent-chamber-attachments}
-      # 经验库判别服务（9 键；插值风格对齐 DB_*）。可选键在无 .env / 未设时注空串，
+      # 经验库判别服务（11 键；插值风格对齐 DB_*）。可选键在无 .env / 未设时注空串，
       # 空串由代码回落缺省（model 键尤其依赖 `?.trim() ||`：空串当请求 model 会 422）。
       # ⚠️ 逐键显式透传：往代码加键却漏加这里的行 = 容器里该键**永远不存在**（.env 设了也没用，
       # 静默吃缺省）——v1.83.0 的 ATTACHMENT_URL_SECRET 漏透传即此坑同族。
@@ -92,12 +94,59 @@ services:
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
       TYPESAFE_BASE_URL: ${TYPESAFE_BASE_URL:-}
       TYPESAFE_DEFAULT_MODEL: ${TYPESAFE_DEFAULT_MODEL:-}
+      TYPESAFE_HTTPS_PROXY: ${TYPESAFE_HTTPS_PROXY:-}
+      TYPESAFE_HTTP_PROXY: ${TYPESAFE_HTTP_PROXY:-}
       JUDGMENT_TIMEOUT_MS: ${JUDGMENT_TIMEOUT_MS:-}
       JUDGMENT_RATE_LIMIT: ${JUDGMENT_RATE_LIMIT:-}
       JUDGMENT_GLOBAL_RATE_LIMIT: ${JUDGMENT_GLOBAL_RATE_LIMIT:-}
       JUDGMENT_CAPABILITY_RATE_LIMIT: ${JUDGMENT_CAPABILITY_RATE_LIMIT:-}
       # 能力白名单（逗号分隔；空串 = 除恒启用的 record_check 外全关）
       JUDGMENT_CAPABILITIES: ${JUDGMENT_CAPABILITIES:-}
+      # Memory 模块（Hument 集成；可选增强，缺省 none）。⚠️ 逐键显式透传（理由同上：
+      # 加键漏行 = 容器里该键永远不存在，.env 设了也没用）。空串由代码回落缺省；
+      # 但 production + hument 缺 HUMENT_BASE_URL 会在启动时 fail-fast（见 .env.example）
+      MEMORY_ENGINE: ${MEMORY_ENGINE:-}
+      HUMENT_BASE_URL: ${HUMENT_BASE_URL:-}
+      HUMENT_TIMEOUT_MS: ${HUMENT_TIMEOUT_MS:-}
+      # 自助开通（二期；缺省关闭）：建项目不传引擎三键时自动注册 Hub workspace/binding。
+      # ⚠️ 逐键显式透传；production + enabled 缺 HUMENT_OPERATOR_SOCKET_PATH 会在启动时
+      # fail-fast（见 .env.example）。socket 需挂进容器才可用（本机部署无需容器，故仅透传）。
+      # ⚠️ operator 面是 **loopback 信任模型**：Hub 要求 Host 与对端都是回环地址、并拒绝
+      # Forwarded/X-Forwarded-* 头——容器化部署时若经反向代理转发，会被直接拒（403）。
+      HUMENT_PROVISIONING_ENABLED: ${HUMENT_PROVISIONING_ENABLED:-}
+      HUMENT_OPERATOR_SOCKET_PATH: ${HUMENT_OPERATOR_SOCKET_PATH:-}
+      HUMENT_OPERATOR_BINDING_ID: ${HUMENT_OPERATOR_BINDING_ID:-}
+      HUMENT_PROVISIONING_TENANT_ID: ${HUMENT_PROVISIONING_TENANT_ID:-}
+      # ⚠️ 无对应 HUMENT_PROVISIONING_CREDENTIAL_REF：凭据引用按项目派生 `ref-<slug>`
+      # （Hub 侧 credential_ref 是主键 ⇒ 与注册 1:1，共享必 409），故不是部署级配置。
+      # 引擎运行时告警（卡 26c43f52 / 5e6cb000；缺省只进日志）：只剩就绪探针开关
+      # （告警推送 = notify `system_alert` 类别，治理面是 NOTIFY_ENABLED，无独立键）。
+      # ⚠️ 逐键显式透传（理由同上：加键漏行 = 容器里该键永远不存在，.env 设了也没用）
+      MEMORY_HEALTH_PROBE_ENABLED: ${MEMORY_HEALTH_PROBE_ENABLED:-}
+      # 通知出口（一期；**可选出口，缺省关闭**）。⚠️ 逐键显式透传（理由同上：加键漏行 =
+      # 容器里该键永远不存在，.env 设了也没用）。空串由代码回落缺省 / 视为关闭；
+      # 但 production + NOTIFY_ENABLED=true 缺飞书四键或 owner 名单会 fail-fast（见 .env.example）。
+      # ⚠️ 出境功能：启用后任务标题/文档路径/话题名/消息摘要会经飞书离开本机网络——
+      # 出境字段清单与"如何关掉"见 .env.example 的 Notify 区块。
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED:-}
+      NOTIFY_CATEGORIES: ${NOTIFY_CATEGORIES:-}
+      NOTIFY_PROVIDERS: ${NOTIFY_PROVIDERS:-}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_RECIPIENT_OPEN_ID: ${FEISHU_RECIPIENT_OPEN_ID:-}
+      NOTIFY_OWNER_USERNAMES: ${NOTIFY_OWNER_USERNAMES:-}
+      NOTIFY_WEB_BASE_URL: ${NOTIFY_WEB_BASE_URL:-}
+      NOTIFY_TASK_THROTTLE_SECONDS: ${NOTIFY_TASK_THROTTLE_SECONDS:-}
+      NOTIFY_DOC_THROTTLE_SECONDS: ${NOTIFY_DOC_THROTTLE_SECONDS:-}
+      NOTIFY_TOPIC_THROTTLE_SECONDS: ${NOTIFY_TOPIC_THROTTLE_SECONDS:-}
+      NOTIFY_GLOBAL_RATE_LIMIT: ${NOTIFY_GLOBAL_RATE_LIMIT:-}
+      NOTIFY_GLOBAL_RATE_WINDOW_SECONDS: ${NOTIFY_GLOBAL_RATE_WINDOW_SECONDS:-}
+      NOTIFY_DIRECT_RATE_LIMIT_PER_WINDOW: ${NOTIFY_DIRECT_RATE_LIMIT_PER_WINDOW:-}
+      NOTIFY_DIRECT_RATE_WINDOW_SECONDS: ${NOTIFY_DIRECT_RATE_WINDOW_SECONDS:-}
+      NOTIFY_PLATFORM_RATE_LIMIT: ${NOTIFY_PLATFORM_RATE_LIMIT:-}
+      NOTIFY_PLATFORM_RATE_WINDOW_SECONDS: ${NOTIFY_PLATFORM_RATE_WINDOW_SECONDS:-}
+      NOTIFY_HTTP_TIMEOUT_MS: ${NOTIFY_HTTP_TIMEOUT_MS:-}
+      NOTIFY_SYSTEM_ALERT_MAX_PER_HOUR: ${NOTIFY_SYSTEM_ALERT_MAX_PER_HOUR:-}
     ports:
       - "8743:8743"
     depends_on:

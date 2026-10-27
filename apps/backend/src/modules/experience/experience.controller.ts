@@ -3,8 +3,13 @@
  * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
  * [功能概念]
- *   - 经验库（Experience Base）REST 面：12 端点（条目 8：录入 / 列表检索 / 分面 / 详情 /
- *     反馈 / 编辑 / 质量终审 / 软删；成员 4：列表 / 授权 / 改角色 / 夺权）
+ *   - 经验库（Experience Base）REST 面：**14 端点**（条目 8：录入 / 列表检索 / 分面 / 详情 /
+ *     反馈 / 编辑 / 质量终审 / 软删；成员 4：列表 / 授权 / 改角色 / 夺权；判断日志 1：列表；
+ *     判定补跑 1：backfill）
+ *
+ *     ⚠️ **口径修正（2026-10-14）**：本行原写"12 端点（条目 8 + 成员 4）"——**漏算了判断
+ *     日志端点**（`GET /experiences/judgments`，第二期批 3 上线）。真实值当时是 13，加上
+ *     本次的判定补跑端点后为 **14**。controller spec 的 `ALL_ENDPOINTS` 才是权威清单。
  *
  * [代码职责]
  *   - 路由声明 + **逐端点守卫布局** + 参数形态守卫（括号数组参数）+ 把 service 结果
@@ -28,6 +33,10 @@
  *      而"人类 admin 专属"的语义已不成立（admin ｜ 空间 owner/reviewer）。
  *      权限判定的**唯一收口** = `ExperienceMemberService.assertCanReview`（403/13004 缺角色）；
  *      **自 v1.81.0 起禁自审四态退役，故 403/13002 不再存在**——controller 不复制任何权限逻辑
+ *   3b. **判定补跑端点判权同样收口在 service**（`isAdmin`，人类 admin 专属），本文件**仍不含
+ *      任何角色守卫/装饰器**——由 controller spec 的源文本断言钉死（它会剥掉注释再逐字搜）。
+ *      补跑的拒绝码刻意用 1009 而**不是**本模块惯用的 13004：见 `ExperienceService
+ *      .assertBackfillAdmin` 的注释（补跑无可授予的角色，13004 的文案会把调用方引向死路）
  *   4. **数组参数只认重复 query 参数**：`signals[]=` 必须在进入 DTO 前被拒
  *      （`assertNoBracketedArrayQuery`，见 experience-query-form.ts 的 qs 归一踩坑）
  *   5. 所有 `:id` / `:actorId` 走 `ParseUUIDPipe`（格式错误不过业务层）；排序/过滤参数
@@ -80,6 +89,7 @@ import type {
   ExperienceDetail,
   ExperienceFacetsResponse,
   ExperienceFeedbackResponse,
+  ExperienceJudgmentsBackfillResponse,
   ExperienceJudgmentsResponse,
   ExperienceListResponse,
   ExperienceMemberDto,
@@ -94,8 +104,14 @@ import { ExperienceService } from './experience.service';
 import { ExperienceMemberService } from './experience-member.service';
 import { ExperienceJudgmentService } from './experience-judgment.service';
 import { assertNoBracketedArrayQuery } from './experience-query-form';
+// 补跑端点的 Swagger 文案引用上下限常量（**禁裸字面量**：改阈值时描述必须跟着动）
+import {
+  EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT,
+  EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT,
+} from './experience.constants';
 import {
   AddExperienceMemberDto,
+  BackfillJudgmentsDto,
   CreateExperienceDto,
   QueryExperienceDto,
   QueryJudgmentDto,
@@ -460,6 +476,86 @@ export class ExperienceController {
     @CurrentActor() actor: UnifiedActor,
   ): Promise<ExperienceJudgmentsResponse> {
     return this.judgmentService.listJudgments(query, actor);
+  }
+
+  /**
+   * 判定补跑（`POST /experiences/judgments/backfill`；**人类 admin 专属**）。
+   *
+   * 用途 = 把 `judgment IS NULL` 的存量条目分批补跑机器判定（"中途才开启判别服务"的动线），
+   * 免去历史清算、也不必等条目被编辑才触发重判。
+   *
+   * ⚠️ **描述文本内禁出现四个 token**（`PERMISSION_DENIED` / 角色守卫类名 / `@Roles` /
+   * 旧 JwtAuthGuard 类名）：同目录 spec 的源文本断言只剥注释、**不剥字符串字面量**，
+   * 写进 description 会当场把测试打红。设计解释（1009 vs 13004 的理由）一律留在注释里。
+   */
+  @Post('judgments/backfill')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtOrApiKeyGuard)
+  @ApiOperation({
+    summary: 'Backfill machine judgments for entries that were never judged (human admin only)',
+    description:
+      'Runs the machine judgment over entries whose `judgment` is still NULL, in batches — the ' +
+      'onboarding path for a deployment that enabled the judgment provider AFTER entries were ' +
+      'already recorded. Who may call: a human admin ONLY (403 with error code 1009 for agents ' +
+      'and for non-admin humans — unlike final review, there is no role to grant here). Batch: ' +
+      `\`limit\` entries — default ${EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT}, max ` +
+      `${EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT}. **\`limit\` is a QUERY parameter, NOT a body ` +
+      'field** (this is a POST, so a limit sent in the body is ignored and the default applies). ' +
+      'Selection: `deleted_at IS NULL AND judgment IS NULL AND (expires_at IS NULL OR ' +
+      'expires_at > now())`, ordered UNTRIED FIRST (no `record_check` log row yet), then oldest ' +
+      'first within the same state — an entry whose judgment keeps failing can therefore NOT pin ' +
+      'the head of every batch, and each batch makes monotonic progress. Expired entries are ' +
+      'excluded; suspect entries ARE included (a judgment predates final review by design, so a ' +
+      'pending review is no reason to skip the check). Judgments run strictly SERIALLY: up to 8 ' +
+      'seconds each plus one full-table similarity scan per entry, so a max batch is ≈13 minutes ' +
+      'worst case — the upper bound is a WALL-CLOCK contract, not just a count. A client timeout ' +
+      'does NOT cancel the batch (the server keeps working and keeps consuming quota); calling ' +
+      'again is safe, since already-judged entries leave the selection set. Read ' +
+      '`providerEnabled` FIRST: false means the judgment provider is not configured — a ' +
+      'restart-level fact, so retrying can never help (configure the provider and restart). ' +
+      'Stop condition = `providerEnabled === true && scanned === 0`. If a batch returns ' +
+      '`ok === 0` with `scanned > 0`, pause and diagnose by log status before retrying ' +
+      '(HTTP 429/529 want backoff; timeouts are retryable). Quota: the same three in-process ' +
+      'sliding-window gates shared with recording and editing (actor / capability / global, 1h) ' +
+      '— a gate-hit batch writes at most ONE `skipped` log row (the rest land in `noLogNulls`), ' +
+      "and that row's `request.reason` names the gate that was hit. An empty log page is NOT " +
+      'proof the check never ran: guard-discarded checks log `ok` while the entry stays NULL, ' +
+      'and fail-open errors leave no row at all. See `GET /experiences/judgments` for the ' +
+      'per-entry log.',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'providerEnabled (read first — false = restart-level config fact) / scanned (0 with ' +
+      'providerEnabled = converged) / ok / notJudged + notJudgedExperienceIds (same set; feed ' +
+      'the ids to GET /experiences/judgments?experienceId=) / noLogNulls + failedNulls ' +
+      '(scope = selection set: never-judged-without-log vs judged-but-still-null) / expiredNulls ' +
+      '(scope = outside the selection set, informational)',
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      `9000 — validation failure (\`limit\`, a QUERY parameter, must be an integer between 1 and ` +
+      `${EXPERIENCE_JUDGMENT_BACKFILL_MAX_LIMIT})`,
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      '1009 — a human admin is required; agents and non-admin humans are refused with two ' +
+      'different messages (an agent is not the right identity class, a non-admin human has a ' +
+      'role problem)',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      '9001 — another backfill batch is already running in this process; read its response ' +
+      'before calling again (batches are serial by design)',
+  })
+  async backfillJudgments(
+    @Query() dto: BackfillJudgmentsDto,
+    @CurrentActor() actor: UnifiedActor,
+  ): Promise<ExperienceJudgmentsBackfillResponse> {
+    return this.experienceService.backfillJudgments(dto, actor);
   }
 
   /**

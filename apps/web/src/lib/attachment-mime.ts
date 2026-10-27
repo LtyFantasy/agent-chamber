@@ -4,7 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/api-definition.md §16a（附件安全模型 / mime 不变量）
- *   - 补充: docs/frontend-architecture.md §3.2.3（消息渲染 + 附件卡片）
+ *   - 补充: docs/frontend/frontend-architecture.md §3.2.3（消息渲染 + 附件卡片）
  *
  * [踩坑索引]
  *   - 本模块是**纯常量 + 纯谓词**（无 'use client'、无 React、无 axios）：三个消费面

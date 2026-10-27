@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §i18n
- *   - 补充: docs/i18n.md（Phase 2 补齐，key 命名与新增语言流程）
+ *   - 主文档: docs/frontend/frontend-architecture.md §i18n
+ *   - 补充: docs/frontend/i18n.md（Phase 2 补齐，key 命名与新增语言流程）
  *
  * [踩坑索引] 无
  *

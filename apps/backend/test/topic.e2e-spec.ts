@@ -887,6 +887,134 @@ describe('TopicController (e2e)', () => {
       .expect(400);
   });
 
+  // ==================== v1.96.0-dev D5：PATCH notification-settings ====================
+
+  it('PATCH /topics/:id/notification-settings - 未知键 mute → 400（forbidNonWhitelisted，mute 未接线）', async () => {
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001/notification-settings')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ mentionsOnly: true, mute: true })
+      .expect(400);
+  });
+
+  it('PATCH /topics/:id/notification-settings - 缺 mentionsOnly / 字符串 true → 400（必填布尔，边界层拦截）', async () => {
+    const url = '/topics/00000000-0000-4000-8000-000000000001/notification-settings';
+    await request(app.getHttpServer())
+      .patch(url)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({})
+      .expect(400);
+    await request(app.getHttpServer())
+      .patch(url)
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ mentionsOnly: 'true' })
+      .expect(400);
+  });
+
+  it('PATCH /topics/:id/notification-settings - OPEN 话题 + 非参与者 → 403 + AGENT_NOT_IN_TOPIC(1006)', async () => {
+    // 可见性分岔（D5）：OPEN 话题存在性不是秘密 → 明说"你不是成员"，message 指向 join
+    mockRepos.Topic.findOne.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000001',
+      title: 'Open Topic',
+      settings: { visibility: 'open' },
+      status: 'active',
+      creatorId: '00000000-0000-4000-8000-0000000000aa',
+      creatorType: 'agent',
+    });
+    // 非参与者：无参与行（hasTopicAccess=false；OPEN read 仍然放行 → 落到 service 领域校验）
+    mockRepos.TopicParticipant.findOne.mockResolvedValue(null);
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001/notification-settings')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ mentionsOnly: true })
+      .expect(403)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.AGENT_NOT_IN_TOPIC);
+        expect(res.body.code).toBe(1006);
+        expect(String(res.body.message)).toContain('POST /topics/:id/join');
+        // 非参与者路径绝不写库
+        expect(mockRepos.TopicParticipant.query).not.toHaveBeenCalled();
+      });
+  });
+
+  it('PATCH /topics/:id/notification-settings - PRIVATE 话题 + 非参与者 → 404 + TOPIC_NOT_FOUND(2000)', async () => {
+    // 安全隐没（D5）：PRIVATE 话题对非成员不泄露存在性；HTTP 路径上由权限层
+    // （ensureCan(read) → 404/2000）先命中，状态码/错误码与 service 侧契约一致
+    mockRepos.Topic.findOne.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000001',
+      title: 'Agent Private Topic',
+      creatorId: '00000000-0000-4000-8000-0000000000aa',
+      creatorType: 'agent',
+      settings: { visibility: 'private' },
+      status: 'active',
+    });
+    mockRepos.TopicParticipant.findOne.mockResolvedValue(null);
+    mockRepos.Agent.exists = jest.fn().mockResolvedValue(false);
+
+    return request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001/notification-settings')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ mentionsOnly: true })
+      .expect(404)
+      .expect((res: any) => {
+        expect(res.body.code).toBe(ErrorCode.TOPIC_NOT_FOUND);
+        expect(res.body.code).toBe(2000);
+        expect(mockRepos.TopicParticipant.query).not.toHaveBeenCalled();
+      });
+  });
+
+  it('PATCH /topics/:id/notification-settings - 合法 body 走到业务层（键名读回 mentionsOnly）', async () => {
+    // 业务路径的完整断言在 unread-cursor.e2e-spec.ts（真 PG）；此处只锁 HTTP 线缆：
+    // 路由注册 + 校验放行 + 响应形状 { topicId, mentionsOnly }
+    mockRepos.Topic.findOne.mockResolvedValue({
+      id: '00000000-0000-4000-8000-000000000001',
+      title: 'T',
+      settings: {},
+      status: 'active',
+      creatorId: '00000000-0000-4000-8000-000000000005',
+    });
+    const row = {
+      topicId: '00000000-0000-4000-8000-000000000001',
+      participantId: '00000000-0000-4000-8000-000000000005',
+      status: 'active',
+      role: 'member',
+      notificationSettings: { mute: false, mentions_only: false },
+      lastReadMessageId: null,
+    };
+    const updated = { ...row, notificationSettings: { mute: false, mentions_only: true } };
+    mockRepos.TopicParticipant.findOne
+      .mockResolvedValueOnce(row) // 前置条件
+      .mockResolvedValueOnce(updated) // 写后读回
+      .mockResolvedValue(updated); // resolveUnreadContext
+    mockRepos.TopicParticipant.query.mockResolvedValue(undefined);
+    mockRepos.Message.createQueryBuilder.mockReturnValue({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getCount: jest.fn().mockResolvedValue(0),
+    });
+
+    const res = await request(app.getHttpServer())
+      .patch('/topics/00000000-0000-4000-8000-000000000001/notification-settings')
+      .set('Authorization', `Bearer ${authToken}`)
+      .send({ mentionsOnly: true })
+      .expect(200);
+
+    expect(res.body.data.mentionsOnly).toBe(true);
+    expect(res.body.data.topicId).toBe('00000000-0000-4000-8000-000000000001');
+    // 模式 true → hiddenUnreadCount 恒附（0 − 0 = 0，键在但值为 0）
+    expect(res.body.data.hiddenUnreadCount).toBe(0);
+    // 写走 SQL 侧 jsonb 合并（键名常量插值 + 值绑定）
+    const [sql, params] = mockRepos.TopicParticipant.query.mock.calls[0];
+    expect(sql).toContain("jsonb_build_object('mentions_only', $3::boolean)");
+    expect(params).toEqual([
+      '00000000-0000-4000-8000-000000000001',
+      '00000000-0000-4000-8000-000000000005',
+      true,
+    ]);
+  });
+
   it('POST /topics/:id/read - 防回退：目标更旧 → advanced=false 且游标不动', async () => {
     mockRepos.Topic.findOne.mockResolvedValue({
       id: '00000000-0000-4000-8000-000000000001',
@@ -950,7 +1078,7 @@ describe('TopicController (e2e)', () => {
       role: 'owner',
     };
     mockRepos.TopicParticipant.findOne.mockResolvedValue(existingParticipant);
-    mockRepos.TopicParticipant.save.mockImplementation((entity: any) => Promise.resolve(entity));
+    mockRepos.TopicParticipant.update.mockResolvedValue({ affected: 1 });
 
     return request(app.getHttpServer())
       .post('/topics/00000000-0000-4000-8000-000000000001/read')
@@ -960,8 +1088,21 @@ describe('TopicController (e2e)', () => {
       .expect((res: any) => {
         expect(res.body.data.advanced).toBe(true);
         expect(res.body.data.lastReadMessageId).toBe('00000000-0000-4000-8000-000000000020');
-        expect(mockRepos.TopicParticipant.save).toHaveBeenCalled();
-        // upsert bug 守卫：role 不被降级
+        // D9（v1.96.0-dev）：既有行分支从整行 save() 改**定点 update()**——载荷只含
+        // lastReadMessageId，结构上不可能回写 notification_settings / role / joinedAt。
+        // 旧断言 `save` 已废（整行 save 会把并发的设置写入静默翻回）。
+        expect(mockRepos.TopicParticipant.update).toHaveBeenCalledWith(
+          {
+            topicId: '00000000-0000-4000-8000-000000000001',
+            participantId: '00000000-0000-4000-8000-000000000005',
+          },
+          { lastReadMessageId: '00000000-0000-4000-8000-000000000020' },
+        );
+        expect(Object.keys(mockRepos.TopicParticipant.update.mock.calls[0][1])).toEqual([
+          'lastReadMessageId',
+        ]);
+        expect(mockRepos.TopicParticipant.save).not.toHaveBeenCalled();
+        // upsert bug 守卫：role 不被降级（内存对象也不被就地改写）
         expect(existingParticipant.role).toBe('owner');
       });
   });

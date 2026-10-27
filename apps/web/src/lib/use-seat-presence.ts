@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态）
- *   - 补充: docs/roundtable-design.md §8b（seat 状态可视化：实时/近况两层模型；
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态）
+ *   - 补充: docs/modules/roundtable-design.md §8b（seat 状态可视化：实时/近况两层模型；
  *     轮询优先 + SSE+Redis 规模化升级路径——本 hook 即传输抽象接缝）
  *
  * [踩坑索引]

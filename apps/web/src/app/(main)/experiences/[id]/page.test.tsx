@@ -279,7 +279,7 @@ function route(handlers: {
         return Promise.reject({
           response: {
             status: handlers.reviewError.status,
-            data: { message: handlers.reviewError.message },
+            data: { code: 9000, message: handlers.reviewError.message },
           },
         });
       }
@@ -300,7 +300,7 @@ function route(handlers: {
         return Promise.reject({
           response: {
             status: handlers.updateError.status,
-            data: { message: handlers.updateError.message },
+            data: { code: 9000, message: handlers.updateError.message },
           },
         });
       }
@@ -779,6 +779,17 @@ describe('ExperienceDetailPage', () => {
       renderPage();
       await openEditDialog();
       const detailCallsBefore = callsTo('GET', '/experiences/e1').length;
+      fireEvent.change(screen.getByTestId('experience-form-title'), {
+        target: { value: 'My unsaved title' },
+      });
+      route({
+        detail: {
+          ...detail(),
+          title: 'Concurrent server title',
+          updatedAt: '2026-10-26T00:00:00Z',
+        },
+        updateError: { status: 409, message: 'expectedUpdatedAt mismatch' },
+      });
 
       fireEvent.click(screen.getByTestId('experience-form-submit'));
 
@@ -789,9 +800,7 @@ describe('ExperienceDetailPage', () => {
         expect(callsTo('GET', '/experiences/e1').length).toBeGreaterThan(detailCallsBefore),
       );
       // 冲突不清空用户输入（表单内容保留，避免重打一遍）
-      expect(screen.getByTestId('experience-form-title')).toHaveValue(
-        'Docker port forwarding fails on WSL2',
-      );
+      expect(screen.getByTestId('experience-form-title')).toHaveValue('My unsaved title');
     });
   });
 });
@@ -911,4 +920,31 @@ describe('ExperienceDetailPage 归属元信息（v1.81.0）', () => {
       messages['experiences.creator.deletedHint'],
     );
   });
+});
+
+it('feedback 409 remains the expired notice, preserves counts, and allows another attempt', async () => {
+  jest.clearAllMocks();
+  signIn('admin');
+  route({ detail: detail() });
+  const normalRoute = mockRequest.getMockImplementation()!;
+  let expired = true;
+  mockRequest.mockImplementation((config: { method?: string; url?: string }) =>
+    config.method === 'POST' && config.url === '/experiences/e1/feedback' && expired
+      ? Promise.reject({
+          response: { status: 409, data: { code: 13004, message: 'server conflict details' } },
+        })
+      : normalRoute(config),
+  );
+  renderPage();
+  fireEvent.click(await screen.findByTestId('experience-feedback-helped'));
+  await waitFor(() =>
+    expect(mockToastError).toHaveBeenCalledWith({
+      title: 'This entry has expired, so feedback is closed.',
+    }),
+  );
+  expect(screen.getByTestId('experience-feedback-counts')).toBeInTheDocument();
+  expired = false;
+  fireEvent.click(screen.getByTestId('experience-feedback-helped'));
+  await waitFor(() => expect(mockToastSuccess).toHaveBeenCalled());
+  expect(callsTo('POST', '/experiences/e1/feedback')).toHaveLength(2);
 });

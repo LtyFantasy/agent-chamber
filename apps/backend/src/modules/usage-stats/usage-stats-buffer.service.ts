@@ -461,10 +461,15 @@ function toFlushRow(acc: UsageStatsAccumulator): UsageStatsFlushRow {
 }
 
 /**
- * 耗时归一：非有限值/负数归 0，小数四舍五入（列是 int，且 pg 对 number → int 会报错）。
- * 上报 DTO 已有 `latencyMs >= 0` 校验，这里是入库前的最后一道（fail-open 不抛）。
+ * 耗时归一：非有限值/负数归 0，小数四舍五入（列是 int，且 pg 对 number → int 会报错），
+ * 并钳到 int4 上界。
+ *
+ * 上界 `2_147_483_647` = PG `int4` 最大值（F4 项4 / S-M3）：DTO 层已有 `@Max(86_400_000)`，
+ * 这里是**纵深防御**——buffer 是入库前的最后一道，且它是 fail-open（不抛），若上界只靠
+ * DTO，任何绕过 DTO 的调用路径（内部调用、未来新上报口）都会把 `22003` 带进 flush，
+ * 而 flush 是整批失败 + mergeBack 重放 ⇒ 遥测恒零。
  */
 function sanitizeLatency(latencyMs: number): number {
   if (!Number.isFinite(latencyMs) || latencyMs <= 0) return 0;
-  return Math.round(latencyMs);
+  return Math.min(Math.round(latencyMs), 2_147_483_647);
 }

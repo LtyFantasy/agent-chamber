@@ -4,7 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/api-definition.md §16 (DocSpace 模块) —— 任务 T6（空间级全量导出/回导）
- *   - 补充: docs/platform-mcp.md §2（语义化高层工具契约）
+ *   - 补充: docs/integrations/platform-mcp.md §2（语义化高层工具契约）
  *   - 补充: v1.62.0（contentHash 读路径透传）——bundle docs[] item 增 docId + contentHash
  *     （原始写入 payload 的 SHA-256 = 权威 revision 标识；content 是重建产物，勿对 content
  *     自算 hash）；import DTO 显式声明该字段防 roundtrip 400

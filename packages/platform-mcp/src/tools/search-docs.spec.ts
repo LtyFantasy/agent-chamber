@@ -312,4 +312,69 @@ describe('search_docs', () => {
     expect(withoutHint).not.toHaveProperty('hint');
     expect(withoutHint).not.toHaveProperty('hintCode');
   });
+
+  it('hints 信封透传（2 期，v1.92.0-dev）：带 hints 时原样产出；缺省/空数组不产出该键', async () => {
+    // 统一 hints 信封是 2 期新面（四态/≤3）；MCP 侧只做**原样透传**——不解析 message、
+    // 不裁剪、不重排（消费方按 code 分支）。两种形态都必须钉住：
+    // ① 上游带非空 hints → 逐字段透传（code/status/message/data 全保留）；
+    // ② 上游缺键或空数组 → 本工具也不产出该键（禁空数组契约，与后端一致）。
+    const request = mockRequest();
+    request.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    request.mockResolvedValueOnce({
+      hits: [],
+      hint: 'No sections strongly matched.',
+      hintCode: 'zero_hit',
+      hints: [
+        {
+          code: 'suggest_relaxing',
+          status: 'suggestion',
+          message: '零命中且本次带了筛选条件；可尝试去掉部分筛选参数扩大范围。',
+          data: { appliedFilters: { type: 'memory' }, removableParams: ['type'] },
+        },
+        {
+          code: 'zero_hit',
+          status: 'suggestion',
+          message: 'No sections strongly matched.',
+          data: { q: 'x' },
+        },
+      ],
+    });
+
+    const withHints = JSON.parse(
+      (await searchDocsTool.handler({ spaceName: 'My Docs', q: 'x' }, ctx())).content[0].text,
+    );
+    expect(withHints.hints).toHaveLength(2);
+    expect(withHints.hints[0]).toEqual({
+      code: 'suggest_relaxing',
+      status: 'suggestion',
+      message: '零命中且本次带了筛选条件；可尝试去掉部分筛选参数扩大范围。',
+      data: { appliedFilters: { type: 'memory' }, removableParams: ['type'] },
+    });
+    // 旧两键保留（一个迁移周期）
+    expect(withHints.hintCode).toBe('zero_hit');
+
+    // 缺键 → 不产出
+    const plain = mockRequest();
+    plain.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    plain.mockResolvedValueOnce({ hits: [] });
+    const noKey = JSON.parse(
+      (await searchDocsTool.handler({ spaceName: 'My Docs', q: 'x' }, ctx())).content[0].text,
+    );
+    expect(noKey).not.toHaveProperty('hints');
+
+    // 空数组（防御：上游异常形态）→ 也不产出该键
+    const empty = mockRequest();
+    empty.mockResolvedValueOnce({
+      items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
+    });
+    empty.mockResolvedValueOnce({ hits: [], hints: [] });
+    const emptyHints = JSON.parse(
+      (await searchDocsTool.handler({ spaceName: 'My Docs', q: 'x' }, ctx())).content[0].text,
+    );
+    expect(emptyHints).not.toHaveProperty('hints');
+  });
 });

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import SkillListPage from './page';
 import { Api } from '@/lib/api';
@@ -43,9 +43,10 @@ const skillFixture = {
   updatedAt: '2026-08-09',
 };
 
-function renderPage() {
+function renderPage(
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   // retry: false —— 查询失败立即进入 isError，避免默认 3 次重试拖慢断言
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <SkillListPage />
@@ -85,13 +86,35 @@ describe('SkillListPage', () => {
     expect(screen.queryByText('agent-chamber')).not.toBeInTheDocument();
   });
 
-  it('查询失败时渲染空态而非永久 Loading', async () => {
+  it('初次失败可重试恢复，不能冒充成功空态', async () => {
     mockList.mockRejectedValue(new Error('boom'));
 
     renderPage();
 
     await waitFor(() => {
-      expect(screen.getByText('No skills available')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'common.retry' })).toBeInTheDocument();
     });
+    expect(screen.queryByText('No skills available')).not.toBeInTheDocument();
+    mockList.mockResolvedValue([skillFixture]);
+    fireEvent.click(screen.getByRole('button', { name: 'common.retry' }));
+    expect(await screen.findByText('agent-chamber')).toBeInTheDocument();
   });
+
+  it.each([{ cached: [] }, { cached: [skillFixture] }])(
+    '缓存空/非空刷新失败仍保留上次内容',
+    async ({ cached }) => {
+      mockList.mockResolvedValue(cached);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      renderPage(client);
+      await screen.findByText(cached.length ? 'agent-chamber' : 'No skills available');
+      mockList.mockRejectedValue(new Error('Network Error'));
+      await act(async () => {
+        await client.refetchQueries({ queryKey: ['skills', 'list'] });
+      });
+      expect(await screen.findByRole('status')).toBeInTheDocument();
+      expect(
+        screen.getByText(cached.length ? 'agent-chamber' : 'No skills available'),
+      ).toBeInTheDocument();
+    },
+  );
 });

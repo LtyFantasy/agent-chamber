@@ -6,7 +6,7 @@
  *   - 主文档: docs/spec.md (错误码体系)
  *   - 补充: docs/architecture.md §3.2 (全局异常过滤器)
  *
- * [踩坑索引] P2-#4(4xx 带 stack 记 error 泄露用户输入) SQLSTATE-MAP(显式码表收窄)
+ * [踩坑索引] P2-#4(4xx 带 stack 记 error 泄露用户输入) SQLSTATE-MAP(PG 映射单源已迁 pg-error.util.ts)
  *
  * [铁律关联] #9(代理层透传) #11(注释)
  *
@@ -18,7 +18,9 @@
  *   SQLSTATE-MAP: QueryFailedError 只按**显式码表**映射（{22021,42601,54001}→400）；
  *          22012/22023/22P02 明文不映射（500 留 stack——22P02 是 9082464c 家族、
  *          22023 是 GUC 配置面，映成 400 = 把服务端 bug 伪装成用户错误）。
- *          见 INPUT_SQLSTATE_CODES 头注（security ②，检索中文根治批次 1-b）。
+ *          **2026-10-17（F4 项5）起码表与 message 子串分支迁到 common/utils/pg-error.util.ts**
+ *          （describePgError），本文件只委托——DocSpace 批量 per-item 消毒共用同一映射，
+ *          两处各写一份必然漂移。码表头注（含「明文不映射」清单）随迁移过去。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -37,25 +39,9 @@ import {
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { ErrorCode } from '@agent-chamber/shared';
-import { QueryFailedError, EntityNotFoundError } from 'typeorm';
+import { EntityNotFoundError } from 'typeorm';
 import { redactUrl } from '../utils/redact-url';
-
-/**
- * SQLSTATE 显式码表（security 复核必改收窄版，检索中文根治批次 1-b）：只映射
- * **输入类码** → 400 VALIDATION_ERROR。
- * - `22021` invalid byte sequence for encoding（如查询串夹 NUL——DTO 层之外的
- *   service 直调兜底面）；
- * - `42601` syntax error（SQL/tsquery 语法错——编译器上线后主要残留面是手写 SQL
- *   段与未来新查询形态）；
- * - `54001` statement too complex（语句复杂度超限，可由超长查询触发）。
- *
- * ⚠️ **明确不映射**（保持 500 + stack，服务端缺陷语义，code review security ②）：
- * `22012`（division by zero）、`22023`（invalid parameter value——GUC 配置面）、
- * `22P02`（invalid text representation——正是本仓 ts_headline options bug 9082464c
- * 家族）。把它们映成 400 会把服务端 bug 伪装成用户输入错误，排查线索（stack）被吞。
- * 码表外的 QueryFailedError 继续走下方 message 子串匹配与 500 兜底。
- */
-const INPUT_SQLSTATE_CODES: ReadonlySet<string> = new Set(['22021', '42601', '54001']);
+import { describePgError } from '../utils/pg-error.util';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -135,37 +121,16 @@ export class AllExceptionsFilter implements ExceptionFilter {
       status = HttpStatus.NOT_FOUND;
       code = ErrorCode.NOT_FOUND;
       message = 'Resource not found';
-    } else if (exception instanceof QueryFailedError) {
-      // PostgreSQL/TypeORM 底层错误映射为 4xx，避免暴露 500
-      const pgMessage = exception.message || '';
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const driverError = (exception as any).driverError;
-      const detail = driverError?.detail || '';
-      const fullMessage = `${pgMessage} ${detail}`.toLowerCase();
-      // ① SQLSTATE 显式码表优先（码表与「明文不映射」清单见 INPUT_SQLSTATE_CODES 头注）：
-      //    输入类码 → 400（日志走下方 4xx 纪律：warn 无 stack，不回显用户输入）
-      const sqlstate = (driverError?.code as string | undefined) ?? '';
-      if (INPUT_SQLSTATE_CODES.has(sqlstate)) {
-        status = HttpStatus.BAD_REQUEST;
-        code = ErrorCode.VALIDATION_ERROR;
-        // message 固定文案——PG 原文（含 driverError.detail）可能回显用户输入
-        message = 'Invalid query input';
-      } else if (pgMessage.includes('invalid input syntax for type uuid')) {
-        status = HttpStatus.BAD_REQUEST;
-        code = ErrorCode.VALIDATION_ERROR;
-        message = 'Invalid UUID format';
-      } else if (pgMessage.includes('violates foreign key constraint')) {
-        // 外键失败通常是引用了不存在的资源；若提示包含 not present 视为 404，否则 400
-        status = fullMessage.includes('is not present in table')
-          ? HttpStatus.NOT_FOUND
-          : HttpStatus.BAD_REQUEST;
-        code = status === HttpStatus.NOT_FOUND ? ErrorCode.NOT_FOUND : ErrorCode.VALIDATION_ERROR;
-        message =
-          status === HttpStatus.NOT_FOUND ? 'Referenced resource not found' : 'Invalid reference';
-      } else if (pgMessage.includes('violates unique constraint')) {
-        status = HttpStatus.CONFLICT;
-        code = ErrorCode.RESOURCE_CONFLICT;
-        message = 'Resource conflict';
+    } else {
+      // PostgreSQL/TypeORM 底层错误 → 4xx 映射，避免暴露 500。
+      // 判定与文案的**唯一单源**是 common/utils/pg-error.util.ts.describePgError
+      // （返回 null = 不是可映射的 PG 错误 → 保持 500 INTERNAL_ERROR + 'Internal server
+      // error' + stack 的服务端缺陷语义，与抽取前逐字一致）。
+      const pg = describePgError(exception);
+      if (pg) {
+        status = pg.status;
+        code = pg.code;
+        message = pg.message;
       }
     }
 

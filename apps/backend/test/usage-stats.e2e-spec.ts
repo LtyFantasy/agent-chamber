@@ -1152,6 +1152,38 @@ describe('接口/MCP 调用频率统计 — 真实 PG + 真实 HTTP 集成（pla
     expect(JSON.stringify(tooWide.body)).toContain('请分段查询');
   }, 30000);
 
+  it('⓪ GET /system/api-usage 所有出口都带 Cache-Control: no-store（200/400/401/403）', async () => {
+    if (!dbAvailable) return;
+    const base = `${API_PREFIX}/system/api-usage`;
+
+    const ok = await request(app.getHttpServer())
+      .get(base)
+      .query({ groupBy: 'tool' })
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200);
+    expect(ok.headers['cache-control']).toBe('no-store');
+
+    const invalid = await request(app.getHttpServer())
+      .get(base)
+      .query({ groupBy: 'tool', from: 'not-a-date' })
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(400);
+    expect(invalid.headers['cache-control']).toBe('no-store');
+
+    const unauthenticated = await request(app.getHttpServer())
+      .get(base)
+      .query({ groupBy: 'tool' })
+      .expect(401);
+    expect(unauthenticated.headers['cache-control']).toBe('no-store');
+
+    const forbidden = await request(app.getHttpServer())
+      .get(base)
+      .query({ groupBy: 'tool' })
+      .set('Authorization', `Bearer ${editorToken}`)
+      .expect(403);
+    expect(forbidden.headers['cache-control']).toBe('no-store');
+  });
+
   it('⑩ migration down/up 真 DDL 往返（事务内验证后回滚，不销毁共享库的表）', async () => {
     if (!dbAvailable) return;
 

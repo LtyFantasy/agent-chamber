@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §8c（最后一公里连接向导）
- *   - 补充: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
+ *   - 主文档: docs/modules/roundtable-design.md §8c（最后一公里连接向导）
+ *   - 补充: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
  *
  * [踩坑索引]
  *   - 旧版 seat-management 启动命令取 window.location.origin：dev 下是 8742（web），

@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 接口原文——统一层是本接口而非 ACP,
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 接口原文——统一层是本接口而非 ACP,
  *           r4 明确)
  *
  * [踩坑索引]
@@ -25,7 +25,7 @@
  * 一个座位 = 一个运行时会话（单线程串行）。厂商无关——chamber 与 runner 其余部分
  * 对具体厂商零感知，只需面向本接口编程。
  *
- * 出处：docs/roundtable-design.md §3（契约①：SeatDriver 接口，r4 原文）。
+ * 出处：docs/modules/roundtable-design.md §3（契约①：SeatDriver 接口，r4 原文）。
  * 类型面（SeatEvent/SeatConfig）统一复用 @agent-chamber/roundtable-protocol。
  */
 import type { SeatConfig, SeatEvent } from '@agent-chamber/roundtable-protocol';
@@ -49,7 +49,7 @@ export class BusyError extends Error {
 
 /**
  * 座位驱动：一个座位 = 一个运行时会话（单线程串行）
- * （docs/roundtable-design.md §3 原文接口）
+ * （docs/modules/roundtable-design.md §3 原文接口）
  */
 export interface SeatDriver {
   /** 拉起或复活座位对应的运行时会话；幂等（已活则复用） */

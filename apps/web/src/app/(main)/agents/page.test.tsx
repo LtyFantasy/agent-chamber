@@ -11,10 +11,11 @@
  * 文案用 en.json 快照（同 docs 页测试模式）。
  */
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import AgentsPage from './page';
 import { Api } from '@/lib/api';
+import { useNotificationStore } from '@/stores/notification.store';
 import type { Agent, AgentDeletionImpact } from '@/types';
 
 /** agents + common 命名空间 + 全键文案快照（同 en.json） */
@@ -35,6 +36,11 @@ const messages: Record<string, string> = {
     'This Agent has no associated data. Its API Key will be revoked immediately. This action is irreversible.',
   'common.actions': 'Actions',
   'common.delete': 'Delete',
+  // 重置 key 弹窗 + 新 key 展示（卡 72566c2e，m2）
+  'agents.resetKey.title': 'Reset and View API Key',
+  'agents.resetKey.confirm': 'Confirm Reset',
+  'agents.resetKey.scopesHint': 'inherit strictest scopes',
+  'agents.newKey.scopes': 'Permissions',
 };
 
 jest.mock('next-intl', () => ({
@@ -193,7 +199,11 @@ describe('AgentsPage 删除确认弹窗（统一批 B 影响面提示）', () =>
     ).not.toBeInTheDocument();
 
     // 不阻塞删除：确认后调用 DELETE
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Confirm deletion' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Delete' }),
+    );
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('a1'));
   });
 });
@@ -211,4 +221,130 @@ describe('AgentsPage 详情页入口（遥测 follow-up F1）', () => {
     const link = await screen.findByRole('link', { name: 'Agent One' });
     expect(link).toHaveAttribute('href', '/agents/a1');
   });
+});
+
+/**
+ * resetKey 新 key 权限展示（2026-10-16 卡 72566c2e，code-review m2）。
+ *
+ * 后端响应白名单带 `scopes`；本用例证明前端**真的消费**了它（渲染实际权限而非只有静态文案），
+ * 否则该契约字段就是死的（类型声明无人读取）。重置弹窗里另有一行 scopes 继承语义提示。
+ */
+describe('AgentsPage 重置 key 弹窗（scopes 契约字段真被消费）', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockListAll.mockResolvedValue([AGENT]);
+  });
+
+  it('resetKey 响应带 scopes → 新 key 弹窗渲染实际权限', async () => {
+    (Api.agents.resetKey as jest.Mock).mockResolvedValue({
+      apiKey: 'ask_new_key_value',
+      scopes: ['read'],
+    });
+    renderPage();
+    await screen.findByText('Agent One');
+
+    fireEvent.click(screen.getByTestId('reset-key-a1'));
+    await screen.findByText('Reset and View API Key');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Reset' }));
+
+    await screen.findByText('ask_new_key_value');
+    expect(screen.getByTestId('new-key-scopes')).toHaveTextContent('read');
+  });
+
+  it('响应缺 scopes（旧后端兼容）→ 不渲染该行，不崩', async () => {
+    (Api.agents.resetKey as jest.Mock).mockResolvedValue({ apiKey: 'ask_legacy_key' });
+    renderPage();
+    await screen.findByText('Agent One');
+
+    fireEvent.click(screen.getByTestId('reset-key-a1'));
+    await screen.findByText('Reset and View API Key');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Reset' }));
+
+    await screen.findByText('ask_legacy_key');
+    expect(screen.queryByTestId('new-key-scopes')).not.toBeInTheDocument();
+  });
+});
+
+describe('operation failures retain their recovery controls', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    useNotificationStore.setState({ toasts: [], alerts: [] });
+    mockListAll.mockResolvedValue([AGENT]);
+    mockGetDeletionImpact.mockResolvedValue({
+      openTaskCount: 0,
+      messageCount: 0,
+      topicCount: 0,
+      seatCount: 0,
+    });
+    (Api.agents.getById as jest.Mock).mockResolvedValue({
+      ...AGENT,
+      description: 'Old description',
+    });
+  });
+  it('status failure keeps the row and can retry', async () => {
+    (Api.agents.toggle as jest.Mock).mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    const row = (await screen.findByText('Agent One')).closest('tr')!;
+    const button = within(row).getByRole('button', {
+      name: 'agents.table.status: agents.status.disabled',
+    });
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(useNotificationStore.getState().toasts[0]?.title).toBe('agents.toggleFailed'),
+    );
+    expect(within(row).getByText('Active')).toBeInTheDocument();
+    (Api.agents.toggle as jest.Mock).mockResolvedValue({});
+    fireEvent.click(button);
+    await waitFor(() => expect(Api.agents.toggle).toHaveBeenCalledTimes(2));
+    expect(useNotificationStore.getState().toasts).toHaveLength(1);
+  });
+  it('update failure keeps edited inputs and retries', async () => {
+    (Api.agents.update as jest.Mock).mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    const row = (await screen.findByText('Agent One')).closest('tr')!;
+    fireEvent.click(within(row).getByRole('button', { name: 'common.edit' }));
+    fireEvent.change(await screen.findByDisplayValue('Old description'), {
+      target: { value: 'Keep edited description' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    await waitFor(() =>
+      expect(useNotificationStore.getState().toasts[0]?.title).toBe('agents.updateFailed'),
+    );
+    expect(screen.getByDisplayValue('Keep edited description')).toBeInTheDocument();
+    (Api.agents.update as jest.Mock).mockResolvedValue({});
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    await waitFor(() =>
+      expect(screen.queryByDisplayValue('Keep edited description')).not.toBeInTheDocument(),
+    );
+    expect(Api.agents.update).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    ['delete', 'Delete', 'Confirm deletion', 'Delete', 'agents.deleteFailed'],
+    [
+      'resetKey',
+      'Reset and View API Key',
+      'Reset and View API Key',
+      'Confirm Reset',
+      'agents.resetKeyFailed',
+    ],
+  ])(
+    '%s failure keeps confirmation and can retry',
+    async (method, trigger, title, action, fallback) => {
+      const request = Api.agents[method as 'delete' | 'resetKey'] as jest.Mock;
+      request.mockRejectedValue({
+        response: { status: 500, data: { code: 500, message: 'internal stack' } },
+      });
+      renderPage();
+      const row = (await screen.findByText('Agent One')).closest('tr')!;
+      fireEvent.click(within(row).getByRole('button', { name: trigger }));
+      const dialog = within((await screen.findByText(title)).parentElement!.parentElement!);
+      fireEvent.click(dialog.getByRole('button', { name: action }));
+      await waitFor(() => expect(useNotificationStore.getState().toasts[0]?.title).toBe(fallback));
+      expect(screen.getByText(title)).toBeInTheDocument();
+      request.mockResolvedValue({ apiKey: 'test-new-key', scopes: ['read'] });
+      fireEvent.click(dialog.getByRole('button', { name: action }));
+      await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(screen.queryByText(title)).not.toBeInTheDocument());
+    },
+  );
 });

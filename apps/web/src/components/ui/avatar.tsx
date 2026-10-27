@@ -10,7 +10,7 @@ import { ActorType } from '@/types';
  * 无 src 时 fallback 底色不再统一灰，而是按 seed（通常为 actor id）hash 到本调色板，
  * 保证同一 Actor 全站任何位置渲染出相同底色（确定性），相邻 Actor 有区分度。
  *
- * 选色依据（与 docs/ui-design-system.md §2 色板协调）：
+ * 选色依据（与 docs/frontend/ui-design-system.md §2 色板协调）：
  * - 色相覆盖主光色青（187）与辅助光色紫（258）及其邻近方位（蓝/靛/青绿/粉/琥珀/天蓝），
  *   全色环 8 等分附近的深空变体，彼此可区分；
  * - 亮度压到 30-38%、饱和度 45-65%：在 --background(222 47% 5%) 深空底色上
@@ -102,7 +102,7 @@ function Avatar({
   };
 
   /**
-   * Bot 角标规格（设计决策，与 docs/ui-design-system.md 同步）：
+   * Bot 角标规格（设计决策，与 docs/frontend/ui-design-system.md 同步）：
    * - xs（20px 头像）不显示徽章——会糊成一团；
    * - sm/md 徽章 12px（图标 8px），lg/xl 14px（图标 9px）；
    * - violet 底（辅助光色，标识 Agent 身份）+ 页面底色细描边圈（ring-background），

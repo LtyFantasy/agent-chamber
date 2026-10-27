@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §i18n
- *   - 补充: docs/ui-design-system.md（玻璃/按钮视觉规范）
+ *   - 主文档: docs/frontend/frontend-architecture.md §i18n
+ *   - 补充: docs/frontend/ui-design-system.md（玻璃/按钮视觉规范）
  *
  * [踩坑索引] 无
  *

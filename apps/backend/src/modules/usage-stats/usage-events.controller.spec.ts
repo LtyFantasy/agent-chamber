@@ -2,7 +2,10 @@ import 'reflect-metadata';
 import { ExecutionContext, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 import { Request } from 'express';
+import { DataSource } from 'typeorm';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { ApiKeyAuthService } from '../../common/services/api-key-auth.service';
 import { SKIP_USAGE_STATS_KEY } from './skip-usage-stats.decorator';
@@ -99,6 +102,76 @@ describe('UsageEventsController', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('usage event dropped'));
 
     warn.mockRestore();
+  });
+
+  // ── 服务端钳制（F4 项4 / M4）──────────────────────────────────────────────
+  it('viaFallbackAuth=true + 无 agent 身份（人类 JWT 通道）→ 落库强制 false（不得铸造 system 行）', async () => {
+    await controller.reportUsageEvent(
+      { user: { userId: USER_ID } } as unknown as Request,
+      { ...validEvent, viaFallbackAuth: true },
+    );
+
+    // actor_type='system' 的唯一生产者就是这个标志；无 Agent 身份时采信它 = 无身份也能
+    // 铸造"身份不可信"行，distinctActors 口径直接失真。
+    expect(mockBuffer.recordInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({ viaFallbackAuth: false, actorId: null }),
+    );
+  });
+
+  it('viaFallbackAuth=true + 有 agent 身份（API Key 通道）→ 原样透传 true', async () => {
+    await controller.reportUsageEvent(
+      { agent: { id: AGENT_ID } } as unknown as Request,
+      { ...validEvent, viaFallbackAuth: true },
+    );
+
+    expect(mockBuffer.recordInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({ viaFallbackAuth: true, actorId: AGENT_ID }),
+    );
+  });
+
+  it('latencyMs 超 @Max(86400000) → DTO 校验拒绝（400；防 int4 溢出把整批 flush 打成静默停摆）', async () => {
+    const over = plainToInstance(UsageEventDto, { ...validEvent, latencyMs: 86_400_001 });
+    const overErrors = await validate(over);
+    expect(overErrors).toHaveLength(1);
+    expect(overErrors[0].property).toBe('latencyMs');
+    expect(Object.keys(overErrors[0].constraints ?? {})).toContain('max');
+
+    // 上界本身是合法的（边界不误伤）
+    const atLimit = plainToInstance(UsageEventDto, { ...validEvent, latencyMs: 86_400_000 });
+    await expect(validate(atLimit)).resolves.toHaveLength(0);
+  });
+});
+
+/**
+ * int4 上界钳制：**走真 buffer** 判（sanitizeLatency 是模块私有函数，且这一层的意义正是
+ * "全链路的最后一道"——DTO 之外还有内部调用路径）。`latency_ms` 是 int4 列，超界会让
+ * PG 报 22003，而 flush 是**整批**失败 + mergeBack 重放 ⇒ 遥测恒零。故钳制必须生效在
+ * 入库参数上，而不只是"不抛错"。
+ */
+describe('UsageEventsController → buffer：latencyMs int4 上界钳制（纵深防御）', () => {
+  const AGENT_ID = '11111111-1111-4111-8111-111111111111';
+  const INT4_MAX = 2_147_483_647;
+
+  it('latencyMs 超 int4 上界 → 入库参数钳到 2147483647（不抛、不整批丢）', async () => {
+    const query = jest.fn().mockResolvedValue([]);
+    const buffer = new UsageStatsBufferService({ query } as unknown as DataSource);
+    const controller = new UsageEventsController(buffer);
+
+    await controller.reportUsageEvent({ agent: { id: AGENT_ID } } as unknown as Request, {
+      toolName: 'task',
+      surface: 'mcp',
+      ok: true,
+      latencyMs: 3_000_000_000,
+    });
+    await buffer.flush();
+
+    const rows = JSON.parse(query.mock.calls[0][1][0] as string) as Array<{
+      ls: number;
+      lm: number;
+    }>;
+    // 单次调用 ⇒ sum 与 max 都等于钳制后的值
+    expect(rows[0]).toMatchObject({ ls: INT4_MAX, lm: INT4_MAX });
+    buffer.onModuleDestroy();
   });
 });
 

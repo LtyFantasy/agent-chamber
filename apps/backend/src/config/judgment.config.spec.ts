@@ -148,6 +148,8 @@ describe('judgmentConfig', () => {
       'TYPESAFE_BASE_URL',
       'TYPESAFE_API_KEY',
       'TYPESAFE_DEFAULT_MODEL',
+      'TYPESAFE_HTTP_PROXY',
+      'TYPESAFE_HTTPS_PROXY',
     ]) {
       delete process.env[key];
     }
@@ -477,6 +479,85 @@ describe('judgmentConfig', () => {
       process.env.JUDGMENT_CAPABILITIES = 'rerank';
       const config = factory();
       expect(config.capabilities).toEqual(['rerank']);
+      expect(config.warnings).toEqual([]);
+    });
+  });
+
+  describe('TYPESAFE_*_PROXY（专用出口代理；只服务判别流量，不读全局代理变量）', () => {
+    it('缺省（未配置）→ proxyUrl=null + 零 warning', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      const config = factory();
+      expect(config.proxyUrl).toBeNull();
+      expect(config.warnings).toEqual([]);
+    });
+
+    it('https 端点读 TYPESAFE_HTTPS_PROXY（HTTP 键在场也不串键）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.TYPESAFE_HTTP_PROXY = 'http://127.0.0.1:9999';
+      process.env.TYPESAFE_HTTPS_PROXY = 'http://127.0.0.1:8001';
+      const config = factory();
+      expect(config.proxyUrl).toBe('http://127.0.0.1:8001');
+      expect(config.warnings).toEqual([]);
+    });
+
+    it('http 本机端点读 TYPESAFE_HTTP_PROXY（按 baseUrl scheme 选键）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.TYPESAFE_BASE_URL = 'http://127.0.0.1:9000';
+      process.env.TYPESAFE_HTTP_PROXY = 'http://127.0.0.1:8001';
+      process.env.TYPESAFE_HTTPS_PROXY = 'http://127.0.0.1:9999';
+      const config = factory();
+      expect(config.proxyUrl).toBe('http://127.0.0.1:8001');
+    });
+
+    it('非法值（非 URL / 非 http(s) scheme / 无 host）→ 回落直连 + 一条 warning（不含原值）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      for (const bad of ['not-a-url', 'ftp://127.0.0.1:8001', 'http://']) {
+        process.env.TYPESAFE_HTTPS_PROXY = bad;
+        const config = factory();
+        // fail-open：判别是增强项，代理写错必须回落直连而不是阻断启动
+        expect(config.proxyUrl).toBeNull();
+        expect(config.warnings).toHaveLength(1);
+        expect(config.warnings[0]).toContain('TYPESAFE_HTTPS_PROXY');
+        expect(config.warnings[0]).toContain('DIRECT');
+        // 代理值可带 userinfo ⇒ 非法值原样回显 = 凭证泄漏通道（JUDGMENT-WARNING-VALUE-LEAK 同源）
+        expect(config.warnings[0]).not.toContain(bad);
+      }
+    });
+
+    it('代理值带 userinfo 也合法（凭证随 URL 进 dispatcher；warnings 不回显）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.TYPESAFE_HTTPS_PROXY = 'http://user:pass@127.0.0.1:8001';
+      const config = factory();
+      expect(config.proxyUrl).toBe('http://user:pass@127.0.0.1:8001');
+      expect(config.warnings).toEqual([]);
+    });
+
+    it('空串 / 纯空白视同未配置（compose `${VAR:-}` 注空串的误报守卫）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'typesafe';
+      process.env.TYPESAFE_API_KEY = 'apikey_unit_test_only';
+      process.env.TYPESAFE_HTTPS_PROXY = '   ';
+      const config = factory();
+      expect(config.proxyUrl).toBeNull();
+      expect(config.warnings).toEqual([]);
+    });
+
+    it('provider=none 时不读键（proxy env 在场也恒 null、零 warning）', () => {
+      clearJudgmentEnv();
+      process.env.JUDGMENT_PROVIDER = 'none';
+      process.env.TYPESAFE_HTTPS_PROXY = 'http://127.0.0.1:8001';
+      const config = factory();
+      expect(config.proxyUrl).toBeNull();
       expect(config.warnings).toEqual([]);
     });
   });

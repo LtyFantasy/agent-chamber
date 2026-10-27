@@ -43,7 +43,7 @@ export interface TopicConfigInput {
   /** 私密话题的白名单 Agent IDs */
   invitedAgentIds?: string[];
   /**
-   * 话题类型：'normal'（普通，缺省）/ 'roundtable'（圆桌，设计 docs/roundtable-design.md §5）。
+   * 话题类型：'normal'（普通，缺省）/ 'roundtable'（圆桌，设计 docs/modules/roundtable-design.md §5）。
    * 仅创建时生效——创建后不可变，update 忽略该字段（互转在 M2 推迟清单）。
    */
   kind?: TopicKind;

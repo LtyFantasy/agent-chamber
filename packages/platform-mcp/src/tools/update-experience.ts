@@ -13,7 +13,7 @@
  *     内容改写回落 unverified）/§4（工具契约：13001 指引 admin 终审路径）
  *   - 补充: apps/backend/src/modules/experience/dto/update-experience.dto.ts — 可改字段与
  *     清空语义（显式 null）真值
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` 后，权威文档指针改为该线上文档
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` 后，权威文档指针改为该线上文档
  *
  * [关键不变量]
  *   - **`expectedUpdatedAt` 必填**：乐观锁是可选项就没有意义（省略即绕过的锁 = 没有锁）。

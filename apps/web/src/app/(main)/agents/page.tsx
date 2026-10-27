@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { toast } from '@/lib/notify';
+import { errorMessageOf } from '@/lib/error-message';
 import { Avatar } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -52,6 +54,12 @@ export default function AgentsPage() {
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [resetKeyId, setResetKeyId] = useState<string | null>(null);
   const [newApiKey, setNewApiKey] = useState<string | null>(null);
+  /**
+   * 新 key 的 scopes（来自 resetKey / createKey 响应白名单，2026-10-16 卡 72566c2e）。
+   * 让后端契约字段真被消费：用户能看到"这把 key 到底拿到了什么权限"，而不是只能看到
+   * 一句静态文案。`null` = 响应未带（旧后端兼容），此时不渲染该行。
+   */
+  const [newKeyScopes, setNewKeyScopes] = useState<string[] | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const { data, isLoading } = useQuery({
@@ -77,10 +85,7 @@ export default function AgentsPage() {
       }
     },
     onError: (err: unknown) => {
-      setErrorMsg(
-        (err as { response?: { data?: { message?: string } }; message?: string }).response?.data
-          ?.message || t('createFailed'),
-      );
+      setErrorMsg(errorMessageOf(err, t('createFailed')));
     },
   });
 
@@ -89,6 +94,7 @@ export default function AgentsPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['agents'] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('toggleFailed')) }),
   });
 
   const updateMutation = useMutation({
@@ -98,6 +104,7 @@ export default function AgentsPage() {
       void queryClient.invalidateQueries({ queryKey: ['agents'] });
       setEditAgent(null);
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('updateFailed')) }),
   });
 
   const deleteMutation = useMutation({
@@ -106,6 +113,7 @@ export default function AgentsPage() {
       void queryClient.invalidateQueries({ queryKey: ['agents'] });
       setDeleteId(null);
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('deleteFailed')) }),
   });
 
   /** 删除影响面（统一批 B）：确认弹窗打开时拉取计数——提示是增强不是门禁：
@@ -135,10 +143,14 @@ export default function AgentsPage() {
     mutationFn: (id: string) => Api.agents.resetKey(id),
     onSuccess: (data) => {
       setNewApiKey(data.apiKey);
+      // 新 key 的实际 scopes（响应白名单字段，2026-10-16 卡 72566c2e）：重置后**真实**
+      // 继承了哪一组由服务端决定（交集/显式入参），前端只读展示，不猜。
+      setNewKeyScopes(data.scopes ?? null);
       setResetKeyId(null);
       // 重置后刷新列表，使新的 apiKeyPrefix 立即生效
       void queryClient.invalidateQueries({ queryKey: ['agents'] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('resetKeyFailed')) }),
   });
 
   // listAll 返回 Agent[]（非 PaginatedResponse）：直接取全量
@@ -320,23 +332,36 @@ export default function AgentsPage() {
                       </td>
                       <td className="p-4 align-middle">
                         <div className="flex items-center justify-end gap-2">
-                          <Button variant="ghost" size="sm" onClick={() => void openEdit(agent)}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={tCommon('edit')}
+                            onClick={() => void openEdit(agent)}
+                          >
                             <Pencil className="h-4 w-4" />
                           </Button>
                           <Button
                             variant="ghost"
                             size="sm"
+                            aria-label={`${t('table.status')}: ${tGlobal(agent.status === AgentStatus.ACTIVE ? AGENT_STATUS_LABEL_KEY.disabled : AGENT_STATUS_LABEL_KEY.active)}`}
                             onClick={() => toggleMutation.mutate(agent.id)}
                             isLoading={toggleMutation.isPending}
                           >
                             <Power className="h-4 w-4" />
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => setResetKeyId(agent.id)}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            aria-label={t('resetKey.title')}
+                            data-testid={`reset-key-${agent.id}`}
+                            onClick={() => setResetKeyId(agent.id)}
+                          >
                             <KeyRound className="h-4 w-4" />
                           </Button>
                           <Button
                             variant="ghost"
                             size="sm"
+                            aria-label={tCommon('delete')}
                             data-testid={`delete-agent-${agent.id}`}
                             onClick={() => setDeleteId(agent.id)}
                           >
@@ -467,6 +492,9 @@ export default function AgentsPage() {
           <DialogTitle>{t('resetKey.title')}</DialogTitle>
           <DialogDescription>{t('resetKey.description')}</DialogDescription>
         </DialogHeader>
+        {/* scopes 继承语义（2026-10-16 卡 72566c2e）：新 key 取被吊销集合的最严交集，
+            永不升格——只读 key 重置后仍只读。文案为纯静态提示，数据不需查询。 */}
+        <p className="text-muted-foreground mt-2 text-sm">{t('resetKey.scopesHint')}</p>
         <DialogFooter>
           <Button variant="outline" onClick={() => setResetKeyId(null)}>
             {tCommon('cancel')}
@@ -481,16 +509,35 @@ export default function AgentsPage() {
       </Dialog>
 
       {/* Show New API Key */}
-      <Dialog open={!!newApiKey} onOpenChange={() => setNewApiKey(null)}>
+      <Dialog
+        open={!!newApiKey}
+        onOpenChange={() => {
+          setNewApiKey(null);
+          setNewKeyScopes(null);
+        }}
+      >
         <DialogHeader>
           <DialogTitle>{t('newKey.title')}</DialogTitle>
           <DialogDescription>{t('newKey.description')}</DialogDescription>
         </DialogHeader>
         <div className="py-4">
           <code className="block rounded bg-muted p-3 text-sm break-all">{newApiKey}</code>
+          {/* 实际 scopes（后端白名单字段直读，见 newKeyScopes 注释） */}
+          {newKeyScopes && (
+            <p className="text-muted-foreground mt-2 text-sm" data-testid="new-key-scopes">
+              {t('newKey.scopes')}: {newKeyScopes.join(', ') || '—'}
+            </p>
+          )}
         </div>
         <DialogFooter>
-          <Button onClick={() => setNewApiKey(null)}>{t('newKey.saved')}</Button>
+          <Button
+            onClick={() => {
+              setNewApiKey(null);
+              setNewKeyScopes(null);
+            }}
+          >
+            {t('newKey.saved')}
+          </Button>
         </DialogFooter>
       </Dialog>
     </div>

@@ -10,8 +10,8 @@
  *   - 提供 DshAcpDriver（契约① SeatDriver 的实现）；传输行为一律由 AcpDriver 基座承担
  *
  * [权威文档]
- *   - 主文档: docs/roundtable-design.md §3 — 契约① SeatDriver 的厂商实现约定
- *   - 补充: docs/roundtable-design.md §8f — dsh ACP 行为档案（0.2.0-rc.1 四环实测）
+ *   - 主文档: docs/modules/roundtable-design.md §3 — 契约① SeatDriver 的厂商实现约定
+ *   - 补充: docs/modules/roundtable-design.md §8f — dsh ACP 行为档案（0.2.0-rc.1 四环实测）
  *
  * [关键不变量]
  *   - 档位 → DSH_PERMISSION_MODE 的映射是**唯一**权限钉死通道：dsh 握手不暴露 mode 面

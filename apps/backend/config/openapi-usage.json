@@ -1,0 +1,248 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Agent Chamber — usage paths snapshot (generated from MemoryController)",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/memory/projects/{id}/usage/summary": {
+      "get": {
+        "operationId": "MemoryController_getUsageSummary",
+        "summary": "Recorded usage summary (Hument engine identity; no pagination)",
+        "description": "Authorized recorded usage summary for THIS project’s CURRENT engine identity (workspace + actor + actor_private scope). The engine block is kept VERBATIM in snake_case; the platform adds only two keys OUTSIDE it: `target` (camelCase identity echo: workspaceId / actorId / scope) and `usageCaveat`. `engine.target` DOES NOT EXIST — binding_id / namespace_id / credentialRef are never returned. Request vs response naming: request query is camelCase (`providerOperation`, `since`, `until`); the engine echo (`engine.filter`) is snake_case (`provider_operation`, `since`, `until`). Read totals from `data.engine.totals` (NOT recomputed from groups) and note that `null` means UNKNOWN, not zero (actual cost/currency are not inferred; micros are not assumed USD). `totals` always covers ALL matches; summary has NO limit/cursor — sending either is a 400. DEFAULT TIME WINDOW: omit BOTH since and until and the server materializes a 7-day absolute UTC [since,until) window ONCE and echoes it in engine.filter; provide both or neither (a one-sided window is 400). The window may not exceed 90 days; timestamps MUST carry a timezone (RFC3339, e.g. 2026-10-24T00:00:00Z) and are passed through verbatim. PERMISSIONS: admin, or READ access on ALL bindings (usage is a project-level aggregate and cannot be filtered per source). Governance viewers / partially readable projects get 403; non-governance callers with zero or unreadable bindings get 404. The engine is NOT called when denied. SHARED IDENTITY: if the engine identity is shared with another project row (including archived/soft-deleted) or its permanent ownership claim is missing/owned elsewhere, the answer is 409/14006 with hintCode=shared_engine_binding and NO engine call — do not retry, an operator must resolve the claim. ERROR ACTIONS: 503/14000 reason=engine_version_unsupported (old Hub without usage routes / contract-violating response → upgrade Hub or wait for a contract fix, retry is useless); reason=engine_data_incompatible (upstream schema_incompatible: reconcile the Hub ledger / receipts — NOT a version signal); reason=engine_identity_invalid (403 scope_denied or a target echo mismatch → fix the binding / inspect_read authorization). 429 carries Retry-After (seconds). All responses set Cache-Control: no-store. No AgentScope is required (GET, read-only).",
+        "parameters": [
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "description": "Agent authentication (alternative to Bearer JWT)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "description": "Memory project UUID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operation",
+            "required": false,
+            "in": "query",
+            "description": "Exact operation (open string per the engine contract; e.g. formation / recall / relation_advisory / navigation_consolidation / provider_mutation)",
+            "schema": {
+              "maxLength": 128,
+              "type": "string"
+            }
+          },
+          {
+            "name": "providerOperation",
+            "required": false,
+            "in": "query",
+            "description": "Exact provider operation (open string; e.g. generation / embedding / rerank / relation_judgment)",
+            "schema": {
+              "maxLength": 128,
+              "type": "string"
+            }
+          },
+          {
+            "name": "model",
+            "required": false,
+            "in": "query",
+            "description": "Exact requested OR resolved model (a record matches once). Leading/trailing whitespace is trimmed; the value is otherwise passed through verbatim.",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "required": false,
+            "in": "query",
+            "description": "Inclusive lower bound (physical request start) as a timezone-bearing RFC3339 timestamp. Provide BOTH since and until, or neither (the server materializes a 7-day window once and echoes it in engine.filter).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "until",
+            "required": false,
+            "in": "query",
+            "description": "Exclusive upper bound (physical request start) as a timezone-bearing RFC3339 timestamp. Must be greater than since; the window may not exceed 90 days.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "engine (verbatim summary: filter / time_basis / snapshot / as_of / totals / groups / coverage; NO target) / target (workspaceId, actorId, scope=actor_private) / usageCaveat"
+          },
+          "400": {
+            "description": "9000 — validation failure: unknown query key (including scope/workspaceId/actorId/body, or limit/cursor on summary), timezone-less or malformed since/until, since ≥ until, window > 90 days, one-sided window"
+          },
+          "403": {
+            "description": "1009 — governance viewer or partially readable bindings (usage requires ALL bindings readable)"
+          },
+          "404": {
+            "description": "14001 — project not found / soft-deleted / not yours"
+          },
+          "409": {
+            "description": "14006 — shared engine identity or missing/foreign ownership claim (hintCode=shared_engine_binding); no engine call"
+          },
+          "429": {
+            "description": "429 — rate limited by the dual bucket (10/min per IP and per actor) or the in-process engine concurrency gate. Wait for the Retry-After header (seconds) and retry. Throttle limits are independent of engine availability."
+          },
+          "502": {
+            "description": "14004 — the engine refused the read (data.engineCode; 409 conflict on a cursor snapshot change / 400 invalid_argument with a cursor → hintCode=cursor_reset_required: drop the accumulated pages and refetch page 1 once)"
+          },
+          "503": {
+            "description": "14000 — engine unavailable or usage not supported by this identity: data.reason ∈ not_configured / project_engine_unbound / engine_unreachable / engine_timeout / engine_error / engine_version_unsupported / engine_data_incompatible / engine_identity_invalid (see the operation description for each action)"
+          }
+        },
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/memory/projects/{id}/usage/trace": {
+      "get": {
+        "operationId": "MemoryController_getUsageTrace",
+        "summary": "Recorded usage trace (Hument engine identity; paginated)",
+        "description": "Authorized recorded usage trace for THIS project’s CURRENT engine identity. The engine block is kept VERBATIM in snake_case (`rows`, `total_rows`, `limit`, `has_more`, `next_cursor`, `totals`, `coverage`, `filter`, `snapshot`, `as_of`); the platform adds `target` (camelCase identity echo) and `usageCaveat` OUTSIDE it, and `engine.target` is absent. PAGING: `limit` is 1–200 (omitted = 100, explicitly sent — the engine config default is never relied on); `0` means \"no limit\" in the engine contract and is REJECTED here. `totals` covers ALL matches and is NOT page-limited — do not recompute it from rows. When `cursor` is present you MUST send the SAME since, until, filters and limit as page 1 (since/until are REQUIRED with a cursor). A snapshot change answers 409 `conflict`; a filter/limit mismatch answers 400 `invalid_argument`; both surface as 502/14004 with hintCode=cursor_reset_required → drop accumulated pages and refetch page 1 ONCE. `next_cursor` may be absent when `has_more=false`. DEFAULT TIME WINDOW: omit BOTH since and until and the server materializes a 7-day absolute UTC [since,until) window once and echoes it in engine.filter. 90-day maximum; timezone-bearing RFC3339 only. PERMISSIONS, SHARED IDENTITY and ERROR ACTIONS are identical to the summary endpoint (admin or ALL bindings readable; shared/claim → 409/14006 with no engine call; version / data / identity / 429 actions per the summary description). `null` means UNKNOWN, not zero. All responses set Cache-Control: no-store. No AgentScope is required (GET, read-only).",
+        "parameters": [
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "description": "Agent authentication (alternative to Bearer JWT)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "description": "Memory project UUID",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operation",
+            "required": false,
+            "in": "query",
+            "description": "Exact operation (open string per the engine contract; e.g. formation / recall / relation_advisory / navigation_consolidation / provider_mutation)",
+            "schema": {
+              "maxLength": 128,
+              "type": "string"
+            }
+          },
+          {
+            "name": "providerOperation",
+            "required": false,
+            "in": "query",
+            "description": "Exact provider operation (open string; e.g. generation / embedding / rerank / relation_judgment)",
+            "schema": {
+              "maxLength": 128,
+              "type": "string"
+            }
+          },
+          {
+            "name": "model",
+            "required": false,
+            "in": "query",
+            "description": "Exact requested OR resolved model (a record matches once). Leading/trailing whitespace is trimmed; the value is otherwise passed through verbatim.",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "required": false,
+            "in": "query",
+            "description": "Inclusive lower bound (physical request start) as a timezone-bearing RFC3339 timestamp. Provide BOTH since and until, or neither (the server materializes a 7-day window once and echoes it in engine.filter).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "until",
+            "required": false,
+            "in": "query",
+            "description": "Exclusive upper bound (physical request start) as a timezone-bearing RFC3339 timestamp. Must be greater than since; the window may not exceed 90 days.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Page size (1–200; omitted = 100). Zero is rejected: it means \"no limit\" in the engine contract and would scan the whole binding. Every page must repeat the same limit.",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "type": "integer"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque continuation cursor bound to target, filters, page size and the data snapshot. When present, since AND until are REQUIRED (send back page 1's exact window). A snapshot change answers 409; a filter/limit mismatch answers 400 — both surface as 502/14004 with hintCode=cursor_reset_required.",
+            "schema": {
+              "maxLength": 4096,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "engine (verbatim trace: rows / total_rows / limit / has_more / next_cursor? / totals / coverage / filter / snapshot / as_of; NO target) / target (workspaceId, actorId, scope=actor_private) / usageCaveat"
+          },
+          "400": {
+            "description": "9000 — validation failure: unknown query key (including scope/workspaceId/actorId/body), timezone-less or malformed since/until, since ≥ until, window > 90 days, one-sided window, limit outside 1–200 (including 0), cursor longer than 4096, or cursor without explicit since AND until"
+          },
+          "403": {
+            "description": "1009 — governance viewer or partially readable bindings"
+          },
+          "404": {
+            "description": "14001 — project not found / soft-deleted / not yours"
+          },
+          "409": {
+            "description": "14006 — shared engine identity or missing/foreign ownership claim (hintCode=shared_engine_binding); no engine call"
+          },
+          "429": {
+            "description": "429 — dual bucket (10/min per IP and per actor) or in-process concurrency gate. Wait for Retry-After (seconds), then retry with the SAME cursor."
+          },
+          "502": {
+            "description": "14004 — engine refused: 409 conflict (snapshot changed) or 400 invalid_argument with a cursor → hintCode=cursor_reset_required (drop pages, refetch page 1)"
+          },
+          "503": {
+            "description": "14000 — engine unavailable / version / data / identity (data.reason; see summary endpoint)"
+          }
+        },
+        "tags": [
+          "Memory"
+        ],
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  }
+}

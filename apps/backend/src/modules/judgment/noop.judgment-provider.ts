@@ -10,7 +10,7 @@
  *     契约兜底（理论不可达时返回 error 结果而**不是抛错**）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（provider 值域 = `none|typesafe`）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（provider 值域 = `none|typesafe`）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（内核抽取）
  *
  * [关键不变量]

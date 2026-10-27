@@ -12,7 +12,7 @@
  * [权威文档]
  *   - 主文档: .kimi/plans/plan-experience-base-p2.md §0（威胁模型：判断日志=正文第二副本）/§1.2（逐列）
  *     /§3.5（写入纪律）/§4（消费面：翻案率配对、导出姿势）
- *   - 补充: 线上 DocSpace `docs/experience-base.md` — 判断日志/训练语料章（批 6 上线后为准）
+ *   - 补充: 线上 DocSpace `docs/modules/experience-base.md` — 判断日志/训练语料章（批 6 上线后为准）
  *
  * [关键不变量]
  *   - **append-only**：应用层无 UPDATE/DELETE 路径（保留策略/清除 = admin 走 DB 人工窗口，

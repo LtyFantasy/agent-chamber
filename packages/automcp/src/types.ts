@@ -88,8 +88,9 @@ export interface JSONSchema {
    * 而 MCP 客户端是**按 inputSchema 校验/引导模型**的，文字约束对模型是弱提示。
    * mcp-server 的 `handleToolsList` 把 tool 对象**原样**作为 JSON-RPC 响应透传
    * （经手写 server，不过任何 SDK/Zod 校验），故新增关键字会真实到达客户端。
-   * 纯注解扩展：OpenAPI 映射路径不产出这些键（openapi-parser 只解析结构关键字），
-   * 既有工具零影响。
+   * 约束透传（alpha.19 起）：`convertSchemaToInternal` 会把 OpenAPI 的
+   * minLength/maxLength/minItems/maxItems/minimum/maximum/default 一并带上，
+   * 让 MCP client 看到与 REST Swagger 一致的边界（例如 usage trace 的 limit 1–200）。
    */
   minLength?: number;
   /** 字符串长度上界（Draft-07；见 minLength 的扩展来由） */
@@ -98,6 +99,10 @@ export interface JSONSchema {
   minItems?: number;
   /** 数组元素数上界（Draft-07；见 minLength 的扩展来由） */
   maxItems?: number;
+  /** 数值下界（Draft-07；由 OpenAPI `minimum` 透传，供 MCP client 校验/引导模型） */
+  minimum?: number;
+  /** 数值上界（Draft-07；由 OpenAPI `maximum` 透传） */
+  maximum?: number;
   /** 缺省值（Draft-07 注解关键字：不改变校验结果，只向模型/客户端说明省缺语义） */
   default?: unknown;
   /** 组合 schema：多选一（透传自 OpenAPI，分支已递归转换） */
@@ -176,6 +181,18 @@ export interface ToolProfile extends ToolFilterOptions {
   name?: string;
   /** profile 说明 */
   description?: string;
+  /**
+   * 按**精确工具名**排除 custom tools（语义工具），仅作用于 `--custom-tools` 挂载的模块。
+   *
+   * 为什么不是正则：custom tools 是封闭集合（platform-mcp `customTools` 数组），
+   * 名字由仓库代码定义，精确名能防误伤同前缀工具（如 `delete_doc` 与
+   * `delete_doc_route` 是两条独立工具）；而 include/exclude 的正则面对的是
+   * OpenAPI 自动映射的 operationId（开放集合），两者语义不同，故独立字段。
+   *
+   * 校验：名字不存在于已加载模块 → 启动直接报错（拼错的排除项静默无效 = 配置事故）。
+   * 与 CLI 无关（custom tools 只能经 profile 或启动参数挂载，profile 是唯一声明处）。
+   */
+  excludeCustomTools?: string[];
 }
 
 /** CLI Generate 选项 */

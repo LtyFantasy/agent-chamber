@@ -5,7 +5,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §4 (契约②: runner 拨号/hello 上报/心跳/对账——本进程运行时契约)
+ *   - 主文档: docs/modules/roundtable-design.md §4 (契约②: runner 拨号/hello 上报/心跳/对账——本进程运行时契约)
  *   - 补充: packages/roundtable-runner/README.md (启动参数/三分钟上手)
  *
  * [踩坑索引] R3STATE(裸CLI共享stateDir)
@@ -17,7 +17,7 @@
  *         目录互相覆盖对账游标（真实事故）。修复：缺省按 runner 名派生
  *         ~/.roundtable-runner-<name>（`/` 转 `-`，与 install-runner.sh 同规则），
  *         旧目录存在时打 mv 迁移 warn；派生逻辑在 src/state-dir.ts（可单测）。
- *         见 docs/roundtable-design.md §4 R3
+ *         见 docs/modules/roundtable-design.md §4 R3
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图

@@ -13,7 +13,7 @@
  *     （与"前缀命中即 400"的闸门表 `EXPERIENCE_SECRET_PATTERNS` 刻意分开，勿混用）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判断日志/训练语料章（脱敏纪律）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判断日志/训练语料章（脱敏纪律）
  *   - 补充: 检索中文根治计划终稿 v1.5 §2.6（零命中日志脱敏族引用口径）
  *
  * [关键不变量]
@@ -25,6 +25,11 @@
  *     删掉长形态兜底只剩短形态 = 半掩码回归）。
  *   - **PEM 私钥块整块掩码**（头到 `END ... PRIVATE KEY` 或串尾）：只掩头会留下
  *     base64 私钥体。
+ *   - **三条前缀族带左边界** `(?<![A-Za-z0-9])`（2026-10-20 评审 M2）：无边界时
+ *     `background-task-timeout` 被改写成 `background-ta[redacted]`——判别日志是训练
+ *     语料/复核事实源，误伤即静默污染。左边界只排除"词中前缀"，串首/空白/换行/`=`/
+ *     引号/`:` 前置仍命中，「吃掉整个值」语义不变。**本表与闸门表是两张独立表**：
+ *     两张表各自加固左边界，改一边不等于改另一边（同族两条不是冗余，见上条）。
  *   - **正则不保证带 g 标志**：消费方统一重建全局正则再 replace（judgment-payload
  *     的 `new RegExp(source, flags + 'g')` 先例——带 g 的正则有 lastIndex 状态，
  *     直接复用会吃字符）。
@@ -61,10 +66,14 @@
  * 若删掉本表的长形态，兜底就只剩短形态，会留下 `[redacted]eadbeef` 式的半掩码。
  */
 export const JUDGMENT_REDACTION_PATTERNS: readonly RegExp[] = [
-  /ask_[A-Za-z0-9_-]+/g,
+  // 三条前缀族**必须带左边界** `(?<![A-Za-z0-9])`（评审 M2，任务 77bf7dd8）：
+  // 无边界时 `background-task-timeout` 会被改写成 `background-ta[redacted]`——判别日志是
+  // 训练语料/复核事实源，误伤它是静默的数据污染。左边界只排除"词中前缀"，真实 key 前的
+  // 空白/换行/`=`/引号/`:`/串首均不受影响，「吃掉整个值」的掩码语义不变。
+  /(?<![A-Za-z0-9])ask_[A-Za-z0-9_-]+/g,
   // TypeSafe 官方云 key 族（与 ask_ 同规：吃整个值，含官方 key 可能出现的 `-` 等字符）
-  /apikey_[A-Za-z0-9_-]+/g,
-  /sk-[A-Za-z0-9_-]+/g,
+  /(?<![A-Za-z0-9])apikey_[A-Za-z0-9_-]+/g,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]+/g,
   /(?:-{2,5}\s*)?BEGIN(?:\s+[A-Z0-9-]+){0,3}\s+PRIVATE KEY[\s\S]*?(?:END(?:\s+[A-Z0-9-]+){0,3}\s+PRIVATE KEY[^\n]*|$)/g,
   /password\s*=\s*\S+/gi,
   /age-secret-key-\S+/gi,

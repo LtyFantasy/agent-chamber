@@ -1,7 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository, ObjectLiteral, In, FindOneOptions, DataSource, EntityManager } from 'typeorm';
-import { NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import {
   ActorType,
   TaskStatus,
@@ -10,6 +15,8 @@ import {
   ErrorCode,
   EventType,
 } from '@agent-chamber/shared';
+import { UnifiedActor } from '../../common/types/actor.types';
+import { PermissionService } from '../../common/services/permission.service';
 import { TaskService } from './task.service';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { Task } from '../../database/entities/task.entity';
@@ -40,7 +47,12 @@ function createMockRepo<T extends ObjectLiteral>() {
     leftJoin: jest.fn().mockReturnThis(),
     leftJoinAndSelect: jest.fn().mockReturnThis(),
     addSelect: jest.fn().mockReturnThis(),
+    // F4-2：跨板族/软删板按主键重载用（withDeleted + addSelect('x.deletedAt')）
+    withDeleted: jest.fn().mockReturnThis(),
     addOrderBy: jest.fn().mockReturnThis(),
+    // 乐观锁路径的行锁读取（`setLock('pessimistic_write')`）——卡 09ffa9a8 新增，
+    // 未加锁的既有用例不会走到这里
+    setLock: jest.fn().mockReturnThis(),
     where: jest.fn().mockReturnThis(),
     andWhere: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
@@ -171,6 +183,8 @@ describe('TaskService', () => {
   let mockEventService: { create: jest.Mock };
   let mockActorProfileService: { resolveProfiles: jest.Mock; assertActorUsable: jest.Mock };
   let mockAuditService: { log: jest.Mock };
+  /** 锁内权限重跑替身（卡 09ffa9a8）：默认恒放行，判定语义由真 PG e2e 负责 */
+  let mockPermService: { ensureCan: jest.Mock; can: jest.Mock };
 
   beforeEach(async () => {
     mockTaskRepo = createMockRepo<Task>();
@@ -185,6 +199,10 @@ describe('TaskService', () => {
     mockMilestoneRepo = createMockRepo<Milestone>();
     mockIdempotencyRepo = createMockRepo<IdempotencyRecord>();
     mockDocLinkRepo = createMockRepo<TaskDocLink>();
+    mockPermService = {
+      ensureCan: jest.fn().mockResolvedValue(undefined),
+      can: jest.fn().mockResolvedValue(true),
+    };
     mockDocRepo = createMockRepo<Doc>();
     mockDocSpaceRepo = createMockRepo<DocSpace>();
     mockDocSpacePolicy = { can: jest.fn().mockResolvedValue(true) };
@@ -321,6 +339,9 @@ describe('TaskService', () => {
         { provide: DataSource, useValue: mockDataSource },
         { provide: ActorProfileService, useValue: mockActorProfileService },
         { provide: AuditService, useValue: mockAuditService },
+        // 乐观锁路径的锁内权限重跑（卡 09ffa9a8）：本层不验判定语义（真 Policy 在
+        // task-optimistic-lock.e2e-spec.ts 里跑），只提供一个恒放行的替身
+        { provide: PermissionService, useValue: mockPermService },
       ],
     }).compile();
 
@@ -1060,19 +1081,25 @@ describe('TaskService', () => {
       expect(await service.resolveTaskBoard(task)).toBeNull();
     });
 
-    it('should return the board of the task list', async () => {
+    it('should return the board of the task list（含软删板：withDeleted 重载）', async () => {
       const board = { id: 'board-1' } as Board;
-      mockBoardListRepo.findOne.mockResolvedValue({
+      // F4-2/P-N3：走 createQueryBuilder + withDeleted（软删板也要能解析出来，供单条/批量
+      // 同口径判定）——findOne 的 relations join 会把软删板的 JOIN 过滤掉，故不再用它。
+      const qb = mockBoardListRepo.createQueryBuilder() as unknown as Record<string, jest.Mock>;
+      qb.getOne.mockResolvedValue({
         id: 'list-1',
         boardId: 'board-1',
         board,
       } as BoardList);
 
       expect(await service.resolveTaskBoard(createMockTask())).toBe(board);
+      expect(qb.where).toHaveBeenCalledWith('list.id = :id', { id: 'list-1' });
+      expect(qb.withDeleted).toHaveBeenCalled();
     });
 
     it('should return null when list is missing', async () => {
-      mockBoardListRepo.findOne.mockResolvedValue(null);
+      const qb = mockBoardListRepo.createQueryBuilder() as unknown as Record<string, jest.Mock>;
+      qb.getOne.mockResolvedValue(null);
       expect(await service.resolveTaskBoard(createMockTask())).toBeNull();
     });
   });
@@ -1865,6 +1892,199 @@ describe('TaskService', () => {
       });
     });
 
+    // ── notifications 一期 S1：TASK_UPDATE 载荷补状态跃迁 + PATCH 改派补发 TASK_ASSIGNED ──
+    it('update：TASK_UPDATE 载荷带 fromStatus/toStatus 跃迁前后值（下游据此判完工）', async () => {
+      const task = createMockTask({ status: TaskStatus.IN_PROGRESS });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { id: 'board-1', topicId: 'topic-1' },
+      } as BoardList);
+
+      await service.update('task-1', { status: TaskStatus.DONE }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: EventType.TASK_UPDATE,
+          resourceType: 'task',
+          resourceId: 'task-1',
+          topicId: 'topic-1',
+          boardId: 'board-1',
+          payload: {
+            taskId: 'task-1',
+            action: 'updated',
+            status: TaskStatus.DONE,
+            fromStatus: TaskStatus.IN_PROGRESS,
+            toStatus: TaskStatus.DONE,
+          },
+        }),
+      );
+    });
+
+    it('update：状态未变 → fromStatus === toStatus（防「改已完成任务的描述 = 刚完工」误报）', async () => {
+      const task = createMockTask({ status: TaskStatus.DONE });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+
+      await service.update('task-1', { title: '改个标题' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            fromStatus: TaskStatus.DONE,
+            toStatus: TaskStatus.DONE,
+          }),
+        }),
+      );
+    });
+
+    it('update：PATCH {assigneeId} 改派 → TASK_UPDATE 照常 + 补发 TASK_ASSIGNED（载荷同 assign()）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+      mockUserRepo.findBy.mockImplementation(async (criteria: any) => {
+        const ids: string[] = criteria?.id?.value ?? [];
+        return ids
+          .filter((id) => id === 'user-2')
+          .map((id) => ({ id, displayName: 'Bob', username: 'bob', avatarUrl: null }) as User);
+      });
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { id: 'board-1', topicId: 'topic-1' },
+      } as BoardList);
+
+      await service.update('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      // 两条都发：TASK_UPDATE 是通用更新事实，TASK_ASSIGNED 是更细的指派事实（去重交给消费侧）
+      expect(mockEventService.create).toHaveBeenCalledTimes(2);
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: EventType.TASK_UPDATE }),
+      );
+      // boardId/topicId 复用同一份 updatedList 派生，不额外查库
+      expect(mockBoardListRepo.findOne).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).toHaveBeenCalledWith({
+        eventType: EventType.TASK_ASSIGNED,
+        resourceType: 'task',
+        resourceId: 'task-1',
+        topicId: 'topic-1',
+        boardId: 'board-1',
+        actorId: 'actor-1',
+        actorType: ActorType.HUMAN,
+        payload: {
+          taskId: 'task-1',
+          assigneeId: 'user-2',
+          assigneeName: 'Bob',
+          boardId: 'board-1',
+          topicId: 'topic-1',
+        },
+      });
+    });
+
+    it('update：未改派（只改 title）→ 不发 TASK_ASSIGNED', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+
+      await service.update('task-1', { title: '改个标题' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).not.toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: EventType.TASK_ASSIGNED }),
+      );
+    });
+
+    it('update：PATCH {assigneeId: ""} 取消分配 → 不发 TASK_ASSIGNED（无被分配者）', async () => {
+      const task = createMockTask({ assigneeId: 'user-1', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+
+      await service.update('task-1', { assigneeId: '' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).not.toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: EventType.TASK_ASSIGNED }),
+      );
+    });
+
+    it('update：真改派（user-1 → user-2，前后两个非空值）→ 补发 TASK_ASSIGNED', async () => {
+      // P2-1：上面正向用例的旧值都是 null（首次分配），真改派（old 非空 → new 非空）此前零覆盖
+      const task = createMockTask({ assigneeId: 'user-1', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+      mockUserRepo.findBy.mockImplementation(async (criteria: any) => {
+        const ids: string[] = criteria?.id?.value ?? [];
+        return ids
+          .filter((id) => id === 'user-2')
+          .map((id) => ({ id, displayName: 'Bob', username: 'bob', avatarUrl: null }) as User);
+      });
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { id: 'board-1', topicId: 'topic-1' },
+      } as BoardList);
+
+      await service.update('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockTaskRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ assigneeId: 'user-2' }),
+      );
+      expect(mockEventService.create).toHaveBeenCalledTimes(2);
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: EventType.TASK_ASSIGNED,
+          resourceId: 'task-1',
+          topicId: 'topic-1',
+          boardId: 'board-1',
+          payload: expect.objectContaining({
+            taskId: 'task-1',
+            assigneeId: 'user-2',
+            assigneeName: 'Bob',
+            boardId: 'board-1',
+            topicId: 'topic-1',
+          }),
+        }),
+      );
+    });
+
+    it('update：重复指派同一人（user-2 → user-2）→ 不发 TASK_ASSIGNED（精确次数：只发 TASK_UPDATE）', async () => {
+      // P2-3：update 路径缺"值未变"负例。用精确次数断言——仅 not.toHaveBeenCalledWith 会漏掉
+      // "多发了第二条其他类型事件"这类回归
+      const task = createMockTask({ assigneeId: 'user-2', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+
+      await service.update('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: EventType.TASK_UPDATE }),
+      );
+      expect(mockEventService.create).not.toHaveBeenCalledWith(
+        expect.objectContaining({ eventType: EventType.TASK_ASSIGNED }),
+      );
+    });
+
     it('should derive assigneeType from Actor when only assigneeId provided', async () => {
       const task = createMockTask();
       mockTaskRepo.findOne.mockResolvedValue(task);
@@ -2139,6 +2359,115 @@ describe('TaskService', () => {
     });
   });
 
+  // 可选乐观锁 expectedUpdatedAt（卡 09ffa9a8）。这里只钉**本层能证明**的合同（走不走
+  // 事务、拿不拿行锁、409 形状、token 不进响应）；真正的并发语义在真 PG 的
+  // test/task-optimistic-lock.e2e-spec.ts（铁律 #23：mock 桩掉事务/QueryBuilder，
+  // 锁语义与 ORM SQL 生成完全无关，本层证不了"确实串行化了"）。
+  describe('update — 可选乐观锁 expectedUpdatedAt', () => {
+    it('不传 token → 不进事务（旧路径零变更）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+
+      await service.update('task-1', { title: 'NoLock' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockDataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('token 命中 → 走事务 + FOR UPDATE 行锁；token 不进实体也不进响应', async () => {
+      const updatedAt = new Date('2026-10-16T08:00:00.000Z');
+      const task = createMockTask({ updatedAt });
+      const qb = mockTaskRepo.createQueryBuilder('task') as unknown as {
+        setLock: jest.Mock;
+        getOne: jest.Mock;
+      };
+      qb.setLock.mockReturnThis();
+      qb.getOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+      } as BoardList);
+
+      const result = await service.update(
+        'task-1',
+        { title: 'Locked', expectedUpdatedAt: updatedAt.toISOString() },
+        'actor-1',
+        ActorType.HUMAN,
+        { id: 'actor-1', type: ActorType.HUMAN } as UnifiedActor,
+      );
+
+      expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+      expect(qb.setLock).toHaveBeenCalledWith('pessimistic_write');
+      expect(result.title).toBe('Locked');
+      // 锁 token 非实体字段：既不能落到实体上，也不能经 toPlain() 展开进响应
+      expect((task as unknown as Record<string, unknown>).expectedUpdatedAt).toBeUndefined();
+      expect('expectedUpdatedAt' in (result as Record<string, unknown>)).toBe(false);
+    });
+
+    it('token 不匹配 → 409 RESOURCE_CONFLICT + data.currentUpdatedAt（不落盘、不留副作用）', async () => {
+      const task = createMockTask({ updatedAt: new Date('2026-10-16T08:00:00.000Z') });
+      const qb = mockTaskRepo.createQueryBuilder('task') as unknown as {
+        setLock: jest.Mock;
+        getOne: jest.Mock;
+      };
+      qb.setLock.mockReturnThis();
+      qb.getOne.mockResolvedValue(task);
+
+      const err = (await service
+        .update(
+          'task-1',
+          { title: 'TooLate', expectedUpdatedAt: '2026-10-16T07:59:59.000Z' },
+          'actor-1',
+          ActorType.HUMAN,
+          { id: 'actor-1', type: ActorType.HUMAN } as UnifiedActor,
+        )
+        .catch((e: unknown) => e)) as {
+        getStatus: () => number;
+        getResponse: () => { code?: number; data?: { currentUpdatedAt?: string } };
+      };
+
+      expect(err.getStatus()).toBe(409);
+      const body = err.getResponse();
+      expect(body.code).toBe(ErrorCode.RESOURCE_CONFLICT);
+      expect(body.data?.currentUpdatedAt).toBe('2026-10-16T08:00:00.000Z');
+      // 冲突路径：不落盘、不产生副作用（副作用在提交之后）
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+      expect(mockEventService.create).not.toHaveBeenCalled();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('带 token 但缺 actor → 500 INTERNAL_ERROR（fail-closed：授权路径不留"可跳过"活口）', async () => {
+      const task = createMockTask({ updatedAt: new Date('2026-10-16T08:00:00.000Z') });
+      const qb = mockTaskRepo.createQueryBuilder('task') as unknown as {
+        setLock: jest.Mock;
+        getOne: jest.Mock;
+      };
+      qb.setLock.mockReturnThis();
+      qb.getOne.mockResolvedValue(task);
+
+      const err = (await service
+        .update(
+          'task-1',
+          { title: 'NoActor', expectedUpdatedAt: '2026-10-16T08:00:00.000Z' },
+          'actor-1',
+          ActorType.HUMAN,
+          // 刻意**不传** actor
+        )
+        .catch((e: unknown) => e)) as {
+        getStatus: () => number;
+        getResponse: () => { code?: number };
+      };
+
+      expect(err.getStatus()).toBe(500);
+      expect(err.getResponse().code).toBe(ErrorCode.INTERNAL_ERROR);
+      // 锁内权限重跑没跑 ⇒ 更不能放行写入；且必须在 token 比对**之前**就抛（不泄漏 token 状态）
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+      expect(mockEventService.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe('remove', () => {
     it('should soft remove a task', async () => {
       const task = createMockTask();
@@ -2255,7 +2584,13 @@ describe('TaskService', () => {
     it('should prioritize position over order', async () => {
       const task = createMockTask();
       mockTaskRepo.findOne.mockResolvedValue(task);
-      mockBoardListRepo.findOne.mockResolvedValue({ id: 'list-2' } as BoardList);
+      // F4-2：跨板门要解析「目标列 + 任务当前列」所属板。真实 board_lists.board_id 是
+      // NOT NULL，mock 行必须带上（否则解析不到 → 按跨板处理 → 无 actor 即 500）。
+      // 两次解析拿到同一 board ⇒ 同板短路，本用例只管 position 优先级。
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-2',
+        boardId: 'board-2',
+      } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
 
       const result = await service.move('task-1', {
@@ -2297,8 +2632,11 @@ describe('TaskService', () => {
     it('should auto-sync status when target list has mappedStatus', async () => {
       const task = createMockTask({ status: TaskStatus.BACKLOG });
       mockTaskRepo.findOne.mockResolvedValue(task);
+      // F4-2：boardId 必填——跨板门要解析「目标列 + 当前列」所属板；缺 boardId 会被按
+      // 跨板处理（fail-closed），本组用例只关心状态联动，故意保持同板（两次解析同值）
       mockBoardListRepo.findOne.mockResolvedValue({
         id: 'list-done',
+        boardId: 'board-2',
         mappedStatus: 'done',
       } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
@@ -2317,6 +2655,7 @@ describe('TaskService', () => {
       mockTaskRepo.findOne.mockResolvedValue(task);
       mockBoardListRepo.findOne.mockResolvedValue({
         id: 'list-progress',
+        boardId: 'board-2',
         mappedStatus: 'in_progress',
       } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
@@ -2340,6 +2679,7 @@ describe('TaskService', () => {
       mockTaskRepo.findOne.mockResolvedValue(task);
       mockBoardListRepo.findOne.mockResolvedValue({
         id: 'list-todo',
+        boardId: 'board-2',
         mappedStatus: 'todo',
       } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
@@ -2358,6 +2698,7 @@ describe('TaskService', () => {
       mockTaskRepo.findOne.mockResolvedValue(task);
       mockBoardListRepo.findOne.mockResolvedValue({
         id: 'list-done',
+        boardId: 'board-2',
         mappedStatus: 'done',
       } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
@@ -2376,6 +2717,7 @@ describe('TaskService', () => {
       mockTaskRepo.findOne.mockResolvedValue(task);
       mockBoardListRepo.findOne.mockResolvedValue({
         id: 'list-generic',
+        boardId: 'board-2',
         mappedStatus: null,
       } as BoardList);
       mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
@@ -2386,6 +2728,82 @@ describe('TaskService', () => {
       });
 
       expect(result.status).toBe('backlog');
+    });
+
+    // ── F4-2 / V2-N2：跨板写族四门（本组是「按行解析」的 mock，同板短路用例在上面）──
+    it('跨板 move 且 actor 无目标板 write → ensureCan(board, write) 拒绝', async () => {
+      const task = createMockTask({ listId: 'list-1' });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      const targetBoard = { id: 'board-2', creatorId: 'other', settings: {} };
+      // 同一 mock 按 id 分发：当前列在 board-1、目标列在 board-2 ⇒ 判定为跨板
+      mockBoardListRepo.findOne.mockImplementation((async (opts: any) => {
+        if (opts?.where?.id === 'list-1') return { id: 'list-1', boardId: 'board-1' } as BoardList;
+        return {
+          id: opts?.where?.id,
+          boardId: 'board-2',
+          board: targetBoard,
+        } as unknown as BoardList;
+      }) as never);
+      mockPermService.ensureCan.mockRejectedValueOnce(new Error('Access denied: write on Board'));
+
+      await expect(
+        service.move(
+          'task-1',
+          { listId: '3757faa2-9306-4944-99ba-b7588c270970', order: 0 },
+          'actor-1',
+          ActorType.AGENT,
+          { id: 'actor-1', type: ActorType.AGENT, role: UserRole.EDITOR } as UnifiedActor,
+        ),
+      ).rejects.toThrow('Access denied');
+      expect(mockPermService.ensureCan).toHaveBeenCalledWith(
+        targetBoard,
+        expect.anything(),
+        'write',
+      );
+      // 未落库
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('跨板 move 缺 actor → fail-closed 500（授权路径不留"可跳过"的活口）', async () => {
+      const task = createMockTask({ listId: 'list-1' });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockBoardListRepo.findOne.mockImplementation((async (opts: any) =>
+        opts?.where?.id === 'list-1'
+          ? ({ id: 'list-1', boardId: 'board-1' } as BoardList)
+          : ({
+              id: opts?.where?.id,
+              boardId: 'board-2',
+              board: {},
+            } as unknown as BoardList)) as never);
+
+      await expect(
+        service.move('task-1', { listId: '3757faa2-9306-4944-99ba-b7588c270970', order: 0 }),
+      ).rejects.toThrow(InternalServerErrorException);
+      expect(mockTaskRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('同板 move：不施加跨板门（成员 assignee 拖拽不被 403 误杀，A-C2/P-N1）', async () => {
+      const task = createMockTask({ listId: 'list-1' });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      // 目标列与当前列同板（board-1）
+      mockBoardListRepo.findOne.mockImplementation(
+        (async (opts: any) =>
+          ({
+            id: opts?.where?.id,
+            boardId: 'board-1',
+            board: { id: 'board-1', topicId: 'topic-1' },
+          }) as unknown as BoardList) as never,
+      );
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+
+      const result = await service.move('task-1', {
+        listId: '3757faa2-9306-4944-99ba-b7588c270970',
+        order: 0,
+      });
+
+      expect(result.listId).toBe('3757faa2-9306-4944-99ba-b7588c270970');
+      // 同板短路：不查任何板 write（controller 的任务 write 已足够）
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
     });
 
     it('should derive new topicId when moving task to list on a different board', async () => {
@@ -2407,6 +2825,92 @@ describe('TaskService', () => {
       // Batch 3: 跨 board 移动时 topicId 从新 board 派生，不再依赖已删除的 task.topicId 列
       expect(result.boardId).toBe('board-2');
       expect(result.topicId).toBe('topic-adyge');
+    });
+  });
+
+  /**
+   * 跨板门的**直接**单测（复审 MINOR-1：此前只有经 move 间的间接覆盖）。
+   * 覆盖三类零覆盖分支 + 404 可达性（reorder 引用查不到的当前列最终也走这里）。
+   */
+  describe('assertCrossBoardPlacement / assertCanPlaceTaskInList', () => {
+    const gateActor = { id: 'actor-1', type: ActorType.AGENT, role: UserRole.EDITOR };
+
+    it('同列短路：target === current → false 且零查询（拖拽排序高频路径）', async () => {
+      const gated = await service.assertCrossBoardPlacement(gateActor, 'list-1', 'list-1');
+
+      expect(gated).toBe(false);
+      // 早退发生在任何列查询之前（MINOR-3）：同 listId 必然同板，无需问库
+      expect(mockBoardListRepo.findOne).not.toHaveBeenCalled();
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
+    });
+
+    it('同板不同列 → false，且不查板 write（只认任务 write）', async () => {
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-x',
+        boardId: 'board-1',
+      } as BoardList);
+
+      const gated = await service.assertCrossBoardPlacement(gateActor, 'list-2', 'list-1');
+
+      expect(gated).toBe(false);
+      expect(mockBoardListRepo.findOne).toHaveBeenCalledTimes(2);
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
+    });
+
+    it('跨板但 actor 缺失 → 500 fail-closed（不做任何授权放行）', async () => {
+      mockBoardListRepo.findOne.mockImplementation((async (opts: any) =>
+        opts?.where?.id === 'list-1'
+          ? ({ id: 'list-1', boardId: 'board-1' } as BoardList)
+          : ({
+              id: opts?.where?.id,
+              boardId: 'board-2',
+              board: {},
+            } as unknown as BoardList)) as never);
+
+      await expect(
+        service.assertCrossBoardPlacement(undefined, 'list-2', 'list-1'),
+      ).rejects.toThrow(InternalServerErrorException);
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
+    });
+
+    it('跨板且有目标板 write → true，并带完整 actor 调 ensureCan(board, write)', async () => {
+      const targetBoard = { id: 'board-2', creatorId: 'other', settings: {} };
+      mockBoardListRepo.findOne.mockImplementation((async (opts: any) =>
+        opts?.where?.id === 'list-1'
+          ? ({ id: 'list-1', boardId: 'board-1' } as BoardList)
+          : ({
+              id: opts?.where?.id,
+              boardId: 'board-2',
+              board: targetBoard,
+            } as unknown as BoardList)) as never);
+
+      const gated = await service.assertCrossBoardPlacement(gateActor, 'list-2', 'list-1');
+
+      expect(gated).toBe(true);
+      // 完整对象（含 role）——迷你对象会让 BoardPolicy 的 admin bypass 静默失效（A-C2）
+      expect(mockPermService.ensureCan).toHaveBeenCalledWith(targetBoard, gateActor, 'write');
+    });
+
+    it('目标列不存在 → 404 LIST_NOT_FOUND（reorder 引用查不到的当前列走同一分支）', async () => {
+      mockBoardListRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.assertCanPlaceTaskInList(gateActor, 'ghost-list')).rejects.toMatchObject(
+        { response: { code: ErrorCode.LIST_NOT_FOUND } },
+      );
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
+    });
+
+    it('列存在但 board 行缺失（软删/损坏）→ 404 BOARD_NOT_FOUND（不泄露存在性）', async () => {
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: null,
+      } as unknown as BoardList);
+
+      await expect(service.assertCanPlaceTaskInList(gateActor, 'list-1')).rejects.toMatchObject({
+        response: { code: ErrorCode.BOARD_NOT_FOUND },
+      });
+      expect(mockPermService.ensureCan).not.toHaveBeenCalled();
     });
   });
 
@@ -2434,6 +2938,123 @@ describe('TaskService', () => {
       expect(result).toEqual(
         expect.objectContaining({ assigneeId: 'user-2', assigneeType: ActorType.HUMAN }),
       );
+    });
+
+    // ── notifications 一期 S1：TASK_ASSIGNED 事件（此前 assign() 只写 activity，死枚举）──
+    it('assign：save 成功后发 TASK_ASSIGNED（载荷含 assigneeName + boardId/topicId 派生）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+      // 被指派者显示名走 ActorProfileService 收口（默认 mock 只认 user-1，此处补 user-2）
+      mockUserRepo.findBy.mockImplementation(async (criteria: any) => {
+        const ids: string[] = criteria?.id?.value ?? [];
+        return ids
+          .filter((id) => id === 'user-2')
+          .map((id) => ({ id, displayName: 'Bob', username: 'bob', avatarUrl: null }) as User);
+      });
+      // B-51：事件载荷顶层缺 boardId/topicId 时订阅方收不到 → list→board 派生（move() 同款）
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { id: 'board-1', topicId: 'topic-1' },
+      } as BoardList);
+
+      await service.assign('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      // P2-4：assign() 不再自建 list 查询——boardId/topicId 复用 findOne() 已做的派生。
+      // 故 boardListRepo.findOne 只会被 findOne() 自己调用一次，钉住"零冗余查询"这一设计决定
+      // （原先用 toHaveBeenCalledWith 同参数断言是弱断言：那次调用是 findOne 发的，绑不住新查询）
+      expect(mockBoardListRepo.findOne).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).toHaveBeenCalledWith({
+        eventType: EventType.TASK_ASSIGNED,
+        resourceType: 'task',
+        resourceId: 'task-1',
+        topicId: 'topic-1',
+        boardId: 'board-1',
+        actorId: 'actor-1',
+        actorType: ActorType.HUMAN,
+        payload: {
+          taskId: 'task-1',
+          assigneeId: 'user-2',
+          assigneeName: 'Bob',
+          boardId: 'board-1',
+          topicId: 'topic-1',
+        },
+      });
+    });
+
+    it('assign：save 抛错 → 不发 TASK_ASSIGNED（emit 在 save 成功之后，事件与业务写入同真同假）', async () => {
+      const task = createMockTask();
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockRejectedValue(new Error('DB down'));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+
+      await expect(service.assign('task-1', { assigneeId: 'user-2' })).rejects.toThrow('DB down');
+
+      expect(mockEventService.create).not.toHaveBeenCalled();
+    });
+
+    it('assign：真改派（user-1 → user-2，前后两个非空值）→ 发 TASK_ASSIGNED', async () => {
+      // P2-1：上面两条正向用例的旧值都是 null（首次分配），真改派（old 非空 → new 非空）此前零覆盖
+      const task = createMockTask({ assigneeId: 'user-1', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+      mockUserRepo.findBy.mockImplementation(async (criteria: any) => {
+        const ids: string[] = criteria?.id?.value ?? [];
+        return ids
+          .filter((id) => id === 'user-2')
+          .map((id) => ({ id, displayName: 'Bob', username: 'bob', avatarUrl: null }) as User);
+      });
+      mockBoardListRepo.findOne.mockResolvedValue({
+        id: 'list-1',
+        boardId: 'board-1',
+        board: { id: 'board-1', topicId: 'topic-1' },
+      } as BoardList);
+
+      await service.assign('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockTaskRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ assigneeId: 'user-2' }),
+      );
+      expect(mockEventService.create).toHaveBeenCalledTimes(1);
+      expect(mockEventService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          eventType: EventType.TASK_ASSIGNED,
+          resourceId: 'task-1',
+          boardId: 'board-1',
+          topicId: 'topic-1',
+          payload: expect.objectContaining({
+            taskId: 'task-1',
+            assigneeId: 'user-2',
+            assigneeName: 'Bob',
+          }),
+        }),
+      );
+    });
+
+    it('assign：取消分配（assigneeId=""）→ 不发 TASK_ASSIGNED（无被分配者，发了即空指派误报）', async () => {
+      const task = createMockTask({ assigneeId: 'user-1', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+
+      const result = await service.assign('task-1', { assigneeId: '' }, 'actor-1', ActorType.HUMAN);
+
+      expect(result.assigneeId).toBeNull();
+      expect(mockEventService.create).not.toHaveBeenCalled();
+    });
+
+    it('assign：重复指派同一人 → 不发 TASK_ASSIGNED（assigneeId 未变化，非事实变更）', async () => {
+      const task = createMockTask({ assigneeId: 'user-2', assigneeType: ActorType.HUMAN });
+      mockTaskRepo.findOne.mockResolvedValue(task);
+      mockTaskRepo.save.mockImplementation((t) => Promise.resolve(t as Task));
+      mockActorRepo.findOne.mockResolvedValue({ id: 'user-2', type: ActorType.HUMAN } as Actor);
+
+      await service.assign('task-1', { assigneeId: 'user-2' }, 'actor-1', ActorType.HUMAN);
+
+      expect(mockEventService.create).not.toHaveBeenCalled();
     });
 
     it('should clear assigneeId and assigneeType when assigneeId is empty', async () => {

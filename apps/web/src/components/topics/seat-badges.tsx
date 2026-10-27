@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
- *   - 补充: docs/roundtable-design.md §6（座位管理：人类 topic 管理员/平台管理员可
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
+ *   - 补充: docs/modules/roundtable-design.md §6（座位管理：人类 topic 管理员/平台管理员可
  *     移除座位，全部动作 topic 公告可观测）+ §12 r13（座位移除软删语义）
  *
  * [踩坑索引]

@@ -1,22 +1,32 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/api-definition.md §16 (PATCH /doc-routes/:id)
- *   - 补充: 任务 T3（routes 写三件套入 MCP——高频策展动作免走裸 REST）
+ * [功能概念]
+ *   - 意图路由的 Partial 三态更新：省略保留、显式 null 清空、有效值更新
  *
- * [踩坑索引] -
+ * [代码职责]
+ *   - 向 MCP 客户端广告可空字段类型，薄包装 PATCH /doc-routes/:id 并透传上游错误
  *
- * [铁律关联] #9(代理层透传) #11(注释强制)
+ * [权威文档]
+ *   - 主文档: DocSpace「Agent Chamber」docs/integrations/platform-mcp.md §2.21 update_doc_route
+ *   - 补充: DocSpace「Agent Chamber」docs/api-definition.md §16.7a 意图路由
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
+ * [关键不变量]
+ *   - 五个可空字段的 schema 与 handler 同时表达 string/null；undefined 不进入请求体
+ *   - intent/primaryDocId/sortOrder/codeEntryType 的 null 守卫和上游 4xx 错误信封保持
+ *   - 次文档与其锚点各自更新；pattern 清空 codeEntry 时仍受服务端合并视图校验
  *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [关联代码]
+ *   - packages/platform-mcp/src/index.ts — customTools 的真实注册入口
+ *   - packages/platform-mcp/src/tools/update-doc-route.spec.ts — 广告 schema、三态和错误回归
+ *   - packages/automcp/src/server/mcp-server.ts — custom tool 注册与 tools/list 输出
+ *
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -60,7 +70,7 @@ export const updateDocRouteTool: CustomTool = {
           description: 'Optional: new intent description ("我要…", ≤200 chars)',
         },
         category: {
-          type: 'string',
+          type: ['string', 'null'],
           description: 'Optional: new route group (≤100 chars)',
         },
         primaryDocId: {
@@ -68,19 +78,19 @@ export const updateDocRouteTool: CustomTool = {
           description: 'Optional: new primary doc ID (UUID)',
         },
         primaryHeadingPath: {
-          type: 'string',
+          type: ['string', 'null'],
           description: 'Optional: new anchor in the primary doc',
         },
         secondaryDocId: {
-          type: 'string',
+          type: ['string', 'null'],
           description: 'Optional: new secondary doc ID (UUID)',
         },
         secondaryHeadingPath: {
-          type: 'string',
+          type: ['string', 'null'],
           description: 'Optional: new anchor in the secondary doc',
         },
         codeEntry: {
-          type: 'string',
+          type: ['string', 'null'],
           description:
             'Optional: new code entry point — repository-relative path (no absolute path or `..` segments)',
         },

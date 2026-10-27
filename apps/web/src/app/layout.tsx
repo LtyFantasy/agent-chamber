@@ -28,7 +28,7 @@ export async function generateMetadata(): Promise<Metadata> {
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const locale = await getRequestLocale();
-  // dark-only：服务端硬编码 dark class（详见 docs/ui-design-system.md）。
+  // dark-only：服务端硬编码 dark class（详见 docs/frontend/ui-design-system.md）。
   // 作用：① globals.css 令牌收敛为 :root 单份暗色值；② 保住 `dark:` 变体（如 skills 页 dark:prose-invert）；
   // ③ 消灭主题切换的 hydration 闪烁。suppressHydrationWarning 保留以容忍浏览器插件改 html 属性。
   return (

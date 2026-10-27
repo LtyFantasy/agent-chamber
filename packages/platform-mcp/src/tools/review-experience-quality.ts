@@ -12,7 +12,7 @@
  *     工具面自解释，否则 reviewer 不知道"该审哪一条、能不能审这一条"）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` §7（终审纪律）/§11（威胁模型 + 退役决策记录）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` §7（终审纪律）/§11（威胁模型 + 退役决策记录）
  *     与 `docs/api-definition.md` §18 — 终审端点与 13004 动作表
  *   - 历史: .kimi/plans/plan-experience-base-p2.md §5（MCP 面要点）/§2.2（终审端点契约）
  *     /§0（禁自审四态——**已退役**；防锚定 suppression 仍有效）

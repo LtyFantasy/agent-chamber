@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §4 (契约②: 控制面协议——拨号/心跳/双向对账/幂等去重/重连重放)
- *   - 补充: docs/roundtable-design.md §7 (安全边界: X-API-Key 握手认证, 注入面逐类型校验)
+ *   - 主文档: docs/modules/roundtable-design.md §4 (契约②: 控制面协议——拨号/心跳/双向对账/幂等去重/重连重放)
+ *   - 补充: docs/modules/roundtable-design.md §7 (安全边界: X-API-Key 握手认证, 注入面逐类型校验)
  *
  * [踩坑索引] ②(seq 复用→幂等去重静默丢弃→busy 楔死) RT-DEBT-2(未确认队列按 hello_ack/ping 游标裁剪, 不无条件清空)
  *

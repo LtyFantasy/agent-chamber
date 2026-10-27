@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态顶部条）
- *   - 补充: docs/roundtable-design.md §8b（实时/近况两层模型：presence 相位唯一权威点
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态顶部条）
+ *   - 补充: docs/modules/roundtable-design.md §8b（实时/近况两层模型：presence 相位唯一权威点
  *     在 chip badge；recentActivity 环形缓冲挂 state jsonb；cancel 语义 = 优雅优先 +
  *     10s 兜底 kill，busy 门控 409）
  *

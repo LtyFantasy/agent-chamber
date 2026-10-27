@@ -14,7 +14,7 @@
  *     q 是过滤+排序 / SCORE_FLOOR 0.08 / 传参协议）/§4（工具契约与措辞要求）
  *   - 补充: apps/backend/src/modules/experience/dto/query-experience.dto.ts — 参数约束真值
  *   - 补充: packages/shared/src/dto/experience-response.dto.ts — 信封与 EXPERIENCE_ZERO_HIT_HINT 单源
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` 后，权威文档指针改为该线上文档
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` 后，权威文档指针改为该线上文档
  *
  * [关键不变量]
  *   - **数组参数必须走 `serializeRepeatedParams`**（`?signals=a&signals=b`）：axios 默认的

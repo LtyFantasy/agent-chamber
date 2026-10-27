@@ -12,7 +12,7 @@
  *     `assertCanReview`（终审资格，服务端单源：detail 的 viewer 字段与终审端点共用同一实现）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` §7（终审纪律）/§11（威胁模型 +
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` §7（终审纪律）/§11（威胁模型 +
  *     退役决策记录）/`docs/api-definition.md` §18
  *   - 历史: .kimi/plans/plan-experience-base-p2.md §0（禁自审四态矩阵——**已退役**）
  *     /§2.2（端点闸门表）/§2.3（既有口径联动：facets 例外、禁止缓存）
@@ -29,7 +29,7 @@
  *     结论：**任何 admin 或空间 owner/reviewer 可终审任意条目（含本人所录）**，终审资格
  *     退化为纯角色判定。双向权力同时放开：持角色者也可对自己/兄弟的条目打 `suspect`
  *     （默认检索排除的唯一隐藏原语）——明文接受，靠审计 old→new+reason 留痕 + admin
- *     翻案权兜底；多租户开放时按决策记录捡回（线上 `docs/experience-base.md` §11）。
+ *     翻案权兜底；多租户开放时按决策记录捡回（线上 `docs/modules/experience-base.md` §11）。
  *     ⚠️ **编辑/删除的作者判定不受本次变更影响**：`experience.service.ts` 的
  *     `assertCanWrite`（admin ｜ creator ｜ owner 代理 → 403/13001）照旧，其中
  *     `ownerProxy.isOwnerProxy` 仍在使用——勿因"四态退役"连带删掉它（那是另一个方向的
@@ -731,7 +731,7 @@ export class ExperienceMemberService {
  * 13004 —— 缺终审角色 / 缺成员管理权 / 缺判断日志读取权（三处共用此码，message 按场景给下一步）
  *
  * **13002（禁自审）已于 2026-09-24 随四态矩阵退役**（号不复用，见 shared enums 注释与
- * 线上 `docs/experience-base.md` §11 的决策记录）：终审资格如今是**纯角色判定**，
+ * 线上 `docs/modules/experience-base.md` §11 的决策记录）：终审资格如今是**纯角色判定**，
  * "这一条是不是你自己录的"不再参与判权——持角色者可以终审本人所录条目，可疑内容走
  * 双向门打 `suspect`。故本文件里已无第二个终审拒绝码可分。
  *

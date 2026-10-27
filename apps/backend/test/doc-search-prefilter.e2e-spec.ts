@@ -131,6 +131,7 @@ import {
   SEARCH_TS_W1,
 } from '../src/common/utils/search/search-tuning';
 import { DOC_SEARCH_POSITIONAL_ORDER_HINT } from '@agent-chamber/shared';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（既有真 PG e2e 的 TEST_DB_* 覆盖约定；禁止在此写死生产凭据） */
 const DB_CONFIG = {
@@ -744,6 +745,7 @@ describe('DocSpace 检索预过滤 — 真实 PG（迁移链临时库 + 真编�
       db.getRepository(TaskDocLink),
       // 判别重排内核（v1.85.0 批次 3）：本套件只测**原路径**的预过滤等价性 ⇒ 能力恒未启用
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
 
     // ─── fixture 落地（真表 + 真触发器维护 search_vector：单字化 + 含 heading_path）───

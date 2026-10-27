@@ -1,9 +1,11 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useState } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
 import { Api, RUNNER_STATUS } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf } from '@/lib/error-message';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -32,7 +34,7 @@ import {
   ShieldCheck,
   AlertTriangle,
 } from 'lucide-react';
-import type { ApiLogListResponse, SystemOverview } from '@/types';
+import type { SystemOverview } from '@/types';
 import { formatRelativeTime } from '@/lib/utils';
 
 function formatDate(dateStr: string) {
@@ -86,12 +88,14 @@ function AttentionStrip({ overview }: { overview: SystemOverview }) {
 /** 系统信息行：version · commit · uptime（来自 /health 裸响应）+ 数据生成时间 */
 function SystemInfoRow({ generatedAt }: { generatedAt?: string }) {
   const t = useTranslations('monitoring.system');
+  const tRead = useTranslations('common');
   const locale = useLocale();
-  const { data: health } = useQuery({
+  const healthQuery = useQuery({
     queryKey: ['monitoring', 'health'],
     queryFn: () => Api.monitoring.getHealth(),
     refetchInterval: 60_000,
   });
+  const { data: health } = healthQuery;
   const items = [
     { label: t('version'), value: health?.version ?? '-' },
     { label: t('commit'), value: health?.commit ?? '-' },
@@ -105,6 +109,17 @@ function SystemInfoRow({ generatedAt }: { generatedAt?: string }) {
         <Server className="h-4 w-4 text-muted-foreground" />
       </CardHeader>
       <CardContent>
+        {healthQuery.isError && (
+          <QueryFeedback
+            compact={healthQuery.data !== undefined}
+            message={errorMessageOf(
+              healthQuery.error,
+              tRead(healthQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+            )}
+            onRetry={() => void healthQuery.refetch()}
+            busy={healthQuery.isFetching}
+          />
+        )}
         <div className="flex flex-wrap gap-x-8 gap-y-2">
           {items.map((item) => (
             <div key={item.label}>
@@ -362,32 +377,22 @@ function PipelineSection({ overview }: { overview: SystemOverview }) {
 
 export default function MonitoringPage() {
   const t = useTranslations('monitoring');
-  const [logs, setLogs] = useState<ApiLogListResponse | null>(null);
-  const [loading, setLoading] = useState(false);
+  const tRead = useTranslations('common');
   const [page, setPage] = useState(1);
   const pageSize = 20;
 
-  const { data: overview } = useQuery({
+  const overviewQuery = useQuery({
     queryKey: ['monitoring', 'overview'],
     queryFn: () => Api.monitoring.getOverview(),
     refetchInterval: 30_000,
   });
+  const { data: overview } = overviewQuery;
 
-  const fetchLogs = useCallback(async (p: number) => {
-    setLoading(true);
-    try {
-      const data = await Api.monitoring.getApiLogs({ page: p, pageSize });
-      setLogs(data);
-    } catch (err) {
-      console.error('获取 API 日志失败:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void fetchLogs(page);
-  }, [page, fetchLogs]);
+  const logsQuery = useQuery({
+    queryKey: ['monitoring', 'logs', page, pageSize],
+    queryFn: () => Api.monitoring.getApiLogs({ page, pageSize }),
+  });
+  const { data: logs, isLoading: loading } = logsQuery;
 
   const handleExport = async () => {
     try {
@@ -408,9 +413,9 @@ export default function MonitoringPage() {
 
   // todayCount / uniqueActors 为后端全量聚合值（ce579dda 修复：不再对当前页
   // 客户端过滤，翻页不漂移）；totalCount 受时间过滤参数影响（当前未启用过滤 UI）
-  const todayCount = logs?.todayCount ?? 0;
-  const totalCount = logs?.total ?? 0;
-  const uniqueActors = logs?.uniqueActors ?? 0;
+  const todayCount = logs?.todayCount ?? '—';
+  const totalCount = logs?.total ?? '—';
+  const uniqueActors = logs?.uniqueActors ?? '—';
 
   const statCards = [
     {
@@ -443,6 +448,17 @@ export default function MonitoringPage() {
         </Button>
       </div>
 
+      {overviewQuery.isError && (
+        <QueryFeedback
+          compact={overviewQuery.data !== undefined}
+          message={errorMessageOf(
+            overviewQuery.error,
+            tRead(overviewQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void overviewQuery.refetch()}
+          busy={overviewQuery.isFetching}
+        />
+      )}
       {overview && <AttentionStrip overview={overview} />}
 
       <SystemInfoRow generatedAt={overview?.generatedAt} />
@@ -473,7 +489,28 @@ export default function MonitoringPage() {
           <CardTitle>{t('apiLogs')}</CardTitle>
         </CardHeader>
         <CardContent>
-          {loading ? (
+          {logsQuery.isError && logs !== undefined && (
+            <QueryFeedback
+              compact={logsQuery.data !== undefined}
+              message={errorMessageOf(
+                logsQuery.error,
+                tRead(logsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void logsQuery.refetch()}
+              busy={logsQuery.isFetching}
+            />
+          )}
+          {logsQuery.isError && logs === undefined ? (
+            <QueryFeedback
+              compact={logsQuery.data !== undefined}
+              message={errorMessageOf(
+                logsQuery.error,
+                tRead(logsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void logsQuery.refetch()}
+              busy={logsQuery.isFetching}
+            />
+          ) : loading ? (
             <Loading />
           ) : !logs || logs.items.length === 0 ? (
             <EmptyState title={t('noLogs')} description={t('noLogsDesc')} />
@@ -521,6 +558,7 @@ export default function MonitoringPage() {
                   <Button
                     variant="outline"
                     size="sm"
+                    aria-label={t('previousPage')}
                     onClick={() => setPage((p) => p - 1)}
                     disabled={!logs.hasPrev}
                   >
@@ -529,6 +567,7 @@ export default function MonitoringPage() {
                   <Button
                     variant="outline"
                     size="sm"
+                    aria-label={t('nextPage')}
                     onClick={() => setPage((p) => p + 1)}
                     disabled={!logs.hasNext}
                   >

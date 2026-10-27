@@ -31,14 +31,25 @@ function Tabs({ value, onValueChange, children, className }: TabsProps) {
   );
 }
 
-interface TabsListProps {
+/**
+ * 额外属性透传：`data-*` / `aria-*` / `id` 等（Memory 二期的 Tab 栏需要 `data-testid`
+ * 做契约测试锚点）。此前这些属性被静默丢弃，消费方写了却查不到——加透传后显式属性
+ * （role/aria-selected/onClick/className）仍由本组件决定，调用方无法覆盖语义。
+ */
+interface TabsListProps extends React.HTMLAttributes<HTMLDivElement> {
   children: React.ReactNode;
   className?: string;
 }
 
-function TabsList({ children, className }: TabsListProps) {
+function TabsList({ children, className, ...props }: TabsListProps) {
   return (
     <div
+      {...props}
+      // role="tablist" 放在 spread **之后**：否则调用方透传的 role 会静默覆盖它
+      // （对齐 TabsTrigger 的写法——显式语义属性一律后置、调用方不可覆盖）。
+      // `role="tab"` 必须挂在 tablist 之下才是合法 ARIA：此前只有触发器带 role，
+      // 读屏看到的是"一串孤立的 tab"。
+      role="tablist"
       className={cn(
         'inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground',
         className,
@@ -49,18 +60,22 @@ function TabsList({ children, className }: TabsListProps) {
   );
 }
 
-interface TabsTriggerProps {
+interface TabsTriggerProps extends Omit<
+  React.ButtonHTMLAttributes<HTMLButtonElement>,
+  'onClick' | 'value'
+> {
   value: string;
   children: React.ReactNode;
   className?: string;
 }
 
-function TabsTrigger({ value, children, className }: TabsTriggerProps) {
+function TabsTrigger({ value, children, className, ...props }: TabsTriggerProps) {
   const { value: selectedValue, onValueChange } = useTabs();
   const isActive = selectedValue === value;
 
   return (
     <button
+      {...props}
       type="button"
       role="tab"
       aria-selected={isActive}

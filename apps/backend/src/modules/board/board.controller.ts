@@ -11,7 +11,7 @@
  *     controller 层插桩决策 2——service 方法均无 actor 参数且仅 controller 调用；
  *     member 增删用 CREATE/DELETE + board_member；metrics 只记键名列表不入全量值）
  *
- * [踩坑索引] D5(权限迁移) B-51(admin-403显式检查) B-45(reorder返回null) B-41(列表页任务统计) B-50(列表权限过滤) OWNER-PROXY(update+成员4端点视同creator) TOPIC-PERM(update结构字段显式403替代静默剥离)
+ * [踩坑索引] D5(权限迁移) B-51(admin-403显式检查) B-45(reorder返回null) B-41(列表页任务统计) B-50(列表权限过滤) OWNER-PROXY(update+成员4端点视同creator) TOPIC-PERM(update结构字段显式403替代静默剥离) V2-N2(removeList/reorderTasks 须把完整 actor 透传给 service)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先)
  *
@@ -221,7 +221,9 @@ export class BoardController {
     // 权限复用 findOne 读路径：findById + ensureCan read（board 可读蕴含 docs 段元数据可读）
     const board = await this.boardService.findById(id);
     await this.permService.ensureCan(board, actor, 'read');
-    return this.boardService.getDigest(id, query);
+    // actor.id 透传下 service（阶段三决策 9）：截断续读码的去重键 = (actor, code, boardId)
+    // ——不透传会退化成全局 'system'，一个 actor 看过就把所有人压掉（观测面失真）。
+    return this.boardService.getDigest(id, query, actor.id);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -244,8 +246,10 @@ export class BoardController {
     summary: 'Update board metrics',
     description:
       'Store machine facts (test baselines, MCP tool counts, etc.) into ' +
-      'board.settings.metrics (v1.42). Atomic jsonb_set merge — only the metrics key ' +
-      'is touched; visibility and other settings keys are preserved. ' +
+      'board.settings.metrics (v1.42). **settings 层键级原子替换**：SQL jsonb_set 只动 ' +
+      'settings.metrics 键（visibility 等其余 settings 键保留），但 metrics **对象本身全量替换** ' +
+      '（传入的 key 集合 = 落库集合，未传的旧键会消失；并发 PUT 是 last-write-wins——' +
+      '脚本侧要增量合并请先 GET 再 PUT，勿靠本端点做 metrics 内的键级 merge）。' +
       'The only writer is scripts/report-metrics.mjs; digest exposes the same object ' +
       'as the metrics section.',
   })
@@ -640,7 +644,9 @@ export class BoardController {
     const list = await this.boardService.findList(id);
     const board = await this.boardService.findById(list.boardId);
     await this.permService.ensureCan(board, actor, 'write');
-    await this.boardService.removeList(id, dto?.moveTasksTo);
+    // actor 传入（V2-N2）：service 需在 `moveTasksTo` **跨板**时施加目标板 write 门；
+    // 传原对象保 {id,type,role} 完整（A-C2）。
+    await this.boardService.removeList(id, dto?.moveTasksTo, actor);
     // 审计（Phase 2）：DELETE + board_list；newData 白名单 {boardId, listId, name}
     await this.auditService.log({
       action: AuditAction.DELETE,
@@ -666,7 +672,10 @@ export class BoardController {
     const list = await this.boardService.findList(listId);
     const board = await this.boardService.findById(list.boardId);
     await this.permService.ensureCan(board, actor, 'write');
-    const result = await this.boardService.reorderTasks(listId, dto);
+    // actor 传入（V2-N2/S-N2 最重项）：本端点会把每个 item 的 list_id 直接写成 listId，
+    // 等于一条批量跨板搬运通道——service 需对**跨板 item 的当前列所属板**施加 write 门，
+    // 否则有目标板 write 的人可批量拉走无权私板里的任务。传原对象保 {id,type,role}（A-C2）。
+    const result = await this.boardService.reorderTasks(listId, dto, actor);
     // 审计（Phase 2）：UPDATE + board_list（tasks reorder）；轻量 newData
     // {boardId, listId, taskCount}（决策 6——不记具体顺序）
     await this.auditService.log({

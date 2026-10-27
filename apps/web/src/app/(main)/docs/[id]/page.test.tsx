@@ -4,6 +4,7 @@ import { unzipSync } from 'fflate';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import DocSpaceDetailPage from './page';
 import { Api } from '@/lib/api';
+import { toast } from '@/lib/notify';
 
 /** 本测试用到的文案快照（同 en.json；未命中 key 回退为完整 key 路径，不影响断言） */
 const messages: Record<string, string> = {
@@ -95,13 +96,21 @@ jest.mock('next-intl', () => ({
 
 const mockSearchParams = new URLSearchParams('doc=doc-1');
 const mockRouter = { replace: jest.fn(), push: jest.fn() };
+/** 可变路由保留页面实例，模拟跨空间 SPA 导航而非卸载后重新挂载。 */
+const mockParams = { id: 'space-1' };
+let mockPathname = '/docs/space-1';
 
 jest.mock('next/navigation', () => ({
-  useParams: () => ({ id: 'space-1' }),
+  useParams: () => mockParams,
   useSearchParams: () => mockSearchParams,
   useRouter: () => mockRouter,
-  usePathname: () => '/docs/space-1',
+  usePathname: () => mockPathname,
 }));
+
+beforeEach(() => {
+  mockParams.id = 'space-1';
+  mockPathname = '/docs/space-1';
+});
 
 jest.mock('next/link', () => {
   return function MockLink({ children, href }: { children: React.ReactNode; href: string }) {
@@ -126,6 +135,7 @@ jest.mock('@/lib/notify', () => ({
     error: (...args: unknown[]) => mockToastError(...args),
     warning: (...args: unknown[]) => mockToastWarning(...args),
     success: jest.fn(),
+    info: jest.fn(),
   },
 }));
 
@@ -144,6 +154,15 @@ jest.mock('@/lib/api', () => ({
       // 反向引用（v1.90.0-dev）：右栏「被引用」卡数据源
       getBacklinks: jest.fn(),
       exportSpaceBundle: jest.fn(),
+      uninviteAgent: jest.fn(),
+      addEditor: jest.fn(),
+      removeEditor: jest.fn(),
+      transferCreator: jest.fn(),
+      createCategory: jest.fn(),
+      updateCategory: jest.fn(),
+      deleteCategory: jest.fn(),
+      updateSpace: jest.fn(),
+      upsertDoc: jest.fn(),
     },
     // v1.37 owner 代理：页面新增我的 agent 列表查询（非 admin 只返回自己拥有的 agents）；
     // listAll 返回数组（循环翻页拉全），非分页响应
@@ -154,9 +173,7 @@ jest.mock('@/lib/api', () => ({
 }));
 
 // 编辑器/批量上传内部链路与本测试无关，stub 掉保持测试轻量
-jest.mock('@/components/docs/doc-editor', () => ({
-  DocEditor: () => <div>DocEditor</div>,
-}));
+
 jest.mock('@/components/docs/batch-upload-dialog', () => ({
   BatchUploadDialog: () => null,
 }));
@@ -847,9 +864,54 @@ describe('DocSpaceDetailPage type/tag 过滤 → 扁平分页列表态（P3 行�
 });
 
 describe('DocSpaceDetailPage 正文相对链接断链点击解析（?path= 单一机制）', () => {
+  /** 相同 path 在不同空间可以映射到不同文档，不依赖左栏已加载的树节点。 */
+  const targetDoc = { id: 'doc-3', path: 'docs/a.md', title: 'Alpha' };
+
+  /** 可控异步解析，用于让旧空间请求在导航或卸载之后才返回。 */
+  function pendingPathLookup() {
+    let resolve!: (value: typeof targetDoc | null) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<typeof targetDoc | null>((resolveRequest, rejectRequest) => {
+      resolve = resolveRequest;
+      reject = rejectRequest;
+    });
+    return { promise, resolve, reject };
+  }
+
+  /** 在 act 内完成旧请求，确保断言包含 Promise 后续的导航、提示和缓存副作用。 */
+  async function settlePathLookup(
+    pending: ReturnType<typeof pendingPathLookup>,
+    outcome: 'hit' | 'missing' | 'error',
+  ) {
+    await act(async () => {
+      if (outcome === 'error') pending.reject(new Error('lookup failed'));
+      else pending.resolve(outcome === 'hit' ? targetDoc : null);
+    });
+  }
+
+  /** 切空间只 rerender，同一 QueryClient 和页面实例继续存活。 */
+  function renderNavigablePage() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(pageElement(queryClient));
+    return {
+      ...view,
+      async switchSpace(spaceId: string) {
+        mockParams.id = spaceId;
+        mockPathname = `/docs/${spaceId}`;
+        view.rerender(pageElement(queryClient));
+        await screen.findByText(`Space ${spaceId}`);
+      },
+    };
+  }
+
   beforeEach(() => {
     jest.clearAllMocks();
+    // RED 用例可能在第二次点击前失败，清除未消费的 once 队列以隔离后续用例。
+    mockApi.getDocByPath.mockReset();
     mockBase();
+    mockApi.getSpace.mockImplementation((id: string) =>
+      Promise.resolve({ ...spaceFixture, id, name: `Space ${id}` }),
+    );
     // 当前文档 path 置根级：链接 docs/a.md 解析为 docs/a.md（源目录相对）
     mockApi.getDoc.mockResolvedValue({ ...docFixture, path: 'README.md' });
     mockApi.getDocContent.mockResolvedValue({
@@ -858,33 +920,165 @@ describe('DocSpaceDetailPage 正文相对链接断链点击解析（?path= 单�
     });
   });
 
-  it('命中 → SPA 跳转（?path= 异步解析 + 会话内缓存）', async () => {
-    mockApi.getDocByPath.mockResolvedValue({ id: 'doc-3', path: 'docs/a.md', title: 'Alpha' });
+  it.each(['hit', 'missing'] as const)(
+    '同空间 %s 结果缓存：重复点击仅请求一次，仍执行对应导航或提示',
+    async (outcome) => {
+      mockApi.getDocByPath.mockResolvedValue(outcome === 'hit' ? targetDoc : null);
+
+      renderPage();
+      fireEvent.click(await screen.findByText('Target'));
+
+      await waitFor(() => {
+        if (outcome === 'hit') expect(mockRouter.push).toHaveBeenCalledTimes(1);
+        else expect(mockToastError).toHaveBeenCalledTimes(1);
+      });
+
+      fireEvent.click(screen.getByText('Target'));
+
+      expect(mockApi.getDocByPath).toHaveBeenCalledTimes(1);
+      expect(mockApi.getDocByPath).toHaveBeenCalledWith('space-1', 'docs/a.md');
+      if (outcome === 'hit') {
+        expect(mockRouter.push).toHaveBeenCalledTimes(2);
+        expect(mockRouter.push).toHaveBeenLastCalledWith('/docs/space-1?doc=doc-3', {
+          scroll: false,
+        });
+        expect(mockToastError).not.toHaveBeenCalled();
+      } else {
+        expect(mockToastError).toHaveBeenCalledTimes(2);
+        expect(mockToastError).toHaveBeenLastCalledWith({
+          title: 'Document not found or has been deleted',
+        });
+        expect(mockRouter.push).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it('解析异常不缓存，下次点击可重新请求并命中', async () => {
+    mockApi.getDocByPath
+      .mockRejectedValueOnce(new Error('lookup failed'))
+      .mockResolvedValueOnce(targetDoc);
 
     renderPage();
     fireEvent.click(await screen.findByText('Target'));
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledTimes(1));
+    expect(mockRouter.push).not.toHaveBeenCalled();
 
-    await waitFor(() => {
-      expect(mockApi.getDocByPath).toHaveBeenCalledWith('space-1', 'docs/a.md');
-    });
+    fireEvent.click(screen.getByText('Target'));
+
     await waitFor(() => {
       expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-1?doc=doc-3', { scroll: false });
     });
+    expect(mockApi.getDocByPath).toHaveBeenCalledTimes(2);
+    expect(mockToastError).toHaveBeenCalledTimes(1);
   });
 
-  it('未命中 → toast「文档不存在或已删除」，不跳转', async () => {
-    mockApi.getDocByPath.mockResolvedValue(null);
-
-    renderPage();
-    fireEvent.click(await screen.findByText('Target'));
-
-    await waitFor(() => {
-      expect(mockToastError).toHaveBeenCalledWith({
-        title: 'Document not found or has been deleted',
+  it.each(['hit', 'missing'] as const)(
+    '空间 A 已缓存 %s，切空间 B 后相同 path 必须重新解析到 B 文档',
+    async (outcome) => {
+      mockApi.getDocByPath
+        .mockResolvedValueOnce(outcome === 'hit' ? targetDoc : null)
+        .mockResolvedValueOnce({ ...targetDoc, id: 'space-2-doc' });
+      const view = renderNavigablePage();
+      fireEvent.click(await screen.findByText('Target'));
+      await waitFor(() => {
+        if (outcome === 'hit') expect(mockRouter.push).toHaveBeenCalledTimes(1);
+        else expect(mockToastError).toHaveBeenCalledTimes(1);
       });
-    });
-    expect(mockRouter.push).not.toHaveBeenCalled();
-  });
+      mockRouter.push.mockClear();
+      mockToastError.mockClear();
+
+      await view.switchSpace('space-2');
+      fireEvent.click(screen.getByText('Target'));
+
+      await waitFor(() => {
+        expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-2?doc=space-2-doc', {
+          scroll: false,
+        });
+      });
+      expect(mockApi.getDocByPath.mock.calls).toEqual([
+        ['space-1', 'docs/a.md'],
+        ['space-2', 'docs/a.md'],
+      ]);
+      expect(mockToastError).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['hit', 'missing', 'error'] as const)(
+    '空间 A 的 pending 请求在 B 中返回 %s：不导航、不提示、不污染 B 缓存',
+    async (outcome) => {
+      const pending = pendingPathLookup();
+      mockApi.getDocByPath
+        .mockReturnValueOnce(pending.promise)
+        .mockResolvedValueOnce({ ...targetDoc, id: 'space-2-doc' });
+      const view = renderNavigablePage();
+      fireEvent.click(await screen.findByText('Target'));
+      expect(mockApi.getDocByPath).toHaveBeenCalledWith('space-1', 'docs/a.md');
+
+      await view.switchSpace('space-2');
+      await settlePathLookup(pending, outcome);
+
+      expect(mockRouter.push).not.toHaveBeenCalled();
+      expect(mockToastError).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('Target'));
+      await waitFor(() => {
+        expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-2?doc=space-2-doc', {
+          scroll: false,
+        });
+      });
+      expect(mockApi.getDocByPath.mock.calls).toEqual([
+        ['space-1', 'docs/a.md'],
+        ['space-2', 'docs/a.md'],
+      ]);
+      expect(mockToastError).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['hit', 'missing', 'error'] as const)(
+    'A→B→A 后旧 A 请求返回 %s：旧会话失效，回到 A 仍重新解析',
+    async (outcome) => {
+      const pending = pendingPathLookup();
+      mockApi.getDocByPath
+        .mockReturnValueOnce(pending.promise)
+        .mockResolvedValueOnce({ ...targetDoc, id: 'new-a-doc' });
+      const view = renderNavigablePage();
+      fireEvent.click(await screen.findByText('Target'));
+
+      await view.switchSpace('space-2');
+      await view.switchSpace('space-1');
+      await settlePathLookup(pending, outcome);
+
+      expect(mockRouter.push).not.toHaveBeenCalled();
+      expect(mockToastError).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('Target'));
+      await waitFor(() => {
+        expect(mockRouter.push).toHaveBeenCalledWith('/docs/space-1?doc=new-a-doc', {
+          scroll: false,
+        });
+      });
+      expect(mockApi.getDocByPath.mock.calls).toEqual([
+        ['space-1', 'docs/a.md'],
+        ['space-1', 'docs/a.md'],
+      ]);
+      expect(mockToastError).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['hit', 'missing', 'error'] as const)(
+    '页面卸载后 pending 请求返回 %s，不执行导航或提示',
+    async (outcome) => {
+      const pending = pendingPathLookup();
+      mockApi.getDocByPath.mockReturnValueOnce(pending.promise);
+      const view = renderPage();
+      fireEvent.click(await screen.findByText('Target'));
+      expect(mockApi.getDocByPath).toHaveBeenCalledTimes(1);
+
+      view.unmount();
+      await settlePathLookup(pending, outcome);
+
+      expect(mockRouter.push).not.toHaveBeenCalled();
+      expect(mockToastError).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('DocSpaceDetailPage diagram doc 中栏 iframe 预览（Diagram IR v1）', () => {
@@ -1346,7 +1540,15 @@ describe('DocSpaceDetailPage 空间级 bundle 导出/导入入口', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
     fireEvent.click(screen.getByTestId('export-menu-zip'));
 
-    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith({ title: 'boom' }));
+    await waitFor(() =>
+      // 断网 / 无 response 的失败按**通道分级**（卡 240c74d6）落本路径的兜底文案：旧断言写的是
+      // `{ title: 'boom' }`——即把 `err.message` 原样上屏，那正是本批要根治的形态（真实场景里
+      // 那是 axios 的 'Network Error' 英文原文）。本条真正要守的是「ZIP 路径用自己的文案、
+      // 不与 JSON 失败串台」，故改断言为 zip 专属兜底文案（比原来更强的路径判别）。
+      expect(mockToastError).toHaveBeenCalledWith({
+        title: 'Failed to build the human-readable export, please retry',
+      }),
+    );
   });
 
   it('编辑中：导入按钮禁用并给出原因；导出触发钮不禁用，仅 title 提示不含未保存编辑（R4）', async () => {
@@ -1769,5 +1971,137 @@ describe('DocSpaceDetailPage 反向引用卡与导航语义（v1.90.0-dev）', (
 
     expect(mockRouter.push).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+});
+
+describe('DocSpace operation feedback and recovery', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockBase();
+    mockUserRole = 'admin';
+  });
+  it.each([
+    ['uninviteAgent', 'member', 'members.remove', 'docs.members.actionFailed', true],
+    ['addEditor', 'member', 'docs.members.setEditor', 'docs.members.actionFailed', false],
+    ['removeEditor', 'editor', 'docs.members.member', 'docs.members.actionFailed', false],
+    ['transferCreator', 'member', 'members.transferCreator', 'docs.members.transferFailed', true],
+  ] as const)(
+    '%s uses the shared toast and keeps the member for retry',
+    async (method, role, menuAction, fallback, confirmation) => {
+      mockApi.getSpace.mockResolvedValue({
+        ...spaceFixture,
+        members: [{ actorId: 'actor-a', actorName: 'Kept member', actorType: 'agent', role }],
+      });
+      const request = Api.docs[method] as jest.Mock;
+      request.mockRejectedValue(new Error('Network Error'));
+      renderPage();
+      fireEvent.click(await screen.findByRole('button', { name: /docs.members.title/ }));
+      const perform = async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'members.menuAria' }));
+        fireEvent.click(screen.getByRole('menuitem', { name: menuAction }));
+        if (confirmation)
+          fireEvent.click(
+            within(await screen.findByRole('alertdialog')).getByRole('button', {
+              name: menuAction,
+            }),
+          );
+      };
+      await perform();
+      await waitFor(() => expect(mockToastError).toHaveBeenCalledWith({ title: fallback }));
+      expect(screen.getByText('Kept member')).toBeInTheDocument();
+      request.mockResolvedValue({});
+      await perform();
+      await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+      expect(mockToastError).toHaveBeenCalledTimes(1);
+    },
+  );
+  it.each(['createCategory', 'updateCategory', 'deleteCategory'] as const)(
+    '%s keeps category input or row and permits retry',
+    async (method) => {
+      mockApi.getSpace.mockResolvedValue({
+        ...spaceFixture,
+        categories: [{ id: 'cat-a', name: 'Existing category', slug: 'existing' }],
+      });
+      const request = Api.docs[method] as jest.Mock;
+      request.mockRejectedValue(new Error('Network Error'));
+      renderPage();
+      fireEvent.click(await screen.findByRole('button', { name: 'docs.categories.manage' }));
+      const original = screen.getByDisplayValue('Existing category');
+      const perform = () => {
+        if (method === 'createCategory') {
+          fireEvent.change(screen.getByPlaceholderText('docs.categories.namePlaceholder'), {
+            target: { value: 'New category' },
+          });
+          fireEvent.click(screen.getByRole('button', { name: 'common.create' }));
+        }
+        if (method === 'updateCategory') {
+          fireEvent.change(original, { target: { value: 'Renamed category' } });
+          fireEvent.blur(original);
+        }
+        if (method === 'deleteCategory')
+          fireEvent.click(screen.getByRole('button', { name: 'common.delete' }));
+      };
+      perform();
+      await waitFor(() =>
+        expect(mockToastError).toHaveBeenCalledWith({ title: 'docs.categories.actionFailed' }),
+      );
+      expect(
+        screen.getByDisplayValue(
+          method === 'updateCategory' ? 'Renamed category' : 'Existing category',
+        ),
+      ).toBeInTheDocument();
+      if (method === 'createCategory')
+        expect(screen.getByDisplayValue('New category')).toBeInTheDocument();
+      request.mockResolvedValue({});
+      perform();
+      await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+      expect(mockToastError).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('space settings failure retains form values and retries', async () => {
+    (Api.docs.updateSpace as jest.Mock).mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'docs.spaceSettings.title' }));
+    fireEvent.change(screen.getByPlaceholderText('docs.spaceSettings.namePlaceholder'), {
+      target: { value: 'Keep space name' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'docs.spaceSettings.save' }));
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith({ title: 'docs.spaceSettings.saveError' }),
+    );
+    expect(screen.getByDisplayValue('Keep space name')).toBeInTheDocument();
+    (Api.docs.updateSpace as jest.Mock).mockResolvedValue({});
+    fireEvent.click(screen.getByRole('button', { name: 'docs.spaceSettings.save' }));
+    await waitFor(() =>
+      expect(screen.queryByDisplayValue('Keep space name')).not.toBeInTheDocument(),
+    );
+    expect(Api.docs.updateSpace).toHaveBeenCalledTimes(2);
+  });
+  it('save failure keeps the real editor content, unchanged stays editing, success alone exits', async () => {
+    (Api.docs.upsertDoc as jest.Mock).mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    const editor = await screen.findByPlaceholderText('docs.editor.contentPlaceholder');
+    fireEvent.change(editor, { target: { value: 'Keep this complete body' } });
+    fireEvent.click(screen.getByRole('button', { name: 'docs.editor.save' }));
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith({ title: 'docs.editor.saveError' }),
+    );
+    expect(screen.getByDisplayValue('Keep this complete body')).toBeInTheDocument();
+    (Api.docs.upsertDoc as jest.Mock).mockResolvedValue({ unchanged: true });
+    fireEvent.click(screen.getByRole('button', { name: 'docs.editor.save' }));
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith({ title: 'docs.editor.unchanged' }),
+    );
+    expect(screen.getByDisplayValue('Keep this complete body')).toBeInTheDocument();
+    (Api.docs.upsertDoc as jest.Mock).mockResolvedValue({ unchanged: false, docId: 'doc-1' });
+    fireEvent.click(screen.getByRole('button', { name: 'docs.editor.save' }));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith({ title: 'docs.editor.saveSuccess' }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByDisplayValue('Keep this complete body')).not.toBeInTheDocument(),
+    );
+    expect(Api.docs.upsertDoc).toHaveBeenCalledTimes(3);
   });
 });

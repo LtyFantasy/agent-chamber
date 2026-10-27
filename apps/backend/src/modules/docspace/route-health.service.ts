@@ -1,21 +1,58 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
- *   - 补充: .kimi/plan-info-online-batch-c.md §2 (C1 设计), docs/api-definition.md §16 (doc_routes 段)
+ * [功能概念]
+ *   - doc_routes **健康重检**（异步全量巡检：headingPath 锚 + codeEntry manifest
+ *     级联）与 **锚校验公共入口**（DocSpace 元数据治理 2 期 A2 收口）。
  *
- * [踩坑索引] (无历史踩坑，新建文件)
+ * [代码职责]
+ *   - `recheckSpace`：拉空间全量路由 → 逐条校验锚与 codeEntry → 组装 issues →
+ *     `health={issues, checkedAt}` 批量落库（三触发点：upsert/remove 的 setImmediate +
+ *     手动端点）。
+ *   - `analyzeDocRouteAnchors`（2 期新增，**A2 唯一锚校验公共入口**）：查指向某文档的
+ *     路由引用 + 逐锚比对，供 doc.service（upsert 事务内 / delete）与 doc-move.service
+ *     复用——**禁止在其他 service 复制锚校验逻辑**（第二事实源必然漂移）。
+ *   - `readRepoManifest`：读 `space.settings.repoManifest`（C2 数据源）。
+ *
+ * [权威文档]
+ *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
+ *   - 补充: 线上 docs/api-definition.md §16（doc_routes 段 + hints 挂点表）
+ *   - 补充: .kimi/plan-info-online-batch-c.md §2（C1 设计）
+ *
+ * [关键不变量]
+ *   - **锚 = `headingPath` 精确等值**（null = 文档级跳转，无条件可解析）；
+ *     `analyzeDocRouteAnchors` 的比对口径与 `sectionExistsByHeadingPath` 同源——
+ *     只是数据源换成了调用方**将要写入的** headingPath 集合（A4：upsert 用 in-memory
+ *     chunks，避免事务后再查 sections 造成快照不一致）。
+ *   - `headingPaths === null` = **文档消失**（delete 语义）：指向它的全部路由判断
+ *     （docId 锚断是语义判定，无逐锚成本）。
+ *   - `issues.length > 0` 是**唯一 broken 判据**（codeEntryStatus:'exempt' 不产 issue
+ *     故天然不计入）。
+ *   - **不报 unchecked**：无 manifest → codeEntryStatus:'unchecked' 且不产 issue
+ *     （「从未上报清单」≠「代码入口失配」）；`health=null/unchecked` **绝不解释为健康**。
+ *
+ * [关联代码]
+ *   - modules/docspace/doc.service.ts — upsert 事务内（route_anchor_broken）与 remove
+ *     （docId 锚断）调用 analyzeDocRouteAnchors
+ *   - modules/docspace/doc-move.service.ts — move 的 route_anchor_recheck 复用
+ *     `impact.docRoutes`（A3：零额外查询，不重复查路由）
+ *   - modules/docspace/doc-route.controller.ts — 手动 recheck 端点（POST …/routes/recheck）
+ *   - route-health.service.spec.ts — recheck 与 analyzeDocRouteAnchors 契约单测
+ *
+ * [持久踩坑]
+ *   - ROUTE-HEALTH-1（unchecked ≠ healthy）：health 为 null / codeEntryStatus 为
+ *     'unchecked' 时，消费方不得据此认为路由健康——提示面必须用 check_skipped 明确
+ *     表达「没检查」。安全方向：需要判定时一律走 analyzeDocRouteAnchors 或 recheck。
  *
  * [铁律关联] #17(测试契约) #22(findOne必须判空) #11(注释强制) #21(双层校验)
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
+ * [修改检查]
+ *   □ 已读 [权威文档] 确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 新增锚校验逻辑一律加进 analyzeDocRouteAnchors，禁止在消费方复制
  * =============================================================================
  */
 import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
@@ -196,5 +233,120 @@ export class RouteHealthService {
       return null;
     }
     return candidate as RepoManifest;
+  }
+
+  // ─── 锚校验公共入口（2 期 A2 收口）────────────────────────────────────
+
+  /**
+   * 取指向该文档的路由引用清单（primary 或 secondary 命中 docId）。
+   *
+   * 空间内先过滤（`space_id` 索引 + 空间内 docId 比对）——route 实体只有
+   * `@Index(['spaceId'])`，量级百级可接受（plan §6 成本评估）。
+   *
+   * public（2 期 A2）：doc.service / doc-move.service 复用，**禁止在消费方另写一份**。
+   */
+  async routesReferencingDoc(spaceId: string, docId: string): Promise<DocRoute[]> {
+    return this.routeRepo
+      .createQueryBuilder('r')
+      .where('r.space_id = :spaceId', { spaceId })
+      .andWhere('(r.primary_doc_id = :docId OR r.secondary_doc_id = :docId)', { docId })
+      .getMany();
+  }
+
+  /**
+   * 锚比对**纯函数**（2 期 A2 + MAJOR-2 修复）：给定引用清单与新的 headingPath 集合，
+   * 返回断锚明细——**零 IO**，故可在 upsert 事务内安全调用（不占第二条连接）。
+   *
+   * 数据源语义（A4）：`headingPaths` 是调用方**将要落库的** section headingPath 集合
+   * ——upsert 传事务内 in-memory `chunks` 的集合（与刚插入的 sections 同一份数据，
+   * 零额外查询且与幂等快照同事务）；`null` = 文档消失（delete 语义，全部引用路由判断）。
+   *
+   * 比对口径与 `sectionExistsByHeadingPath` 完全一致（headingPath 精确等值；null 锚 =
+   * 文档级跳转，无条件可解析），只是数据源不同——**本方法是唯一的锚校验实现**，
+   * 消费方不得复制。
+   *
+   * @param routes 引用清单（调用方经 `routesReferencingDoc` 在**事务外**取好）
+   * @param docId 目标文档
+   * @param headingPaths 新 headingPath 集合；null = 文档消失（delete）
+   * @returns routeCount（引用总数，供调用方做 cap 判定）+ 断锚路由 ID + 逐锚明细
+   */
+  analyzeRouteAnchors(
+    routes: DocRoute[],
+    docId: string,
+    headingPaths: Set<string> | null,
+  ): {
+    routeCount: number;
+    brokenRouteIds: string[];
+    anchors: Array<{ routeId: string; headingPath: string }>;
+  } {
+    const brokenRouteIds: string[] = [];
+    const anchors: Array<{ routeId: string; headingPath: string }> = [];
+
+    for (const route of routes) {
+      const routeAnchors = this.anchorsForDoc(route, docId);
+
+      // 文档消失分支（delete）：**全部引用路由**判断——含纯文档级跳转（无 headingPath
+      // 锚）的路由，它的 docId 锚目标已不存在；anchors 只列有锚的那些（docId 锚断本身
+      // 无锚点可比）。
+      if (headingPaths === null) {
+        brokenRouteIds.push(route.id);
+        anchors.push(...routeAnchors);
+        continue;
+      }
+
+      if (routeAnchors.length === 0) continue; // 纯文档级引用（无锚）——内容变更不断它
+      const broken = routeAnchors.filter((anchor) => !headingPaths.has(anchor.headingPath));
+      if (broken.length === 0) continue;
+      brokenRouteIds.push(route.id);
+      anchors.push(...broken);
+    }
+
+    return { routeCount: routes.length, brokenRouteIds, anchors };
+  }
+
+  /**
+   * 锚校验便捷入口（2 期 A2）：**查引用 + 比对**一步完成。
+   *
+   * ⚠️ **调用位置约束（MAJOR-2）**：本方法内含一次 `doc_routes` 查询，走 `routeRepo`
+   * 的**独立连接**——**绝不可在已持有事务连接的代码路径内调用**（upsert 事务内调用会
+   * 申请第二条连接；pg 池 max=10 且无获取超时，≥10 并发写即整库挂起）。
+   * 事务内一律改为：事务外 `routesReferencingDoc` 取清单 → 事务内 `analyzeRouteAnchors`
+   * 纯比对。**delete / 手动巡检（无事务）可直用本方法**。
+   *
+   * @param spaceId 目标空间
+   * @param docId 目标文档
+   * @param headingPaths 新 headingPath 集合；null = 文档消失（delete）
+   */
+  async analyzeDocRouteAnchors(
+    spaceId: string,
+    docId: string,
+    headingPaths: Set<string> | null,
+  ): Promise<{
+    routeCount: number;
+    brokenRouteIds: string[];
+    anchors: Array<{ routeId: string; headingPath: string }>;
+  }> {
+    const routes = await this.routesReferencingDoc(spaceId, docId);
+    return this.analyzeRouteAnchors(routes, docId, headingPaths);
+  }
+
+  /**
+   * 取某路由中**指向目标文档的**非空锚（primary/secondary 两侧都判）。
+   *
+   * 纯函数（无 IO）：仅做角色归属判定与 null 锚过滤——null = 文档级跳转，
+   * 与锚无关（delete 场景的「docId 锚断」由调用方的 null 分支统一表达）。
+   */
+  private anchorsForDoc(
+    route: DocRoute,
+    docId: string,
+  ): Array<{ routeId: string; headingPath: string }> {
+    const out: Array<{ routeId: string; headingPath: string }> = [];
+    if (route.primaryDocId === docId && route.primaryHeadingPath) {
+      out.push({ routeId: route.id, headingPath: route.primaryHeadingPath });
+    }
+    if (route.secondaryDocId === docId && route.secondaryHeadingPath) {
+      out.push({ routeId: route.id, headingPath: route.secondaryHeadingPath });
+    }
+    return out;
   }
 }

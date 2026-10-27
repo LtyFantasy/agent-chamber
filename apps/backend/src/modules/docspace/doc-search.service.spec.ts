@@ -7,7 +7,9 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocRoute } from '../../database/entities/doc-route.entity';
 import { TaskDocLink } from '../../database/entities/task-doc-link.entity';
 import { JudgmentRunnerService } from '../judgment/judgment-runner.service';
+import { HintDedupService } from '../hints/hint-dedup.service';
 import * as zeroHitLog from '../../common/utils/search/zero-hit-log';
+import * as hintLog from '../hints/hint-log';
 import { DOC_SEARCH_WEAK_HIT_SCORE } from '../../common/utils/search/search-tuning';
 import {
   DOC_SEARCH_STRONG_HIT_SCORE,
@@ -121,6 +123,9 @@ describe('DocSearchService', () => {
     recordSkip: jest.Mock;
   };
 
+  /** hint 去重窗口（2 期）：真实例；需要跨调用断言窗口语义的用例自行 reset */
+  let hintDedup: HintDedupService;
+
   beforeEach(async () => {
     // ── Subquery mock ──
     mockSubQb = createMockQueryBuilder();
@@ -176,10 +181,13 @@ describe('DocSearchService', () => {
         // 判别重排的编排器（v1.85.0 批次 3）：默认**未启用** ⇒ 既有用例全走原路径
         // （与未接入判别前的行为逐字节一致——这正是"重排是可选增强"的验证基础）
         { provide: JudgmentRunnerService, useValue: judgment },
+        // hint 去重窗口（2 期，v1.92.0-dev）：真实例（内存 TTL Map），用例按需 reset
+        HintDedupService,
       ],
     }).compile();
 
     service = moduleRef.get<DocSearchService>(DocSearchService);
+    hintDedup = moduleRef.get<HintDedupService>(HintDedupService);
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -317,13 +325,37 @@ describe('DocSearchService', () => {
   });
 
   // ─── Test 5: Tag filter ──────────────────────────────────────
-  it('should add tag filter to subquery WHERE clause', async () => {
+  it('should add tag filter to subquery WHERE clause（3 期：数组重叠形态，无词表时单元素）', async () => {
     mockOuterQb.getRawMany.mockResolvedValue([]);
 
     await service.search(['space-1'], { q: 'test', tag: 'combat' });
 
-    // Verify subquery includes tag condition
-    expect(mockSubQb.andWhere).toHaveBeenCalledWith(':tagVal = ANY(d.tags)', { tagVal: 'combat' });
+    // v1.92.0-dev 3 期（plan D3/A1）：单值 `:tag = ANY(d.tags)` 改为集合重叠
+    // `d.tags && CAST(:tagValues AS text[])`；未命中词表 / 未传 hintContext 时
+    // tagValues = [tag] 单元素 ⇒ 语义与旧形态逐字节等价（本用例即该等价性的钉子）
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.tags && CAST(:tagValues AS text[])', {
+      tagValues: ['combat'],
+    });
+  });
+
+  // ─── Test 5b: Tag filter + 空间词表 alias 展开（3 期）─────────
+  it('hintContext.settings 携带词表时 tag 查询值展开为 [canonical, ...aliases]', async () => {
+    mockOuterQb.getRawMany.mockResolvedValue([]);
+
+    await service.search(
+      ['space-1'],
+      { q: 'test', tag: 'NPC' },
+      {
+        hintContext: {
+          spaceId: 'space-1',
+          settings: { canonicalTags: [{ value: 'npc', aliases: ['NPC', 'npc-old'] }] },
+        },
+      },
+    );
+
+    expect(mockSubQb.andWhere).toHaveBeenCalledWith('d.tags && CAST(:tagValues AS text[])', {
+      tagValues: ['npc', 'NPC', 'npc-old'],
+    });
   });
 
   // ─── Test 6: Type filter ─────────────────────────────────────
@@ -884,6 +916,212 @@ describe('DocSearchService', () => {
 
       // 前提自证：现构线必须**高于**基准线（否则本用例退化成旧口径的等价物）
       expect(DOC_SEARCH_WEAK_HIT_SCORE).toBeGreaterThan(DOC_SEARCH_STRONG_HIT_SCORE);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // hints 信封（2 期，v1.92.0-dev）：旧三态双写 + 读侧两条（A1 契约）
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe('hints 信封（2 期）', () => {
+    const hintContext = (settings: Record<string, unknown>) => ({
+      actor: null,
+      hintContext: { spaceId: 'space-1', settings },
+    });
+
+    it('零命中：旧 hint/hintCode 保留 + 双写 hints[zero_hit]（data={q}，文案逐字一致）', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+
+      const res = await service.search(['space-1'], { q: '端口映射失效' });
+
+      expect(res.hintCode).toBe('zero_hit');
+      expect(res.hint).toBe(DOC_SEARCH_ZERO_HIT_HINT);
+      const dual = res.hints?.find((h) => h.code === 'zero_hit');
+      expect(dual).toMatchObject({
+        status: 'suggestion',
+        message: DOC_SEARCH_ZERO_HIT_HINT,
+        data: { q: '端口映射失效' },
+      });
+    });
+
+    it('无触发（强命中）→ hints 键不出现（禁空数组；与 hint/hintCode 同款严格形态）', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([
+        makeRawRow({ score: DOC_SEARCH_WEAK_HIT_SCORE * 1.5 }),
+      ]);
+
+      const res = await service.search(['space-1'], { q: '端口映射失效' });
+
+      expect(Object.keys(res)).toEqual(['hits']);
+      expect(res).not.toHaveProperty('hints');
+    });
+
+    it('A1：未传 hintContext（全局检索面）→ 读侧两条整段跳过', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+
+      const res = await service.search(
+        ['space-1'],
+        { q: 'docs/a.md', type: 'memory' },
+        { actor: null },
+      );
+
+      expect(res.hints?.map((h) => h.code)).toEqual(['zero_hit']);
+      // 读侧的存在性轻查也不做（族闸门在 hintContext 之后）
+      expect(mockDocRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('read 族关 → 无**读侧族内** hints（含 path 存在性轻查也不做）；引流码**不受族闸门**约束', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+
+      const res = await service.search(
+        ['space-1'],
+        { q: 'docs/a.md', type: 'memory' },
+        hintContext({ hintToggles: { read: false } }),
+      );
+
+      // zero_hit 双写 + 引流码（**刻意放 read 族闸门外**，决策 9）；族内的
+      // query_looks_like_path / suggest_relaxing 两条不出现（这就是"族关"的可见效果）
+      expect(res.hints?.map((h) => h.code)).toEqual(['zero_hit', 'search_experiences_suggested']);
+      expect(mockDocRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('read 族开：suggest_relaxing 只列真实用过的可筛参数（sort/limit 不算筛选）', async () => {
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+
+      const res = await service.search(
+        ['space-1'],
+        { q: '端口映射失效', type: 'memory', sort: 'createdAt_desc', limit: 5 },
+        hintContext({ hintToggles: { read: true } }),
+      );
+
+      const hint = res.hints?.find((h) => h.code === 'suggest_relaxing');
+      expect(hint?.data).toEqual({
+        appliedFilters: { type: 'memory' },
+        removableParams: ['type'],
+        note: 'relaxing filters is not guaranteed to produce hits',
+      });
+      // q 形似路径但无斜杠形态要求不满足（'端口映射失效' 不含 /）→ 不发 query_looks_like_path
+      expect(res.hints?.some((h) => h.code === 'query_looks_like_path')).toBe(false);
+    });
+
+    it('read 族开：query_looks_like_path 命中本空间 doc 且 top hit 不是它 → 发；top hit 是它 → 不发', async () => {
+      const docQb = {
+        select: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue({ id: 'doc-path', path: 'docs/a.md' }),
+      };
+      (mockDocRepo.createQueryBuilder as jest.Mock).mockReturnValue(docQb);
+      // 零命中 → top hit 不是它
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+
+      const miss = await service.search(
+        ['space-1'],
+        { q: 'docs/a.md' },
+        hintContext({ hintToggles: { read: true } }),
+      );
+      expect(miss.hints?.find((h) => h.code === 'query_looks_like_path')?.data).toEqual({
+        path: 'docs/a.md',
+        docId: 'doc-path',
+      });
+
+      // top hit 就是该 doc → 不发（检索已排第一，提示无价值）
+      mockOuterQb.getRawMany.mockResolvedValue([
+        makeRawRow({ doc_id: 'doc-path', score: DOC_SEARCH_WEAK_HIT_SCORE * 1.5 }),
+      ]);
+      const hit = await service.search(
+        ['space-1'],
+        { q: 'docs/a.md' },
+        hintContext({ hintToggles: { read: true } }),
+      );
+      // 无任何候选 → hints 键不出现（强命中无旧三态，且 query_looks_like_path 被抑制）
+      expect(hit.hints).toBeUndefined();
+      expect(hit).not.toHaveProperty('hints');
+    });
+
+    it('去重窗口：旧三态**豁免**（逐响应等价于 hint/hintCode）；新读侧两条仍被压制', async () => {
+      // MAJOR-1：旧 hint/hintCode 是逐响应引导（不去重）⇒ 双写必须同款豁免，否则
+      // 第二次零命中时出现「旧字段有、新字段无」的语义倒挂（MCP 描述承诺同触发为假）。
+      mockOuterQb.getRawMany.mockResolvedValue([]);
+      const withRead = {
+        actor: null,
+        hintContext: { spaceId: 'space-1', settings: { hintToggles: { read: true } } },
+      };
+
+      const first = await service.search(['space-1'], { q: '端口映射失效' }, withRead);
+      expect(first.hints?.some((h) => h.code === 'zero_hit')).toBe(true);
+      expect(first.hints?.some((h) => h.code === 'suggest_relaxing')).toBe(false);
+
+      // 第二次同 q + 带筛选：旧三态仍在（豁免）；新读侧 suggest_relaxing 首次触发
+      const second = await service.search(
+        ['space-1'],
+        { q: '端口映射失效', type: 'memory' },
+        withRead,
+      );
+      expect(second.hintCode).toBe('zero_hit');
+      expect(second.hint).toBe(DOC_SEARCH_ZERO_HIT_HINT);
+      expect(second.hints?.find((h) => h.code === 'zero_hit')?.message).toBe(
+        DOC_SEARCH_ZERO_HIT_HINT,
+      );
+
+      // 新读侧两条**不豁免**：第三次同筛选 → suggest_relaxing 被窗口压制
+      const third = await service.search(
+        ['space-1'],
+        { q: '端口映射失效', type: 'memory' },
+        withRead,
+      );
+      expect(third.hints?.some((h) => h.code === 'suggest_relaxing')).toBe(false);
+      // 旧三态依旧在场（豁免 = 每次响应都有）
+      expect(third.hints?.some((h) => h.code === 'zero_hit')).toBe(true);
+    });
+
+    it('埋点资源键哈希化：q 原文不进 resourceKey（MAJOR-3，禁用户输入落日志）', async () => {
+      const emitted: Array<{ code: string; resourceKey?: string | null }> = [];
+      const collect = (_logger: unknown, input: { code: string; resourceKey?: string | null }) => {
+        emitted.push({ code: input.code, resourceKey: input.resourceKey });
+      };
+      // 搜索面同时有两条出口：常规 hint（warn）与旧三态（debug，N1）——两处都要采
+      const spy = jest.spyOn(hintLog, 'logHintEmitted').mockImplementation(collect as never);
+      const legacySpy = jest
+        .spyOn(hintLog, 'logHintEmittedLegacy')
+        .mockImplementation(collect as never);
+      try {
+        mockOuterQb.getRawMany.mockResolvedValue([]);
+        const secret = 'secret-query-token-abc';
+        // 带 hintContext → scope = 空间 ID；不带 → scope = 'global'（全局面无空间归属）
+        await service.search(
+          ['space-1'],
+          { q: secret },
+          {
+            actor: null,
+            hintContext: { spaceId: 'space-1', settings: {} },
+          },
+        );
+        await service.search(['space-1'], { q: secret });
+
+        expect(emitted.length).toBeGreaterThan(0);
+        for (const entry of emitted) {
+          expect(entry.resourceKey).not.toContain(secret);
+          if (entry.code === 'search_experiences_suggested') {
+            // 引流码的 resourceKey = **spaceId 本身**（不是用户输入——它是空间标识，
+            // 白名单允许项；见 hint-log 的标量纪律）
+            expect(entry.resourceKey).toBe('space-1');
+          } else {
+            // 其余码形态 = `${scope}:${16 位 hex}`（scope ∈ {spaceId, 'global'}）
+            expect(entry.resourceKey).toMatch(/^(space-1|global):[0-9a-f]{16}$/);
+          }
+        }
+        // 同签名同键（去重语义保留）：两个 scope 各一条（含引流码）emitted
+        expect(emitted.map((e) => e.resourceKey)).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/^space-1:/),
+            expect.stringMatching(/^global:/),
+            'space-1',
+          ]),
+        );
+      } finally {
+        spy.mockRestore();
+        legacySpy.mockRestore();
+      }
     });
   });
 

@@ -33,6 +33,7 @@ const BASE_SETTINGS: JudgmentConfig = {
   baseUrl: DEFAULT_TYPESAFE_BASE_URL,
   apiKey: null,
   typesafeModel: null,
+  proxyUrl: null,
   timeoutMs: 8000,
   rateLimitPerHour: 60,
   globalRateLimitPerHour: 240,
@@ -120,6 +121,7 @@ describe('judgment-provider.factory', () => {
         baseUrl: DEFAULT_TYPESAFE_BASE_URL,
         apiKey: null,
         typesafeModel: null,
+        proxyUrl: null,
         timeoutMs: 8000,
         rateLimitPerHour: 60,
         // 三级成本闸缺省 + 能力白名单空集 + 无配置来源（未 load 工厂）⇒ 无可告警项
@@ -190,6 +192,39 @@ describe('judgment-provider.factory', () => {
       expect(text).not.toContain('leaked-pass');
       // href 含 userinfo ⇒ 任何一行日志都不许出现完整 URL 形态
       expect(text).not.toContain('leaked-user:leaked-pass@');
+    });
+
+    it('配了专用出口代理 ⇒ INFO 同行打 proxy=host:port（userinfo 不进日志）；未配 ⇒ 无 proxy=', () => {
+      logSpy.mockClear();
+      createJudgmentProvider(
+        configServiceOf(
+          settingsOf({
+            provider: 'typesafe',
+            baseUrl: 'https://api.typesafe.ai',
+            apiKey: FAKE_TYPESAFE_KEY,
+            typesafeModel: 'jev-latest',
+            proxyUrl: 'http://proxy-user:proxy-pass@127.0.0.1:8001',
+          }),
+        ),
+      );
+      const withProxy = loggedText(logSpy);
+      expect(withProxy).toContain('proxy=127.0.0.1:8001');
+      // 代理 URL 允许带基本认证 ⇒ 凭证部分绝不进启动日志（与端点 userinfo 踩坑同源）
+      expect(withProxy).not.toContain('proxy-user');
+      expect(withProxy).not.toContain('proxy-pass');
+
+      logSpy.mockClear();
+      createJudgmentProvider(
+        configServiceOf(
+          settingsOf({
+            provider: 'typesafe',
+            baseUrl: 'https://api.typesafe.ai',
+            apiKey: FAKE_TYPESAFE_KEY,
+            typesafeModel: 'jev-latest',
+          }),
+        ),
+      );
+      expect(loggedText(logSpy)).not.toContain('proxy=');
     });
 
     it('畸形端点 URL → 诊断退化为固定文案（不抛、不打 href）（PM nit1）', () => {

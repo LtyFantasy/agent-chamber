@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { DocSpaceService } from './docspace.service';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocRenameService } from './doc-rename.service';
 import { DocLinksService } from './doc-links.service';
 import { DocBundleService } from './doc-bundle.service';
 import { DocSpaceController } from './docspace.controller';
@@ -32,6 +33,8 @@ import { DocSearchService } from './doc-search.service';
 import { DocRouteService } from './doc-route.service';
 import { DocRouteController } from './doc-route.controller';
 import { RouteHealthService } from './route-health.service';
+// hint 去重窗口 / 信封接线 / 埋点已抽到 modules/hints/（阶段一抽核）：
+// HintDedupService 由 @Global 的 HintsModule 提供（**单例**），本模块不再本地注册
 import { DocRoute } from '../../database/entities/doc-route.entity';
 // Diagram IR v1（plan diagram-ir-v1-plan.md §4/§7 Phase 1）
 import { DiagramService } from './diagram.service';
@@ -86,6 +89,9 @@ import { JudgmentModule } from '../judgment/judgment.module';
     DocSpaceService,
     DocService,
     DocMoveService,
+    // 存量治理写服务（3 期，v1.92.0-dev）：tag rename/merge + category merge 的唯一写通道
+    // （docs 批量改写 + 词表 alias 声明 + 软引用修正 + 汇总审计）
+    DocRenameService,
     // 全空间入链反扫内核（v1.90.0-dev backlinks 批次）：DocMoveService 与
     // DocController(/docs/:id/backlinks) 共用；漏注册 → 启动即抛未解析依赖
     DocLinksService,
@@ -93,6 +99,9 @@ import { JudgmentModule } from '../judgment/judgment.module';
     DocRouteService,
     RouteHealthService,
     DocBundleService,
+    // 注：hint 去重窗口（HintDedupService）已迁至 @Global 的 HintsModule 提供——
+    // 五个消费方（doc / doc-move / doc-search / doc-route / docspace）仍共享**同一份**
+    // 进程单例，注入代码不变；**禁止**在本模块再注册一次（会得到第二份窗口 = 去重静默失效）
     // Diagram IR v1：渲染门（DocService upsertCore diagram 分支依赖）+ 端点业务服务
     DiagramRendererService,
     DiagramService,

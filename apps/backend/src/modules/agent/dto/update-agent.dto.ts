@@ -56,10 +56,13 @@ export class UpdateAgentDto implements UpdateAgentInput {
 
   @IsOptional()
   @IsString()
+  // 显式 type：`string | null` 联合类型经 reflect-metadata 推成 Object，仅给 nullable 不足以
+  // 修正（Swagger/automcp 仍输出 type:object，MCP 通道传字符串必 400；守卫见 swagger-schema.spec.ts）
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
     description: 'Avatar URL; pass null to clear the avatar and cascade-clear avatar_svg',
     example: 'https://example.com/avatar.png',
-    nullable: true,
   })
   avatar?: string | null;
 

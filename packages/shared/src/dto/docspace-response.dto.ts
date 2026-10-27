@@ -5,6 +5,7 @@
  * 遵循项目惯例：列表视图不含大字段（description 摘要化、不含 content）。
  */
 import { DocSpaceMemberRole, Visibility } from '../enums';
+import type { DocSpaceCanonicalTag, DocSpaceHintToggles, DocSpacePathType } from './docspace.dto';
 
 // ─── DocSpace ────────────────────────────────────────────
 
@@ -326,6 +327,18 @@ export interface DocSectionOutline {
    * 提取 lastHeadingSegment 兜底）。headingLevel=0 文首段为 null。
    */
   headingText?: string | null;
+  /**
+   * 派生锚点哈希（与 DocSectionContent.sectionHash 同口径：
+   * sha256(headingPath + '\n' + headingLevel + '\n' + content) hex，纯派生不落库）。
+   *
+   * outline 每节携带它是为**复核/对账场景**：一次 outline 调用即可完成全篇比对，
+   * 免去逐节 positions[] 往返。写前提校验的取数通道仍是 positions[] / 单节读
+   * （patch expectedSectionHash）——两处口径相同，可自由混用。
+   *
+   * 派生输入 = 存储三元组；服务端为此在 outline 查询额外 select content 列
+   * （内存派生后即丢弃，不进响应体）——响应体不因正文膨胀，每节只多本字段（≈85B）。
+   */
+  sectionHash?: string;
 }
 
 /**
@@ -509,12 +522,27 @@ export interface DocTreeResponse {
 
 /**
  * 聚合计数项（facets 的 types/tags 共用）
+ *
+ * v1.92.0-dev（DocSpace 元数据治理 1 期）：新增词表状态两字段——**仅当该族词表已配置时
+ * 出现**（未配置时整字段省略，区分「没配词表」与「词表外」）。
  */
 export interface DocFacetCount {
   /** 聚合值（doc_type 或 tag 原文） */
   value: string;
   /** 命中未删文档数 */
   count: number;
+  /**
+   * 词表状态（仅该族词表已声明时出现）：
+   * - types 组：`declared`（ci ∈ settings.docTypes）/ `undeclared`（词表外）；
+   * - tags 组：`canonical`（**精确等于**某条目 value）/ `alias`（非声明形态但 ci 命中
+   *   value 或 alias，含大小写变体）/ `undeclared`（词表外）。
+   */
+  vocabStatus?: 'declared' | 'undeclared' | 'canonical' | 'alias';
+  /**
+   * 指向的 canonical 值（**仅 tags 组且 vocabStatus='alias' 时出现**）——
+   * 该 alias 归一后的落库形态，喂 3 期 rename/merge 工具。
+   */
+  canonicalValue?: string;
 }
 
 /**
@@ -534,6 +562,9 @@ export interface DocFacetCategoryCount {
  *
  * 替代前端全量列表聚合：types = GROUP BY doc_type（非空）；tags = unnest(tags)
  * GROUP BY；categories = JOIN doc_categories（含软删过滤）。全部只统计未删文档。
+ *
+ * v1.92.0-dev：facets 升级为「一词调用」体检面 = 声明词表（vocabulary）+
+ * 实际分布（types/tags/categories）+ 逐项状态（vocabStatus/canonicalValue）。
  */
 export interface DocFacetsResponse {
   /** 文档类型聚合（按 count DESC，同 count 按 value ASC） */
@@ -542,6 +573,31 @@ export interface DocFacetsResponse {
   tags: DocFacetCount[];
   /** 分类聚合（按 count DESC，同 count 按 slug ASC） */
   categories: DocFacetCategoryCount[];
+  /**
+   * 已声明词表回显（v1.92.0-dev）——**词表的唯一读路径之一**（另一条 = PATCH 响应回显）。
+   * 未声明该键时为 null；整个 space.settings 无词表时本字段省略（与逐项 vocabStatus
+   * 省略口径一致）。内部键（repoManifest 等）不外泄——只回显三词表键。
+   */
+  vocabulary?: DocFacetsVocabulary;
+}
+
+/**
+ * facets 回显的已声明词表（v1.92.0-dev）
+ *
+ * 三键分别对应 settings.docTypes / canonicalTags / pathTypes；未声明为 null。
+ */
+export interface DocFacetsVocabulary {
+  /** 已声明 docType 词表（未声明 = null） */
+  docTypes: string[] | null;
+  /** 已声明规范标签词表（未声明 = null） */
+  canonicalTags: DocSpaceCanonicalTag[] | null;
+  /** 已声明路径前缀→docType 声明（未声明 = null） */
+  pathTypes: DocSpacePathType[] | null;
+  /**
+   * hint 族开关现状（v1.92.0-dev 2 期）——未声明 = null（全关）。
+   * 与三词表键并列，构成「一词调用 = 词表 + 开关 + 分布」的完整体检面。
+   */
+  hintToggles: DocSpaceHintToggles | null;
 }
 
 // ─── Search ──────────────────────────────────────────────
@@ -684,6 +740,15 @@ export interface DocSearchResponse {
    * 消费方分支请读本键而非匹配文案。
    */
   hintCode?: DocSearchHintCode;
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：读侧 query_looks_like_path / suggest_relaxing
+   * + **旧三态双写**（同一触发同时进 hints[]，code 同值、status=suggestion、
+   * message 与上方 `hint` 逐字一致）。
+   *
+   * 不变量：为空 ⇒ 键不出现（禁 null/禁空数组）；≤3 条；仅 per-space 端点（全局检索
+   * 不传 hintContext ⇒ 整段跳过）。
+   */
+  hints?: DocHint[];
 }
 
 /**
@@ -743,6 +808,152 @@ export const DOC_SEARCH_WEAK_HIT_HINT =
 export const DOC_SEARCH_POSITIONAL_ORDER_HINT =
   'Single-character or very high-frequency query: results are matched exactly but NOT ' +
   'ranked by relevance (ordered by section position). Use a longer query for relevance ranking.';
+
+// ─── 统一 hint 信封（DocSpace 元数据治理 2 期，v1.92.0-dev）──────────────
+
+/**
+ * hint 四态（DocHint.status，语义钉死——消费方按 status 决定是否采取动作）
+ *
+ * - `suggestion`：写入**已提交**，这是事后建议（如 missing_category / tag_near_dup）；
+ * - `normalized`：值**已按空间词表归一**（事实回显，如 tags_normalized）——
+ *   不是建议，是「你的输入被纠偏了」的通知；
+ * - `check_skipped`：**检查未执行**（附原因，如 route 影响面超 cap）——
+ *   ⚠️ **绝不解释为健康**（unchecked ≠ healthy）；
+ * - `check_failed`：**检查已执行且发现问题**（如 route_anchor_broken / path_type_mismatch）。
+ */
+export const DOC_HINT_STATUSES = [
+  'suggestion',
+  'normalized',
+  'check_skipped',
+  'check_failed',
+] as const;
+
+/** DOC_HINT_STATUSES 元素联合 */
+export type DocHintStatus = (typeof DOC_HINT_STATUSES)[number];
+
+/**
+ * hint code 单源常量数组（v1.92.0-dev 2 期；阶段三扩 2 码；overview routes 截断补 1 码）
+ *
+ * 分三段：**写侧 10**（upsert / patch_metadata / batch / move / delete / route /
+ * category 写路径产出）+ **读侧 5**（搜索读路径 2 + 零命中引流 1 + overview docs 截断 1
+ * + overview routes 截断 1）
+ * + **旧三态 3**（`DOC_SEARCH_HINT_CODES` 的三态双写进 hints[]，迁移一周期后旧
+ * `hint`/`hintCode` 字段下线——届时本段三码一并移除）。
+ *
+ * 消费方一律按 code 分支，**不要解析 message 文案**（文案会微调，code 稳定）。
+ */
+export const DOC_HINT_CODES = [
+  // ── 写侧（10）──
+  'missing_category',
+  'empty_tags',
+  'empty_summary',
+  'path_type_mismatch',
+  'tag_near_dup',
+  'category_near_dup',
+  'route_target_excluded',
+  'route_anchor_recheck',
+  'route_anchor_broken',
+  'tags_normalized',
+  // ── 读侧（5）──
+  'query_looks_like_path',
+  'suggest_relaxing',
+  // 阶段三（决策 9）：零命中引流（经验库单目的地）——刻意排在 zero_hit 之后
+  'search_experiences_suggested',
+  // 阶段三（决策 9）：overview 文档条目被 maxTokens 截断的分页教学（名次末位）
+  'docs_overview_truncated',
+  // overview **routes 段**内嵌条数截断（策展序前 50）的抓全教学——与 docs 段截断**独立**
+  // 触发（catalog 只豁免 docs 段）；排在最末位（名次 17），同为「顺带告知」
+  'docs_overview_routes_truncated',
+  // ── 旧搜索三态（双写过渡，3）──
+  'zero_hit',
+  'weak_hit',
+  'positional_order',
+] as const;
+
+/** DOC_HINT_CODES 元素联合（18 个 code） */
+export type DocHintCode = (typeof DOC_HINT_CODES)[number];
+
+/**
+ * hint 文案单源（code → 可执行下一步指引）
+ *
+ * 形态纪律（对齐 `DOC_SEARCH_*_HINT` 先例）：一句话说清「发现了什么 + 下一步做什么」，
+ * 不承诺结果、不描述内部实现。旧三态三条**直接引用既有常量**——同一触发条件在
+ * `hint` 与 `hints[].message` 两处必须逐字一致（双写过渡期的硬契约）。
+ *
+ * 机器可读的补充信息一律走 `DocHint.data`，**消费方不要从 message 里解析结构化值**。
+ */
+export const DOC_HINT_MESSAGES: Record<DocHintCode, string> = {
+  missing_category:
+    '文档未设置分类；建议用 patch_doc_metadata 传 category 归位，便于在空间地图中检索。',
+  empty_tags: '文档未设置标签；建议补 3–5 个标识符型 tag（先 get_doc_facets 复用空间既有取值）。',
+  empty_summary: '文档摘要为空；建议补 1–2 句 summary（回答「这是什么 + 什么场景该读它」）。',
+  path_type_mismatch:
+    '文档路径命中空间声明的 pathTypes 前缀，但 docType 与声明不一致；建议核对 docType，或更新空间 pathTypes 声明。',
+  tag_near_dup:
+    '有 tag 不在空间词表内，但与空间既有 tag 高度相似；建议复用既有取值（平台不会自动改写）。',
+  category_near_dup:
+    '分类与空间既有分类高度相似；建议复用既有分类，避免近义分裂（平台不会自动合并）。',
+  route_target_excluded:
+    '该路由指向的文档被空间默认 overviewFilter 排除，overview 地图中不会出现它；建议确认是否需要调整排除项或改主文档。',
+  route_anchor_recheck:
+    '有意图路由指向本文档；move 只改 path、不改标题锚，docId 引用连续——以下路由供知悉核对。',
+  route_anchor_broken:
+    '有意图路由的 headingPath 锚在本次写入后不再命中；建议更新路由锚点（update_doc_route）。',
+  tags_normalized: '部分 tag 已按空间词表归一为 canonical 形态（下次可直接写 canonical 值）。',
+  query_looks_like_path:
+    '查询形似本空间文档路径；若想直接读该文档，用 read_doc（spaceName + path）一跳直达。',
+  suggest_relaxing:
+    '零命中且本次带了筛选条件；可尝试去掉部分筛选参数扩大范围（去掉筛选不保证一定有结果）。',
+  search_experiences_suggested:
+    '本空间零命中。若你在排障或用陌生工具/流程，先去经验库搜一轮（search_experiences，' +
+    'signals 给症状 token 如 econnrefused 最准）：别人踩过的同一个坑往往已收录，比重头摸索便宜。',
+  docs_overview_truncated:
+    'overview 的文档条目已达 maxTokens 预算被截断（已够用可忽略）。要看全目录：换投影重调本端点' +
+    '（catalog=true 豁免截断，或 slim=true 更瘦），或改走分页清单（list_docs / GET /doc-spaces/:id/docs）。',
+  docs_overview_routes_truncated:
+    'overview 的意图路由内嵌条数有上限，本次已被截断（实际返回数见 data.returnedCount、全量规模见 ' +
+    'routesTotal；已够用可忽略）。catalog 投影只豁免文档条目截断、不能补齐 routes；要看全部路由请用 ' +
+    'list_doc_routes 分页拉取（可按 q/category 过滤定位）。',
+  zero_hit: DOC_SEARCH_ZERO_HIT_HINT,
+  weak_hit: DOC_SEARCH_WEAK_HIT_HINT,
+  positional_order: DOC_SEARCH_POSITIONAL_ORDER_HINT,
+};
+
+/**
+ * `route_anchor_recheck` 的 **check_skipped 变体**文案（影响面超 cap，检查未执行）
+ *
+ * 为什么单独一条：check_skipped 的语义是「没检查」，复用 suggestion 文案
+ * （「以下路由供知悉核对」）会让消费方把「未检查」误读为「已检查且正常」——
+ * health=null/unchecked **绝不解释为健康**是本信封的硬纪律。
+ */
+export const DOC_HINT_ROUTE_RECHECK_SKIPPED_MESSAGE =
+  '指向本文档的意图路由过多，本次未逐条校验锚点（check_skipped —— 不是「健康」）；' +
+  '可用 POST /doc-spaces/:id/routes/recheck 全量重检，或人工核对路由锚点。';
+
+/**
+ * 统一 hint 信封条目（v1.92.0-dev 2 期）
+ *
+ * 挂面：`UpsertDocResult` / `PatchDocMetadataResult` / `BatchUpsertItemResult` /
+ * `DocSearchResponse` / `DocMoveResult` / `DocDeleteResult` / `DocRouteWriteResult` /
+ * `DocCategoryWriteResult`——各带可选 `hints?: DocHint[]`。
+ *
+ * **不变量（消费方可依赖）**：
+ * - hints 为空 ⇒ **该键不出现**（禁 null、禁空数组）；
+ * - 只在 2xx 响应出现（4xx/5xx 无 hints）；
+ * - 单响应 ≤3 条（先按 (actor, code, resource) 去重窗口过滤，再按固定优先级截尾，
+ *   静默——不额外标记 truncated）；
+ * - `data` 是结构化建议值（候选/字段/来源），消费方**不解析 message**。
+ */
+export interface DocHint {
+  /** 稳定机器判别码（`DOC_HINT_CODES` 单源），按它分支而非匹配 message */
+  code: DocHintCode;
+  /** 四态语义（见 `DOC_HINT_STATUSES`）：suggestion / normalized / check_skipped / check_failed */
+  status: DocHintStatus;
+  /** 可执行下一步指引（人/Agent 可读面，`DOC_HINT_MESSAGES` 单源） */
+  message: string;
+  /** 结构化建议值（候选/字段/来源），消费方读这里而不是解析 message */
+  data?: Record<string, unknown>;
+}
 
 // ─── Overview ────────────────────────────────────────────
 
@@ -931,6 +1142,17 @@ export interface DocSpaceOverview {
   docsReturned: number;
   /** 实际生效的过滤条件回显（未传任何过滤且无空间默认时缺省） */
   appliedFilters?: DocSpaceOverviewAppliedFilters;
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期；阶段三补 docs 段截断，本批补 routes 段截断）：
+   * **两个产出码，触发条件互相独立**——
+   * ① `docs_overview_truncated`：**文档条目**因 maxTokens 预算被截断时的分页教学，
+   *    且调用方**未显式传** maxTokens（显式传 = 调用方自己管预算，不再教学）；
+   * ② `docs_overview_routes_truncated`：**意图路由段**被内嵌条数上限（`OVERVIEW_ROUTES_LIMIT`）
+   *    截断时的抓全教学——该上限是响应防爆闸，与预算/投影无关，**catalog 模式下照常触发**。
+   * 两者同时成立时按固定优先级并存（均属「顺带告知」的末位档）。
+   * 均不触发 ⇒ **键不出现**（禁空数组）。
+   */
+  hints?: DocHint[];
 }
 
 /**
@@ -969,8 +1191,10 @@ export interface DocCategoryOverviewCatalog extends Omit<DocCategoryOverview, 'd
  * DocSummarySlim（routes 段两种模式同为 DocRouteNav 导航投影）。
  * 语义：slim=true 时返回本形状；缺省/false 返回 DocSpaceOverview（向后兼容）。
  */
-export interface DocSpaceOverviewSlim
-  extends Omit<DocSpaceOverview, 'categories' | 'uncategorized'> {
+export interface DocSpaceOverviewSlim extends Omit<
+  DocSpaceOverview,
+  'categories' | 'uncategorized'
+> {
   /** 分类树（docs 为 slim 条目） */
   categories: DocCategoryOverviewSlim[];
   /** 未分类文档（slim 条目） */
@@ -985,8 +1209,10 @@ export interface DocSpaceOverviewSlim
  * catalog 胜出）；缺省/false 返回 DocSpaceOverview（向后兼容）。
  * 与 slim 的差异：catalog 豁免 maxTokens 对 doc 条目的截断（目录完整性是契约）。
  */
-export interface DocSpaceOverviewCatalog
-  extends Omit<DocSpaceOverview, 'categories' | 'uncategorized'> {
+export interface DocSpaceOverviewCatalog extends Omit<
+  DocSpaceOverview,
+  'categories' | 'uncategorized'
+> {
   /** 分类树（docs 为 catalog 三键条目） */
   categories: DocCategoryOverviewCatalog[];
   /** 未分类文档（catalog 三键条目） */
@@ -1011,6 +1237,20 @@ export interface TaskDocLinkItem {
 }
 
 // ─── Upsert Result ───────────────────────────────────────
+
+/**
+ * 标签归一映射（v1.92.0-dev，DocSpace 元数据治理 1 期）
+ *
+ * 空间声明 `settings.canonicalTags` 时，写路径把命中 alias 的 tag 归一为 canonical
+ * 声明形态。本类型记录「实际发生的」归一（from = 调用方原值，to = 落库 canonical 值），
+ * **仅实际发生归一时才出现在响应里**——机器可读 data 字段，不是 prose hint。
+ */
+export interface TagNormalization {
+  /** 调用方原始 tag（trim 前的输入形态） */
+  from: string;
+  /** 实际落库的 canonical 值 */
+  to: string;
+}
 
 /**
  * Upsert 文档结果
@@ -1047,6 +1287,31 @@ export interface UpsertDocResult {
    * response_snapshot 存的首次成功响应（非当前状态）。仅携带幂等键的请求可能出现。
    */
   idempotentReplay?: boolean;
+  /**
+   * true = **23505 并发败者出口**（v1.94.0-dev）：本请求与另一请求同时 upsert 同一个
+   * `(spaceId, path)`，本请求的插入撞部分唯一索引（`uq_docs_space_id_path`，
+   * `WHERE deleted_at IS NULL`）回滚，服务端按重放语义返回**胜者**那一行。
+   *
+   * ⚠️ **语义要点（调用方必读）**：本请求写入的 `content` **未落库**——返回的
+   * `sectionCount` / `tokenEstimate` / `contentHash` 全都来自胜者，内容可能与本请求
+   * 提交的完全不同。要确认「我写的内容是否生效」请重读 `GET /docs/:id`。
+   *
+   * 领域侧门控据此跳过「**未写入却 emit**」的观测面（`doc.upserted` 事实与凭证扫描），
+   * 与 `unchanged` / `rechunked` / `idempotentReplay` 同一族（见 docs/modules/hint-system.md §4.1）。
+   */
+  concurrentWinner?: boolean;
+  /**
+   * 实际发生的 tag 归一映射（v1.92.0-dev，仅空间声明 canonicalTags 且命中 alias 时出现）。
+   * ⚠️ unchanged 早退（内容 hash 未变）不落 tags 也不归一，故本字段不出现——纯标签
+   * 调整请走 patch_doc_metadata 通道。
+   */
+  tagNormalizations?: TagNormalization[];
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：metadata / pathType / tags / routes 族建议
+   * + tags_normalized 事实回显。族开关未开 ⇒ 键不出现；unchanged 早退与 23505 winner
+   * 出口**不发 hints**（前者内容未变，后者是竞争重试面）。
+   */
+  hints?: DocHint[];
 }
 
 // ─── Batch Upsert ──────────────────────────────────────────
@@ -1068,6 +1333,12 @@ export interface BatchUpsertItemResult {
     /** 数值型业务错误码（ErrorCode 枚举值，如 10003 = DOC_SOURCE_MISMATCH） */
     code?: number;
   };
+  /**
+   * 实际发生的 tag 归一映射（v1.92.0-dev，仅该条命中 alias 时出现；语义同 UpsertDocResult）。
+   */
+  tagNormalizations?: TagNormalization[];
+  /** 统一 hint 信封（v1.92.0-dev 2 期；语义同 UpsertDocResult，仅该条命中时出现） */
+  hints?: DocHint[];
 }
 
 /**
@@ -1334,6 +1605,28 @@ export interface DocMoveResult {
    * response_snapshot 存的首次成功响应（文档不会再次移动）。仅携带幂等键的请求可能出现。
    */
   idempotentReplay?: boolean;
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：routes 族 route_anchor_recheck（有路由指向
+   * 本文档时的知悉提示；move 不动标题锚，docId 引用连续）。dryRun 与正式 move 同发。
+   */
+  hints?: DocHint[];
+}
+
+/**
+ * DELETE /docs/:id 响应（v1.92.0-dev 2 期补齐 shared 类型并增 hints 信封）
+ *
+ * 语义：软删（sections 经 CASCADE FK 保留）；`path` 是删除时的文档路径。
+ */
+export interface DocDeleteResult {
+  /** 恒 true（软删成功；失败路径抛 4xx/5xx 无响应体） */
+  deleted: boolean;
+  /** 被删文档的 path（删除前快照） */
+  path: string;
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：routes 族 route_anchor_broken——
+   * 指向该文档的路由锚点因文档消失而失效（docId 锚断 = 语义判定，无逐锚成本）。
+   */
+  hints?: DocHint[];
 }
 
 // ─── Metadata-only patch（v1.61.0 批次 2，Board 任务 201ae04f）──────────────
@@ -1384,6 +1677,45 @@ export interface PatchDocMetadataResult {
    * response_snapshot 存的首次成功响应。仅携带幂等键的请求可能出现。
    */
   idempotentReplay?: boolean;
+  /**
+   * 实际发生的 tag 归一映射（v1.92.0-dev，仅空间声明 canonicalTags 且命中 alias 时出现）。
+   * 归一在幂等 replay 检查**之后**执行——幂等指纹保持 caller 原始输入（归一确定性，
+   * 重放语义不变）；本字段参与 changedFields 比较（归一后值才是落库值）。
+   */
+  tagNormalizations?: TagNormalization[];
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：metadata / categories 族建议 + tags_normalized
+   * 事实回显。**unchanged 出口同样发**（镜像 1 期「零变更也回显归一」语义：零写操作
+   * 不等于零建议）。
+   */
+  hints?: DocHint[];
+}
+
+/**
+ * POST /doc-spaces/:id/routes 与 PATCH /doc-routes/:id 响应（v1.92.0-dev 2 期）
+ *
+ * 形状 = `DocRoute` + 可选 hints 信封（route_target_excluded 建议）。
+ */
+export interface DocRouteWriteResult extends DocRoute {
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：routes 族 route_target_excluded——
+   * primaryDoc 的 docType ∈ 空间 overviewFilter.excludeTypes，或其 category slug ∈
+   * excludeCategories（该文档不会出现在 overview 地图里）。
+   */
+  hints?: DocHint[];
+}
+
+/**
+ * POST /doc-spaces/:id/categories 响应（v1.92.0-dev 2 期）
+ *
+ * 形状 = `DocCategoryDto` + 可选 hints 信封（category_near_dup 建议）。
+ */
+export interface DocCategoryWriteResult extends DocCategoryDto {
+  /**
+   * 统一 hint 信封（v1.92.0-dev 2 期）：categories 族 category_near_dup——
+   * 新建分类与空间既有分类 trigram 高度相似（只出候选，**不自动合并**）。
+   */
+  hints?: DocHint[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,4 +1772,219 @@ export interface DocBacklinks {
    * 不设 total（前端首屏取前 5 组，全量即本数组长度）。
    */
   sources: DocBacklinksSource[];
+}
+
+// ─── 存量治理（DocSpace 元数据治理 3 期，v1.92.0-dev）──────────────────────
+//
+// tag rename/merge 与 category merge 的响应形状。dryRun 与 execute **共用同一
+// interface**（dryRun 字段区分，非 dryRun 专属字段可空）——对齐 DocMoveResult 形态，
+// 消费方（MCP 工具 / web）按同一形状读取。
+
+/** ingest（非 native 来源）受影响文档引用（治理响应单列提醒仓侧同步改 frontmatter） */
+export interface DocGovernanceIngestRef {
+  /** 文档 ID */
+  docId: string;
+  /** 文档 path */
+  path: string;
+}
+
+/**
+ * 受影响文档清单（tag rename / category merge 共用）
+ *
+ * `sample` 恒 ≤50 条（plan D4 明列），`truncated = total > sample.length`；execute 前
+ * 的 dryRun 用它与 batchToken 一起构成「预演 → 执行」契约。
+ */
+export interface DocGovernanceAffectedDocs<T> {
+  /** 受影响文档总数 */
+  total: number;
+  /** 受影响样本（≤50 条，按 docId 升序——与 batchToken 序列化口径一致） */
+  sample: T[];
+  /** true = 样本被截断（total > sample.length） */
+  truncated: boolean;
+}
+
+/** tag rename 受影响样本条目（含改写前 tags 快照，供人工核对/回滚） */
+export interface RenameDocTagsAffectedSample {
+  /** 文档 ID */
+  docId: string;
+  /** 文档 path */
+  path: string;
+  /** 改写前的 tags 值（快照；execute 后旧值消失，此字段是 dryRun 的对照面） */
+  currentTags: string[];
+}
+
+/** 逐 distinct from 值的命中计数（dryRun 的 perValue / similarNotAffected 共用） */
+export interface DocGovernanceValueCount {
+  /** tag 值 */
+  value: string;
+  /** 命中文档数 */
+  docCount: number;
+}
+
+/**
+ * 词表变换计划 / 结果（applyTagRenameToVocabulary 的产物投影）
+ *
+ * `created=true` = 空间原本未声明 canonicalTags（null/空），本次 rename **创建**了
+ * 词表键（plan D6 无条件生成 alias：词表键不存在则创建，不因未声明而跳过）。
+ */
+export interface RenameDocTagsVocabularyChange {
+  /** true = 创建了 settings.canonicalTags 键（原为 null/空） */
+  created: boolean;
+  /** 新加入 `to` 条目的 alias 值（含从其他 canonical 迁移来的） */
+  addedAliases: string[];
+  /** 被删除的 canonical 条目值（from 中本身是 canonical 的，merge 两个 canonical 的形态） */
+  removedCanonicals: string[];
+  /** alias 归属迁移（原属其他 canonical 的 alias 被摘除并转入 to） */
+  movedAliases: Array<{ alias: string; fromCanonical: string; toCanonical: string }>;
+  /**
+   * 因触达词表别名上限（`DOC_SPACE_TAG_ALIASES_MAX` = 20）被裁掉的值（minor-1）。
+   * **空则不出现该键**（对齐仓内「空集合不落键」惯例）。语义：别名是召回兼容层，
+   * 极端反复 rename 累积超限时截断尾部（保「先旧后新」）比让 canonicalTags 超限
+   * （此后该空间 `PATCH /doc-spaces/:id` 直接 422，编辑面锁死）更不糟；本次被裁形态
+   * 对应的存量文档已改写成 canonical，当前数据零召回损失。
+   */
+  truncatedAliases?: string[];
+}
+
+/**
+ * tag rename/merge 响应（POST /doc-spaces/:id/tags/rename）
+ *
+ * dryRun（200，零副作用零审计零幂等占用）：`affectedDocs` / `perValue` /
+ * `similarNotAffected` / `vocabularyPlan` 有值，`renamed`/`updatedDocs`/`vocabulary` 缺省。
+ * execute（200）：`renamed`/`updatedDocs`/`vocabulary` 有值。两者恒带 `batchToken`。
+ */
+export interface RenameDocTagsResult {
+  /** true = 预演（未写库）；false = 已执行 */
+  dryRun: boolean;
+  /** 本次受影响集的快照 token（sha256；execute 传 expectedBatchToken 做并发冲突检测） */
+  batchToken: string;
+  /** 实际生效的 from→to（execute 回显；dryRun 缺省） */
+  renamed?: { from: string[]; to: string };
+  /** 受影响文档清单（dryRun 专用；execute 只回总数 updatedDocs） */
+  affectedDocs?: DocGovernanceAffectedDocs<RenameDocTagsAffectedSample>;
+  /** 逐 distinct from 值的命中计数（dryRun 专用） */
+  perValue?: DocGovernanceValueCount[];
+  /** trgm 近义候选（未在 from 中的相似值，DX 提示可补进 from；dryRun 专用） */
+  similarNotAffected?: DocGovernanceValueCount[];
+  /** 词表变换计划（dryRun 专用） */
+  vocabularyPlan?: RenameDocTagsVocabularyChange;
+  /** 实际生效的词表变更（execute 专用） */
+  vocabulary?: RenameDocTagsVocabularyChange;
+  /** 实际改写的文档数（execute 专用） */
+  updatedDocs?: number;
+  /** ingest（非 native）受影响文档（单列提醒仓侧同步改 frontmatter；两者恒有） */
+  ingestAffected: DocGovernanceIngestRef[];
+  /** true = 幂等重放（同 actor + idempotencyKey 的重复请求返回首次响应快照） */
+  idempotentReplay?: boolean;
+}
+
+/** category merge 受影响样本条目（含改写前 categoryId 快照） */
+export interface MergeDocCategoryAffectedSample {
+  /** 文档 ID */
+  docId: string;
+  /** 文档 path */
+  path: string;
+  /** 改写前分类 ID（快照；恒等于 source.id，留字段便于消费方对齐 tag 侧形状） */
+  currentCategoryId: string | null;
+}
+
+/** category merge 的软引用影响面（dryRun 报告 / execute 回执共用形状） */
+export interface MergeDocCategorySoftRefs {
+  /** doc_routes.category === sourceSlug 的路由行数（merge 时改写为 targetSlug） */
+  routesCategoryCount: number;
+  /** settings.overviewFilter.excludeCategories 是否含 sourceSlug（含则替换为 targetSlug） */
+  excludeCategories: boolean;
+}
+
+/**
+ * category merge 响应（POST /doc-categories/:id/merge）
+ *
+ * dryRun：`source`/`target`/`affectedDocs`/`softRefs` 有值；execute：`merged`/
+ * `repointedDocs`/`softRefsFixed`/`sourceDeleted` 有值。两者恒带 `batchToken` 与
+ * `ingestAffected`。⚠️ category **无 alias 机制**——merge 后旧 slug 查询即空。
+ */
+export interface MergeDocCategoryResult {
+  /** true = 预演（未写库）；false = 已执行 */
+  dryRun: boolean;
+  /** 本次受影响集的快照 token */
+  batchToken: string;
+  /** source 分类（路径参数 `:id`；dryRun 回显） */
+  source?: { id: string; slug: string; name: string };
+  /** target 分类（dryRun 回显） */
+  target?: { id: string; slug: string; name: string };
+  /** 受影响文档清单（dryRun 专用） */
+  affectedDocs?: DocGovernanceAffectedDocs<MergeDocCategoryAffectedSample>;
+  /** 软引用影响面（dryRun 专用） */
+  softRefs?: MergeDocCategorySoftRefs;
+  /** 实际生效的 slug 迁移（execute 专用） */
+  merged?: { fromSlug: string; toSlug: string };
+  /** 重指向的文档数（execute 专用） */
+  repointedDocs?: number;
+  /** 软引用修正计数（execute 专用；excludeCategoriesUpdated 是 0/1 计数） */
+  softRefsFixed?: { routesUpdated: number; excludeCategoriesUpdated: number };
+  /** true = source 分类已软删（execute 专用） */
+  sourceDeleted?: boolean;
+  /** ingest（非 native）受影响文档（两者恒有） */
+  ingestAffected: DocGovernanceIngestRef[];
+  /** true = 幂等重放 */
+  idempotentReplay?: boolean;
+}
+
+/** orphan 清单条目（GET /doc-spaces/:id/docs/orphans） */
+export interface OrphanDocItem {
+  /** 文档 ID */
+  id: string;
+  /** 文档 path */
+  path: string;
+  /** 文档标题 */
+  title: string;
+  /** docType（可空） */
+  docType: string | null;
+  /** 分类 slug（无分类 / 分类已软删 → null） */
+  categorySlug: string | null;
+  /** 最近更新时间（ISO 字符串） */
+  updatedAt: string;
+}
+
+/** orphan 清单统计（含 byTopDir 结构分组——维护者一眼分辨「结构性叶子群」vs「可行动孤儿」） */
+export interface OrphanDocsStats {
+  /** 空间内未软删文档总数（应用 pathPrefix 过滤后） */
+  totalDocs: number;
+  /** 被 doc_routes（primary ∪ secondary）引用的文档数（应用 pathPrefix 过滤后） */
+  routedDocs: number;
+  /** orphan 文档数（totalDocs - routedDocs；= 全量口径，不含 overviewFilter 排除） */
+  orphanDocs: number;
+  /** 因 overviewFilter 默认排除而未进入清单的 orphan 数（includeExcluded=true 时为 0） */
+  excludedOrphanDocs: number;
+  /** 按 path 第一段分组计数（结构性叶子群识别；count DESC + dir ASC 确定性排序） */
+  byTopDir: Array<{ dir: string; count: number }>;
+}
+
+/**
+ * orphan 文档清单响应（GET /doc-spaces/:id/docs/orphans）
+ *
+ * 只读现算，不落库、无调度——「周期性产出」= 维护者按需调用。
+ */
+export interface OrphanDocsResponse {
+  /** 当前页条目 */
+  items: OrphanDocItem[];
+  /** 过滤后清单总数（分页前） */
+  total: number;
+  /** 当前页码 */
+  page: number;
+  /** 每页条数 */
+  pageSize: number;
+  /** 实际生效的过滤条件回显（overviewFilter 默认排除 + pathPrefix） */
+  appliedFilters: {
+    /** 生效的 docType 黑名单（含空间默认 excludeTypes） */
+    excludeTypes?: string[];
+    /** 生效的 category slug 黑名单（含空间默认 excludeCategories） */
+    excludeCategories?: string[];
+    /** 生效的路径前缀 */
+    pathPrefix?: string;
+    /** true = 调用方显式关闭了 overviewFilter 默认排除 */
+    includeExcluded?: boolean;
+  };
+  /** 统计（口径见 OrphanDocsStats） */
+  stats: OrphanDocsStats;
 }

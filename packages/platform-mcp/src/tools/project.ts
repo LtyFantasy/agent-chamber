@@ -1,23 +1,33 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/platform-mcp.md §2.3（get_topic_digest 契约）
- *   - 补充: 看板任务 fdc1851b（Batch F：MCP 语义工具 token 瘦身）
- *   - 补充: plan forge-jubilee-robin（WS-C：truncateField 通用化抽取，C3/C4 共用）
+ * [功能概念]
+ *   - MCP Agent 消费模型投影与共用文本截断
  *
- * [踩坑索引] -
+ * [代码职责]
+ *   - 集中投影消息、话题与 DocSpace 摘要；提供共用 truncateField
+ *
+ * [权威文档]
+ *   - 主文档: 线上 docs/integrations/platform-mcp.md §2.3 — digest 字段投影/截断/去重
+ *   - 补充: 线上 docs/api-definition.md §6.11 — 上游 MessageAttachment 投影
+ *
+ * [关键不变量]
+ *   - 只拷贝上游实际存在的白名单字段；附件数组完整保留，不派生 URL/TTL 或裁剪条目
+ *   - recent 仅截断正文，unread 全文；maxChars=0 不截断，其余按字符裸 slice
+ *   - Batch F（任务 fdc1851b）剔除人类 UI 字段；共用 truncateField 保持调用方截断语义
+ *
+ * [关联代码]
+ *   - packages/platform-mcp/src/tools/get-topic-digest.ts — recent/unread 共用投影
+ *   - packages/platform-mcp/src/tools/get-topic-digest.spec.ts — 附件与截断/标读合同
  *
  * [铁律关联] #9(代理层透传) #11(注释强制)
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
- *   -
- *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
@@ -64,6 +74,8 @@ const MESSAGE_KEPT_FIELDS = [
   'senderName',
   'senderType',
   'content',
+  /** 上游已投影的附件发现元数据原样保留，正文 snippet 不影响附件。 */
+  'attachments',
   'replyTo',
   'type',
   'createdAt',
@@ -71,6 +83,7 @@ const MESSAGE_KEPT_FIELDS = [
 
 /**
  * 投影单条消息：按白名单保留字段（仅拷贝实际存在的字段）。
+ * attachments 沿用上游数组；不解析正文、不重算 URL/TTL，也不为旧后端补字段。
  *
  * @param msg      - 后端返回的原始消息对象
  * @param truncate - true 时对 content 应用 snippet 截断（仅 recent 用；unread 保持全文）

@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
-import type { Message, Board } from '@/types';
+import type { Message, Board, SendMessageResponse } from '@/types';
 import {
   ActorType,
   AgentStatus,
@@ -18,6 +18,8 @@ import {
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api, SEAT_LIFECYCLE_STATUS } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { TopicKind } from '@agent-chamber/shared';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { confirm, toast } from '@/lib/notify';
@@ -37,7 +39,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Sheet, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
-// framer-motion：新消息进入动画（仅 opacity+transform，见 docs/ui-design-system.md §5）
+// framer-motion：新消息进入动画（仅 opacity+transform，见 docs/frontend/ui-design-system.md §5）
 import { motion, useReducedMotion } from 'framer-motion';
 import { fadeSlideUp } from '@/lib/animations';
 import { MembersSheet } from '@/components/members/members-sheet';
@@ -73,6 +75,7 @@ export default function TopicDetailPage() {
   const id = params.id as string;
   const queryClient = useQueryClient();
   const t = useTranslations('topics');
+  const tRead = useTranslations('common');
   const tGlobal = useTranslations();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -103,27 +106,30 @@ export default function TopicDetailPage() {
   const [linkBoardOpen, setLinkBoardOpen] = useState(false);
   const [selectedBoardId, setSelectedBoardId] = useState<string>('');
 
-  const { data: topic, isLoading: topicLoading } = useQuery({
+  const topicQuery = useQuery({
     queryKey: ['topics', 'detail', id],
     queryFn: () => Api.topics.getById(id),
     enabled: !!id,
   });
+  const { data: topic, isLoading: topicLoading } = topicQuery;
 
   /** 查询所有 Agent 列表，用于邀请选择器 */
-  const { data: agentsData } = useQuery({
+  const agentsQuery = useQuery({
     queryKey: ['agents', 'list'],
     // listAll 循环翻页拉全：单页 pageSize:100 在 >100 个 agent 时静默丢数据（评审 M-e）
     queryFn: () => Api.agents.listAll(),
   });
+  const { data: agentsData } = agentsQuery;
 
   /** v1.37 owner 代理：我的 agent id 集合（GET /agents 对非 admin 只返回自己拥有的 agents） */
   const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
 
   /** 查询用户列表，用于邀请人类用户选择器 */
-  const { data: usersData } = useQuery({
+  const usersQuery = useQuery({
     queryKey: ['users', 'list'],
     queryFn: () => Api.users.listUsers({ pageSize: 100 }),
   });
+  const { data: usersData } = usersQuery;
 
   const {
     data: messagesData,
@@ -131,6 +137,10 @@ export default function TopicDetailPage() {
     hasNextPage,
     isFetchingNextPage,
     isPending: messagesLoading,
+    isError: messagesError,
+    error: messagesErrorValue,
+    refetch: refetchMessages,
+    isFetching: messagesFetching,
   } = useInfiniteQuery({
     queryKey: ['topics', 'messages', id, filterSender?.senderId],
     queryFn: ({ pageParam }) =>
@@ -158,11 +168,12 @@ export default function TopicDetailPage() {
     },
   });
 
-  const { data: unreadData } = useQuery({
+  const unreadQuery = useQuery({
     queryKey: ['topics', 'unread', id],
     queryFn: () => Api.topics.getUnread(id),
     enabled: !!id && isAuthenticated,
   });
+  const { data: unreadData } = unreadQuery;
 
   const markAsReadMutation = useMutation({
     mutationFn: () => Api.topics.markAsRead(id),
@@ -177,15 +188,13 @@ export default function TopicDetailPage() {
         content: input.content,
         attachmentIds: input.attachmentIds,
       }),
-    onError: (err) => {
+    onError: (err: unknown) => {
       // plan §0.4：发送失败补 onError toast（此前无——失败静默，用户误以为已发送）。
-      // 范式照抄 docs 页 alertMutationError：优先服务端 message，兜底 axios message
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      toast.error({
-        title: axiosErr?.response?.data?.message || axiosErr?.message || t('message.sendFailed'),
-      });
+      // 文案走 errorMessageOf（通道分级单源，卡 240c74d6）：仅 4xx + 业务码透传服务端
+      // message，断网时用本地文案——旧写法的 `|| axiosErr?.message` 会露出 axios 英文原文。
+      toast.error({ title: errorMessageOf(err, t('message.sendFailed')) });
     },
-    onSuccess: (rawMessage: Message) => {
+    onSuccess: (rawMessage: SendMessageResponse) => {
       // 乐观更新：将新消息添加到第一页（最新消息页），避免丢失已加载的历史分页
       const optimisticMessage: import('@/types').Message = {
         id: rawMessage.id,
@@ -195,7 +204,10 @@ export default function TopicDetailPage() {
         senderName: currentUser?.name || t('message.senderSelf'),
         senderAvatar: currentUser?.avatar ?? undefined,
         content: rawMessage.content,
-        replyTo: (rawMessage as unknown as { replyToId?: string }).replyToId || undefined,
+        // SendMessageResponse 是诚实类型：replyTo 为 `string | null`（不再是旧 Message 上
+        // 那个并不存在的 replyToId 强转 hack——旧代码靠 `as unknown as` 读一个后端从不返回
+        // 的字段，回复关系在乐观消息里恒丢失）。null → undefined（乐观 Message.replyTo 可选）。
+        replyTo: rawMessage.replyTo ?? undefined,
         createdAt: rawMessage.createdAt,
         // 契约补齐（P1）：附件投影恒存在；乐观消息无附件 → []（UI 不消费该字段）
         attachments: [],
@@ -319,18 +331,20 @@ export default function TopicDetailPage() {
     },
   });
 
-  const { data: allBoardsData } = useQuery({
+  const boardsQuery = useQuery({
     queryKey: ['boards', 'list'],
     queryFn: () => Api.boards.list({ pageSize: 100 }),
     enabled: linkBoardOpen,
   });
+  const { data: allBoardsData } = boardsQuery;
 
   /** 绑定本话题的文档空间（关联区 Docs tab 薄入口） */
-  const { data: topicSpacesData } = useQuery({
+  const spacesQuery = useQuery({
     queryKey: ['docs', 'spaces', 'topic', id],
     queryFn: () => Api.docs.listSpaces({ topicId: id, pageSize: 20 }),
     enabled: !!id && relatedOpen,
   });
+  const { data: topicSpacesData } = spacesQuery;
 
   const linkBoardMutation = useMutation({
     mutationFn: (boardId: string) => Api.boards.update(boardId, { topicId: id }),
@@ -450,12 +464,13 @@ export default function TopicDetailPage() {
 
   /** 圆桌 @ 补全候选源（M2 web 批次）：仅 kind='roundtable' 拉座位，active 座位 label 作为 mentionTargets */
   const isRoundtable = topic?.kind === TopicKind.ROUNDTABLE;
-  const { data: seatsData } = useQuery({
+  const seatsQuery = useQuery({
     queryKey: ['roundtable', 'seats', id],
     queryFn: () => Api.roundtable.listSeats(id),
     enabled: isRoundtable,
     staleTime: 30_000,
   });
+  const { data: seatsData } = seatsQuery;
   const mentionTargets = useMemo(() => {
     if (!isRoundtable) return null;
     return (seatsData ?? [])
@@ -624,7 +639,7 @@ export default function TopicDetailPage() {
     );
   }
 
-  if (!topic) {
+  if (!topic && httpStatusOf(topicQuery.error) === 404) {
     return (
       <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <AlertCircle className="h-12 w-12 text-muted-foreground mb-4" />
@@ -635,6 +650,19 @@ export default function TopicDetailPage() {
       </div>
     );
   }
+
+  if (!topic)
+    return (
+      <QueryFeedback
+        compact={topicQuery.data !== undefined}
+        message={errorMessageOf(
+          topicQuery.error,
+          tRead(topicQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void topicQuery.refetch()}
+        busy={topicQuery.isFetching}
+      />
+    );
 
   // ── MembersSheet 差异化文案与回调（R2 邀请 Promise 契约 + 按类型分发）──
 
@@ -695,6 +723,28 @@ export default function TopicDetailPage() {
 
   return (
     <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col">
+      {topicQuery.isError && (
+        <QueryFeedback
+          compact={topicQuery.data !== undefined}
+          message={errorMessageOf(
+            topicQuery.error,
+            tRead(topicQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void topicQuery.refetch()}
+          busy={topicQuery.isFetching}
+        />
+      )}
+      {!participantsOpen && isRoundtable && seatsQuery.isError && (
+        <QueryFeedback
+          compact={seatsQuery.data !== undefined}
+          message={errorMessageOf(
+            seatsQuery.error,
+            tRead(seatsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void seatsQuery.refetch()}
+          busy={seatsQuery.isFetching}
+        />
+      )}
       {/* Header：玻璃化壳层（允许 backdrop-blur），半透明底让网格纹透出。
           relative z-20：.glass 的 backdrop-filter 会创建 stacking context，header 内
           ⋮ 下拉（z-50 被困其中）需整层抬到 SeatPresenceBar（z-10）之上才不遮盖；
@@ -829,42 +879,88 @@ export default function TopicDetailPage() {
         members={memberItems}
         invited={canManage ? invitedItems : undefined}
         candidates={candidateItems}
-        humanCandidates={humanCandidates}
-        capabilities={{ invite: canManage, remove: canManage, cancelInvite: canManage }}
+        humanCandidates={usersData === undefined ? undefined : humanCandidates}
+        capabilities={{
+          invite:
+            canManage &&
+            agentsData !== undefined &&
+            (topic.visibility !== Visibility.PRIVATE || usersData !== undefined),
+          remove: canManage,
+          cancelInvite: canManage,
+        }}
         onInvite={handleInvite}
         onRemove={handleRemoveMember}
         onCancelInvite={handleCancelInvite}
         inviting={inviteAgentMutation.isPending || inviteUserMutation.isPending}
-        topSlot={
-          isRoundtable && (
-            <div className="space-y-3">
-              {/* 圆桌座位管理分区（v1.49.0，C2）：runner 在线状态 + 建座入口；
-                  canManage 与参与者管理同规（平台 admin ｜ topic 创建者/owner 代理） */}
-              <SeatManagement
-                topicId={id}
-                canManage={canManage}
-                onExitGuide={() => setParticipantsOpen(false)}
+        feedbackSlot={
+          <>
+            {agentsQuery.isError && (
+              <QueryFeedback
+                compact={agentsQuery.data !== undefined}
+                message={errorMessageOf(
+                  agentsQuery.error,
+                  tRead(agentsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void agentsQuery.refetch()}
+                busy={agentsQuery.isFetching}
               />
-              {/* 圆桌座位兜底组（M3 阶段 3 改版）：bindActorId 不匹配任何活跃
+            )}
+            {usersQuery.isError && (
+              <QueryFeedback
+                compact={usersQuery.data !== undefined}
+                message={errorMessageOf(
+                  usersQuery.error,
+                  tRead(usersQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void usersQuery.refetch()}
+                busy={usersQuery.isFetching}
+              />
+            )}
+            {isRoundtable && seatsQuery.isError && (
+              <QueryFeedback
+                compact={seatsQuery.data !== undefined}
+                message={errorMessageOf(
+                  seatsQuery.error,
+                  tRead(seatsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void seatsQuery.refetch()}
+                busy={seatsQuery.isFetching}
+              />
+            )}
+          </>
+        }
+        topSlot={
+          <div className="space-y-3">
+            {isRoundtable && (
+              <>
+                {/* 圆桌座位管理分区（v1.49.0，C2）：runner 在线状态 + 建座入口；
+                  canManage 与参与者管理同规（平台 admin ｜ topic 创建者/owner 代理） */}
+                <SeatManagement
+                  topicId={id}
+                  canManage={canManage}
+                  onExitGuide={() => setParticipantsOpen(false)}
+                />
+                {/* 圆桌座位兜底组（M3 阶段 3 改版）：bindActorId 不匹配任何活跃
                   参与者的座位（罕见：actor 已离桌/被移除，座位残留；invited agent
                   预建座也在内）——独立小组展示，管理员仍可移除清理；无此类座位
                   零渲染。随 C1 接入迁入 topSlot（组件无列表区底部槽位），位置由
                   原成员列表底部改为 Sheet 顶部 */}
-              {leftSeats.length > 0 && (
-                <div className="space-y-2">
-                  <h4 className="text-xs font-medium text-muted-foreground">
-                    {t('seatManager.leftGroup')}
-                  </h4>
-                  <SeatBadges
-                    topicId={id}
-                    seats={leftSeats}
-                    canManage={canManage}
-                    onExitGuide={() => setParticipantsOpen(false)}
-                  />
-                </div>
-              )}
-            </div>
-          )
+                {leftSeats.length > 0 && (
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-medium text-muted-foreground">
+                      {t('seatManager.leftGroup')}
+                    </h4>
+                    <SeatBadges
+                      topicId={id}
+                      seats={leftSeats}
+                      canManage={canManage}
+                      onExitGuide={() => setParticipantsOpen(false)}
+                    />
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         }
         renderRowExtra={(seat) =>
           isRoundtable && seat.actorType === ActorType.AGENT ? (
@@ -1095,7 +1191,22 @@ export default function TopicDetailPage() {
           ) : (
             /* Docs tab：绑定本话题的文档空间薄入口（名称 + docCount + 链接） */
             <div className="space-y-2">
-              {(topicSpacesData?.items ?? []).length === 0 ? (
+              {spacesQuery.isError && (
+                <QueryFeedback
+                  compact={spacesQuery.data !== undefined}
+                  message={errorMessageOf(
+                    spacesQuery.error,
+                    tRead(spacesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                  )}
+                  onRetry={() => void spacesQuery.refetch()}
+                  busy={spacesQuery.isFetching}
+                />
+              )}
+              {topicSpacesData === undefined ? (
+                spacesQuery.isLoading ? (
+                  <Loading />
+                ) : null
+              ) : (topicSpacesData.items ?? []).length === 0 ? (
                 <div className="text-center py-8 text-muted-foreground">
                   <FileText className="h-8 w-8 mx-auto mb-2 opacity-50" />
                   <p className="text-sm">{t('related.noDocs')}</p>
@@ -1130,43 +1241,60 @@ export default function TopicDetailPage() {
           <DialogDescription>{t('linkBoard.description')}</DialogDescription>
         </DialogHeader>
         <div className="space-y-2 py-4 max-h-[300px] overflow-y-auto">
-          {(() => {
-            const linkedIds = new Set(
-              (topic.boards || []).map(
-                (b: { id: string; name: string; taskCount?: number }) => b.id,
-              ),
-            );
-            const available = (allBoardsData?.items || []).filter(
-              (b: Board) => !linkedIds.has(b.id),
-            );
-            if (available.length === 0) {
-              return (
-                <div className="text-center py-6 text-muted-foreground">
-                  <p className="text-sm">{t('linkBoard.noAvailable')}</p>
-                </div>
+          {boardsQuery.isError && (
+            <QueryFeedback
+              compact={boardsQuery.data !== undefined}
+              message={errorMessageOf(
+                boardsQuery.error,
+                tRead(boardsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void boardsQuery.refetch()}
+              busy={boardsQuery.isFetching}
+            />
+          )}
+          {allBoardsData === undefined ? (
+            boardsQuery.isLoading ? (
+              <Loading />
+            ) : null
+          ) : (
+            (() => {
+              const linkedIds = new Set(
+                (topic.boards || []).map(
+                  (b: { id: string; name: string; taskCount?: number }) => b.id,
+                ),
               );
-            }
-            return available.map((b: Board) => (
-              <label
-                key={b.id}
-                className={`flex items-center gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
-                  selectedBoardId === b.id
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:bg-muted/50'
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="linkBoard"
-                  value={b.id}
-                  checked={selectedBoardId === b.id}
-                  onChange={() => setSelectedBoardId(b.id)}
-                  className="h-4 w-4 text-primary"
-                />
-                <span className="text-sm font-medium">{b.name}</span>
-              </label>
-            ));
-          })()}
+              const available = (allBoardsData?.items || []).filter(
+                (b: Board) => !linkedIds.has(b.id),
+              );
+              if (available.length === 0) {
+                return (
+                  <div className="text-center py-6 text-muted-foreground">
+                    <p className="text-sm">{t('linkBoard.noAvailable')}</p>
+                  </div>
+                );
+              }
+              return available.map((b: Board) => (
+                <label
+                  key={b.id}
+                  className={`flex items-center gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
+                    selectedBoardId === b.id
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:bg-muted/50'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="linkBoard"
+                    value={b.id}
+                    checked={selectedBoardId === b.id}
+                    onChange={() => setSelectedBoardId(b.id)}
+                    className="h-4 w-4 text-primary"
+                  />
+                  <span className="text-sm font-medium">{b.name}</span>
+                </label>
+              ));
+            })()
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => setLinkBoardOpen(false)}>
@@ -1219,7 +1347,28 @@ export default function TopicDetailPage() {
               </div>
             )}
 
-            {messagesLoading ? (
+            {messagesError && messagesData !== undefined && (
+              <QueryFeedback
+                compact={messagesData !== undefined}
+                message={errorMessageOf(
+                  messagesErrorValue,
+                  tRead(messagesData !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void refetchMessages()}
+                busy={messagesFetching}
+              />
+            )}
+            {messagesError && messagesData === undefined ? (
+              <QueryFeedback
+                compact={messagesData !== undefined}
+                message={errorMessageOf(
+                  messagesErrorValue,
+                  tRead(messagesData !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void refetchMessages()}
+                busy={messagesFetching}
+              />
+            ) : messagesLoading ? (
               <Loading />
             ) : allMessages.length === 0 ? (
               <div className="flex h-full flex-col items-center justify-center text-muted-foreground">
@@ -1286,6 +1435,17 @@ export default function TopicDetailPage() {
           </div>
 
           {/* Unread hint */}
+          {isAuthenticated && unreadQuery.isError && (
+            <QueryFeedback
+              compact={unreadQuery.data !== undefined}
+              message={errorMessageOf(
+                unreadQuery.error,
+                tRead(unreadQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void unreadQuery.refetch()}
+              busy={unreadQuery.isFetching}
+            />
+          )}
           {unreadData && unreadData.unreadCount > 0 && (
             <div className="mt-2 text-xs md:text-sm text-destructive font-medium">
               {t('message.unreadCount', { count: unreadData.unreadCount })}

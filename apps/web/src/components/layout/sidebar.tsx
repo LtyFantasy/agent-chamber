@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import { useQuery } from '@tanstack/react-query';
+import { MEMORY_FEATURE_ENABLED } from '@agent-chamber/shared';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth.store';
 import { Api } from '@/lib/api';
@@ -19,11 +20,13 @@ import {
   Search,
   Settings,
   Activity,
+  BarChart3,
   History,
   X,
   BookOpen,
   ExternalLink,
   Lightbulb,
+  Brain,
   LogOut,
   ChevronUp,
 } from 'lucide-react';
@@ -43,9 +46,16 @@ const allNavItems = [
   // 经验库：平台第四资源（Topic 管人 / Board 管事 / DocSpace 管知识 / Experience 管实战笔记），
   // 插在 docs 之后 search 之前——知识 → 经验 → 检索的动线顺序
   { href: '/experiences', labelKey: 'experiences', icon: Lightbulb },
+  // 记忆（Memory 二期只读视图）：与 docs/experiences 同属"知识面"的第三块——
+  // 放在 experiences 之后、search 之前，保持「知识 → 经验 → 记忆 → 检索」的阅读动线；
+  // 无 adminOnly 门（可见性由服务端按项目绑定判定，前端不做第二套权限逻辑）
+  { href: '/memory', labelKey: 'memory', icon: Brain },
   { href: '/search', labelKey: 'search', icon: Search },
   { href: '/settings', labelKey: 'settings', icon: Settings },
   { href: '/monitoring', labelKey: 'monitoring', icon: Activity },
+  // 用量：平台 API/MCP 统计 + Hument 模型用量两一级 Tab。
+  // 不加 adminOnly——Hument Tab 对非 admin 开放；平台 Tab 在页内按角色渲染权限面板。
+  { href: '/usage', labelKey: 'usage', icon: BarChart3 },
   // 活动日志：不加 adminOnly——human 非 admin 可见可查自己+名下 agent（plan 决策）
   { href: '/logs', labelKey: 'logs', icon: History },
   { href: '/skills', labelKey: 'skill', icon: BookOpen, external: true },
@@ -93,7 +103,7 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
    *   facets 查询（与圆桌角标同节奏 30s 轮询）。
    * - **角标语义 = 全局积压**（含"我不可审"的那些条目）：web 无 per-item 判定投影，
    *   逐条算成本不值（plan §13 已登记"列表页不提示哪条我能审"）；文案措辞与 4 周度量
-   *   口径一致（见 docs/experience-base.md 的积压量口径）。
+   *   口径一致（见 docs/modules/experience-base.md 的积压量口径）。
    */
   const { data: experienceFacets } = useQuery({
     queryKey: ['experiences', 'facets'],
@@ -122,6 +132,9 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps = {}) {
   });
 
   const navItems = allNavItems.filter((item) => {
+    // 本期 OSS 发行关闭 Memory；平台统计仍是 admin 面，非 admin 不展示空入口。
+    if (!MEMORY_FEATURE_ENABLED && item.href === '/memory') return false;
+    if (!MEMORY_FEATURE_ENABLED && item.href === '/usage' && !isAdmin) return false;
     if ('adminOnly' in item && item.adminOnly && !isAdmin) return false;
     return true;
   });

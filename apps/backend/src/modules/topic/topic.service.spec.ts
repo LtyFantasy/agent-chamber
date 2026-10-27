@@ -37,6 +37,9 @@ import {
   AuditAction,
   TopicKind,
   WakePolicy,
+  TopicParticipantRole,
+  SYSTEM_ACTOR_ID,
+  NOTIFY_KEY_MENTIONS_ONLY,
 } from '@agent-chamber/shared';
 import { EventService } from '../event/event.service';
 import { AccessQueryService } from '../../common/services/access-query.service';
@@ -80,6 +83,39 @@ function createMockRepo<T extends ObjectLiteral>() {
       clone: jest.fn().mockReturnThis(),
     })),
   } as unknown as jest.Mocked<Repository<T>>;
+}
+
+/**
+ * F1/D9 定点 UPDATE 断言助手（v1.96.0-dev 未读语义批终审修复）。
+ *
+ * 断言三件事，缺一不可：
+ * 1. **WHERE 精确**（复合 PK，不能误伤其他参与行）；
+ * 2. **载荷键集合精确**——这是本修法的核心契约：结构上不可能回写未改动列；
+ * 3. 载荷**不含 `notificationSettings`**（消除并发 PATCH notification-settings
+ *    被一次 join/leave/invite/editor 操作静默翻回的面）。
+ *
+ * 同时断言 `save` **零调用**：整行 save 才是回写全列的路径，只要它还出现一次，
+ * 这条防线就形同虚设。
+ *
+ * @param mockUpdate 被断言仓库的 update mock（取 `unknown` 入参再收窄为 `jest.Mock`：
+ *   `jest.Mocked<Repository<T>>['update']` 是带具体签名的 MockInstance，
+ *   直接声明成 `jest.Mock` 会因参数逆变而不可赋值）
+ * @param where      期望的 WHERE（复合 PK）
+ * @param keys       期望的载荷键集合（顺序无关）
+ * @returns 载荷对象（便于进一步断言具体值）
+ */
+function expectPointUpdate(
+  mockUpdate: unknown,
+  where: { topicId: string; participantId: string },
+  keys: string[],
+): Record<string, unknown> {
+  const fn = mockUpdate as jest.Mock;
+  expect(fn).toHaveBeenCalledTimes(1);
+  const [actualWhere, payload] = fn.mock.calls[0] as [unknown, Record<string, unknown>];
+  expect(actualWhere).toEqual(where);
+  expect(Object.keys(payload).sort()).toEqual([...keys].sort());
+  expect(payload).not.toHaveProperty('notificationSettings');
+  return payload;
 }
 
 function createMockTopic(overrides: Partial<Topic> = {}): Topic {
@@ -1414,18 +1450,25 @@ describe('TopicService', () => {
         joinedAt: oldJoinedAt,
       });
       mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
-      mockParticipantRepo.save.mockResolvedValue(existingParticipant);
 
       const result = await service.join('topic-1', 'user-2', ActorType.HUMAN);
 
-      expect(existingParticipant.status).toBe('active');
-      expect(existingParticipant.leftAt).toBeNull();
       // re-join 语义：joinedAt 刷新为本次激活时间（不再是 left 前的旧值）
       expect(existingParticipant.joinedAt).toBeInstanceOf(Date);
       expect(existingParticipant.joinedAt!.getTime()).toBeGreaterThan(oldJoinedAt.getTime());
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ joinedAt: existingParticipant.joinedAt }),
+      // F1：定点 UPDATE（不是整行 save）——载荷只含本次激活改动的列。
+      // lastReadMessageId 在 SET 里是因为原游标为 null（激活时初始化，v1.69 D2 语义）。
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'user-2' },
+        ['status', 'leftAt', 'joinedAt', 'lastReadMessageId'],
       );
+      expect(payload.status).toBe(ParticipantStatus.ACTIVE);
+      expect(payload.leftAt).toBeNull();
+      expect(payload.joinedAt).toBe(existingParticipant.joinedAt);
+      // role 不在 SET 里：invited/left 行激活不改角色（v1.40 语义）
+      expect(payload).not.toHaveProperty('role');
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual({
         topicId: 'topic-1',
         participantId: 'user-2',
@@ -1444,16 +1487,18 @@ describe('TopicService', () => {
         joinedAt: null,
       });
       mockParticipantRepo.findOne.mockResolvedValue(invitedParticipant);
-      mockParticipantRepo.save.mockResolvedValue(invitedParticipant);
 
       await service.join('topic-1', 'agent-2', ActorType.AGENT);
 
-      expect(invitedParticipant.status).toBe(ParticipantStatus.ACTIVE);
-      // 激活时写入 joinedAt
-      expect(invitedParticipant.joinedAt).toBeInstanceOf(Date);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ joinedAt: expect.any(Date) }),
+      // 激活时写入 joinedAt（F1：定点 UPDATE 载荷）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-2' },
+        ['status', 'leftAt', 'joinedAt', 'lastReadMessageId'],
       );
+      expect(payload.status).toBe(ParticipantStatus.ACTIVE);
+      expect(payload.joinedAt).toBeInstanceOf(Date);
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
 
     it('v1.69 D2：新行 join → 游标初始化为当前最新消息（未读=加入后增量）', async () => {
@@ -1489,14 +1534,17 @@ describe('TopicService', () => {
         lastReadMessageId: null,
       });
       mockParticipantRepo.findOne.mockResolvedValue(invitedParticipant);
-      mockParticipantRepo.save.mockResolvedValue(invitedParticipant);
       mockMessageRepo.findOne.mockResolvedValue({ id: 'msg-latest' } as Message);
 
       await service.join('topic-1', 'agent-2', ActorType.AGENT);
 
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ lastReadMessageId: 'msg-latest' }),
+      // 游标原本为 null → 本次激活初始化（进 SET 子句）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-2' },
+        ['status', 'leftAt', 'joinedAt', 'lastReadMessageId'],
       );
+      expect(payload.lastReadMessageId).toBe('msg-latest');
     });
 
     it('v1.69 D2：re-join 保留非 null 游标（离开期间消息仍计未读）', async () => {
@@ -1509,15 +1557,20 @@ describe('TopicService', () => {
         lastReadMessageId: 'msg-before-left',
       });
       mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
-      mockParticipantRepo.save.mockResolvedValue(existingParticipant);
 
       await service.join('topic-1', 'user-2', ActorType.HUMAN);
 
       // 游标非 null → 不查最新消息、不覆盖
       expect(mockMessageRepo.findOne).not.toHaveBeenCalled();
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(
-        expect.objectContaining({ lastReadMessageId: 'msg-before-left' }),
+      // F1 加固（与 D9 同类）：游标非 null 时该列**不进 SET 子句**——若把读到的旧值写回去，
+      // 并发的 markAsRead 推进会被这次 join 回滚（read-modify-write 面）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'user-2' },
+        ['status', 'leftAt', 'joinedAt'],
       );
+      expect(payload).not.toHaveProperty('lastReadMessageId');
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
 
     it('should throw BadRequestException when topic is closed', async () => {
@@ -1544,17 +1597,23 @@ describe('TopicService', () => {
       mockTopicRepo.findOne.mockResolvedValue(topic);
       const participant = createMockParticipant({ participantId: 'user-2' });
       mockParticipantRepo.findOne.mockResolvedValue(participant);
-      mockParticipantRepo.save.mockResolvedValue(participant);
 
       const result = await service.leave('topic-1', 'user-2', ActorType.HUMAN);
 
-      expect(participant.status).toBe('left');
-      expect(participant.leftAt).toBeInstanceOf(Date);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(participant);
+      // F1：定点 UPDATE 只写 status + leftAt；游标/角色/joinedAt 一律不动
+      // （游标保留 = 离开期间消息仍计未读，v1.69 D2 语义）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'user-2' },
+        ['status', 'leftAt'],
+      );
+      expect(payload.status).toBe(ParticipantStatus.LEFT);
+      expect(payload.leftAt).toBeInstanceOf(Date);
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual({
         topicId: 'topic-1',
         participantId: 'user-2',
-        leftAt: participant.leftAt,
+        leftAt: payload.leftAt,
       });
     });
 
@@ -1703,7 +1762,7 @@ describe('TopicService', () => {
 
     it('should passthrough seatLabel on history messages (metadata.seatLabel single key only)', async () => {
       // 圆桌座位发言：metadata.seatLabel 透传为 seatLabel，其余 metadata 键不透
-      // （隐私/体积，设计 docs/roundtable-design.md §6/§7；历史加载路径 = mapToMessageDtos）
+      // （隐私/体积，设计 docs/modules/roundtable-design.md §6/§7；历史加载路径 = mapToMessageDtos）
       const msgWithSeat = createMockMessage({
         id: 'msg-1',
         senderId: 'agent-1',
@@ -2796,6 +2855,7 @@ describe('TopicService', () => {
       // 禁止 find/save（并发首消息/幂等重试 PK 冲突 23505）；
       // role 不出现在 SET 子句（moderator 不被降级）；
       // status/joined_at 仅对 invited/left 行激活刷新（active 行保持原值）。
+      // v1.96.0-dev D1 **行为变更**：ON CONFLICT 分支不再推进未读游标（发送不冲未读）。
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
       const savedMsg = createMockMessage({ id: 'msg-1', content: 'Hello' });
@@ -2811,13 +2871,16 @@ describe('TopicService', () => {
       expect(sql).toContain('INSERT INTO topic_participants');
       expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
       expect(sql).toContain('CASE WHEN topic_participants.status IN');
-      // v1.69 发送即已读：SET 子句含 last_read_message_id 单调推进（含旧锚点软删逃生口）
+      // D1：INSERT 分支仍写 $3（首发 auto-join 的「加入点即已读点」例外）……
       expect(sql).toContain('last_read_message_id');
-      expect(sql).toContain('NOT EXISTS');
+      // ……但 **SET 子句里没有它**——ON CONFLICT 分支不再推进游标（v1.69 的整个 CASE 已删除，
+      // 连 NOT EXISTS 逃生口一并消失：自愈改由 markAsRead 在读到时完成）
+      expect(sql).not.toMatch(/last_read_message_id\s*=/);
+      expect(sql).not.toContain('NOT EXISTS');
       // SET 子句中不得出现 role（moderator 不被降级为 member）
       expect(sql).not.toContain('SET role');
       expect(sql).not.toMatch(/role\s*=/);
-      // 参数 = (topicId, senderId, 新消息 id)——v1.69 发送即已读：$3 推进发送者游标
+      // 参数 = (topicId, senderId, 新消息 id)——$3 只作用于 INSERT 分支
       expect(params).toEqual(['topic-1', 'user-1', 'msg-1']);
     });
 
@@ -2840,8 +2903,10 @@ describe('TopicService', () => {
       const [sql, params] = mockEntityManager.query.mock.calls[0];
       expect(sql).toContain('ON CONFLICT (topic_id, participant_id) DO UPDATE');
       expect(sql).toContain('last_read_message_id');
+      // D1：事务路径与无幂等路径**同一份 SQL**——SET 子句同样不含游标列
+      expect(sql).not.toMatch(/last_read_message_id\s*=/);
       expect(sql).not.toMatch(/role\s*=/);
-      // 参数 = (topicId, senderId, 新消息 id)——v1.69 发送即已读（同事务内可见）
+      // 参数 = (topicId, senderId, 新消息 id)——$3 只作用于 INSERT 分支
       expect(params).toEqual(['topic-1', 'user-1', 'msg-idem-sql']);
     });
 
@@ -2938,8 +3003,21 @@ describe('TopicService', () => {
         content: 'Existing',
         senderId: 'user-1',
       });
+      // 落库的 mentions 列（replay 回放的就是它——首次写入时持久化的提取结果）
+      existingMsg.mentions = ['11110000-0000-4000-8000-000000000002', '*'];
       mockMessageRepo.findOne.mockResolvedValue(existingMsg);
       mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+      // replay 的 unreadCount 由 buildMessageResponse **现算**（响应时刻快照）：
+      // sender 无参与行 → 降级全量 + 模式 false
+      mockParticipantRepo.findOne.mockResolvedValue(null);
+      const replayCountQb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(4),
+      };
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        replayCountQb as unknown as SelectQueryBuilder<Message>,
+      );
 
       const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
         content: 'Hello',
@@ -2948,8 +3026,46 @@ describe('TopicService', () => {
 
       expect(result).toHaveProperty('idempotentReplay', true);
       expect(result.id).toBe('msg-existing-1');
+      // F4：replay 响应含 mentions = **落库列**（不是重新提取——重放不重算提及）
+      expect(result.mentions).toEqual(['11110000-0000-4000-8000-000000000002', '*']);
+      // F4：replay 的 unreadCount 也照附（响应时刻快照，与首次响应同形状）
+      expect(result.unreadCount).toBe(4);
       // 审计（Phase 2）：幂等 replay 不重复记（决策 2）——replay 路径零审计
       expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('F4：replay 的 unreadCount 计算失败 → 省略键（fail-open，省略 ≠ 0）但 mentions 仍在', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      mockDataSource.transaction.mockRejectedValueOnce(
+        Object.assign(new Error('duplicate key'), {
+          code: '23505',
+          constraint: 'uq_idempotency_actor_key',
+        }),
+      );
+      mockIdempotencyRepo.findOne.mockResolvedValue({
+        id: 'rec-3',
+        actorId: 'user-1',
+        clientRequestId: 'req-msg-003',
+        entityType: 'message',
+        entityId: 'msg-existing-2',
+      } as IdempotencyRecord);
+      const existingMsg = createMockMessage({ id: 'msg-existing-2', senderId: 'user-1' });
+      existingMsg.mentions = ['11110000-0000-4000-8000-000000000003'];
+      mockMessageRepo.findOne.mockResolvedValue(existingMsg);
+      mockUserRepo.findBy.mockResolvedValue([{ id: 'user-1', displayName: 'Alice' } as User]);
+      // unreadCount 计算炸掉（participantRepo.findOne reject → buildMessageResponse catch）
+      mockParticipantRepo.findOne.mockRejectedValue(new Error('count blew up'));
+
+      const result = await service.sendMessage('topic-1', 'user-1', ActorType.HUMAN, {
+        content: 'Hello',
+        clientRequestId: 'req-msg-003',
+      });
+
+      // unreadCount 省略（fail-open），但 replay 本身成功且 mentions 照常回放
+      expect(result).not.toHaveProperty('unreadCount');
+      expect(result.mentions).toEqual(['11110000-0000-4000-8000-000000000003']);
+      expect(result).toHaveProperty('idempotentReplay', true);
     });
 
     it('should rethrow non-idempotency 23505 error for sendMessage', async () => {
@@ -3839,7 +3955,6 @@ describe('TopicService', () => {
 
       const existingParticipant = createMockParticipant({ lastReadMessageId: 'msg-10' });
       mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
-      mockParticipantRepo.save.mockResolvedValue(existingParticipant);
 
       const result = await service.markAsRead('topic-1', 'user-1', ActorType.HUMAN, {
         messageId: 'msg-20',
@@ -3849,7 +3964,12 @@ describe('TopicService', () => {
         expect.stringContaining('SELECT (n.created_at, n.id) > (o.created_at, o.id) AS newer'),
         ['msg-20', 'msg-10'],
       );
-      expect(mockParticipantRepo.save).toHaveBeenCalled();
+      // D9：定点 UPDATE（不是整行 save）
+      expect(mockParticipantRepo.update).toHaveBeenCalledWith(
+        { topicId: 'topic-1', participantId: 'user-1' },
+        { lastReadMessageId: 'msg-20' },
+      );
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual({
         topicId: 'topic-1',
         lastReadMessageId: 'msg-20',
@@ -3857,7 +3977,11 @@ describe('TopicService', () => {
       });
     });
 
-    it('should not overwrite role/joinedAt on existing participant (upsert bug fix)', async () => {
+    it('should NOT touch notificationSettings / role / joinedAt on existing participant (D9 targeted UPDATE)', async () => {
+      // D9（v1.96.0-dev）：既有行分支从整行 save() 改定点 update()。
+      // 为什么必须锁死：整行 save() 会把内存里读到的整行（含 notification_settings）全列
+      // 回写——并发 PATCH notification-settings 刚写的收件偏好会被一次已读操作静默翻回。
+      // 本用例断言 update() 的**载荷只含 lastReadMessageId**（结构上不可能碰到其他列）。
       const topic = createMockTopic();
       mockTopicRepo.findOne.mockResolvedValue(topic);
       const targetMsg = createMockMessage({
@@ -3869,24 +3993,35 @@ describe('TopicService', () => {
       // DB 内行值比较：新目标更新 → newer=true
       mockMessageRepo.query.mockResolvedValue([{ newer: true }]);
 
-      // existing participant is an owner, not member
+      // existing participant is an owner, not member; 且已开启静默（settings 必须原样保留）
       const existingParticipant = createMockParticipant({
         lastReadMessageId: 'msg-10',
         role: 'moderator',
         joinedAt: new Date('2024-01-01T00:00:00Z'),
       });
+      existingParticipant.notificationSettings = { mute: false, mentions_only: true };
       mockParticipantRepo.findOne.mockResolvedValue(existingParticipant);
-      mockParticipantRepo.save.mockResolvedValue(existingParticipant);
 
       await service.markAsRead('topic-1', 'user-1', ActorType.HUMAN, {
         messageId: 'msg-20',
       });
 
-      // save should only update lastReadMessageId, not role/joinedAt
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(existingParticipant);
-      expect(existingParticipant.lastReadMessageId).toBe('msg-20');
-      expect(existingParticipant.role).toBe('moderator'); // unchanged
-      expect(existingParticipant.joinedAt).toEqual(new Date('2024-01-01T00:00:00Z')); // unchanged
+      // 定点 UPDATE：载荷**只有** lastReadMessageId 一个键——notification_settings 不在其中
+      expect(mockParticipantRepo.update).toHaveBeenCalledTimes(1);
+      const [, partial] = mockParticipantRepo.update.mock.calls[0];
+      expect(partial).toEqual({ lastReadMessageId: 'msg-20' });
+      expect(Object.keys(partial)).toEqual(['lastReadMessageId']);
+      expect(partial).not.toHaveProperty('notificationSettings');
+      expect(partial).not.toHaveProperty('role');
+      expect(partial).not.toHaveProperty('joinedAt');
+      // 整行 save 一次都不许发生（那才是回写全列的路径）
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+      // 内存对象不被就地改写（旧实现会 mutate existingParticipant.lastReadMessageId）
+      expect(existingParticipant.role).toBe('moderator');
+      expect(existingParticipant.notificationSettings).toEqual({
+        mute: false,
+        mentions_only: true,
+      });
     });
 
     it('should use tie-break for same-created_at newer detection', async () => {
@@ -4068,13 +4203,22 @@ describe('TopicService', () => {
         status: ParticipantStatus.LEFT,
       });
       mockParticipantRepo.findOne.mockResolvedValue(leftParticipant);
-      mockParticipantRepo.save.mockResolvedValue(leftParticipant);
+      // 首次 invite 是 insert 分支（save 一次）；下面只统计「re-invite 这一段」的写
+      mockParticipantRepo.save.mockClear();
 
       // Re-invite: should update status from 'left' to 'invited'
       const result = await service.inviteAgent('topic-1', 'agent-1');
 
-      expect(leftParticipant.status).toBe(ParticipantStatus.INVITED);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(leftParticipant);
+      // F1：定点 UPDATE 只写 status 一列——role（left 行可能是 editor）与游标
+      // （保留 = 离开期间消息仍计未读）都不动
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['status'],
+      );
+      expect(payload.status).toBe(ParticipantStatus.INVITED);
+      // re-invite 段（既有行）不再整行 save（save 已 clear，若仍调用即为 1）
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual(topic);
     });
 
@@ -4189,13 +4333,18 @@ describe('TopicService', () => {
         status: ParticipantStatus.ACTIVE,
       });
       mockParticipantRepo.findOne.mockResolvedValue(participant);
-      mockParticipantRepo.save.mockResolvedValue(participant);
 
       const result = await service.uninviteAgent('topic-1', 'agent-1');
 
-      expect(participant.status).toBe(ParticipantStatus.LEFT);
-      expect(participant.leftAt).toBeInstanceOf(Date);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(participant);
+      // F1：定点 UPDATE 只写 status + leftAt（不整行回写 settings/role/游标）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['status', 'leftAt'],
+      );
+      expect(payload.status).toBe(ParticipantStatus.LEFT);
+      expect(payload.leftAt).toBeInstanceOf(Date);
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual(topic);
     });
 
@@ -4271,13 +4420,19 @@ describe('TopicService', () => {
         status: ParticipantStatus.INVITED,
       });
       mockParticipantRepo.findOne.mockResolvedValue(member);
-      mockParticipantRepo.save.mockResolvedValue(member);
 
       await service.addEditor('topic-1', 'agent-1');
 
-      expect(member.role).toBe('editor');
-      expect(member.status).toBe(ParticipantStatus.INVITED); // status 不动
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(member);
+      // F1：定点 UPDATE **只写 role 一列** —— status 不进 SET 子句，
+      // 「不隐式改状态」（铁律 #18）从"代码没写"升级为"结构上不可能写"
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['role'],
+      );
+      expect(payload.role).toBe(TopicParticipantRole.EDITOR);
+      expect(payload).not.toHaveProperty('status');
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
 
     it('member active 行 → 置 role=editor，保留 active', async () => {
@@ -4291,13 +4446,17 @@ describe('TopicService', () => {
         status: ParticipantStatus.ACTIVE,
       });
       mockParticipantRepo.findOne.mockResolvedValue(member);
-      mockParticipantRepo.save.mockResolvedValue(member);
 
       await service.addEditor('topic-1', 'agent-1');
 
-      expect(member.role).toBe('editor');
-      expect(member.status).toBe(ParticipantStatus.ACTIVE);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(member);
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['role'],
+      );
+      expect(payload.role).toBe(TopicParticipantRole.EDITOR);
+      expect(payload).not.toHaveProperty('status'); // active 保持 active
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
 
     it('已是 editor → 幂等成功（不重复 save 不抛冲突）', async () => {
@@ -4406,13 +4565,19 @@ describe('TopicService', () => {
         status: ParticipantStatus.ACTIVE,
       });
       mockParticipantRepo.findOne.mockResolvedValue(editor);
-      mockParticipantRepo.save.mockResolvedValue(editor);
 
       const result = await service.removeEditor('topic-1', 'agent-1');
 
-      expect(editor.role).toBe('member');
-      expect(editor.status).toBe(ParticipantStatus.ACTIVE); // 不踢人
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(editor);
+      // F1：定点 UPDATE 只写 role —— status/joinedAt 不进 SET（"不踢人"的结构保证）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['role'],
+      );
+      expect(payload.role).toBe(TopicParticipantRole.MEMBER);
+      expect(payload).not.toHaveProperty('status');
+      expect(payload).not.toHaveProperty('joinedAt');
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual(topic);
     });
 
@@ -4427,12 +4592,17 @@ describe('TopicService', () => {
         status: ParticipantStatus.INVITED,
       });
       mockParticipantRepo.findOne.mockResolvedValue(editor);
-      mockParticipantRepo.save.mockResolvedValue(editor);
 
       await service.removeEditor('topic-1', 'agent-1');
 
-      expect(editor.role).toBe('member');
-      expect(editor.status).toBe(ParticipantStatus.INVITED);
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'agent-1' },
+        ['role'],
+      );
+      expect(payload.role).toBe(TopicParticipantRole.MEMBER);
+      expect(payload).not.toHaveProperty('status'); // invited 保持 invited（仍是受邀者）
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
     });
 
     it('非 editor 行（member）→ 404', async () => {
@@ -4481,7 +4651,6 @@ describe('TopicService', () => {
       });
       mockTopicRepo.findOne.mockResolvedValue(topic);
       mockParticipantRepo.findOne.mockResolvedValue(participant);
-      mockParticipantRepo.save.mockResolvedValue(participant);
 
       const result = await service.uninviteUser('topic-1', 'user-2');
 
@@ -4492,13 +4661,19 @@ describe('TopicService', () => {
           participantId: 'user-2',
         },
       });
-      expect(participant.status).toBe('left');
-      expect(participant.leftAt).toBeInstanceOf(Date);
-      expect(mockParticipantRepo.save).toHaveBeenCalledWith(participant);
+      // F1：定点 UPDATE 只写 status + leftAt（不整行回写 settings/role/游标）
+      const payload = expectPointUpdate(
+        mockParticipantRepo.update,
+        { topicId: 'topic-1', participantId: 'user-2' },
+        ['status', 'leftAt'],
+      );
+      expect(payload.status).toBe(ParticipantStatus.LEFT);
+      expect(payload.leftAt).toBeInstanceOf(Date);
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual({
         topicId: 'topic-1',
         participantId: 'user-2',
-        leftAt: participant.leftAt,
+        leftAt: payload.leftAt,
       });
     });
 
@@ -4940,6 +5115,788 @@ describe('TopicService', () => {
         ForbiddenException,
       );
       expect(mockMessageRepo.softRemove).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ===========================================================================
+   * 未读语义批（v1.96.0-dev：D1 发送不冲未读 / D2 发送响应附未读+提及 /
+   * D3 写时提及提取 / D4 mentions_only 读路径 / D5 设置端点 / D9 定点更新）
+   * ===========================================================================
+   *
+   * 分层说明：本块锁**领域与 SQL 生成**（service 层）；真 PG 行为（谓词真的命中、
+   * jsonb `@>` 语义、并发）由 unread-cursor / agent-unread 两个 e2e 套件锁
+   * （铁律 #23：jsonb 查询 mock 测不出 SQL 生成）。
+   */
+  describe('未读语义批（D1/D2/D3/D4/D5/D9）', () => {
+    /**
+     * 合法 v4 UUID 常量：sendMessage 的 replyTo 前置校验走 uuidRegex（格式错误 → 400），
+     * 故回复类用例必须用真 UUID 形状的字符串，不能像其它 id 那样用 'parent-1' 之类占位。
+     */
+    const PARENT_UUID = '11111111-1111-4111-8111-111111111111';
+    const SYS_PARENT_UUID = '22222222-2222-4222-8222-222222222222';
+    const OUT_PARENT_UUID = '33333333-3333-4333-8333-333333333333';
+
+    /** 让 resolveProfiles 能解析出指定 id → 显示名（经 mock 的公共解析链路） */
+    function stubProfiles(rows: Array<{ id: string; name: string; type?: ActorType }>): void {
+      mockActorRepo.find.mockResolvedValue(
+        rows.map((r) => ({ id: r.id, type: r.type ?? ActorType.AGENT, deletedAt: null })) as any,
+      );
+      mockUserRepo.findBy.mockResolvedValue(
+        rows
+          .filter((r) => (r.type ?? ActorType.AGENT) === ActorType.HUMAN)
+          .map((r) => ({ id: r.id, displayName: r.name, avatarUrl: null })) as any,
+      );
+      mockAgentRepo.findBy.mockResolvedValue(
+        rows
+          .filter((r) => (r.type ?? ActorType.AGENT) === ActorType.AGENT)
+          .map((r) => ({ id: r.id, name: r.name, avatarUrl: null, description: null })) as any,
+      );
+    }
+
+    /** 参与者行候选（resolveMentionIds 的取数面） */
+    function stubParticipantRows(ids: string[]): void {
+      mockParticipantRepo.find.mockResolvedValue(ids.map((id) => ({ participantId: id })) as any);
+    }
+
+    /** 空未读计数 QB（buildMessageResponse 的 unreadCount 计算） */
+    function stubUnreadCount(count: number): { andWhere: jest.Mock } {
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getCount: jest.fn().mockResolvedValue(count),
+      };
+      mockMessageRepo.createQueryBuilder.mockReturnValue(
+        qb as unknown as SelectQueryBuilder<Message>,
+      );
+      return qb;
+    }
+
+    describe('D3 resolveMentionIds（写时提取，经 sendMessage 可观测）', () => {
+      it('应把 @显示名 展开为全部同名参与者的 id（name→ids 多值映射，禁单值覆盖）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m1', content: 'hey @Alice please look' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        // 两个同名参与者：单值映射（Map<name,id>）会只保留后者 → 静默漏提
+        stubParticipantRows(['a1', 'a2', 'sender-1']);
+        stubProfiles([
+          { id: 'a1', name: 'Alice' },
+          { id: 'a2', name: 'Alice' },
+          { id: 'sender-1', name: 'Sender' },
+        ]);
+        stubUnreadCount(0);
+
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'hey @Alice please look',
+        });
+
+        const created = mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] };
+        expect(created.mentions.sort()).toEqual(['a1', 'a2']);
+      });
+
+      it('@all 应记为广播令牌 "*"，且 id 一律小写', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m2' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        // 大写 id：写入侧必须 toLowerCase，否则两读面（PG ::text 小写）漂移
+        stubParticipantRows(['ABC-DEF', 'sender-1']);
+        stubProfiles([
+          { id: 'ABC-DEF', name: 'Bob' },
+          { id: 'sender-1', name: 'Sender' },
+        ]);
+        stubUnreadCount(0);
+
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: '@Bob @all ping',
+        });
+
+        const created = mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] };
+        expect(created.mentions.sort()).toEqual(['*', 'abc-def']);
+      });
+
+      it('代码块 / 引用 / inline code 里的 @ 不算提及（复用圆桌剥噪规则）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m3' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['a1', 'sender-1']);
+        stubProfiles([
+          { id: 'a1', name: 'Alice' },
+          { id: 'sender-1', name: 'Sender' },
+        ]);
+        stubUnreadCount(0);
+
+        const content = ['```', '@Alice', '```', '> @Alice', 'inline `@Alice` here'].join('\n');
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, { content });
+
+        const created = mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] };
+        expect(created.mentions).toEqual([]);
+      });
+
+      it('replyTo 闭环：父消息发送者被追加；自己回复自己 / 系统哨兵 / 非参与者一律跳过', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m4' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['parent-sender', 'sender-1']);
+        stubProfiles([
+          { id: 'parent-sender', name: 'Carol' },
+          { id: 'sender-1', name: 'Sender' },
+        ]);
+        stubUnreadCount(0);
+        // replyTo 校验 + 闭环各读一次父消息（校验读 select id/topicId，闭环读 senderId）
+        mockMessageRepo.findOne.mockResolvedValue(
+          createMockMessage({ id: PARENT_UUID, topicId: 'topic-1', senderId: 'parent-sender' }),
+        );
+
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'no at-signs here',
+          replyTo: PARENT_UUID,
+        });
+
+        const created = mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] };
+        expect(created.mentions).toEqual(['parent-sender']);
+      });
+
+      it('replyTo 指向自己发的消息 → 不追加（自发永不计入自己未读）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m5' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        stubUnreadCount(0);
+        mockMessageRepo.findOne.mockResolvedValue(
+          createMockMessage({ id: PARENT_UUID, topicId: 'topic-1', senderId: 'sender-1' }),
+        );
+
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'self reply',
+          replyTo: PARENT_UUID,
+        });
+
+        const created = mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] };
+        expect(created.mentions).toEqual([]);
+      });
+
+      it('replyTo 指向系统哨兵 / 已离开（无参与行）的发送者 → 跳过', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m6' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        // 参与行只有 sender-1：system 哨兵与 outsider 都不在候选内
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        stubUnreadCount(0);
+
+        mockMessageRepo.findOne.mockResolvedValue(
+          createMockMessage({ id: SYS_PARENT_UUID, topicId: 'topic-1', senderId: SYSTEM_ACTOR_ID }),
+        );
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'x',
+          replyTo: SYS_PARENT_UUID,
+        });
+        expect(
+          (mockMessageRepo.create.mock.calls[0][0] as { mentions: string[] }).mentions,
+        ).toEqual([]);
+
+        mockMessageRepo.findOne.mockResolvedValue(
+          createMockMessage({ id: OUT_PARENT_UUID, topicId: 'topic-1', senderId: 'outsider' }),
+        );
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'y',
+          replyTo: OUT_PARENT_UUID,
+        });
+        expect(
+          (mockMessageRepo.create.mock.calls[1][0] as { mentions: string[] }).mentions,
+        ).toEqual([]);
+      });
+
+      it('fail-open：提取失败 → 不写该列（DB default [] 兜底）+ 响应省略 mentions 键', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m7' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        // 候选取数炸掉 → resolveMentionIds reject → catch 分支
+        mockParticipantRepo.find.mockRejectedValue(new Error('participant query blew up'));
+        stubUnreadCount(0);
+
+        const result = await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'hello',
+        });
+
+        // 不写该列（绝不写 null——jsonb NOT NULL 会 23502）
+        expect(mockMessageRepo.create).toHaveBeenCalledWith(
+          expect.not.objectContaining({ mentions: expect.anything() }),
+        );
+        // F8 加严：create 载荷的**键集合**里根本没有 mentions（上一条只证明"值不匹配"，
+        // 若有人写成 `mentions: undefined` 仍会带出该键——DB 默认值兜底依赖的是**键缺席**）
+        const createPayload = mockMessageRepo.create.mock.calls[0][0] as Record<string, unknown>;
+        expect(Object.keys(createPayload)).not.toContain('mentions');
+        expect(Object.keys(createPayload)).toEqual([
+          'topicId',
+          'senderId',
+          'senderType',
+          'type',
+          'content',
+          'replyToId',
+          'metadata',
+        ]);
+        // 响应省略 mentions 键（省略 ≠ 无提及）
+        expect(result).not.toHaveProperty('mentions');
+        expect(Object.keys(result as Record<string, unknown>)).not.toContain('mentions');
+      });
+
+      it('幂等路径同样回填 mentions（事务内 create 载荷）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-m8' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        mockIdempotencyRepo.save.mockResolvedValue({ id: 'rec-m8' } as IdempotencyRecord);
+        stubParticipantRows(['a1', 'sender-1']);
+        stubProfiles([
+          { id: 'a1', name: 'Alice' },
+          { id: 'sender-1', name: 'Sender' },
+        ]);
+        stubUnreadCount(0);
+
+        await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: '@Alice hi',
+          clientRequestId: 'req-m8',
+        });
+
+        expect(mockMessageRepo.create).toHaveBeenCalledWith(
+          expect.objectContaining({ mentions: ['a1'] }),
+        );
+      });
+    });
+
+    describe('D4 getUnread mentionsOnly（模式与锚点正交）', () => {
+      it('参与行开启 mentions_only 且无游标 → mentionsOnly=true + 谓词追加提及过滤', async () => {
+        const topic = createMockTopic({ messageCount: 9 });
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockParticipantRepo.findOne.mockResolvedValue(
+          createMockParticipant({
+            lastReadMessageId: null,
+            notificationSettings: { mute: false, mentions_only: true },
+          }),
+        );
+        const countQb = {
+          where: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+          getCount: jest.fn().mockResolvedValue(2),
+        };
+        const fetchQb = createMockQueryBuilder([], 2);
+        mockMessageRepo.createQueryBuilder
+          .mockReturnValueOnce(countQb as unknown as SelectQueryBuilder<Message>)
+          .mockReturnValueOnce(fetchQb as unknown as SelectQueryBuilder<Message>);
+
+        const result = await service.getUnread('topic-1', {}, 'user-1', ActorType.HUMAN);
+
+        expect(result.mentionsOnly).toBe(true);
+        // 谓词：JSON.stringify([actorId]) + '"*"' 标量广播令牌
+        expect(countQb.andWhere).toHaveBeenCalledWith(
+          `(message.mentions @> :meMention::jsonb OR message.mentions @> '"*"'::jsonb)`,
+          { meMention: JSON.stringify(['user-1']) },
+        );
+        // count 与 list 必须同口径（否则 hasMore 会撒谎）
+        expect(fetchQb.andWhere).toHaveBeenCalledWith(
+          `(message.mentions @> :meMention::jsonb OR message.mentions @> '"*"'::jsonb)`,
+          { meMention: JSON.stringify(['user-1']) },
+        );
+      });
+
+      it('无参与行 → mentionsOnly=false（无设置可读）且不追加提及谓词', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockParticipantRepo.findOne.mockResolvedValue(null);
+        const countQb = {
+          where: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+          getCount: jest.fn().mockResolvedValue(0),
+        };
+        mockMessageRepo.createQueryBuilder
+          .mockReturnValueOnce(countQb as unknown as SelectQueryBuilder<Message>)
+          .mockReturnValueOnce(
+            createMockQueryBuilder([], 0) as unknown as SelectQueryBuilder<Message>,
+          );
+
+        const result = await service.getUnread('topic-1', {}, 'user-1', ActorType.HUMAN);
+
+        expect(result.mentionsOnly).toBe(false);
+        for (const call of countQb.andWhere.mock.calls) {
+          expect(String(call[0])).not.toContain('message.mentions @>');
+        }
+      });
+
+      it('锚点悬空降级分支**沿用该行设置**（模式与锚点正交，禁在悬空时分岔两读面）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        mockParticipantRepo.findOne.mockResolvedValue(
+          createMockParticipant({
+            lastReadMessageId: 'msg-deleted',
+            notificationSettings: { mentions_only: true },
+          }),
+        );
+        // 锚点消息软删 → findOne 返回 null → 降级全量；但模式仍为 true
+        mockMessageRepo.findOne.mockResolvedValue(null);
+        const countQb = {
+          where: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+          getCount: jest.fn().mockResolvedValue(1),
+        };
+        mockMessageRepo.createQueryBuilder
+          .mockReturnValueOnce(countQb as unknown as SelectQueryBuilder<Message>)
+          .mockReturnValueOnce(
+            createMockQueryBuilder([], 1) as unknown as SelectQueryBuilder<Message>,
+          );
+
+        const result = await service.getUnread('topic-1', {}, 'user-1', ActorType.HUMAN);
+
+        expect(result.mentionsOnly).toBe(true);
+        expect(result).not.toHaveProperty('lastReadMessageId'); // 降级分支不回带锚点
+        expect(countQb.andWhere).toHaveBeenCalledWith(
+          `(message.mentions @> :meMention::jsonb OR message.mentions @> '"*"'::jsonb)`,
+          { meMention: JSON.stringify(['user-1']) },
+        );
+      });
+
+      it('无 actorId 分支也带 mentionsOnly=false（响应形状对调用方恒定）', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(createMockTopic({ messageCount: 4 }));
+
+        const result = await service.getUnread('topic-1', {}, undefined);
+
+        expect(result.mentionsOnly).toBe(false);
+        expect(result.unreadCount).toBe(4);
+      });
+
+      it('脏设置值（字符串 "true"）按 false 处理（严格 === true，与 DB @> 同口径）', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(createMockTopic());
+        mockParticipantRepo.findOne.mockResolvedValue(
+          createMockParticipant({
+            lastReadMessageId: null,
+            notificationSettings: { mentions_only: 'true' },
+          }),
+        );
+        mockMessageRepo.createQueryBuilder
+          .mockReturnValueOnce({
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            getCount: jest.fn().mockResolvedValue(0),
+          } as unknown as SelectQueryBuilder<Message>)
+          .mockReturnValueOnce(
+            createMockQueryBuilder([], 0) as unknown as SelectQueryBuilder<Message>,
+          );
+
+        const result = await service.getUnread('topic-1', {}, 'user-1', ActorType.HUMAN);
+
+        expect(result.mentionsOnly).toBe(false);
+      });
+    });
+
+    describe('D2 发送响应附带字段（fail-open 语义）', () => {
+      it('应附 unreadCount（与 GET unread 同源口径，含提及模式）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-r1' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        // resolveUnreadContext：sender 的参与行（锚点 msg-0，开启静默）
+        mockParticipantRepo.findOne.mockResolvedValue(
+          createMockParticipant({
+            lastReadMessageId: 'msg-0',
+            notificationSettings: { mentions_only: true },
+          }),
+        );
+        mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: 'msg-0' }));
+        const qb = stubUnreadCount(3);
+
+        const result = await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'hello',
+        });
+
+        expect(result.unreadCount).toBe(3);
+        // 与 GET unread 同谓词：提及模式被带上（不是硬编码 false）
+        expect(qb.andWhere).toHaveBeenCalledWith(
+          `(message.mentions @> :meMention::jsonb OR message.mentions @> '"*"'::jsonb)`,
+          { meMention: JSON.stringify(['sender-1']) },
+        );
+      });
+
+      it('首次发言 auto-join 例外：INSERT 分支游标落本条 → unreadCount=0（join 语义）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-first' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        // auto-join 后行存在且游标 = 本条消息（与 INSERT 分支同语义）
+        mockParticipantRepo.findOne.mockResolvedValue(
+          createMockParticipant({ lastReadMessageId: 'msg-first' }),
+        );
+        mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: 'msg-first' }));
+        stubUnreadCount(0);
+
+        const result = await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'first!',
+        });
+
+        expect(result.unreadCount).toBe(0);
+        // $3 只作用于 INSERT 分支（首发 auto-join 的加入点即已读点）
+        expect(mockParticipantRepo.query).toHaveBeenCalledWith(expect.any(String), [
+          'topic-1',
+          'sender-1',
+          'msg-first',
+        ]);
+      });
+
+      it('unreadCount 计算失败 → 省略键（省略 ≠ 0）+ 发送仍成功', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-r2' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        mockParticipantRepo.findOne.mockRejectedValue(new Error('count blew up'));
+
+        const result = await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'hi',
+        });
+
+        expect(result).not.toHaveProperty('unreadCount');
+        expect(result.id).toBe('msg-r2'); // 发送本身成功
+      });
+
+      it('响应 mentions 与提取结果一致（提取成功且无提及 → []，不是省略）', async () => {
+        const topic = createMockTopic();
+        mockTopicRepo.findOne.mockResolvedValue(topic);
+        const saved = createMockMessage({ id: 'msg-r3' });
+        mockMessageRepo.create.mockReturnValue(saved);
+        mockMessageRepo.save.mockResolvedValue(saved);
+        stubParticipantRows(['sender-1']);
+        stubProfiles([{ id: 'sender-1', name: 'Sender' }]);
+        mockParticipantRepo.findOne.mockResolvedValue(createMockParticipant());
+        stubUnreadCount(0);
+
+        const result = await service.sendMessage('topic-1', 'sender-1', ActorType.AGENT, {
+          content: 'no mentions at all',
+        });
+
+        expect(result).toHaveProperty('mentions');
+        expect(result.mentions).toEqual([]);
+      });
+    });
+
+    describe('D5 updateNotificationSettings（逐态逐可见性 + hiddenUnreadCount）', () => {
+      /** 走一遍成功路径所需的 mock 装配 */
+      function stubSuccessPath(opts: {
+        preSettings?: Record<string, unknown>;
+        postSettings?: Record<string, unknown>;
+        status?: string;
+        visibility?: Visibility;
+        offCount?: number;
+        onCount?: number;
+        countThrows?: boolean;
+      }) {
+        mockTopicRepo.findOne.mockResolvedValue(
+          createMockTopic({ settings: { visibility: opts.visibility ?? Visibility.OPEN } }),
+        );
+        const pre = createMockParticipant({
+          status: opts.status ?? 'active',
+          notificationSettings: opts.preSettings ?? { mute: false, mentions_only: false },
+          lastReadMessageId: 'msg-0',
+        });
+        const post = createMockParticipant({
+          status: opts.status ?? 'active',
+          notificationSettings: opts.postSettings ?? { mute: false, mentions_only: true },
+          lastReadMessageId: 'msg-0',
+        });
+        // 第 1 次 = 前置条件；第 2 次 = 写后读回；第 3 次 = resolveUnreadContext
+        mockParticipantRepo.findOne
+          .mockResolvedValueOnce(pre)
+          .mockResolvedValueOnce(post)
+          .mockResolvedValue(post);
+        mockMessageRepo.findOne.mockResolvedValue(createMockMessage({ id: 'msg-0' }));
+        if (opts.countThrows) {
+          mockMessageRepo.createQueryBuilder.mockReturnValue({
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            getCount: jest.fn().mockRejectedValue(new Error('count blew up')),
+          } as unknown as SelectQueryBuilder<Message>);
+        } else {
+          mockMessageRepo.createQueryBuilder
+            .mockReturnValueOnce({
+              where: jest.fn().mockReturnThis(),
+              andWhere: jest.fn().mockReturnThis(),
+              getCount: jest.fn().mockResolvedValue(opts.offCount ?? 7),
+            } as unknown as SelectQueryBuilder<Message>)
+            .mockReturnValueOnce({
+              where: jest.fn().mockReturnThis(),
+              andWhere: jest.fn().mockReturnThis(),
+              getCount: jest.fn().mockResolvedValue(opts.onCount ?? 2),
+            } as unknown as SelectQueryBuilder<Message>);
+        }
+      }
+
+      it('话题不存在 → 404 TOPIC_NOT_FOUND(2000)', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(null);
+
+        await expect(
+          service.updateNotificationSettings('topic-x', 'user-1', { mentionsOnly: true }),
+        ).rejects.toMatchObject({ response: { code: ErrorCode.TOPIC_NOT_FOUND } });
+      });
+
+      it('PRIVATE + 非参与者 → 404 TOPIC_NOT_FOUND（安全隐没，message 双候选指引）', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(
+          createMockTopic({ settings: { visibility: Visibility.PRIVATE } }),
+        );
+        mockParticipantRepo.findOne.mockResolvedValue(null);
+
+        const err = await service
+          .updateNotificationSettings('topic-1', 'stranger', { mentionsOnly: true })
+          .catch((e) => e);
+        expect(err).toBeInstanceOf(NotFoundException);
+        expect(err.response.code).toBe(ErrorCode.TOPIC_NOT_FOUND);
+        expect(err.response.message).toContain('ask the topic creator');
+        // 隐没路径绝不写库
+        expect(mockParticipantRepo.query).not.toHaveBeenCalled();
+      });
+
+      it('PRIVATE + left → 404 TOPIC_NOT_FOUND（left 视同无行）', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(
+          createMockTopic({ settings: { visibility: Visibility.PRIVATE } }),
+        );
+        mockParticipantRepo.findOne.mockResolvedValue(createMockParticipant({ status: 'left' }));
+
+        await expect(
+          service.updateNotificationSettings('topic-1', 'user-1', { mentionsOnly: true }),
+        ).rejects.toMatchObject({ response: { code: ErrorCode.TOPIC_NOT_FOUND } });
+      });
+
+      it('OPEN + 非参与者 → 403 AGENT_NOT_IN_TOPIC(1006)，message 指向 join', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(
+          createMockTopic({ settings: { visibility: Visibility.OPEN } }),
+        );
+        mockParticipantRepo.findOne.mockResolvedValue(null);
+
+        const err = await service
+          .updateNotificationSettings('topic-1', 'stranger', { mentionsOnly: true })
+          .catch((e) => e);
+        expect(err).toBeInstanceOf(ForbiddenException);
+        expect(err.response.code).toBe(ErrorCode.AGENT_NOT_IN_TOPIC);
+        expect(err.response.message).toContain('POST /topics/:id/join');
+        expect(err.response.message).not.toContain('Re-join');
+      });
+
+      it('OPEN + left → 403 AGENT_NOT_IN_TOPIC(1006)，message 指向 re-join（分岔）', async () => {
+        mockTopicRepo.findOne.mockResolvedValue(
+          createMockTopic({ settings: { visibility: Visibility.OPEN } }),
+        );
+        mockParticipantRepo.findOne.mockResolvedValue(createMockParticipant({ status: 'left' }));
+
+        const err = await service
+          .updateNotificationSettings('topic-1', 'user-1', { mentionsOnly: true })
+          .catch((e) => e);
+        expect(err.response.code).toBe(ErrorCode.AGENT_NOT_IN_TOPIC);
+        expect(err.response.message).toContain('Re-join');
+      });
+
+      it('invited 行允许设置（受邀即有行）', async () => {
+        stubSuccessPath({ status: 'invited' });
+
+        const result = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        expect(result.mentionsOnly).toBe(true);
+        expect(mockParticipantRepo.query).toHaveBeenCalledTimes(1);
+      });
+
+      it('archived / closed 话题允许设置（设置与生命周期正交）', async () => {
+        for (const status of [TopicStatus.ARCHIVED, TopicStatus.CLOSED]) {
+          mockParticipantRepo.query.mockClear();
+          mockTopicRepo.findOne.mockResolvedValue(
+            createMockTopic({ status, settings: { visibility: Visibility.OPEN } }),
+          );
+          mockParticipantRepo.findOne.mockReset();
+          stubSuccessPath({});
+
+          const result = await service.updateNotificationSettings('topic-1', 'user-1', {
+            mentionsOnly: true,
+          });
+          expect(result.mentionsOnly).toBe(true);
+          expect(mockParticipantRepo.query).toHaveBeenCalledTimes(1);
+        }
+      });
+
+      it('写走 SQL 侧 jsonb 合并（键名常量插值 + $3::boolean 绑定，保留 mute 等既有键）', async () => {
+        stubSuccessPath({ preSettings: { mute: true, mentions_only: false } });
+
+        await service.updateNotificationSettings('topic-1', 'user-1', { mentionsOnly: true });
+
+        const [sql, params] = mockParticipantRepo.query.mock.calls[0];
+        // 键名模板插值（裸 SQL 写不出绑定占位符；键名是编译期常量，值面全绑定）
+        expect(sql).toContain(`jsonb_build_object('${NOTIFY_KEY_MENTIONS_ONLY}', $3::boolean)`);
+        // 合并（||）而不是整体替换 → mute 等既有键被保留
+        expect(sql).toContain('notification_settings = notification_settings ||');
+        expect(sql).toContain('WHERE topic_id = $1 AND participant_id = $2');
+        // 值走参数绑定 + boolean cast（字面量 '"{$v}"' 是非法 SQL）
+        expect(params).toEqual(['topic-1', 'user-1', true]);
+      });
+
+      it('响应以库读回为准（不是内存推导）：读回 false 就报 false', async () => {
+        // 请求 true，但读回的库值仍是 false（模拟并发/写入未生效）→ 响应必须说实话
+        stubSuccessPath({
+          preSettings: { mentions_only: false },
+          postSettings: { mentions_only: false },
+        });
+
+        const result = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        expect(result.mentionsOnly).toBe(false);
+        // 结果模式为 false → 省略 hiddenUnreadCount（省略 ≠ 0）
+        expect(result).not.toHaveProperty('hiddenUnreadCount');
+        // 且不做 hidden 计算（省两次 COUNT）
+        expect(mockMessageRepo.createQueryBuilder).not.toHaveBeenCalled();
+      });
+
+      it('hiddenUnreadCount = mode off 计数 − mode on 计数（模式为 true 时恒附）', async () => {
+        stubSuccessPath({ offCount: 7, onCount: 2 });
+
+        const result = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        expect(result).toEqual({
+          topicId: 'topic-1',
+          mentionsOnly: true,
+          hiddenUnreadCount: 5,
+        });
+        // 两次 COUNT 走同一锚点、只有模式不同（定义式：off − on）
+        const calls = mockMessageRepo.createQueryBuilder.mock.calls;
+        expect(calls).toHaveLength(2);
+      });
+
+      it('hiddenUnreadCount 的 COUNT 失败 → 省略键（fail-open）+ 设置写入已生效', async () => {
+        stubSuccessPath({ countThrows: true });
+
+        const result = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        expect(result.mentionsOnly).toBe(true);
+        expect(result).not.toHaveProperty('hiddenUnreadCount');
+        // 设置写入本身成功（UPDATE 已发出）
+        expect(mockParticipantRepo.query).toHaveBeenCalledTimes(1);
+      });
+
+      it('幂等：重复提交同一值 → 同结果（合并语义天然幂等）', async () => {
+        stubSuccessPath({ offCount: 7, onCount: 2 });
+        const first = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        mockParticipantRepo.findOne.mockReset();
+        mockParticipantRepo.query.mockClear();
+        stubSuccessPath({ offCount: 7, onCount: 2 });
+        const second = await service.updateNotificationSettings('topic-1', 'user-1', {
+          mentionsOnly: true,
+        });
+
+        expect(second).toEqual(first);
+      });
+    });
+  });
+
+  /**
+   * F1 汇总回归锁（v1.96.0-dev 未读语义批终审修复）。
+   *
+   * 逐处单测（join/leave/removeParticipant/inviteAgent/addEditor/removeEditor/
+   * uninviteAgent/uninviteUser）已各自锁了载荷键集合；本用例再把 8 处串成一条链，
+   * 锁**同一个不变量**：既有行写路径**永不整行 save()**，且载荷键**永远只落在
+   * {status, leftAt, joinedAt, lastReadMessageId, role} 白名单内**。
+   *
+   * 为什么需要这条：单点测试在「某人把某一处改回 save()」时会红，但若新增第 9 处
+   * 整行写路径则无人发现——白名单式反向锁把"新列/新路径"变成显式评审事件。
+   */
+  describe('F1：既有行写路径不整行回写（并发 PATCH notification-settings 防线）', () => {
+    it('8 处操作全部定点 UPDATE，载荷永不出现 notificationSettings，save 零调用', async () => {
+      const topic = createMockTopic();
+      mockTopicRepo.findOne.mockResolvedValue(topic);
+      // 同一参与行带静默设置（= 会被整行 save 静默翻回的那一列），跨 8 个操作复用
+      const row = createMockParticipant({
+        participantId: 'user-2',
+        participantType: ActorType.AGENT,
+        role: 'member',
+        status: ParticipantStatus.LEFT,
+        notificationSettings: { mute: false, mentions_only: true },
+      });
+      mockParticipantRepo.findOne.mockResolvedValue(row);
+      // 让 resolveProfiles（removeParticipant 的 resolveActorTypes 用）能解析出类型
+      mockActorRepo.find.mockResolvedValue([
+        { id: 'user-2', type: ActorType.AGENT, deletedAt: null },
+      ] as any);
+      mockAgentRepo.findBy.mockResolvedValue([
+        { id: 'user-2', name: 'Agent Two', avatarUrl: null, description: null },
+      ] as any);
+
+      // ① join：left → active
+      row.status = ParticipantStatus.LEFT;
+      await service.join('topic-1', 'user-2', ActorType.AGENT);
+      // ② leave：active → left
+      row.status = ParticipantStatus.ACTIVE;
+      await service.leave('topic-1', 'user-2', ActorType.AGENT);
+      // ③ removeParticipant：active → left（操作者是别人）
+      row.status = ParticipantStatus.ACTIVE;
+      await service.removeParticipant('topic-1', 'operator-1', 'user-2');
+      // ④ inviteAgent：left → invited
+      row.status = ParticipantStatus.LEFT;
+      await service.inviteAgent('topic-1', 'user-2');
+      // ⑤ addEditor：member → editor（status 不动）
+      row.status = ParticipantStatus.ACTIVE;
+      row.role = TopicParticipantRole.MEMBER;
+      await service.addEditor('topic-1', 'user-2');
+      // ⑥ removeEditor：editor → member（status 不动）
+      row.role = TopicParticipantRole.EDITOR;
+      await service.removeEditor('topic-1', 'user-2');
+      // ⑦ uninviteAgent：active → left
+      row.status = ParticipantStatus.ACTIVE;
+      await service.uninviteAgent('topic-1', 'user-2');
+      // ⑧ uninviteUser：active → left
+      row.status = ParticipantStatus.ACTIVE;
+      await service.uninviteUser('topic-1', 'user-2');
+
+      // 8 次全部走 update（既有行分支），整行 save 一次都不许出现
+      expect(mockParticipantRepo.update).toHaveBeenCalledTimes(8);
+      expect(mockParticipantRepo.save).not.toHaveBeenCalled();
+
+      // 载荷白名单反向锁：只允许这几列出现（含 notificationSettings 即红）
+      const ALLOWED = ['status', 'leftAt', 'joinedAt', 'lastReadMessageId', 'role'];
+      for (const [, payload] of mockParticipantRepo.update.mock.calls as [
+        unknown,
+        Record<string, unknown>,
+      ][]) {
+        expect(Object.keys(payload)).not.toContain('notificationSettings');
+        for (const key of Object.keys(payload)) {
+          expect(ALLOWED).toContain(key);
+        }
+      }
     });
   });
 });

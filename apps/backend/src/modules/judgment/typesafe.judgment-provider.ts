@@ -12,7 +12,7 @@
  *   - 失败面（transport / timeout / HTTP / 空体·非 JSON / 白名单失败）统一映射成结果对象
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（失败标签 / provider 列语义）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（失败标签 / provider 列语义）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（provider 通用化 + 元数据归属）
  *
  * [关键不变量]
@@ -35,7 +35,7 @@
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
  *   □ 新增失败分类必须同时给出 `status` 映射与"不进日志"的敏感信息边界
- *   □ 改请求体形状 = 改所有能力的发问契约：同步 `docs/experience-base.md` 的 request 形状小表
+ *   □ 改请求体形状 = 改所有能力的发问契约：同步 `docs/modules/experience-base.md` 的 request 形状小表
  *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  * =============================================================================
  */
@@ -47,7 +47,11 @@ import type {
   JudgmentOutcome,
   JudgmentProvider,
 } from './judgment-capability.interface';
-import { extractJudgmentModel, postSystemone } from './judgment.transport';
+import {
+  extractJudgmentModel,
+  JUDGMENT_TRANSPORT_STATUS,
+  postSystemone,
+} from './judgment.transport';
 
 /** 判定提供方名（落 `experience_judgments.provider`；值域见 config 的 `JUDGMENT_PROVIDERS`） */
 export const TYPESAFE_PROVIDER_NAME = 'typesafe';
@@ -62,6 +66,8 @@ export interface TypeSafeProviderOptions {
   model: string;
   /** 硬顶超时（毫秒） */
   timeoutMs: number;
+  /** 专用出口代理（null/缺省 = 直连；值可能带 userinfo 凭证，**绝不进日志**） */
+  proxyUrl?: string | null;
 }
 
 /**
@@ -82,10 +88,7 @@ export class TypeSafeJudgmentProvider implements JudgmentProvider {
    * @param input 能力输入
    * @returns ok（归一化 `value` + 观测 `meta`）/ error（各类失败）/ timeout（硬顶超时）
    */
-  async run<I, O>(
-    capability: JudgmentCapability<I, O>,
-    input: I,
-  ): Promise<JudgmentOutcome<O>> {
+  async run<I, O>(capability: JudgmentCapability<I, O>, input: I): Promise<JudgmentOutcome<O>> {
     const questions = capability.buildQuestions(input);
     const state = capability.buildState(input);
     // 日志事实源 = 实际发包体（questions / state 单源 + 当次模型名，不事后重造）
@@ -97,10 +100,11 @@ export class TypeSafeJudgmentProvider implements JudgmentProvider {
         baseUrl: this.options.baseUrl,
         apiKey: this.options.apiKey,
         timeoutMs: this.options.timeoutMs,
+        proxyUrl: this.options.proxyUrl ?? null,
       },
       request,
     );
-    if (transport.status === 'failed') {
+    if (transport.status === JUDGMENT_TRANSPORT_STATUS.FAILED) {
       // 失败也要留档"问了什么"（语料要能复现输入）；标签与分码由传输层保证
       return { ...transport.outcome, request };
     }

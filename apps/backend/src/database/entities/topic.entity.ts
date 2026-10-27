@@ -4,7 +4,7 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.2 (Topic / Message)
- *   - 补充: docs/roundtable-design.md §5 (topics.kind 增列，M2 落地)
+ *   - 补充: docs/modules/roundtable-design.md §5 (topics.kind 增列，M2 落地)
  *
  * [踩坑索引] RESP-SYNC(前端类型同步)
  *
@@ -72,7 +72,7 @@ export class Topic {
   settings: Record<string, any>;
 
   /**
-   * 话题类型（设计 docs/roundtable-design.md §5，M2 阶段 1 落地）：
+   * 话题类型（设计 docs/modules/roundtable-design.md §5，M2 阶段 1 落地）：
    * 'normal' = 普通话题（缺省，存量行零感知）；'roundtable' = 圆桌模式（席位 +
    * 会话层规则 wakePolicy/攒批生效）。创建后不可变——update 忽略 kind，
    * normal↔roundtable 互转在 M2 推迟清单（避免 topic 生命周期中途语义突变）。

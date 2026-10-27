@@ -121,7 +121,10 @@ describe('AuthController (e2e)', () => {
       actor: { status: 'active' },
     };
     mockRepos.User.createQueryBuilder.mockReturnValue({
-      leftJoinAndSelect: jest.fn().mockReturnThis(),
+      // login 走 innerJoinAndSelect（软删 fail-open 修复，卡 e6926d73：LEFT JOIN 的 ON
+      // 子句不丢行会让软删用户漏成 actor=null → status getter 回落 'active'）。
+      // 真 PG 语义见 test/soft-deleted-login.e2e-spec.ts
+      innerJoinAndSelect: jest.fn().mockReturnThis(),
       addSelect: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       getOne: jest.fn().mockResolvedValue(mockUser),
@@ -146,7 +149,7 @@ describe('AuthController (e2e)', () => {
 
   it('/auth/login (POST) - failure when password is incorrect', async () => {
     mockRepos.User.createQueryBuilder.mockReturnValue({
-      leftJoinAndSelect: jest.fn().mockReturnThis(),
+      innerJoinAndSelect: jest.fn().mockReturnThis(),
       addSelect: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       getOne: jest.fn().mockResolvedValue({
@@ -194,6 +197,10 @@ describe('AuthController (e2e)', () => {
       role: 'observer',
       avatarUrl: null,
       status: 'active',
+      // refresh 的 user 门（卡 e6926d73）：eager 关系必须已加载且 status=active——
+      // 缺 actor 会被门判为软删用户形态并 401；真 PG 语义见
+      // test/soft-deleted-login.e2e-spec.ts ②
+      actor: { status: 'active' },
     });
 
     return request(app.getHttpServer())

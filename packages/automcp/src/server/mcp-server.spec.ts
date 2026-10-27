@@ -156,7 +156,19 @@ describe('McpServer', () => {
       };
       proxy.execute.mockResolvedValueOnce(mockResult);
 
-      const mappings = [makeMapping('list_topics')];
+      const mappings = [
+        makeMapping('list_topics', {
+          tool: {
+            name: 'list_topics',
+            description: 'Tool list_topics',
+            inputSchema: {
+              type: 'object',
+              properties: { page: { type: 'number' } },
+              additionalProperties: false,
+            },
+          },
+        }),
+      ];
       server.registerTools(mappings);
       await server.start();
 
@@ -454,7 +466,15 @@ describe('McpServer', () => {
         const handler = jest.fn().mockResolvedValue({
           content: [{ type: 'text', text: 'done' }],
         });
-        const ctFoo = makeCustomTool('foo_tool', handler);
+        // 该 tool 的 schema 必须声明 param1——本轮起未知键 fail-closed（MCP-ARG-1），
+        // 本用例的意图是"声明过的键原样到达 handler"
+        const ctFoo = makeCustomTool('foo_tool', handler, {
+          inputSchema: {
+            type: 'object',
+            properties: { param1: { type: 'string' } },
+            additionalProperties: false,
+          },
+        });
         server.registerCustomTools([ctFoo]);
         await server.start();
 
@@ -595,6 +615,231 @@ describe('McpServer', () => {
         expect(() => {
           server.registerCustomTools([ctA, ctB]);
         }).toThrow(/Duplicate custom tool name/);
+      });
+    });
+  });
+
+  /**
+   * tools/call 入参校验（MCP-ARG-1：未知键曾静默丢弃）
+   *
+   * 事故：memory_controller_nominate 误传 `content`（正确键 `contentOverride`），键被
+   * paramLocations 静默丢弃 → 记忆建成但正文为空。本轮起未知键 fail-closed：不发上游
+   * 请求，错误文本必须点名未知键与合法键（可行动）。
+   */
+  describe('tools/call 入参校验（fail-closed 白名单）', () => {
+    /** 造一个声明了 contentOverride 的映射工具（事故形状的最小复刻） */
+    function makeNominateMapping(name = 'memory_controller_nominate'): ToolMapping {
+      return makeMapping(name, {
+        tool: {
+          name,
+          description: 'Nominate a claim',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              contentOverride: { type: 'string' },
+              category: { type: 'string' },
+            },
+            required: ['category'],
+            additionalProperties: false,
+          },
+        },
+      });
+    }
+
+    /** 发起 tools/call 并返回 supertest 响应 */
+    function callTool(name: string, args: Record<string, unknown>) {
+      return request(app)
+        .post('/mcp')
+        .send({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name, arguments: args },
+        });
+    }
+
+    it('① 映射工具带未知键 → isError + 文本含未知键与合法键，且不调用 proxy', async () => {
+      server.registerTools([makeNominateMapping()]);
+      await server.start();
+
+      const res = await callTool('memory_controller_nominate', {
+        category: 'ruling',
+        content: '正文',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.result.isError).toBe(true);
+      const text = res.body.result.content[0].text as string;
+      expect(text).toContain('memory_controller_nominate');
+      expect(text).toContain('"content"');
+      // 合法键清单：既提示正确键，也说明"未知参数此前会被静默忽略"
+      expect(text).toContain('"contentOverride"');
+      expect(text).toContain('"category"');
+      expect(text).toMatch(/previously dropped silently before the upstream REST request/);
+      // fail-closed 的核心：一个字节都不发上游
+      expect(proxy.execute).not.toHaveBeenCalled();
+    });
+
+    it('② 全部键都是声明过的 → 原样透传给 proxy', async () => {
+      proxy.execute.mockResolvedValueOnce({ content: [{ type: 'text', text: '{"ok":true}' }] });
+      server.registerTools([makeNominateMapping()]);
+      await server.start();
+
+      const res = await callTool('memory_controller_nominate', {
+        category: 'ruling',
+        contentOverride: '正文',
+      });
+
+      expect(res.body.result.isError).toBeUndefined();
+      expect(proxy.execute).toHaveBeenCalledTimes(1);
+      expect(proxy.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool: expect.objectContaining({ name: 'memory_controller_nominate' }),
+        }),
+        { category: 'ruling', contentOverride: '正文' },
+        undefined,
+      );
+    });
+
+    it('③ 无参工具（properties 为空）带任意键 → 报错且提示该工具不接受参数', async () => {
+      server.registerTools([makeMapping('get_current_user')]);
+      await server.start();
+
+      const res = await callTool('get_current_user', { page: 1 });
+
+      expect(res.body.result.isError).toBe(true);
+      expect(res.body.result.content[0].text).toContain('This tool takes no arguments');
+      expect(proxy.execute).not.toHaveBeenCalled();
+    });
+
+    it('④ custom tool 带未知键 → 报错且 handler 不被调用', async () => {
+      const handler = jest.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+      server.registerCustomTools([
+        {
+          tool: {
+            name: 'record_experience',
+            description: 'Record an experience',
+            inputSchema: {
+              type: 'object',
+              properties: { title: { type: 'string' }, content: { type: 'string' } },
+              additionalProperties: false,
+            },
+          },
+          handler,
+        },
+      ]);
+      await server.start();
+
+      const res = await callTool('record_experience', { title: 't', contentx: 'c' });
+
+      expect(res.body.result.isError).toBe(true);
+      expect(res.body.result.content[0].text).toContain('"contentx"');
+      // 文案分支锁定：custom tool 的未知键此前是「原样进 handler」，不能说成「不进 REST」
+      expect(res.body.result.content[0].text).toContain(
+        'previously passed through to the tool handler',
+      );
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('⑤ arguments 非对象（数组）→ 明确报错（不产生 "0"/"1" 这类假未知键）', async () => {
+      server.registerTools([makeMapping('list_topics')]);
+      await server.start();
+
+      const res = await callTool('list_topics', ['a'] as unknown as Record<string, unknown>);
+
+      expect(res.body.result.isError).toBe(true);
+      expect(res.body.result.content[0].text).toContain('must be a JSON object');
+      expect(proxy.execute).not.toHaveBeenCalled();
+    });
+
+    it('⑥ tools/list 补 additionalProperties:false 且不改写调用方传入的 schema 对象', async () => {
+      const originalSchema = { type: 'object', properties: { flag: { type: 'boolean' } } };
+      server.registerCustomTools([
+        {
+          tool: {
+            name: 'handwritten_schema_tool',
+            description: 'schema 未写 additionalProperties',
+            inputSchema: originalSchema,
+          },
+          handler: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+        },
+      ]);
+      await server.start();
+
+      const res = await request(app)
+        .post('/mcp')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+      const advertised = res.body.result.tools[0].inputSchema;
+      expect(advertised.additionalProperties).toBe(false);
+      expect(advertised.properties).toEqual({ flag: { type: 'boolean' } });
+      // 注册期归一化必须构造新对象：入参 schema 属于调用方（模块导出对象），
+      // 原地改写会让同一模块被第二个 server 实例挂载时带上不属于它的策略
+      expect(originalSchema).not.toHaveProperty('additionalProperties');
+    });
+
+    it('⑦ 显式 additionalProperties:true（作者 opt-in 自由参数）→ 任意键放行到 handler', async () => {
+      const handler = jest.fn().mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+      server.registerCustomTools([
+        {
+          tool: {
+            name: 'free_form_tool',
+            description: '作者显式允许任意键',
+            inputSchema: {
+              type: 'object',
+              properties: { kind: { type: 'string' } },
+              additionalProperties: true,
+            },
+          },
+          handler,
+        },
+      ]);
+      await server.start();
+
+      const res = await callTool('free_form_tool', { kind: 'k', anything: 'v', nested: { a: 1 } });
+
+      expect(res.body.result.isError).toBeUndefined();
+      expect(handler).toHaveBeenCalledWith(
+        { kind: 'k', anything: 'v', nested: { a: 1 } },
+        expect.anything(),
+      );
+      // advertised 与运行时同口径：显式 true 不被注册期归一化覆盖
+      const listRes = await request(app)
+        .post('/mcp')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+      expect(listRes.body.result.tools[0].inputSchema.additionalProperties).toBe(true);
+    });
+
+    it('⑧ 未知键超过 10 个 → 只列前 10 个并折叠为 "… and N more"', async () => {
+      server.registerTools([makeNominateMapping()]);
+      await server.start();
+
+      // 12 个未知键（模拟整段 DSL 被当参数塞入）
+      const args: Record<string, unknown> = { category: 'ruling' };
+      for (let i = 1; i <= 12; i += 1) {
+        args[`bogus_${String(i).padStart(2, '0')}`] = i;
+      }
+
+      const res = await callTool('memory_controller_nominate', args);
+
+      expect(res.body.result.isError).toBe(true);
+      const text = res.body.result.content[0].text as string;
+      expect(text).toContain('"bogus_01"');
+      expect(text).toContain('"bogus_10"');
+      expect(text).not.toContain('"bogus_11"');
+      expect(text).toContain('… and 2 more');
+      expect(proxy.execute).not.toHaveBeenCalled();
+    });
+
+    it('⑨ tool 名未命中 + 任意 arguments → 仍返回 Tool not found（先查工具再校验）', async () => {
+      server.registerTools([makeNominateMapping()]);
+      await server.start();
+
+      const res = await callTool('nonexistent', { foo: 1 });
+
+      expect(res.body.result).toEqual({
+        content: [{ type: 'text', text: 'Tool not found: nonexistent' }],
+        isError: true,
       });
     });
   });

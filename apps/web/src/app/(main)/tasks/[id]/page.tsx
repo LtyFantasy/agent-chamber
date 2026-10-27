@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.4（看板详情页-任务详情抽屉）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.4（看板详情页-任务详情抽屉）
  *
  * [踩坑索引] （暂无）
  *
@@ -25,6 +25,8 @@ import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { taskStatusMap as statusMap, taskPriorityMap as priorityMap } from '@/lib/status-visuals';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -42,14 +44,16 @@ export default function TaskDetailPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('tasks');
+  const tRead = useTranslations('common');
   const tGlobal = useTranslations();
 
   /** 任务详情（仅用于头部展示和加载/404 态判断） */
-  const { data: task, isLoading } = useQuery({
+  const taskQuery = useQuery({
     queryKey: ['tasks', 'detail', id],
     queryFn: () => Api.tasks.getById(id),
     enabled: !!id,
   });
+  const { data: task, isLoading } = taskQuery;
 
   // ── 加载态 ────────────────────────────────────
 
@@ -63,7 +67,7 @@ export default function TaskDetailPage() {
 
   // ── 404 态 ────────────────────────────────────
 
-  if (!task) {
+  if (!task && httpStatusOf(taskQuery.error) === 404) {
     return (
       <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
@@ -73,6 +77,19 @@ export default function TaskDetailPage() {
       </div>
     );
   }
+
+  if (!task)
+    return (
+      <QueryFeedback
+        compact={taskQuery.data !== undefined}
+        message={errorMessageOf(
+          taskQuery.error,
+          tRead(taskQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void taskQuery.refetch()}
+        busy={taskQuery.isFetching}
+      />
+    );
 
   const status = statusMap[task.status] || { labelKey: task.status, variant: 'default' as const };
   const priority = priorityMap[task.priority] || { label: task.priority, color: '' };

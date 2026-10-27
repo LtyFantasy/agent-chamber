@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态 Popover）
- *   - 补充: docs/roundtable-design.md §8b（recentActivity 近况契约：cap 10 环形、
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位实时态 Popover）
+ *   - 补充: docs/modules/roundtable-design.md §8b（recentActivity 近况契约：cap 10 环形、
  *     服务端 R5 摘要化——剥离敏感载荷，participant 全可读）
  *
  * [踩坑索引]

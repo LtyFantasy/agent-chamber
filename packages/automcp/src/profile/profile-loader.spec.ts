@@ -88,6 +88,38 @@ describe('profile-loader', () => {
       expect(profile.include).toBeUndefined();
       expect(profile.exclude).toBeUndefined();
       expect(profile.tags).toBeUndefined();
+      expect(profile.excludeCustomTools).toBeUndefined();
+    });
+
+    it('should parse excludeCustomTools（精确名，去重保序）', async () => {
+      const filePath = writeFile('custom-exclude.json', {
+        include: ['^agent_controller_get_me$'],
+        excludeCustomTools: ['delete_doc', 'read_diagram', 'delete_doc'],
+      });
+
+      const profile = await loadProfile(filePath);
+
+      expect(profile.excludeCustomTools).toEqual(['delete_doc', 'read_diagram']);
+    });
+
+    it('should throw for empty excludeCustomTools name', async () => {
+      const filePath = writeFile('bad-custom-name.json', {
+        excludeCustomTools: ['delete_doc', '   '],
+      });
+
+      await expect(loadProfile(filePath)).rejects.toThrow(
+        'must not contain empty tool names',
+      );
+    });
+
+    it('should throw for non-array excludeCustomTools', async () => {
+      const filePath = writeFile('bad-custom-type.json', {
+        excludeCustomTools: 'delete_doc',
+      });
+
+      await expect(loadProfile(filePath)).rejects.toThrow(
+        'field "excludeCustomTools" must be an array of strings',
+      );
     });
 
     it('should throw for non-object JSON', async () => {

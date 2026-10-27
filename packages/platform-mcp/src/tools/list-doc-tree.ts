@@ -26,6 +26,8 @@
  *   - sort 只影响 folders 排序（recent=latestDocAt DESC / name=段名 ASC），
  *     docs 恒按 path ASC；
  *   - 参数透传空值不携带（对齐 list_docs 先例），保持请求干净。
+ *   - **三层匹配 / 失败信封构造自 v1.92.0-dev 收敛到同目录 `_resolve-space.ts`**
+ *     （与 list-docs / get-doc-facets 共用单源）——改解析语义改单源，勿在本文件重加拷贝。
  *
  * [关联代码]
  *   - apps/backend/src/modules/docspace/doc.controller.ts — findTree 路由
@@ -47,17 +49,12 @@ import type { CustomTool, CustomToolContext, ToolCallResult } from '@agent-chamb
 import { PlatformApiClient } from '../platform-client';
 import { handlePlatformError } from './get-my-briefing';
 import { DOC_TREE_SORT_VALUES } from '@agent-chamber/shared';
+// v1.92.0-dev：三层匹配与失败信封构造收敛到单源（同目录 _resolve-space.ts）
+import { matchByLayers, resolutionFailureBody, type DocSpaceListItem } from './_resolve-space';
 
 // ---------------------------------------------------------------------------
 // 类型定义
 // ---------------------------------------------------------------------------
-
-interface DocSpaceListItem {
-  id: string;
-  name: string;
-  slug: string;
-  [key: string]: unknown;
-}
 
 /** 目录树子目录项（后端 DocTreeFolder） */
 interface DocTreeFolder {
@@ -98,54 +95,8 @@ interface DocTreeResponse {
 }
 
 // ---------------------------------------------------------------------------
-// 工具函数（照抄 list-docs.ts 的 matchByLayers / resolutionFailureBody）
+// 工具函数：三层匹配 / 失败信封构造（v1.92.0-dev 起单源 = ./_resolve-space.ts）
 // ---------------------------------------------------------------------------
-
-/**
- * 三层匹配（大小写不敏感）：
- * ① 精确匹配（ci）
- * ② 前缀匹配（ci）
- * ③ 子串匹配（ci）
- *
- * 取最先产生匹配的那一层。该层内 0 个 → 返回 []，>1 个 → 返回该层全部。
- */
-function matchByLayers<T>(
-  needle: string,
-  candidates: T[],
-  keyFn: (c: T) => string,
-): { layer: number; matches: T[] } {
-  const lower = needle.toLowerCase();
-
-  const exact = candidates.filter((c) => keyFn(c).toLowerCase() === lower);
-  if (exact.length > 0) return { layer: 1, matches: exact };
-
-  const prefix = candidates.filter((c) => keyFn(c).toLowerCase().startsWith(lower));
-  if (prefix.length > 0) return { layer: 2, matches: prefix };
-
-  const substring = candidates.filter((c) => keyFn(c).toLowerCase().includes(lower));
-  return { layer: 3, matches: substring };
-}
-
-function resolutionFailureBody(err: unknown): Record<string, unknown> {
-  if (!(err instanceof Error)) {
-    return { message: String(err) };
-  }
-  const failure = err as Error & {
-    candidates?: unknown[];
-    options?: unknown[];
-    availableNames?: string[];
-    isAmbiguous?: boolean;
-    layer?: string;
-  };
-  return {
-    message: failure.message,
-    candidates: failure.candidates,
-    options: failure.options,
-    availableNames: failure.availableNames,
-    isAmbiguous: failure.isAmbiguous,
-    layer: failure.layer,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // 工具定义

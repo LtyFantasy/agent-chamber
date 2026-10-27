@@ -4,7 +4,9 @@
  * =============================================================================
  * [设计文档]
  *   - 主文档: docs/architecture.md §3.2.3 (Board / Task)
- *   - 补充: docs/api-definition.md §7. Tasks, docs/spec.md §3.2 TaskStatus
+ *   - 补充: docs/api-definition.md §7. Tasks（PATCH /tasks/:id 的 `expectedUpdatedAt` 与
+ *     409 契约、§18.7「可选的锁 = 没有锁」的一般结论——本端点是有意例外）、
+ *     docs/spec.md §3.2 TaskStatus 与任务并发语义
  *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（service 层插桩点 =
  *     create/update/patchDescription/addComment/addDocLink——create 有内部调用方
  *     batchCreate（batch 不单独记，循环自然产 N 行）；update/addComment/addDocLink
@@ -12,11 +14,63 @@
  *     步骤自然不双记）；patchDescription 幂等 replay 不记。move/remove/assign/
  *     dependency/doc-link 删除在 controller 层）
  *
- * [踩坑索引] B-50(列表权限过滤) B-50-EVT(任务事件boardId) B-42(单对象返回null) B-49(softDelete500) B-3(completedAt缺失) B-4(move到不存在的list) D5(权限迁移) P1-1(findOne载荷瘦身) Batch1-P2(milestone绑定校验) Batch3(topicId下线) R1(公共解析收口) A2.5(assignee须usable) WS-A(orderBy表达式坑)
+ * [踩坑索引] B-50(列表权限过滤) B-50-EVT(任务事件boardId) B-42(单对象返回null) B-49(softDelete500) B-3(completedAt缺失) B-4(move到不存在的list) D5(权限迁移) P1-1(findOne载荷瘦身) Batch1-P2(milestone绑定校验) Batch3(topicId下线) R1(公共解析收口) A2.5(assignee须usable) WS-A(orderBy表达式坑) LOCK-LOCKED-ROW(任务乐观锁必须锁内判定) LOCK-TOCTOU-PERM(锁内重跑权限) LOCK-TOKEN-LEAK(锁token非实体字段) F4-2(跨板写族四门+assignee∧boardRead) P-N3(resolveTaskBoard 须与单条 GET 同口径含软删板)
  *
- * [铁律关联] #17(测试契约) #18(不变量检查) #7(测试绑定) #9(代理层透传)
+ * [铁律关联] #17(测试契约) #18(不变量检查) #7(测试绑定) #9(代理层透传) #23(ORM/锁语义须真PG覆盖)
+ *
+ * [凭证扫描挂点]（v1.94.0-dev，卡 349d337e）四个调用点：create 的**两条返回路径**
+ *   （无幂等键 / 有幂等键齐步；replay 分支禁扫）/ update（仅 `dto.description` 存在时）/
+ *   patchDescription（只扫 `newString`；入口 replay 与并发 23505 都提前返回 ⇒ 天然不扫）/
+ *   addComment（save 成功后）。命中只落告警行 + 领域事实（`hints/credential-scan.ts`），
+ *   正文不进日志 / 事实 / hint data。
+ *
+ * [hint 事实挂点]（值导入 `hints/hint-facts` 的 `emitFact`；载荷只放 ID / 状态标量 /
+ *   任务**标题**，**禁正文**）：
+ *   - `task.created`（v1.95.0-dev 撞重提示）：create 的**两条真实写入路径**齐步
+ *     （与凭证扫描同一位置）；**幂等 replay 分支不 emit**（2 期固化契约）。载荷
+ *     `{taskId, boardId?, title}`——拿不到 boardId 就省键（provider fail-closed 跳过）。
+ *     `batchCreate` 循环调 create ⇒ 天然覆盖（一次批建 = N 条事实）。
+ *   - `task.status_changed`：update 的两条路径 + move 的自动改状态（详见各自调用点注释）。
+ *   - `task.comment_added`：addComment（`via` 只在 reportResult 内部路径带）。
+ *
+ * [事件挂点]（`eventService.create`；notifications 一期 S1 起补 TASK_ASSIGNED）：
+ *   - `TASK_UPDATE`：create 的两条真实写入路径（action='created'）/ update（action='updated'，
+ *     载荷含 **fromStatus/toStatus** 跃迁前后值——下游据此判完工，见 plan
+ *     nightcrawler-black-hawk-devil-dinosaur §5）/ move（action='moved'，autoStatus 分支带跃迁）
+ *     / patchDescription（action='updated' + fieldName='description'，**无 status**——描述局部写
+ *     不涉及状态，消费侧不得据此判完工）。
+ *   - `TASK_ASSIGNED`：**两条入口**——update（PATCH `{assigneeId}` 改派）与 assign
+ *     （POST /tasks/:id/assign）。**仅当 assigneeId 由旧值变为非空新值时发**：取消分配（→null）
+ *     与重复指派同一人都不发——skill `agent-chamber` §5.3 定义其消费方是「被分配者」，
+ *     无被分配者即无该事实（别把"字段有变化就发"当同义词）。载荷
+ *     `{taskId, assigneeId, assigneeName, boardId?, topicId?}`，派生失败省键。
+ *     改这两处前先读 skill `agent-chamber` §5.3 事件表。
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
+ *   LOCK-LOCKED-ROW: update() 的可选乐观锁 `expectedUpdatedAt` **必须在一个事务 + 行锁
+ *       内完成**（锁内重读 → 锁内比对 token → 派生写与 save 全部落在锁定行上）。
+ *       "先 findOne 比 token、再 save"是 TOCTOU 窗口：并发双写会双双通过、后写覆盖前写
+ *       （先例 experience.service 的 M3 同款事故）。token 比对**只在 JS 侧**做毫秒
+ *       getTime()：`updated_at` 由 TypeORM 以 `CURRENT_TIMESTAMP` 写（µs 精度，读侧截到
+ *       ms），SQL 级时间等值谓词会静默不命中 = "一切 409"；已知限制 = 两次写的事务开始
+ *       毫秒相同则 ABA（毫秒量级窗口）。副作用（事件/活动/审计/touch）一律在**提交之后**
+ *       跑，行锁不被下游 IO 拖长。并发语义只能靠真 PG 覆盖（mock 桩掉事务与 QueryBuilder
+ *       什么都证不了）：test/task-optimistic-lock.e2e-spec.ts。2026-10-16 卡 09ffa9a8。
+ *   LOCK-POOL-EXHAUST: 行锁事务**持有 1 条连接**，而锁内的权限重跑（TaskPolicy→
+ *       BoardPolicy 2-4 条查询）与派生写用的仍是**全局 Repository** → 每条并发请求还要
+ *       临时再借 1 条。连接池被"全部占满且都在等第 2 条"时**永久挂死**（pg `Pool.connect()`
+ *       默认不超时），条件 = 带 token 的并发 PATCH 数 ≥ poolSize。当前 poolSize 已显式设为
+ *       pg-session-defaults.ts 的 PG_POOL_SIZE（抬高阈值，**不消除**死锁：根因是"事务+行锁
+ *       内再用全局 repo"，本仓同款形态还有 patchDescription（本文件 :1690 附近）、
+ *       doc.service.ts:1231/3633、doc-move.service.ts:488、docspace.service.ts:1595）。
+ *       彻底修法 = 把事务 `manager` 透传进这些查询，属跨模块改造，需单独立卡。
+ *   LOCK-TOCTOU-PERM: controller 的第一份快照判权（findById → ensureCan）**不是充分条件**
+ *       ——并发 move/改派可在"判权"与"加锁"之间把任务换到当前 actor 无写权的 board。
+ *       故锁内基于**锁定行**重跑同一 write 判定，且排在 token 比对**之前**（无权限 +
+ *       stale token 该得 403 而非 409；否则 409 会沦为"存在且有人并发写"的 oracle）。
+ *   LOCK-TOKEN-LEAK: `expectedUpdatedAt` 是锁 token、**不是实体字段**（tasks 表无此列）：
+ *       必须剥在批量合并回环之外，否则会挂到实体上并经 toPlain() 的 `...task` 展开泄漏
+ *       进 PATCH 响应（实体展开 = 响应契约），还会混进活动日志的 fieldName 假字段。
  *   A2.5: create/update/assign 的 assigneeId 统一走 ActorProfileService.assertActorUsable
  *       （存在+未软删两态，404 AGENT_NOT_FOUND）。assign 原 USER_NOT_FOUND 错误码语义误导
  *       （actorRepo 已挡软删但码说 user），本批统一为 AGENT_NOT_FOUND——消费方对"未存在"
@@ -71,7 +125,7 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, DataSource } from 'typeorm';
+import { Repository, In, DataSource, EntityManager } from 'typeorm';
 import { createHash } from 'crypto';
 import { Task } from '../../database/entities/task.entity';
 import { TaskComment } from '../../database/entities/task-comment.entity';
@@ -112,8 +166,19 @@ import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
 import { ActorProfileService } from '../../common/services/actor-profile.service';
+// 权限门面（PermissionModule 是 @Global()，common/permission.module.ts:24，直接注入即可，
+// 无循环依赖）。update() 的乐观锁路径用它做**锁内重跑**判定（TOCTOU，卡 09ffa9a8）
+import { PermissionService } from '../../common/services/permission.service';
 import { AuditService } from '../audit/audit.service';
 import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
+// hint 事实袋（阶段二「该提名了」提示的**输入**）：service 只写领域语言的事实，
+// hint 层在响应封装前翻译成 hints[]。⚠️ 必须 import 平台单例（禁本地 new 一份 ALS，
+// 否则 provider 读到的袋恒为空、提示静默消失）；无请求袋时 emitFact 是 no-op（fail-open）
+import { emitFact } from '../hints/hint-facts';
+// 凭证粘贴扫描（v1.94.0-dev，卡 349d337e）：**四个** task 写入挂点共用同一 helper——
+// create（幂等/无幂等两条返回路径齐步、replay 不扫）/ update（仅 dto.description 存在时）/
+// patchDescription（只扫 newString；replay 提前返回故自然不扫）/ addComment
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
 import { AuditAction } from '@agent-chamber/shared';
 import type { PaginatedResponse, TaskSummary } from '@agent-chamber/shared';
 import { TASK_SEARCH_WEAK_HIT_SCORE, TASK_SEARCH_ZERO_HIT_HINT } from '@agent-chamber/shared';
@@ -174,6 +239,27 @@ export interface TaskPatchDescriptionResult {
   idempotentReplay?: boolean;
 }
 
+/**
+ * `applyTaskUpdate()` 的产出（内部类型，不对外导出）。
+ *
+ * 把「写入阶段算出来的前后值」显式带到 `finishTaskUpdate()` 的副作用阶段——
+ * 锁路径下两个阶段之间隔了一次事务提交，无法再靠局部变量传递。
+ */
+interface TaskUpdateOutcome {
+  /** 落库行（响应展开与副作用判据的唯一来源） */
+  saved: Task;
+  /** 变更前状态（状态机 + `task.status_changed` 事实 + 事件 fromStatus） */
+  oldStatus: TaskStatus;
+  /** 变更前 listId（审计；可能被 status→mappedStatus 自动吸附改写） */
+  oldListId: string;
+  /** 变更前 assigneeId（`TASK_ASSIGNED` 事实判据 + 审计） */
+  oldAssigneeId: string | null;
+  /** `undefined` = DTO 未传 assigneeId（不变更）；`null` = 显式取消分配 */
+  effectiveAssigneeId: string | null | undefined;
+  /** 已剥 `assigneeId` / `expectedUpdatedAt` 的 DTO 残余，活动日志 fieldName 的唯一来源 */
+  restDto: Record<string, unknown>;
+}
+
 @Injectable()
 export class TaskService {
   private readonly logger = new Logger(TaskService.name);
@@ -212,6 +298,7 @@ export class TaskService {
     private readonly docSpacePolicy: DocSpacePolicy,
     private readonly actorProfileService: ActorProfileService,
     private readonly auditService: AuditService,
+    private readonly permService: PermissionService,
   ) {}
 
   /**
@@ -686,16 +773,138 @@ export class TaskService {
   /**
    * 解析 Task 所属 Board（B-58 批量权限前置检查用；orphan task 无 listId 返回 null =
    * 公开，与 TaskPolicy 的 orphan 语义一致）
+   *
+   * ⚠️ **含软删板**（P-N3 镜面一致性）：`GET /tasks/blockers/batch`（task.controller.ts:898-915）
+   * 与单条 `GET /tasks/:id` 必须同口径。不带 `withDeleted` 时软删板的 JOIN 被
+   * `deleted_at IS NULL` 过滤 ⇒ 本方法返回 null ⇒ batch 走 `if (!board) continue`
+   * **放行**，而单条 GET 走 TaskPolicy 的软删板分支拿 404 —— 同一状态在两处一放一拒，
+   * 就是一条可探测的「单条 404 / 批量放行」**存在性 oracle 分叉**（P-N3）。
+   * 载入软删板后判定交给同一份谓词（controller 的 `permService.can(board, actor, 'read')`）：
+   * OPEN 软删板外人仍可读、PRIVATE 软删板外人 403 —— 与单条 GET 结论一致（404 vs 403
+   * 是 batch 端点既有且已在 controller:902 注释文档化的差异，不是分叉）。
+   *
+   * `withDeleted` 的钝器语义（对主实体与所有 join 同时生效）见
+   * `common/policies/task.policy.ts` 的 reloadListWithBoard；⚠️ **顺序同样必须
+   * `withDeleted()` 在 join 之前**（join 的软删条件在 join() 当场定，后置无效——
+   * TypeORM SelectQueryBuilder.js:975-990）。本方法不判板是否已删，故无需 addSelect。
+   *
    * @param task 已加载的 Task 实体
-   * @returns 所属 Board 实体；orphan task 或 list 的 board 软删/缺失返回 null
+   * @returns 所属 Board 实体（含软删板）；orphan task 或 list/board 行不存在返回 null
    */
   async resolveTaskBoard(task: Task): Promise<Board | null> {
     if (!task.listId) return null;
+    const list = await this.boardListRepo
+      .createQueryBuilder('list')
+      .withDeleted()
+      .leftJoinAndSelect('list.board', 'board')
+      .where('list.id = :id', { id: task.listId })
+      .getOne();
+    return list?.board ?? null;
+  }
+
+  /**
+   * 「列 → 所属 boardId」（跨板写族判定用；列不存在返回 null）。
+   * 只选 `board_id` 一列——跨板判定不需要 board 实体，避免把整行板数据拉进来。
+   * 注意 `findOne` 仍过滤软删列：软删列 → null → 调用方按「跨板」处理（fail-closed）。
+   */
+  private async resolveListBoardId(listId: string): Promise<string | null> {
+    const list = await this.boardListRepo.findOne({ where: { id: listId }, select: ['boardId'] });
+    return list?.boardId ?? null;
+  }
+
+  /**
+   * 跨板写族统一门（V2-N2 / S-N2）：断言 actor 对 `listId` 所属的板有 write。
+   * 四个写入点（update 改 listId / move / removeList.moveTasksTo / reorderTasks）统一经
+   * `assertCrossBoardPlacement` 走它——四份手写校验必然漂移。
+   *
+   * ⚠️ 本门**与方向无关**（判定对象只有"该列所属板可写"这一条谓词），作用在哪一端由调用点
+   * 按威胁模型决定：**防注入**（update / move / removeList）传**目标**列；**防取出**
+   * （reorder）传 item 的**当前**列。理由见各调用点注释，改调用点前先读它们。
+   *
+   * 404/403 语义照 `resolveCreateBoard` 先例（本文件 :752-770）：
+   * - 目标列不存在 → 404 LIST_NOT_FOUND
+   * - 列存在但 board 软删/缺失 → 404 BOARD_NOT_FOUND（权限无法判定时安全默认拒绝，
+   *   与 create 对软删板的行为一致）
+   * - board 存在但 actor 无 write → 403 PERMISSION_DENIED（ensureCan）
+   *
+   * @param actor 统一身份。**必须传完整 `{id,type,role}` 对象**——传迷你对象（只 id/type）
+   *   会让 BoardPolicy 的 `actor?.role === ADMIN` bypass 静默失效（A-C2 实证）
+   * @param listId 目标列 id
+   */
+  async assertCanPlaceTaskInList(actor: UnifiedActor, listId: string): Promise<void> {
     const list = await this.boardListRepo.findOne({
-      where: { id: task.listId },
+      where: { id: listId },
       relations: ['board'],
     });
-    return list?.board ?? null;
+    if (!list) {
+      throw new NotFoundException({
+        message: 'Board list not found',
+        code: ErrorCode.LIST_NOT_FOUND,
+      });
+    }
+    if (!list.board) {
+      throw new NotFoundException({
+        message: 'Board not found',
+        code: ErrorCode.BOARD_NOT_FOUND,
+      });
+    }
+    await this.permService.ensureCan(list.board, actor, 'write');
+  }
+
+  /**
+   * 跨板写族的**触发条件**：目标列与任务当前列是否不同板。
+   *
+   * 契约（A-C2/P-N1）——**仅 targetBoardId ≠ currentBoardId 时校验**：同板流转只认任务
+   * write（controller 的 `ensureCan(task, actor, 'write')`），再加一道目标板 write 会把
+   * 「成员 assignee 拖拽自己板内的任务」误杀成 403。这是本 wave 最容易写错的一条。
+   *
+   * 任一侧无法解析（列缺失 / 数据损坏）→ 返回 **true**（按跨板处理，fail-closed）。
+   *
+   * @param targetListId 任务将落入的列
+   * @param currentListId 任务当前列（null/undefined = 无当前板 → 视为跨板）
+   */
+  private async isCrossBoardPlacement(
+    targetListId: string,
+    currentListId: string | null | undefined,
+  ): Promise<boolean> {
+    if (!currentListId) return true;
+    // 同一列（拖拽排序的高频路径：目标列 = 当前列）⇒ 必然同板，直接短路，省两次列查询。
+    // 判据等价性：同一 listId 只能落在同一个 board（board_lists.board_id 是列上的单值），
+    // 故与下方"两侧解析出的 boardId 相等"逐字等价，不是特例放宽。
+    if (targetListId === currentListId) return false;
+    const [targetBoardId, currentBoardId] = await Promise.all([
+      this.resolveListBoardId(targetListId),
+      this.resolveListBoardId(currentListId),
+    ]);
+    if (!targetBoardId || !currentBoardId) return true;
+    return targetBoardId !== currentBoardId;
+  }
+
+  /**
+   * 跨板写族四门**统一入口**：仅跨板时施加 `assertCanPlaceTaskInList`（同板短路返回 false）。
+   *
+   * @param actor 操作者（`undefined` **仅在跨板时** fail-closed 抛 500 —— 授权路径不留
+   *   "可以跳过"的活口，同 update() 乐观锁路径的 actor 缺失处理；同板流转不需要它）
+   * @param targetListId 任务将落入的列
+   * @param currentListId 任务当前列
+   * @returns true = 施加了门（跨板）；false = 同板短路（只认任务 write）
+   */
+  async assertCrossBoardPlacement(
+    actor: UnifiedActor | undefined,
+    targetListId: string,
+    currentListId: string | null | undefined,
+  ): Promise<boolean> {
+    if (!(await this.isCrossBoardPlacement(targetListId, currentListId))) return false;
+    if (!actor) {
+      throw new InternalServerErrorException({
+        message:
+          'Cross-board task placement requires an actor: the target-board write check cannot be ' +
+          'skipped (internal callers must not move tasks across boards without the actor)',
+        code: ErrorCode.INTERNAL_ERROR,
+      });
+    }
+    await this.assertCanPlaceTaskInList(actor, targetListId);
+    return true;
   }
 
   async create(dto: CreateTaskDto, actorId?: string, actorType?: ActorType) {
@@ -831,6 +1040,26 @@ export class TaskService {
         source: 'api',
       });
 
+      // 凭证扫描（v1.94.0-dev）：无幂等键路径——真实写成功后扫；本分支**没有**幂等 replay
+      // 形态（零开销原路径），故无需 replay 门控；有幂等键的分支在下面同款调用（双路径齐步）
+      emitCredentialScanFactIfHit(dto.description, {
+        resourceKind: 'task_description',
+        resourceId: savedTask.id,
+        actorId: actorId ?? null,
+      });
+
+      // 领域事实（v1.95.0-dev 撞重提示的输入）：**真实写成功后**才写——事实必须对应一次
+      // 真实发生的创建。带 `title`（标题，**不是正文**——口径与依赖引导的下游 title 同款，
+      // 见 task-hygiene-hint.provider.ts 文件头的「回显标题」例外）；带 boardId（本流程
+      // 已解析出的板，provider 据此只在同板内判撞重）；拿不到 boardId（orphan 任务）则
+      // 省略该键 ⇒ provider fail-closed 跳过（**不猜板**）。
+      // ⚠️ 重放路径（下方 23505 分支）**不**写本事实——幂等 replay 禁 emit 是 2 期固化契约。
+      emitFact('task.created', {
+        taskId: savedTask.id,
+        ...(boardId ? { boardId } : {}),
+        title: savedTask.title,
+      });
+
       return { ...this.toPlain(savedTask), boardId: boardId ?? null, topicId: topicId ?? null };
     }
 
@@ -896,6 +1125,22 @@ export class TaskService {
           ...(savedTask.assigneeId !== undefined && { assigneeId: savedTask.assigneeId }),
         },
         source: 'api',
+      });
+
+      // 凭证扫描（v1.94.0-dev）：**幂等键路径的真实写成功后**扫（本行在 catch 之前 ⇒
+      // replay 分支（下方 23505）根本走不到这里）。两条返回路径齐步，见无幂等键分支同款调用。
+      emitCredentialScanFactIfHit(dto.description, {
+        resourceKind: 'task_description',
+        resourceId: savedTask.id,
+        actorId: actorId ?? null,
+      });
+
+      // 领域事实（v1.95.0-dev 撞重提示的输入）：与无幂等键路径**齐步**（同一位置、同一键集）；
+      // 本行同样在 catch 之前 ⇒ 23505 重放分支走不到这里（幂等 replay 禁 emit）。
+      emitFact('task.created', {
+        taskId: savedTask.id,
+        ...(boardId ? { boardId } : {}),
+        title: savedTask.title,
       });
 
       return { ...this.toPlain(savedTask), boardId: boardId ?? null, topicId: topicId ?? null };
@@ -1015,11 +1260,160 @@ export class TaskService {
     });
   }
 
-  async update(id: string, dto: UpdateTaskDto, actorId?: string, actorType?: ActorType) {
+  /**
+   * 更新任务（PATCH /tasks/:id）——派生写 + 落库 + 副作用的唯一入口。
+   *
+   * **可选乐观锁 `expectedUpdatedAt`**（卡 09ffa9a8）：token 显式传入时全程在
+   * 「一个事务 + 行锁」内完成——锁内重读该行 → 锁内重跑权限判定 → 锁内比对 token →
+   * 派生写与 save 全部基于**锁定行**；**事务提交之后**才跑副作用（事件 / 活动日志 /
+   * 审计 / 触碰 Agent 活跃时间），行锁不被下游 IO 拖长、副作用失败也不连带回滚任务写
+   * （`reportResult` 的"状态已改但评论失败"语义不变）。
+   *
+   * ⚠️ **不传 token = 无锁**，这是**有意的例外**（`docs/api-definition.md` §18.7 的
+   * 「可选的锁 = 没有锁」一般结论在此刻意放宽）：`reportResult` 的内部状态写路径与
+   * 存量旧客户端无法提供 token，一刀切要求会直接打断它们。**新代码应当总是传**。
+   *
+   * ⚠️ token 比对**只在 JS 侧**做毫秒 `getTime()` 等值，**禁止写 SQL 级时间等值谓词**：
+   * PG 的 UPDATE 由 TypeORM 追加 `updated_at = CURRENT_TIMESTAMP`
+   * （typeorm/query-builder/UpdateQueryBuilder.js:403-407；列默认 `NOW()`）——**微秒**精度
+   * （实测本地 tasks 表 55/55 行带微秒、0 行毫秒对齐），而读侧经 pg 驱动进 JS `Date` 时被
+   * **截到毫秒**。SQL 里拿"详情响应那个毫秒串"去比微秒列 ⇒ 静默不命中，失败形态是
+   * "**一切 409**"——**没有正向探针（用例 ①）就只剩这一种症状**。JS 侧毫秒等值则与 token
+   * 的表达能力（ISO 毫秒串）严格同域，故比对只在 JS 侧做。
+   * **已知限制**：`CURRENT_TIMESTAMP` 取的是**事务开始**时刻（非语句时刻），若两次写的
+   * 事务开始时刻落在**同一毫秒**（毫秒量级，不是苛刻的"同瞬间"条件），后写者锁内重读到的
+   * `updated_at` 截到毫秒后可能与旧 token 相等 ⇒ 双双通过。故本锁**不承诺"完全消除竞态"**，
+   * 只消除人类可感知的写-写覆盖窗口；真正的串行化由 FOR UPDATE 行锁提供。
+   *
+   * @param id 任务 UUID
+   * @param dto 更新载荷（可选 `expectedUpdatedAt` = 详情响应里的 `updatedAt` 原样值）
+   * @param actorId 操作者 actor id（副作用用）
+   * @param actorType 操作者 actor 类型
+   * @param actor 统一身份。**乐观锁路径必需**：锁内拿锁定行重跑 write 判定。
+   *   缺省时锁内跳过重跑并打 warn（当前只有不传 token 的内部调用方才走到，不会静默假装判过）
+   */
+  async update(
+    id: string,
+    dto: UpdateTaskDto,
+    actorId?: string,
+    actorType?: ActorType,
+    actor?: UnifiedActor,
+  ) {
+    // 只认显式传入的 token：undefined/null/'' 都走无锁旧路径
+    const expectedUpdatedAt = dto.expectedUpdatedAt;
+
+    // ── 乐观锁路径：一个事务 + 行锁，锁内判定，提交后副作用 ──
+    if (expectedUpdatedAt) {
+      const outcome = await this.dataSource.transaction(async (manager) => {
+        // ① 锁内重读（FOR UPDATE）：并发写者在此串行化，读到的 updatedAt 即本次判定基准
+        const task = await this.lockTaskForUpdate(manager, id);
+
+        // ② 锁内**重跑**权限判定（sec TOCTOU 修复）：controller 的第一份快照
+        //    （findById → ensureCan）与本次加锁之间，并发 move/改派可能已把任务换到
+        //    当前 actor 无写权的 board——只用快照判权会放行越权写。判定必须基于
+        //    **锁定行**，且排在 token 比对**之前**：无权限者带 stale token 该得 403
+        //    （资源无权）而不是 409（资源被改），否则 409 就成了"资源存在且存在并发写"
+        //    的 oracle，且会把越权写伪装成可重试的冲突。
+        //    TaskPolicy 用自己的 listRepo 按锁定行的 listId 重查 board→权限，正是所需语义。
+        //
+        // ⚠️ actor 缺失 = **编程错误，fail-closed 抛 500**（授权路径不留"可以跳过"的活口）：
+        //    带 token 的调用若不能锁内重跑判定，本路径唯一的存在理由（闭 TOCTOU 窗口）
+        //    就形同虚设，而"放行"是**无声**的（日志里的 warn 没人读）。与铁律 #21/#22 同向：
+        //    资源/权限不满足必须给明确的 4xx/5xx，不得裸奔。当前全仓只有 controller
+        //    （恒传 actor）与 reportResult（恒不传 token）两个调用方，该分支不可达。
+        if (!actor) {
+          throw new InternalServerErrorException({
+            message:
+              'expectedUpdatedAt requires an actor: the lock-time permission re-check cannot be ' +
+              'skipped (internal callers must not pass an optimistic-lock token without the actor)',
+            code: ErrorCode.INTERNAL_ERROR,
+          });
+        }
+        await this.permService.ensureCan(task, actor, 'write');
+
+        // ③ 锁内比对 token（JS 侧毫秒等值，理由见方法头注释）
+        const expected = new Date(expectedUpdatedAt).getTime();
+        const actual = new Date(task.updatedAt).getTime();
+        if (expected !== actual) {
+          throw new ConflictException({
+            message:
+              'Task was modified (any field, including move/assign/report). ' +
+              'Re-read it (GET /tasks/:id) and retry with the fresh updatedAt — ' +
+              'do NOT retry with the same token, it will keep failing.',
+            code: ErrorCode.RESOURCE_CONFLICT,
+            // data 槽回吐"当前 token"，调用方一次重读即可重试（形状对齐 doc 的
+            // DOC_CONTENT_CONFLICT + data.currentDescriptionHash 先例；experience 的
+            // 乐观锁无 data 载荷）。toISOString = HTTP 响应里 updatedAt 的同一形态
+            data: { currentUpdatedAt: new Date(task.updatedAt).toISOString() },
+          });
+        }
+
+        return this.applyTaskUpdate(manager.getRepository(Task), task, dto, actor);
+      });
+      return this.finishTaskUpdate(id, dto, actorId, actorType, outcome);
+    }
+
+    // ── 无锁路径（旧行为逐字不变：不引入事务、不拿行锁）──
     // 必须用实体实例执行 save；同时只更新 DTO 中显式传入的字段，避免 class-transformer
     // 生成的可选字段（undefined）把 task 上的现有值（如 listId）覆盖掉。
     const task = await this.findById(id);
+    const outcome = await this.applyTaskUpdate(this.taskRepo, task, dto, actor);
+    return this.finishTaskUpdate(id, dto, actorId, actorType, outcome);
+  }
 
+  /**
+   * 事务内 `SELECT ... FOR UPDATE` 重读任务行（乐观锁路径专用，必须在事务的连接上调用）。
+   *
+   * 用 QueryBuilder + `setLock('pessimistic_write')` 而不是 `findOne({lock})`，两个原因：
+   * ① 与 experience.service 的乐观锁先例同款（同一套锁语义，便于比对排查）；
+   * ② `FOR UPDATE` **不能与 relations 的 LEFT JOIN 同用**——PG 会拒绝
+   *    `FOR UPDATE cannot be applied to the nullable side of an outer join`。
+   *    故锁读不带 relations，`milestone` 关系改按已锁行的 `milestone_id` 列在锁内补载，
+   *    使实体形状与 `findById`（relations: ['milestone']）对齐——否则 `save()` 在
+   *    relation 属性缺失时可能把 milestone 外键写坏（D-B1-4 踩过同一形状的坑）。
+   *
+   * @param manager 事务内的 EntityManager（禁止传全局 repository，否则锁在另一条连接上）
+   * @param id 任务 UUID
+   */
+  private async lockTaskForUpdate(manager: EntityManager, id: string): Promise<Task> {
+    const task = await manager
+      .getRepository(Task)
+      .createQueryBuilder('task')
+      .setLock('pessimistic_write')
+      .where('task.id = :id', { id })
+      .getOne();
+    if (!task) {
+      throw new NotFoundException({ message: 'Task not found', code: ErrorCode.TASK_NOT_FOUND });
+    }
+    // 关系补载（同一事务连接，只读，不参与锁判定）
+    task.milestone = task.milestoneId
+      ? ((await manager.getRepository(Milestone).findOne({ where: { id: task.milestoneId } })) ??
+        null)
+      : null;
+    return task;
+  }
+
+  /**
+   * 「派生写 + 落库」阶段——`update()` 的**唯一写入实现**，加锁/无锁两条路径共用
+   * （复制两份派生逻辑必然漂移：状态机、list 吸附、milestone 关系同步三处都极易漏改）。
+   *
+   * 本方法只做「读校验 + 在传入实体上派生 + 用传入 repo 落库」，**不产生任何跨事务副作用**
+   * （事件 / 活动日志 / 审计 / 触碰活跃时间一律交给 `finishTaskUpdate`）——锁路径下那些
+   * 副作用因此天然落在事务提交之后。
+   *
+   * @param taskRepo 落库所用 repository（锁路径 = 事务内 `manager.getRepository(Task)`）
+   * @param task 已加载（无锁）或已锁定（有锁）的任务实体，本方法在其上原地派生写
+   * @param dto 更新载荷（`assigneeId` / `expectedUpdatedAt` 已由调用方处理，本方法不再合并）
+   * @param actor 操作者统一身份（**仅跨板改 listId 时必需**：目标板 write 门；
+   *   同板流转不用它，故内部调用方（reportResult 等，恒不带 listId）传 undefined 无害）
+   * @returns 落库行 + 副作用与响应组装所需的前后值
+   */
+  private async applyTaskUpdate(
+    taskRepo: Repository<Task>,
+    task: Task,
+    dto: UpdateTaskDto,
+    actor?: UnifiedActor,
+  ): Promise<TaskUpdateOutcome> {
     // 手写 assignee 变更（不通过 Object.assign 批量合并，避免 assigneeId/assigneeType 被覆盖）
     // assigneeId 显式传入时应用（传 null/'' 取消分配、未传则不变更）
     const oldAssigneeId = task.assigneeId;
@@ -1047,11 +1441,22 @@ export class TaskService {
     // listId 变更时，保留 list 存在性校验（topicId 不再存储，由后续 join 派生）
     if (dto.listId && dto.listId !== task.listId) {
       await this.resourceValidator.exists(this.boardListRepo, dto.listId, ErrorCode.LIST_NOT_FOUND);
+      // 跨板写族闭合（V2-N2 / S-N2）：**仅跨板时**要求目标板 write。同板流转只认任务
+      // write，再加目标板 write 会把「成员 assignee 在自己板内改列」误杀成 403
+      // （A-C2/P-N1——本 wave 最容易写错的一条）。锁路径下本判定在事务内、基于
+      // **锁定行**的 task.listId，与上方的 TOCTOU 修复同向。
+      await this.assertCrossBoardPlacement(actor, dto.listId, task.listId);
     }
 
-    // 其他字段批量合并（排除 assigneeId，已手动处理）
+    // 其他字段批量合并（排除 assigneeId 与锁 token，两者都在别处处理）
     // 只合并显式传入（非 undefined）的值，防止 DTO 可选字段覆盖 task 现有数据。
-    const { assigneeId: _a, ...restDto } = dto;
+    //
+    // ⚠️ `expectedUpdatedAt` **必须在此剥掉**：它是锁 token、不是实体字段（tasks 表无此列），
+    // 混进合并回环会以同名字段挂到 task 实体上，再经 `toPlain()` 的 `...task` 整体展开
+    // 泄漏进 PATCH 响应（实体展开 = 响应契约，多一个"长得像字段"的键会让调用方误以为
+    // 它是可读回的持久化数据）。同时它也绝不能进 restDto——活动日志的 fieldName 由
+    // restDto 的键拼出，混进去会出现"更新了: expectedUpdatedAt"这种假字段记录。
+    const { assigneeId: _a, expectedUpdatedAt: _lock, ...restDto } = dto;
     for (const [key, value] of Object.entries(restDto)) {
       if (value !== undefined) {
         (task as unknown as Record<string, unknown>)[key] = value;
@@ -1117,7 +1522,38 @@ export class TaskService {
       }
     }
 
-    const saved = await this.taskRepo.save(task);
+    // ⚠️ 落库必须用**传入的 taskRepo**（锁路径 = 事务内 `manager.getRepository(Task)`）：
+    // 若这里写 `this.taskRepo.save(task)`，锁路径会另开一条连接、绕过事务与行锁，
+    // 锁内重读+派生就全白做了（典型的"锁了但没锁住写"）。
+    const saved = await taskRepo.save(task);
+
+    return { saved, oldStatus, oldListId, oldAssigneeId, effectiveAssigneeId, restDto };
+  }
+
+  /**
+   * `update()` 的副作用阶段（事件 / 活动日志 / 审计 / 触碰 Agent 活跃时间 / 凭证扫描）。
+   *
+   * **锁路径下本方法在事务提交之后才被调用**，这是刻意的边界：
+   * ① 行锁不被下游 IO（事件分发、审计写、外部调用）拖长；
+   * ② 副作用失败不连带回滚已完成的任务写（与 `reportResult` 的"状态已改但评论失败"
+   *    部分成功语义一致）；反之，冲突（409）路径在抛出时天然不会跑到这里——不留
+   *    "已更新"的假痕迹（事件/活动/审计都不落）。
+   *
+   * @param id 任务 UUID
+   * @param dto 原更新载荷（凭证扫描只认 `dto.description` 显式传入）
+   * @param actorId 操作者 actor id（`undefined` = 系统/无操作者，不记活动日志）
+   * @param actorType 操作者 actor 类型
+   * @param outcome `applyTaskUpdate` 的产出
+   * @returns PATCH 响应体（实体展开 + boardId/topicId 派生填充）
+   */
+  private async finishTaskUpdate(
+    id: string,
+    dto: UpdateTaskDto,
+    actorId: string | undefined,
+    actorType: ActorType | undefined,
+    outcome: TaskUpdateOutcome,
+  ) {
+    const { saved, oldStatus, oldListId, oldAssigneeId, effectiveAssigneeId, restDto } = outcome;
 
     // 更新操作者/负责人的 Agent 最后活跃时间
     await this.touchAgentLastActiveAt(actorId, actorType);
@@ -1130,6 +1566,20 @@ export class TaskService {
       where: { id: saved.listId },
       relations: ['board'],
     });
+
+    // 领域事实（hint 阶段二「该提名了」提示的输入）：**只在状态真实变更时**写——
+    // 幂等重试同一状态、只改 title 等路径都不产生事实（否则提示退化成噪音）。
+    // 载荷只带 ID 与状态机标量、**禁正文**（provider 需要正文时回库读，见其 MEM-NOM-2）；
+    // boardId 派生失败时不落该键 —— provider 拿不到 boardId 会放弃本次判定（不猜）
+    if (dto.status && dto.status !== oldStatus) {
+      emitFact('task.status_changed', {
+        taskId: saved.id,
+        ...(updatedList?.boardId ? { boardId: updatedList.boardId } : {}),
+        fromStatus: oldStatus,
+        toStatus: saved.status,
+      });
+    }
+
     await this.eventService.create({
       eventType: EventType.TASK_UPDATE,
       resourceType: ResourceType.TASK,
@@ -1138,8 +1588,50 @@ export class TaskService {
       boardId: updatedList?.boardId ?? undefined,
       actorId,
       actorType,
-      payload: { taskId: saved.id, action: 'updated', status: saved.status },
+      // 状态跃迁前后值（notifications 一期 S1）：补 fromStatus/toStatus。
+      // 此前载荷只有**当前** status，「一个已完成任务被改了描述」与「任务刚刚完工」在事件面上
+      // 形状完全相同，下游无法判完工（完工误报）。**无条件带这两个键**（未变化时两值相等），
+      // 把「算不算跃迁」的判据只留在消费侧一处（`toStatus∈{done,blocked} && fromStatus!==toStatus`）。
+      // 不删既有 `status` 键——旧消费方（SSE 订阅、事件游标）仍在读。
+      payload: {
+        taskId: saved.id,
+        action: 'updated',
+        status: saved.status,
+        fromStatus: oldStatus,
+        toStatus: saved.status,
+      },
     });
+
+    // 指派事实（notifications 一期 S1）：PATCH /tasks/:id {assigneeId} 是改派的**第二条入口**，
+    // 与 POST /tasks/:id/assign 端点并列——此前两条路径都只写 activity，`TASK_ASSIGNED`
+    // （值早在 PG enum 内）是死枚举，事件面完全看不到"任务换人了"。
+    // **只在"有人接手"时发**（新 assignee 非空且与旧值不同）：skill `agent-chamber` §5.3 事件表
+    // 定义 TASK_ASSIGNED 的消费方是「被分配者」，取消分配（→null）没有被分配者，发出去只会让
+    // 下游渲染出空指派误报；重新指派同一人（值未变）亦非事实变更。
+    // TASK_UPDATE 照常同发（通用更新事实，粒度更粗），去重交给消费侧的 per-task 节流。
+    // boardId/topicId 复用上方同一次派生（updatedList），零额外查询；派生失败省键（同 emitFact
+    // 纪律，下游 fail-closed）。
+    const assignedId = saved.assigneeId;
+    if (assignedId && assignedId !== oldAssigneeId) {
+      // 名字走既有收口（R1：禁止散落 actors 查询）——下游通知可直接渲染，不必回库解析
+      const assigneeName = await this.resolveActorName(assignedId);
+      await this.eventService.create({
+        eventType: EventType.TASK_ASSIGNED,
+        resourceType: ResourceType.TASK,
+        resourceId: saved.id,
+        topicId: updatedList?.board?.topicId ?? undefined,
+        boardId: updatedList?.boardId ?? undefined,
+        actorId,
+        actorType,
+        payload: {
+          taskId: saved.id,
+          assigneeId: assignedId,
+          assigneeName,
+          boardId: updatedList?.boardId ?? undefined,
+          topicId: updatedList?.board?.topicId ?? undefined,
+        },
+      });
+    }
 
     if (actorId) {
       const changedFields: string[] = [];
@@ -1153,11 +1645,11 @@ export class TaskService {
         }
       });
 
-      // assignee 变更单独检测并记录
+      // assignee 变更单独检测并记录（`saved` = 落库行；task 实体的引用不跨方法传递）
       if (effectiveAssigneeId !== undefined && effectiveAssigneeId !== oldAssigneeId) {
         changedFields.push('assigneeId');
         oldValues.assigneeId = oldAssigneeId;
-        newValues.assigneeId = task.assigneeId;
+        newValues.assigneeId = saved.assigneeId;
       }
 
       if (changedFields.length > 0) {
@@ -1200,6 +1692,16 @@ export class TaskService {
       },
       source: 'api',
     });
+
+    // 凭证扫描（v1.94.0-dev）：**只在 `dto.description` 显式传入时**扫（update 是整段覆盖
+    // 写；未传 description 的更新没有新描述文本可扫——扫回库旧值会把历史泄漏重复计入分母）
+    if (dto.description !== undefined) {
+      emitCredentialScanFactIfHit(dto.description, {
+        resourceKind: 'task_description',
+        resourceId: saved.id,
+        actorId: actorId ?? null,
+      });
+    }
 
     return {
       ...this.toPlain(saved),
@@ -1312,7 +1814,9 @@ export class TaskService {
             throw new NotFoundException({
               message:
                 `oldString not found in the task description (0 matches); ` +
-                `re-read the task (GET /tasks/:id) and retry`,
+                `re-read the task (GET /tasks/:id) and retry; ` +
+                `matching is byte-exact including leading whitespace/indentation — copy ` +
+                `oldString verbatim from the task detail response instead of hand-typing it`,
               code: ErrorCode.DOC_NOT_FOUND,
             });
           }
@@ -1406,6 +1910,14 @@ export class TaskService {
         source: 'api',
       });
 
+      // 凭证扫描（v1.94.0-dev）：只扫 **newString**（被删片段不报警——删除凭证是修复动作）；
+      // 幂等 replay 与并发 23505 都在事务内外**提前返回**（上面两处），走不到这里 ⇒ 天然不扫
+      emitCredentialScanFactIfHit(newString, {
+        resourceKind: 'task_description',
+        resourceId: id,
+        actorId: actor.id,
+      });
+
       return response;
     } catch (err: unknown) {
       const pgErr = err as { code?: string; constraint?: string };
@@ -1444,7 +1956,13 @@ export class TaskService {
     return { items: results, count: results.length };
   }
 
-  async move(id: string, dto: MoveTaskDto, actorId?: string, actorType?: ActorType) {
+  async move(
+    id: string,
+    dto: MoveTaskDto,
+    actorId?: string,
+    actorType?: ActorType,
+    actor?: UnifiedActor,
+  ) {
     // 与 update 保持一致：用实体实例 save，避免 listId 等关联列变更丢失。
     const task = await this.findById(id);
 
@@ -1467,6 +1985,14 @@ export class TaskService {
         message: `List ${dto.listId} not found`,
         code: ErrorCode.LIST_NOT_FOUND,
       });
+
+    // 跨板写族闭合（V2-N2 / S-N2）：**仅跨板时**要求目标板 write —— 否则「非目标板成员的
+    // assignee」可以把任务注入任意板（P-Q-C 已知情取舍：放弃非 editor 成员的跨板 hand-off）。
+    // 同板 move 只认任务 write（controller 的 ensureCan），成员 assignee 拖拽必须仍 200
+    // （A-C2/P-N1）。
+    // ⚠️ actor 必须是完整 `{id,type,role}`：controller 传的是 @CurrentActor() 原对象，
+    // **禁止**在调用链上游改造成迷你对象（丢 role 会让 BoardPolicy 的 admin bypass 失效）。
+    await this.assertCrossBoardPlacement(actor, dto.listId, task.listId);
 
     const oldListId = task.listId;
     const oldStatus = task.status;
@@ -1494,6 +2020,19 @@ export class TaskService {
     }
 
     const saved = await this.taskRepo.save(task);
+
+    // 领域事实（hint 阶段二「该提名了」提示的输入）：**move 自动改状态也算一次真实的
+    // 状态变更**（P2-3：这条路径此前漏挂，是触发链的真缺口——把任务拖进 mappedStatus=done
+    // 的列，语义上就是"这事拍板了"，与 PATCH status 同权）。载荷纪律与 update() 一致：
+    // 只带 ID + 状态机标量、**禁正文**；boardId 取自目标 list（move 一定有目标列）
+    if (autoStatus) {
+      emitFact('task.status_changed', {
+        taskId: saved.id,
+        boardId: list.boardId,
+        fromStatus: oldStatus,
+        toStatus: saved.status,
+      });
+    }
 
     await this.eventService.create({
       eventType: EventType.TASK_UPDATE,
@@ -1543,6 +2082,15 @@ export class TaskService {
   async assign(id: string, dto: AssignTaskDto, actorId?: string, actorType?: ActorType) {
     const task = await this.findOne(id);
     const oldAssigneeId = task.assigneeId;
+    // 事件载荷用的 boardId/topicId（B-51）在 save **之前**先捕获为局部常量：findOne() 已经
+    // 用 list→board 派生并对投影赋值过（其 `plain.topicId` / 返回字面量 `boardId`），直接复用
+    // 即可省掉 save 之后再查一次 list。
+    // **不在 save 之后读 `task.boardId`**：boardId/topicId 是投影字段（不是 Task 列），
+    // save() 返回值是否保留非列属性取决于 TypeORM 的实体重载语义，不可依赖；先落局部常量
+    // 则与它无关。
+    // 语义等价性：assign() 从不改 listId，先前按 `saved.listId` 重查读到的也是同一行。
+    const taskBoardId = task.boardId;
+    const taskTopicId = task.topicId;
     if (dto.assigneeId) {
       // 统一批 A2.5（R14）：校验被指派 actor 存在且未软删——错误码由 USER_NOT_FOUND 统一为
       // AGENT_NOT_FOUND（"从未存在"与"已删除"消费方正确动作相同，单一语义，契约 docs/spec.md §1）
@@ -1554,6 +2102,38 @@ export class TaskService {
       task.assigneeType = null;
     }
     const saved = await this.taskRepo.save(task);
+
+    // 指派事实（notifications 一期 S1）：此前 assign() 只写 activity，`TASK_ASSIGNED`（值早在
+    // PG enum 内）是死枚举——事件面看不到"任务换人了"。emit 必须在 `await save()` **成功之后**：
+    // save 抛错则整体不 emit，事件与业务写入同真同假（事件层不是"意图记录"，是既成事实）。
+    // **只在"有人接手"时发**（新 assignee 非空且与旧值不同）：skill `agent-chamber` §5.3 事件表
+    // 定义 TASK_ASSIGNED 的消费方是「被分配者」，取消分配（→null）没有被分配者；重新指派同一人
+    // 亦非事实变更。载荷与 PATCH 改派路径（update()）保持同形。
+    // boardId/topicId 取上方 save 前捕获的 findOne 派生值（`taskBoardId/taskTopicId`），
+    // **不在 save 之后重查 list**——findOne 已经查过同一行了。B-51：事件载荷顶层缺
+    // topicId/boardId 时 SSE/轮询按 actor 白名单过滤后订阅方收不到。
+    const assignedId = saved.assigneeId;
+    if (assignedId && assignedId !== oldAssigneeId) {
+      // 名字走既有收口（R1：禁止散落 actors 查询）——下游通知可直接渲染，不必回库解析
+      const assigneeName = await this.resolveActorName(assignedId);
+      await this.eventService.create({
+        eventType: EventType.TASK_ASSIGNED,
+        resourceType: ResourceType.TASK,
+        resourceId: saved.id,
+        topicId: taskTopicId ?? undefined,
+        boardId: taskBoardId ?? undefined,
+        actorId,
+        actorType,
+        payload: {
+          taskId: saved.id,
+          assigneeId: assignedId,
+          assigneeName,
+          boardId: taskBoardId ?? undefined,
+          topicId: taskTopicId ?? undefined,
+        },
+      });
+    }
+
     if (actorId) {
       await this.activityRepo.save({
         taskId: id,
@@ -1598,7 +2178,25 @@ export class TaskService {
     return profile?.name ?? null;
   }
 
-  async addComment(id: string, authorId: string, authorType: ActorType, dto: AddCommentDto) {
+  /**
+   * 新建任务评论。
+   *
+   * @param id 任务 ID
+   * @param authorId 作者 actor id
+   * @param authorType 作者类型
+   * @param dto 评论内容
+   * @param via **内部路径标记**（缺省 = 外部 REST 调用）：`'report'` = 由 {@link reportResult}
+   *   编排内部发起。该标记只进**领域事实**（task hygiene provider 据此豁免
+   *   `comment_on_done_task` —— 验收补证是完成流程本身的一部分，不该被提示「挪回进行中
+   *   复活」）；**不落库、不入审计**（它是调用路径的元信息，不是评论的属性）。
+   */
+  async addComment(
+    id: string,
+    authorId: string,
+    authorType: ActorType,
+    dto: AddCommentDto,
+    via?: 'report',
+  ) {
     // 先校验任务存在性；findOne 找不到会抛 NotFoundException
     await this.findOne(id);
     const authorName = await this.resolveActorName(authorId, authorType);
@@ -1610,6 +2208,25 @@ export class TaskService {
       content: dto.content,
     });
     const saved = await this.commentRepo.save(comment);
+
+    // 领域事实（hint 阶段二「该提名了」提示的输入）：**save 成功后**才写——事实必须对应
+    // 一次真实发生的写入。只带 ID：正文由 provider 回库读（评论可能被并发软删，事实里的
+    // 快照不可信；同时避免正文经事实袋外流）。`via` 是**路径元信息**（缺省不落键——
+    // 事实载荷保持扁平且最小），由 task hygiene provider 消费，见本方法 JSDoc。
+    emitFact('task.comment_added', {
+      taskId: id,
+      commentId: saved.id,
+      ...(via ? { via } : {}),
+    });
+
+    // 凭证扫描（v1.94.0-dev）：扫描对象 = 本次评论正文（**与上面的事实同门控**——save 成功
+    // 之后）；`report_task_result` 内部补证评论同样真实落库 ⇒ 同样扫（那是真实写入）
+    emitCredentialScanFactIfHit(dto.content, {
+      resourceKind: 'task_comment',
+      resourceId: id,
+      actorId: authorId,
+    });
+
     await this.activityRepo.save({
       taskId: id,
       action: 'commented',
@@ -1852,8 +2469,16 @@ export class TaskService {
       } else {
         commentText = `Commit: ${commitSha}`;
       }
-      // 失败向上透传（4xx 原样），status 未被触碰
-      result.comment = await this.addComment(id, actor.id, actor.type, { content: commentText });
+      // 失败向上透传（4xx 原样），status 未被触碰。
+      // `via:'report'`（hint 阶段三决策 9）：report 编排内部发的评论被 task hygiene
+      // provider 豁免（不产出 comment_on_done_task）——验收补证不是"新增未完成工作"。
+      result.comment = await this.addComment(
+        id,
+        actor.id,
+        actor.type,
+        { content: commentText },
+        'report',
+      );
       commentPostedThisRun = true;
       // checkpoint：评论结果先落快照再改状态——此后重试不得重复发评论
       if (idemCtx) {

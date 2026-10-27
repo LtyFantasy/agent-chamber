@@ -13,7 +13,7 @@
  *   - 主文档: .kimi/plans/plan-experience-base.md §0（威胁模型：禁止密钥/PII 的理由）
  *     /§2（写侧归一化）/§3（POST 契约）/§4（工具契约与措辞要求）
  *   - 补充: apps/backend/src/modules/experience/dto/create-experience.dto.ts — 字段约束真值
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` 后，权威文档指针改为该线上文档
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` 后，权威文档指针改为该线上文档
  *
  * [关键不变量]
  *   - **不传 `quality`/`createdBy`**：录入通道强制 unverified、录入者取认证身份；

@@ -573,7 +573,8 @@ describe('DocSpaceController', () => {
 
       expect(await controller.getOverview('space-1', {}, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
-      expect(service.getOverview).toHaveBeenCalledWith('space-1', {});
+      // actor.id 透传下 service（阶段三决策 9：截断续读码的去重键维度）
+      expect(service.getOverview).toHaveBeenCalledWith('space-1', {}, mockActor.id);
     });
   });
 

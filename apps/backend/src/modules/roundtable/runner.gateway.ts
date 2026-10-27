@@ -3,13 +3,22 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §2 (② 控制通道层: WebSocket 服务端)
- *   - 补充: docs/roundtable-design.md §4 (控制面协议: 信封/上行/下行/双向对账)
- *           docs/roundtable-design.md §7 (安全边界: WS 握手 API Key 认证, 注入面逐类型校验)
+ *   - 主文档: docs/modules/roundtable-design.md §2 (② 控制通道层: WebSocket 服务端)
+ *   - 补充: docs/modules/roundtable-design.md §4 (控制面协议: 信封/上行/下行/双向对账)
+ *           docs/modules/roundtable-design.md §7 (安全边界: WS 握手 API Key 认证, 注入面逐类型校验)
  *
  * [踩坑索引] WS-SPIKE-1(全局守卫不作用) WS-SPIKE-2(handler 返回值自动回发) WS-SPIKE-3(异常无帧) WS-SPIKE-4(eventemitter2 同步冒泡) RT-DEBT-2(hello_ack/上行游标: 长连接定期裁剪载体)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #20(契约即设计) #21(双层校验)
+ *
+ * [关键不变量]
+ *   - **WS 握手在 authenticate() 之后恒需 write scope**（runner 是写角色：下发 seat.assign、
+ *     回传 seat.event）。判定必须与 HTTP 守卫共用 `common/utils/api-key-scope.ts`，禁止本地
+ *     重写一份（两处漂移 = 通道间权限不一致，属安全缺陷）。fail-closed：scopes 缺失/非法 → 拒。
+ *   - 拒连一律用既有 `WS_CLOSE_AUTH_FAILED`(4401) 且**关闭原因不回显 scope 细节**——否则
+ *     关闭原因本身成为"这把 key 具备哪些能力"的探测面。
+ *   - 全局 APP_GUARD 不作用于本 gateway（WS-SPIKE-1），故 scope 判定必须在此**显式**调用；
+ *     不要以为 `ApiKeyScopeGuard` 会自动覆盖 WS 路径。
  *
  * [详细踩坑]（最多 5 条）
  *   RT-DEBT-2: runner 未确认队列的裁剪依据（上游游标）由本 gateway 下发——hello 处理后
@@ -48,6 +57,7 @@ import {
 } from '@agent-chamber/roundtable-protocol';
 import { ApiKeyAuthService } from '../../common/services/api-key-auth.service';
 import type { AgentPayload } from '../../common/services/api-key-auth.service';
+import { hasScope, resolveKeyScopes } from '../../common/utils/api-key-scope';
 import { RunnerRegistryService } from './runner-registry.service';
 import { RoundtableService } from './roundtable.service';
 
@@ -122,6 +132,22 @@ export class RunnerGateway implements OnGatewayConnection, OnGatewayDisconnect {
     } catch (err) {
       // 铁律 #9：认证失败透传 4401 关闭（不包装成 500；错误详情记日志，客户端只见关闭码）
       this.logger.warn(`WS 握手拒绝: API Key 认证失败 — ${String(err)}`);
+      this.closeWithReason(client, WS_CLOSE_AUTH_FAILED, 'invalid API key');
+      return;
+    }
+    // scope 判定（2026-10-16 卡 72566c2e）：runner 是**写角色**（下发 seat.assign / 回传
+    // seat.event），故恒需 write scope。判定与 HTTP 守卫共用 common/utils/api-key-scope.ts
+    // 的同一函数（两处漂移 = 通道间权限不一致）。
+    // 拒连沿用既有 WS_CLOSE_AUTH_FAILED(4401)，**不回显 scope 细节**（只记日志）——握手失败
+    // 的客户端一律看到同一关闭码，不构成"这把 key 有哪些能力"的探测面。
+    if (!hasScope(resolveKeyScopes(agent.permissions), 'write')) {
+      this.logger.warn(
+        `WS 握手拒绝: API Key 缺少 write scope — actor=${agent.id} keyPrefix=${String(
+          agent.keyPrefix ?? 'n/a',
+        )}`,
+      );
+      // 关闭原因与认证失败**完全同形**（'invalid API key'）：任何握手失败对客户端都不可区分，
+      // 否则关闭原因本身成了"这把 key 有/没有 write"的探测面。真实原因只进服务端日志。
       this.closeWithReason(client, WS_CLOSE_AUTH_FAILED, 'invalid API key');
       return;
     }

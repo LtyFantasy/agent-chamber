@@ -21,7 +21,7 @@
  */
 import { createParamDecorator, ExecutionContext } from '@nestjs/common';
 import { UnifiedActor } from '../types/actor.types';
-import { ActorType } from '@agent-chamber/shared';
+import { resolveRequestActor } from '../utils/actor';
 
 /**
  * 统一身份装饰器：从 Guard 注入的 request.user 或 request.agent 中提取 UnifiedActor
@@ -35,45 +35,18 @@ import { ActorType } from '@agent-chamber/shared';
  *   @CurrentActor('id') actorId: string
  *   @CurrentActor('role') role: UserRole
  *
- * ⚠️ 两个字段的填充纪律（2026-09-22 经验库第二期，见 actor.types.ts 踩坑 O1/P1）：
- * - `ownerId` **只在 agent 分支填充**（`agents.owner_id`，来自 ApiKeyAuthService）
- *   ——human 分支刻意留空（人即 owner 自身，不是"某个 agent 的 owner"）。
- *   漏填 = 经验库禁自审四态的"agent 审自己 owner""同 owner 兄弟互审"两态**静默放行**。
- * - `permissions` 形状 = `{ scopes: [...] }`（Record），与 AgentPayload 同形。
- *
- * `getRequest()` 返回 `any`（NestJS 签名默认），故此处**没有**编译期形状校验——
- * 上游 guard 漏塞字段只会表现为运行期 undefined，改本文件时必须对照
- * `api-key-auth.service.ts` 的 AgentPayload 与 `types/express.d.ts` 的 request.agent。
+ * ⚠️ **身份形状的单源已抽到 `common/utils/actor.ts`（`resolveRequestActor`）**：本装饰器
+ * 只做「取哪个字段」的投影，字段填充纪律（`ownerId` 只在 agent 分支填、
+ * `permissions` 形状 = `{ scopes: [...] }`、human 分支刻意留空）全部收在那一个地方——
+ * 同语义手写副本曾出现三份，漏填 = 禁自审两态静默放行（经验库第二期踩坑 O1/P1）。
  */
 export const CurrentActor = createParamDecorator(
   (
     data: keyof UnifiedActor | undefined,
     ctx: ExecutionContext,
   ): UnifiedActor | UnifiedActor[keyof UnifiedActor] | null => {
-    const request = ctx.switchToHttp().getRequest();
-
-    let actor: UnifiedActor | null = null;
-
-    if (request.user) {
-      actor = {
-        id: request.user.userId,
-        type: ActorType.HUMAN,
-        name: request.user.name,
-        role: request.user.role,
-      };
-    } else if (request.agent) {
-      actor = {
-        id: request.agent.id,
-        type: ActorType.AGENT,
-        name: request.agent.name,
-        permissions: request.agent.permissions,
-        // 决策 9：透传本次认证所用 key 前缀（审计插桩 keyPrefix 缓解，非明文）
-        keyPrefix: request.agent.keyPrefix,
-        // 第二期：agent 的人类 owner（禁自审四态后两态的判定输入；human 分支刻意不填）
-        ownerId: request.agent.ownerId,
-      };
-    }
-
+    // 身份形状单源 = common/utils/actor.ts（本处只做字段投影，见文件头）
+    const actor = resolveRequestActor(ctx.switchToHttp().getRequest());
     if (!actor) return null;
     return data ? actor[data] : actor;
   },

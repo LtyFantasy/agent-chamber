@@ -15,8 +15,9 @@
 #       search_vector + 经验库零命中轻表 experience_search_events 的 PK 之外无裸 SQL 产物。
 #       守卫 = 经验库 e2e 的 indexdef/trigger 断言（test/experience.e2e-spec.ts §⑪，plan §7）。
 #       ⚠️ 本段是人工注释：`UPDATE_DRIFT_BASELINE=1` 重写会连注释一起重生成而**丢失**
-#       这几行（2026-09-21 批 2 实测；2026-09-22 第二期批 1 重写再次实测），重写后如发现
-#       本段消失请照上文重新补回。
+#       这几行（2026-09-21 批 2 实测；2026-09-22 第二期批 1 重写再次实测；2026-10-13
+#       Notifications 二期批 1 重写第三次实测；2026-10-24 claims 批重写第四次实测），
+#       重写后如发现本段消失请照上文重新补回。
 #       第二期补充：experience_judgments 的两条索引**可见**（已进 [B] 段，DESC 排序不改变
 #       可见性），但其 **DESC 全序语义与表级 reloptions 不在本门禁的比对面内**——那两项由
 #       test/experience.e2e-spec.ts 的 indexdef / pg_class.reloptions 断言守卫。
@@ -28,6 +29,42 @@
 #       守卫 = test/doc-search-prefilter.e2e-spec.ts §⑤ 的 indexdef 断言
 #       （含 `USING gin` + `gin_trgm_ops`，另断言它确实是迁移链产物）。
 #       ⚠️ 同属人工注释：重写会丢失本段，请照上文补回。
+# 本次新增（2026-10-07 memory 模块数据层批）：[B] 段 +9 条（migration 1791700000000
+#       AddMemoryModule）—— 7 条 DROP INDEX + 2 条 DROP CONSTRAINT，与 migration 头注的
+#       「漂移预测逐条点名」完全对齐（多出任何一条即缺陷，先怀疑 PK DEFAULT / jsonb 默认值，
+#       不要去改基线）。实体侧刻意零 `@Index`、零 `@ManyToOne`：3 条部分索引
+#       （uq_memory_projects_slug / idx_memory_nominations_project_{status,category} /
+#       uq_memory_nominations_correction_of）+ 1 条部分唯一幂等键
+#       （uq_memory_nominations_client_key，无谓词）+ 2 条遥测 (project_id, created_at)
+#       与 2 条 FK（nominations.project_id / correction_of，全 ON DELETE RESTRICT）都是
+#       裸 SQL 产物；两遥测表刻意无 FK ⇒ 不产生 CONSTRAINT 项（日志须比主体活得久）。
+#       守卫 = test/memory-schema.e2e-spec.ts（逐列对齐 / PK DEFAULT / confdeltype='r' ×2 /
+#       indexdef 谓词 ×3 / 遥测零 FK）。
+# 本次新增（2026-10-13 Notifications 二期批 1）：[B] 段 +2 条（migration 1792200000000
+#       AddNotificationChannels）——`uq_user_notification_channels_user_provider`（无谓词）
+#       与 `uq_user_notification_channels_verified_address`（**部分唯一**，谓词
+#       `WHERE unbound_at IS NULL AND last_test_status='ok'`）。两条都是**裸 SQL + 实体刻意零
+#       `@Index`**（同 memory 批纪律：TypeORM 元数据表达不了谓词，建模只会让谓词成为不可见盲区）
+#       ⇒ 进 [B] 段。**FK 零产物**（刻意点名）：`user_notification_channels_user_id_fkey`
+#       用实体 `@JoinColumn({ foreignKeyConstraintName })` 逐字同名建模 ⇒ 不产生 DROP CONSTRAINT
+#       （对照 memory 批：那批 FK 未建模 ⇒ 2 条 DROP CONSTRAINT）。`notification_deliveries`
+#       的新列与 `idx_notification_deliveries_recipient_user` 由实体显式建模 ⇒ 同样零产物。
+#       守卫 = test/user-notification-channels-schema.e2e-spec.ts（逐列 / PK DEFAULT / 列级默认值 /
+#       两条 indexdef 谓词 / FK confdeltype='c' / 部分唯一三条语义 / barrel↔glob）。
+# 本次新增（2026-10-24 Memory 引擎身份占用批）：[B] 段 +2 条（migration 1792400000000
+#       AddMemoryEngineBindingClaims）——`uq_memory_engine_binding_claims_triple`（四列唯一，
+#       无谓词）与 `chk_memory_engine_binding_claims_engine_not_none`。实体刻意零 `@Index`
+#       且不建模 CHECK ⇒ 归 [B]。**project_id 刻意无 FK** ⇒ 零 DROP CONSTRAINT（项目硬删后
+#       claim 必须保留）。守卫 = test/memory-schema.e2e-spec.ts ④-b +
+#       test/memory-engine-binding-claims.e2e-spec.ts。
+#       ⚠️ 本批基线由 `UPDATE_DRIFT_BASELINE=1` 正规重生成：[B] 计数修正为 39 条（旧 35 条
+#       漏计了 Notifications 二期批的 2 条）；语句集合与人工分段注释保持不变。
+#       ⚠️ 同属人工注释：重写会丢失本段，请照上文补回。
+# 本次新增（2026-10-25 当前引擎身份唯一约束）：[B] 段 +1 条（migration 1792500000000）
+#       uq_memory_projects_engine_triple 是手写部分唯一索引；实体不加 @Index。
+#       守卫 = test/memory-project-engine-identity.e2e-spec.ts（indexdef 四谓词 / INSERT /
+#       UPDATE / archived / 迁移重复失败无损），永久 claims 的归属规则不由此索引替代。
+#       本批由 UPDATE_DRIFT_BASELINE=1 真实生成新增项，人工仅归类为 B 并恢复历史说明。
 # =============================================================================
 # [A] 命名差异 — 迁移显式名（idx_*/uq_*/显式 FK 名）↔ 实体隐式 @Index 期望的 IDX_<hash>；可修（改实体声明名），属另一个工程 —— 36 条
 ALTER TABLE "board_members" ADD CONSTRAINT "FK_ca2c72a39c80199717012df3932" FOREIGN KEY ("board_id") REFERENCES "boards"("id") ON DELETE CASCADE ON UPDATE NO ACTION    # A
@@ -67,13 +104,16 @@ DROP INDEX "public"."idx_docs_space_id"    # A
 DROP INDEX "public"."idx_milestones_board_id"    # A
 DROP INDEX "public"."idx_task_doc_links_doc_id"    # A
 #
-# [B] 裸 SQL 产物 — TypeORM 表达不了或实体未建模：GIN trgm/tsvector 索引、部分唯一索引、chk_* CHECK、attachments 显式 FK（曾含"部分索引重建对"，2026-09-19 实证系列可空性漂移的下游产物，随 C 类清偿自动消失——见文件头注释） —— 26 条
+# [B] 裸 SQL 产物 — TypeORM 表达不了或实体未建模：GIN trgm/tsvector 索引、部分唯一索引、chk_* CHECK、attachments 显式 FK（曾含"部分索引重建对"，2026-09-19 实证系列可空性漂移的下游产物，随 C 类清偿自动消失——见文件头注释） —— 40 条
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_doc_id_fkey"    # B
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_topic_id_fkey"    # B
 ALTER TABLE "attachments" DROP CONSTRAINT "attachments_uploader_id_fkey"    # B
 ALTER TABLE "attachments" DROP CONSTRAINT "chk_attachments_binding"    # B
 ALTER TABLE "doc_spaces" DROP CONSTRAINT "chk_doc_spaces_binding"    # B
 ALTER TABLE "experience_feedback" DROP CONSTRAINT "experience_feedback_experience_id_fkey"    # B
+ALTER TABLE "memory_engine_binding_claims" DROP CONSTRAINT "chk_memory_engine_binding_claims_engine_not_none"    # B
+ALTER TABLE "memory_nominations" DROP CONSTRAINT "memory_nominations_correction_of_fkey"    # B
+ALTER TABLE "memory_nominations" DROP CONSTRAINT "memory_nominations_project_id_fkey"    # B
 ALTER TABLE "topic_participants" DROP CONSTRAINT "chk_tp_active_has_joined_at"    # B
 DROP INDEX "public"."idx_doc_sections_content_trgm"    # B
 DROP INDEX "public"."idx_doc_sections_heading_path_trgm"    # B
@@ -87,11 +127,22 @@ DROP INDEX "public"."idx_experience_entries_signals"    # B
 DROP INDEX "public"."idx_experience_entries_sort"    # B
 DROP INDEX "public"."idx_experience_judgments_created_at_id"    # B
 DROP INDEX "public"."idx_experience_judgments_experience_created_at"    # B
+DROP INDEX "public"."idx_memory_formation_events_project_created"    # B
+DROP INDEX "public"."idx_memory_nominations_project_category"    # B
+DROP INDEX "public"."idx_memory_nominations_project_status"    # B
+DROP INDEX "public"."idx_memory_recall_events_project_created"    # B
 DROP INDEX "public"."idx_topic_participants_status"    # B
 DROP INDEX "public"."uq_doc_categories_space_slug"    # B
 DROP INDEX "public"."uq_doc_spaces_slug"    # B
 DROP INDEX "public"."uq_docs_space_path"    # B
 DROP INDEX "public"."uq_experience_feedback_actor_key"    # B
 DROP INDEX "public"."uq_experience_feedback_experience_actor"    # B
+DROP INDEX "public"."uq_memory_engine_binding_claims_triple"    # B
+DROP INDEX "public"."uq_memory_nominations_client_key"    # B
+DROP INDEX "public"."uq_memory_nominations_correction_of"    # B
+DROP INDEX "public"."uq_memory_projects_engine_triple"    # B
+DROP INDEX "public"."uq_memory_projects_slug"    # B
 DROP INDEX "public"."uq_milestones_board_version"    # B
+DROP INDEX "public"."uq_user_notification_channels_user_provider"    # B
+DROP INDEX "public"."uq_user_notification_channels_verified_address"    # B
 #

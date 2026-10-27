@@ -10,12 +10,38 @@
  *     （admin 类，createByAdmin 改签名传操作者，auth register 先例）；newData
  *     {userId, username, 变更字段名列表}，passwordHash 黑名单）
  *
- * [踩坑索引] B-55(QueryBuilder orderBy select 风险)
+ * [踩坑索引] B-55(QueryBuilder orderBy select 风险) LEFTJOIN-SOFTDEL(左连接空虚满足软删过滤)
  *
- * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释)
+ * [铁律关联] #21(双层校验) #22(findOne 判空) #11(注释) #23(jsonb/ORM 语义需真 PG 覆盖)
  *
  * [详细踩坑]（最多 5 条，按严重/最近排序）
- *   B-55: findAllLightweight 中 skip/take + leftJoin + orderBy('actor.displayName') +
+ *   LEFTJOIN-SOFTDEL: findAll 曾用 leftJoinAndSelect(actor) + 显式 `actor.deleted_at IS NULL`
+ *         过滤软删用户，**生产实证真漏**（已软删用户被列表重新捞出）。软删标记
+ *         只在 actors 行上（User 无 @DeleteDateColumn），TypeORM 把软删条件塞进 LEFT JOIN
+ *         的 ON 子句；左连接下 ON 不匹配不丢行（actor 列全 NULL），显式 where 对 NULL 求值
+ *         UNKNOWN（三值逻辑）空虚满足 → 过滤形同虚设。
+ *         findAllLightweight 是同一 join 形状，但**并列的** `actor.status = :status` 谓词
+ *         把 NULL 行排除掉，故**修复前侥幸不漏**——语义脆弱（该谓词一旦挪走/重排即复现），
+ *         一并改 innerJoin 消隐患。
+ *         修复与先例：两处 join 旁注释 + agent.service.ts `findAll`（同为"列表 +
+ *         innerJoinAndSelect + 显式 deleted_at"）、notifications/notify-orchestrator.service.ts
+ *         `resolveOwners`（同族 slug `NOTIFY-CANDIDATE-SOFTDELETED-LEAK`）。
+ *         真 PG 覆盖：test/admin-user-delete.e2e-spec.ts（mock 单测证不了 SQL 语义）。
+ *         同族第二处（卡 e6926d73）：auth.service.ts login/refresh 同形状漏软删——软删
+ *         用户可用原密码登录并拿到 token；已改 innerJoin / 门前移，详见该文件 HOOK。
+ *         本文件 5 处 `if (!user || !user.actor)` 守卫（getMe :85 / updateMe :93 /
+ *         updateAvatar :216 / updateByAdmin :425 / deleteByAdmin :492）= 软删判定本体：
+ *         `findOne({relations:{actor:true}})` 走 eager leftJoin，软删条件在 ON 子句 →
+ *         软删行的 actor 列全 NULL → `!user.actor` 命中。原先并列的 `|| user.actor.deletedAt`
+ *         是**死代码**（@DeleteDateColumn({select:false}) 该列永不进 SELECT，恒 undefined），
+ *         已删——勿再补回；要改判据方向请先读本条与 A3-1b 先例 api-key-auth.service.ts:16-21。
+ *   DEL-REVOKE: `deleteByAdmin` 是**事务化凭证吊销**（先 revoke 后软删，照
+ *         agent.service.remove :789-804）——删人 ⇒ 该用户全部未撤销 refresh token +
+ *         其名下 agent 的全部未撤销 API Key 一并置 revoked_at（`IsNull()` 限定条件，
+ *         不覆写历史撤销时间戳）；agent 本体保持 active（Owner 拍板）。改动本方法时
+ *         禁止把两步拆回非事务顺序：反序会留下"人已删、凭证仍活跃"的半完成态。
+ *         真 PG 覆盖：test/soft-deleted-login.e2e-spec.ts。
+ *   B-55: findAllLightweight 中 skip/take + 关联 join + orderBy('actor.displayName') +
  *         select() 未包含 actor 字段，触发 TypeORM 0.3.30
  *         `distinctAlias.actor_display_name does not exist` 生产 500。
  *         修复：select 显式包含 actor.displayName / actor.avatarUrl。
@@ -35,10 +61,12 @@ import {
 } from '@nestjs/common';
 import { ErrorCode, UserRole, ActorType, AgentStatus } from '@agent-chamber/shared';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
 import { User } from '../../database/entities/user.entity';
 import { Actor } from '../../database/entities/actor.entity';
+import { ApiKey } from '../../database/entities/api-key.entity';
+import { RefreshToken } from '../../database/entities/refresh-token.entity';
 import { buildAvatarUrl } from '../avatars/avatar.constants';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -60,7 +88,7 @@ export class UserService {
 
   async getMe(userId: string) {
     const user = await this.userRepo.findOne({ where: { id: userId }, relations: { actor: true } });
-    if (!user || !user.actor || user.actor.deletedAt) {
+    if (!user || !user.actor) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
     return this.toProfile(user);
@@ -68,7 +96,7 @@ export class UserService {
 
   async updateMe(userId: string, dto: UpdateProfileDto) {
     const user = await this.userRepo.findOne({ where: { id: userId }, relations: { actor: true } });
-    if (!user || !user.actor || user.actor.deletedAt) {
+    if (!user || !user.actor) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
     if (dto.name !== undefined) {
@@ -82,10 +110,27 @@ export class UserService {
         user.actor.avatarSvg = null;
       }
     }
-    if (dto.preferences !== undefined) {
-      user.preferences = { ...user.preferences, ...dto.preferences };
-    }
     await this.userRepo.save(user);
+    if (dto.preferences !== undefined) {
+      // Notifications 二期堵旁门（两件事，都必须在**这一个**入口做）：
+      // ① **剥掉 `notificationCategories`**：通知类别偏好有专门的面（`PUT/DELETE
+      //    /notification-settings/me/prefs`，带自定义 validator + 原子键级合并）；从
+      //    `/users/me` 的通用 preferences 旁路写它 = 绕过那层校验（拼错的键、非布尔值会静默落库）。
+      // ② **原子顶层合并**（`coalesce(preferences,'{}') || $1`）替代"读到内存再整体 save"：
+      //    后者在并发下会丢更新（两个请求各读到旧快照，后写的赢，先写的键消失）。
+      //    ⚠️ 与 notification-settings 的**键级**合并刻意不同：这里是顶层键合并（`theme` 等
+      //    其余偏好仍整体覆盖），那里是 `notificationCategories` 内的键级稀疏覆盖。
+      //    ⚠️ 顺序：**在 save(user) 之后**——save 只写内存里变过的列（name/avatar），preferences
+      //    未在内存中被改动故不进它的 UPDATE；此处的 SQL 才是 preferences 的唯一写路径。
+      const patch = stripNotificationCategories(dto.preferences);
+      await this.userRepo.query(
+        `UPDATE users SET preferences = coalesce(preferences, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+        [userId, JSON.stringify(patch)],
+      );
+      // 内存里的 user.preferences 已陈旧（原子 SQL 绕过了它）⇒ 重读一份给响应
+      const fresh = await this.userRepo.findOne({ where: { id: userId } });
+      if (fresh) user.preferences = fresh.preferences;
+    }
     // 审计（Phase 2）：UPDATE + user；actor=自己；newData {userId, username, 变更字段名列表}
     // （决策 6——email/preferences 值不入，只记字段名）
     await this.auditService.log({
@@ -118,8 +163,16 @@ export class UserService {
     if (!user) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
-    user.preferences = { ...user.preferences, ...dto };
-    await this.userRepo.save(user);
+    // Notifications 二期堵旁门 + 原子合并（与 updateMe 同纪律，见那里的注释）：剥掉
+    // `notificationCategories`（它有专门的面），并把"读内存再整体 save"换成原子顶层合并
+    // （`ValidationPipe` 是裸的、无 whitelist ⇒ 未知属性会透传到这里，剥键必须在此做）。
+    const patch = stripNotificationCategories(dto as Record<string, unknown>);
+    await this.userRepo.query(
+      `UPDATE users SET preferences = coalesce(preferences, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+      [userId, JSON.stringify(patch)],
+    );
+    const fresh = await this.userRepo.findOne({ where: { id: userId } });
+    if (fresh) user.preferences = fresh.preferences;
     // 审计（Phase 2）：UPDATE + user（settings）；actor=自己；newData 只记字段名
     // （决策 6——preferences 值不入）
     await this.auditService.log({
@@ -166,7 +219,7 @@ export class UserService {
 
   async updateAvatar(userId: string, avatarUrl: string) {
     const user = await this.userRepo.findOne({ where: { id: userId }, relations: { actor: true } });
-    if (!user || !user.actor || user.actor.deletedAt) {
+    if (!user || !user.actor) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
     user.avatarUrl = avatarUrl;
@@ -198,9 +251,21 @@ export class UserService {
     const pageSize = Math.max(1, Math.min(100, parseInt(String(query.pageSize), 10) || 20));
     const q = query.q ? String(query.q).trim() : '';
 
+    // ⚠️ 必须 `innerJoinAndSelect`，不能用 `leftJoinAndSelect`：
+    // 软删标记只落在 `actors.deleted_at`（User 实体没有 @DeleteDateColumn，只有 delegating
+    // getter/setter），TypeORM 会把 Actor 的软删条件自动追加到 JOIN 的 **ON 子句**。
+    // 左连接语义下，"ON 不匹配"不丢行——软删 actor 的用户行照样返回，只是 actor 列全 NULL；
+    // 而显式 `.where('actor.deleted_at IS NULL')` 对 NULL 求值为 UNKNOWN（三值逻辑），
+    // **空虚满足**，过滤形同虚设 → 已软删用户被列表重新捞出，且因 actor=null 而看起来像活人：
+    // status getter 回落 `'active'`（:49-51）、displayName getter 回落 `null`（:27-29）、
+    // createdAt getter 无兜底变 `undefined`（:60-62）——合起来看就像个活人。
+    // 改 innerJoin 后 ON 条件参与行匹配，软删 actor 的行才真正被丢弃。
+    // 同类先例：agent.service.ts `findAll`（列表 + innerJoinAndSelect + 显式 deleted_at）、
+    // notifications/notify-orchestrator.service.ts `resolveOwners`（完整说明见其
+    // `NOTIFY-CANDIDATE-SOFTDELETED-LEAK`）。
     const qb = this.userRepo
       .createQueryBuilder('user')
-      .leftJoinAndSelect('user.actor', 'actor')
+      .innerJoinAndSelect('user.actor', 'actor')
       .where('actor.deleted_at IS NULL')
       .orderBy('actor.createdAt', 'DESC')
       .skip((page - 1) * pageSize)
@@ -240,13 +305,21 @@ export class UserService {
 
     /**
      * 必须显式选择 orderBy 依赖的 actor 字段。
-     * TypeORM 0.3.30 在 skip/take + leftJoin + orderBy(关联字段) + select(不含该字段) 时，
+     * TypeORM 0.3.30 在 skip/take + 关联 join + orderBy(关联字段) + select(不含该字段) 时，
      * 生成 count 子查询会出现 `distinctAlias.actor_display_name does not exist` 错误。
+     *
+     * ⚠️ `innerJoin` 而非 `leftJoin`：软删条件被 ORM 塞进 JOIN 的 ON 子句，左连接下软删
+     * actor 的行不丢（actor 列全 NULL），显式 `actor.deleted_at IS NULL` 被 NULL 空虚满足。
+     * 本查询修复前**侥幸不漏**——靠并列的 `andWhere('actor.status = :status')` 把 NULL 行
+     * 排除（`NULL = 'active'` 为 UNKNOWN）；这是运气不是设计，该谓词一旦挪走/重排即复现
+     * findAll 的漏洞，故同样改 innerJoin 消隐患。见 findAll 处注释与先例
+     * agent.service.ts `findAll`、notifications/notify-orchestrator.service.ts `resolveOwners`
+     * （同族 slug `NOTIFY-CANDIDATE-SOFTDELETED-LEAK`）。
      */
     const qb = this.userRepo
       .createQueryBuilder('user')
       .select(['user.id', 'user.username', 'user.role', 'actor.displayName', 'actor.avatarUrl'])
-      .leftJoin('user.actor', 'actor')
+      .innerJoin('user.actor', 'actor')
       .where('actor.deleted_at IS NULL')
       .andWhere('actor.status = :status', { status: AgentStatus.ACTIVE })
       .orderBy('actor.displayName', 'ASC')
@@ -355,7 +428,7 @@ export class UserService {
    */
   async updateByAdmin(id: string, dto: UpdateUserByAdminDto, currentAdminId: string) {
     const user = await this.userRepo.findOne({ where: { id }, relations: { actor: true } });
-    if (!user || !user.actor || user.actor.deletedAt) {
+    if (!user || !user.actor) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
 
@@ -409,7 +482,11 @@ export class UserService {
   }
 
   /**
-   * 管理员删除用户（软删除）
+   * 管理员删除用户（软删 + 事务化凭证吊销，卡 e6926d73）
+   *
+   * Owner 2026-10-16 拍板：**删人 = 同事务吊销其名下全部凭证**（refresh token + 名下
+   * agent 的 API Key）；**agent 本体保持 active**（孤儿 agent 的状态治理另行登记）。
+   *
    * @param id 目标用户 ID
    * @param currentAdminId 当前管理员自身 ID（用于自保护）
    * @returns 是否删除成功
@@ -418,7 +495,7 @@ export class UserService {
    */
   async deleteByAdmin(id: string, currentAdminId: string) {
     const user = await this.userRepo.findOne({ where: { id }, relations: { actor: true } });
-    if (!user || !user.actor || user.actor.deletedAt) {
+    if (!user || !user.actor) {
       throw new NotFoundException({ message: 'User not found', code: ErrorCode.USER_NOT_FOUND });
     }
 
@@ -430,10 +507,36 @@ export class UserService {
       });
     }
 
-    // 软删除标记在 actor 表上（users 已不再持有 deleted_at）
-    user.deletedAt = new Date();
-    await this.userRepo.save(user);
-    // 审计（Phase 2）：DELETE + user（admin 软删）；actor=操作 admin 本人；
+    // 事务化吊销，顺序**先 revoke 后软删**（照 agent.service.remove :789-804 先例）：
+    // revoke 抛错则整个事务回滚、用户仍存活可登录（可恢复）；反序会留下
+    // "人已删、凭证仍活跃"的半完成态——旧实现正是如此：软删只写 actors.deleted_at，
+    // 该用户的 refresh token 与其名下 agent 的 API Key 原样存活、无人撤销。
+    // 用 manager.update / manager.createQueryBuilder 免改 UserModule 的 DI 注册面。
+    await this.userRepo.manager.transaction(async (manager) => {
+      const now = new Date();
+
+      // ① 该用户全部未吊销的 refresh token。`IsNull()` 限定条件只打未撤销行，
+      //    绝不覆写历史已撤销行的 revoked_at 时间戳（吊销时间不可变）。
+      await manager.update(RefreshToken, { userId: id, revokedAt: IsNull() }, { revokedAt: now });
+
+      // ② 其名下全部 agent 的未吊销 API Key（revokedReason 对齐 agent.service.ts:797
+      //    先例的字段用法）。子查询一次更新，避免"先查 agent id 再 In()"的两趟往返；
+      //    agent 本体保持 active（Owner 拍板），此处只动凭证。
+      await manager
+        .createQueryBuilder()
+        .update(ApiKey)
+        .set({ revokedAt: now, revokedReason: 'owner deleted' })
+        .where('agent_id IN (SELECT id FROM agents WHERE owner_id = :id) AND revoked_at IS NULL', {
+          id,
+        })
+        .execute();
+
+      // ③ 软删除标记在 actor 表上（users 已不再持有 deleted_at）
+      user.deletedAt = now;
+      await manager.save(user);
+    });
+
+    // ④ 审计（Phase 2）：DELETE + user（admin 软删）；actor=操作 admin 本人；
     // newData 白名单 {userId, username}
     await this.auditService.log({
       action: AuditAction.DELETE,
@@ -474,4 +577,34 @@ export class UserService {
       preferences: user.preferences || {},
     };
   }
+}
+
+/**
+ * `users.preferences` 里**通知类别偏好**的键名（Notifications 二期专用）。
+ *
+ * 它有专门的面（`PUT/DELETE /notification-settings/me/prefs`，带自定义 validator 与原子键级
+ * 合并）——`/users/me` 与 `/users/me/settings` 的通用 preferences 写路径必须**剥掉**它，
+ * 否则同一份数据有两条入口，其中一条（通用面）没有任何键/值校验。
+ */
+const NOTIFICATION_CATEGORIES_PREF_KEY = 'notificationCategories';
+
+/**
+ * 剥掉 `notificationCategories` 键（其余偏好原样保留）。
+ *
+ * 非对象入参一律返回 `{}`（jsonb 的 `||` 对非对象会报错，让一次畸形入参变成 500——
+ * 铁律 #21：格式问题在本层收敛，不把畸形值透传给 PostgreSQL）。
+ *
+ * @param prefs 原始 preferences 补丁（DTO 已保证是对象；此处再兜一层防御）
+ * @returns 去掉通知类别键后的补丁
+ */
+function stripNotificationCategories(
+  prefs: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(prefs)) {
+    if (key === NOTIFICATION_CATEGORIES_PREF_KEY) continue;
+    out[key] = value;
+  }
+  return out;
 }

@@ -3,13 +3,13 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
- *   - 补充: docs/roundtable-design.md §8 (kimi ACP 行为档案 8 条: resume 复活/审批/用量/fs caps,
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
+ *   - 补充: docs/modules/roundtable-design.md §8 (kimi ACP 行为档案 8 条: resume 复活/审批/用量/fs caps,
  *           0.34.0 实测——本文件设计输入；M4a 起传输层在 acp-driver.ts 基座，本文件为
  *           profile 薄壳：spawn 命令 + mode 单条钉死)
  *
  * [踩坑索引] ③(message_complete 无 text) ④(resume 失败无降级→楔死) ⑤(fs caps 声明→turn 静默死亡)
- *              ⑥(RT-PERM-1: kind 命名不可信→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
+ *              ⑥(RT-PERM-1: 执行选项不按 kind 猜测→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #17(测试契约) #20(契约即设计)
  *
@@ -20,10 +20,10 @@
  *      修复：driver 累积 message_chunk 全文，complete 携带全文 text。见 memory/2026-08-07.md §6
  *   ⑤: client 声明 fs caps 后 turn 静默死亡（Write 成功但完成路径无响应）→ 一律不声明
  *      fs caps（clientCapabilities 仅 terminal:false）。见 memory/2026-08-07.md §4
- *   ⑥: RT-PERM-1 —— ACP 审批选项的 kind 是厂商自由命名（真机为 allow_once/
- *      allow_always/reject_once），旧代码按猜测的 approve_* 双重映射把 approve 吞成
- *      reject。根治：answerPermission 收 optionId（与 request_permission params 同源），
- *      在挂起选项里精确匹配 String(o.optionId) === optionId，不做 kind 猜测。
+ *   ⑥: RT-PERM-1 —— ACP kind 标准值为 allow_once/allow_always/reject_once/
+ *      reject_always；optionId 是不透明选择键。旧代码按猜测的 approve_* 双重映射把
+ *      批准吞成拒绝。answerPermission 精确匹配挂起选项并原样透传 optionId，
+ *      禁止按 kind 猜执行 ID；平台仅按标准 kind 记录批准/拒绝结果（设计 §6）。
  *   ⑦: RT-PERM-2 —— ACP tool_call/tool_response 更新的工具元数据（toolCallId/title/
  *      kind/status/locations/rawInput）挂在 update 本体上，content 是内容块数组（或
  *      缺失）；旧代码取 update.content ?? {} 当 tool 载荷 → chamber 校验丢弃。
@@ -43,7 +43,7 @@
  * - spawn：`kimi acp`（bin 默认 KIMI_BIN 环境变量，缺省 PATH 的 'kimi'；测试注入
  *   假子进程脚本用 spawnArgs 覆盖）；
  * - 权限档位钉死：单条 `mode=permissionMode`（kimi 原语，config.toml yolo 泄漏防护）；
- * - 行为档案 8 条（docs/roundtable-design.md §8，kimi 0.34.0 实测）全部由基座承载，
+ * - 行为档案 8 条（docs/modules/roundtable-design.md §8，kimi 0.34.0 实测）全部由基座承载，
  *   见 acp-driver.ts 顶部注释。
  */
 import type { Logger } from '../logger';

@@ -103,6 +103,7 @@ interface RenderOpts {
   onOpenChange?: jest.Mock;
   renderRowExtra?: (m: MemberItem) => React.ReactNode;
   topSlot?: React.ReactNode;
+  feedbackSlot?: React.ReactNode;
   inviting?: boolean;
 }
 
@@ -123,6 +124,7 @@ function renderSheet(opts: RenderOpts = {}) {
     onCancelInvite: opts.onCancelInvite,
     renderRowExtra: opts.renderRowExtra,
     topSlot: opts.topSlot,
+    feedbackSlot: opts.feedbackSlot,
     inviting: opts.inviting,
   };
   const utils = render(<MembersSheet {...props} />);
@@ -573,4 +575,26 @@ describe('MembersSheet 关闭重置（R4）', () => {
     fireEvent.click(screen.getByTestId('open-invite'));
     expect(screen.getByTestId('invite-selected-count')).toHaveTextContent('Selected 0');
   });
+});
+
+/** Feedback is presentation only and must never reset the invite view or its checked candidates. */
+it('renders optional query feedback in both views without resetting selection', () => {
+  const { rerender, props } = renderSheet({ candidates: [member('c1', 'candidate', 'Alpha')] });
+  expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByTestId('open-invite'));
+  fireEvent.click(within(screen.getByTestId('invite-candidate-c1')).getByRole('checkbox'));
+  const feedback = (
+    <div role="status">
+      Refresh failed<button onClick={jest.fn()}>Retry</button>
+    </div>
+  );
+  rerender(<MembersSheet {...props} feedbackSlot={feedback} />);
+  expect(screen.getByRole('status')).toHaveTextContent('Refresh failed');
+  expect(within(screen.getByTestId('invite-candidate-c1')).getByRole('checkbox')).toBeChecked();
+  rerender(<MembersSheet {...props} />);
+  expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  expect(within(screen.getByTestId('invite-candidate-c1')).getByRole('checkbox')).toBeChecked();
+  fireEvent.click(screen.getByTestId('invite-back'));
+  rerender(<MembersSheet {...props} feedbackSlot={feedback} />);
+  expect(screen.getByRole('status')).toHaveTextContent('Refresh failed');
 });

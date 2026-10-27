@@ -125,7 +125,7 @@ function makePendingInject(seq: number, messageIds: string[] = ['msg-1']) {
   };
 }
 
-/** 构造审批请求行（M3 阶段 1 默认 pending；options 为 ACP 三选项形状 {optionId, kind, label}） */
+/** 构造 pending 审批行：ACP 标准 kind 与不透明 optionId 分属两个命名空间。 */
 function makePermissionRequest(overrides: Partial<RoundtablePermissionRequest> = {}) {
   return {
     id: 'pr-1',
@@ -134,9 +134,9 @@ function makePermissionRequest(overrides: Partial<RoundtablePermissionRequest> =
     topicId: 'topic-1',
     tool: { name: 'bash', input: 'rm -rf /tmp/x' },
     options: [
-      { optionId: 'approve_once', kind: 'approve_once', label: 'Approve once' },
-      { optionId: 'approve_always', kind: 'approve_always', label: 'Approve always' },
-      { optionId: 'reject', kind: 'reject', label: 'Reject' },
+      { optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' },
+      { optionId: 'approve_always', kind: 'allow_always', name: 'Approve always' },
+      { optionId: 'reject', kind: 'reject_once', name: 'Reject' },
     ],
     status: 'pending',
     verdictOptionId: null,
@@ -2117,7 +2117,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1',
           tool: { name: 'bash', input: 'rm -rf /tmp/x' },
-          options: [{ optionId: 'approve_once', kind: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2130,7 +2130,7 @@ describe('RoundtableService', () => {
         seatId: 'seat-1',
         topicId: 'topic-1',
         tool: { name: 'bash', input: 'rm -rf /tmp/x' },
-        options: [{ optionId: 'approve_once', kind: 'approve_once' }],
+        options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         status: 'pending',
         verdictOptionId: null,
         resolvedBy: null,
@@ -2149,6 +2149,34 @@ describe('RoundtableService', () => {
     expect(seat.lastEventSeq).toBe('1');
   });
 
+  it('permission_request 上行 options 原样保存：未知/缺失 kind 与扩展字段不在入库阶段收窄', async () => {
+    const seat = makeSeat();
+    seatRepo.findOne.mockResolvedValue(seat);
+    seatRepo.save.mockImplementation(async (s: RoundtableSeat) => s);
+    permReqRepo.findOne.mockResolvedValue(null);
+    /** 上行协议保持宽松；只在选中选项并裁决时解释 kind。 */
+    const options = [
+      { optionId: 'opaque:first', kind: 'future_kind', name: 'Future', _meta: { vendor: 1 } },
+      { optionId: 'opaque:second', name: 'Missing kind' },
+    ];
+    await service.handleSeatEvent(
+      'runner-1',
+      seatEventEnvelope(
+        1,
+        eventPayload('permission_request', {
+          requestId: 'req-raw',
+          tool: { title: 'bash' },
+          options,
+        }),
+      ),
+    );
+    await flushMicrotasks();
+    expect(permReqRepo.create.mock.calls[0][0].options).toEqual(options);
+    expect(permReqRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ options, status: 'pending' }),
+    );
+  });
+
   it('permission_request 重放幂等：同 (seatId, requestId) 已有 pending 行 → 不重复落库不重复公告，游标推进', async () => {
     const seat = makeSeat();
     seatRepo.findOne.mockResolvedValue(seat);
@@ -2162,7 +2190,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1',
           tool: { name: 'bash' },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2195,7 +2223,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1', // 跨会话撞键：与 orphaned 旧行同 requestId
           tool: { name: 'bash' },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2231,7 +2259,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1',
           tool: { name: 'bash' },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2255,7 +2283,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1',
           tool: { name: 'bash' },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2266,7 +2294,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-2',
           tool: { name: 'rm' },
-          options: [{ optionId: 'reject' }],
+          options: [{ optionId: 'reject', kind: 'reject_once', name: 'Reject' }],
         }),
       ),
     );
@@ -2290,7 +2318,7 @@ describe('RoundtableService', () => {
         eventPayload('permission_request', {
           requestId: 'req-1',
           tool: { input: { dangerous: true } },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2318,7 +2346,7 @@ describe('RoundtableService', () => {
           requestId: 'req-1',
           // 真机 ACP 形状：无 name 字段（公告正文不得退化成原始 JSON dump）
           tool: { title: 'Write', toolCallId: 'call_abc', content: [{ type: 'text', text: 'x' }] },
-          options: [{ optionId: 'approve_once' }],
+          options: [{ optionId: 'approve_once', kind: 'allow_once', name: 'Approve once' }],
         }),
       ),
     );
@@ -2754,7 +2782,7 @@ describe('RoundtableService', () => {
     expect(result).toBe(saved);
   });
 
-  // ── r17 唯一座位约束（一 agent 一 topic 一 active 座位，docs/roundtable-design.md §12 r17）──
+  // ── r17 唯一座位约束（一 agent 一 topic 一 active 座位，docs/modules/roundtable-design.md §12 r17）──
 
   it('createSeat（r17 唯一约束）：同 topic 同 bindActorId 已有 active 座位 → 409 且 code=11002', async () => {
     topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't', creatorId: 'agent-1' });
@@ -3274,66 +3302,120 @@ describe('RoundtableService', () => {
 
   describe('审批裁决 verdictPermissionRequest（M3 阶段 1）', () => {
     beforeEach(() => {
+      mockAuditService.log.mockClear();
       permReqRepo.findOne.mockResolvedValue(makePermissionRequest());
       topicService.findById.mockResolvedValue({ id: 'topic-1', title: 't', creatorId: 'user-1' });
       permService.ensureCan.mockResolvedValue(undefined);
       permReqRepo.save.mockImplementation(async (r: RoundtablePermissionRequest) => r);
     });
 
-    it('pending → approved（approve_once 放行）：落库三件套 + verdict 下行 + topic 公告', async () => {
-      const seat = makeSeat();
-      seatRepo.findOne.mockResolvedValue(seat);
-      const result = await service.verdictPermissionRequest(
-        'pr-1',
-        { optionId: 'approve_once' },
-        HUMAN_ACTOR,
-      );
-      await flushMicrotasks(); // 公告 fire-and-forget
+    it.each([
+      ['approve_once', 'allow_once', 'approved', '已批准'],
+      ['opaque:session-17', 'allow_always', 'approved', '已批准'],
+      ['approve_always', 'reject_once', 'rejected', '已拒绝'],
+      ['opaque:deny-forever', 'reject_always', 'rejected', '已拒绝'],
+    ])(
+      'optionId=%s / kind=%s → %s：落库、公告、审计一致，原 ID 下发',
+      async (optionId, kind, status, text) => {
+        /** 熟悉的 approve_* ID 也可能承载 reject kind，禁止从 ID 猜测结果。 */
+        const request = makePermissionRequest({ options: [{ optionId, kind, name: 'Selected' }] });
+        permReqRepo.findOne.mockResolvedValue(request);
+        const result = await service.verdictPermissionRequest('pr-1', { optionId }, HUMAN_ACTOR);
+        await flushMicrotasks();
 
-      // 落库（铁律 #18：状态与 resolved 字段同次写入）
-      expect(result.status).toBe('approved');
-      expect(result.verdictOptionId).toBe('approve_once');
-      expect(result.resolvedBy).toBe('user-1');
-      expect(result.resolvedAt).toBeInstanceOf(Date);
-      expect(permReqRepo.save).toHaveBeenCalled();
-      // verdict 下行（§4：requestId + optionId；seq=0 对账游标仅适用 inject）
-      expect(registry.sendToRunner).toHaveBeenCalledTimes(1);
-      const envelope = registry.sendToRunner.mock.calls[0][1] as Envelope;
-      expect(envelope.type).toBe('seat.permission_verdict');
-      expect(envelope.seatId).toBe('seat-1');
-      expect(envelope.seq).toBe(0);
-      expect(envelope.payload).toEqual({ requestId: 'req-1', optionId: 'approve_once' });
-      // topic 公告（「<人> 已批准了座位 X 的审批请求」）
-      expect(topicService.sendMessage).toHaveBeenCalledWith(
-        'topic-1',
-        SYSTEM_ACTOR_ID,
-        ActorType.SYSTEM,
-        expect.objectContaining({
-          content: 'Tianyu 已批准了座位 kimi-1 的审批请求',
-          type: MessageType.SYSTEM,
-        }),
-      );
-    });
+        expect(result).toBe(request);
+        expect(result).toMatchObject({
+          status,
+          verdictOptionId: optionId,
+          resolvedBy: HUMAN_ACTOR.id,
+        });
+        expect(result.resolvedAt).toBeInstanceOf(Date);
+        expect(permReqRepo.save).toHaveBeenCalledTimes(1);
+        expect(permReqRepo.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            status,
+            verdictOptionId: optionId,
+            resolvedBy: HUMAN_ACTOR.id,
+            resolvedAt: expect.any(Date),
+          }),
+        );
+        expect(registry.sendToRunner).toHaveBeenCalledTimes(1);
+        const envelope = registry.sendToRunner.mock.calls[0][1] as Envelope;
+        expect(envelope).toMatchObject({
+          type: 'seat.permission_verdict',
+          seatId: 'seat-1',
+          seq: 0,
+          payload: { requestId: 'req-1', optionId },
+        });
+        expect(topicService.sendMessage).toHaveBeenCalledWith(
+          'topic-1',
+          SYSTEM_ACTOR_ID,
+          ActorType.SYSTEM,
+          expect.objectContaining({
+            content: `Tianyu ${text}了座位 kimi-1 的审批请求`,
+            type: MessageType.SYSTEM,
+          }),
+        );
+        expect(mockAuditService.log).toHaveBeenCalledTimes(1);
+        expect(mockAuditService.log).toHaveBeenCalledWith(
+          expect.objectContaining({
+            entityId: request.id,
+            actorId: HUMAN_ACTOR.id,
+            newData: {
+              requestId: request.id,
+              seatId: request.seatId,
+              topicId: request.topicId,
+              status,
+            },
+          }),
+        );
+      },
+    );
 
-    it('pending → rejected（option.kind=reject）：状态 rejected + 「已拒绝」公告', async () => {
-      seatRepo.findOne.mockResolvedValue(makeSeat());
-      const result = await service.verdictPermissionRequest(
-        'pr-1',
-        { optionId: 'reject' },
-        HUMAN_ACTOR,
-      );
+    it.each([
+      ['unknown string', { optionId: 'opaque:unknown', kind: 'future_kind' }],
+      ['missing', { optionId: 'opaque:missing' }],
+      ['null', { optionId: 'opaque:null', kind: null }],
+      ['number', { optionId: 'opaque:number', kind: 1 }],
+      ['object', { optionId: 'opaque:object', kind: { value: 'allow_once' } }],
+      ['bare reject', { optionId: 'reject', kind: 'reject' }],
+      ['wrong approve_once kind', { optionId: 'approve_once', kind: 'approve_once' }],
+      ['wrong approve_always kind', { optionId: 'approve_always', kind: 'approve_always' }],
+      ['familiar ID / unknown kind', { optionId: 'allow_once', kind: 'future_kind' }],
+    ])('kind %s → 422：请求快照不变，零持久化/下行/公告/审计', async (_label, option) => {
+      const request = makePermissionRequest({ options: [{ ...option, name: 'Unsupported' }] });
+      const before = structuredClone(request);
+      permReqRepo.findOne.mockResolvedValue(request);
+      let error: unknown;
+      try {
+        await service.verdictPermissionRequest('pr-1', { optionId: option.optionId }, HUMAN_ACTOR);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(UnprocessableEntityException);
+      expect(error).toMatchObject({
+        status: 422,
+        response: {
+          code: ErrorCode.VALIDATION_ERROR,
+          message: expect.stringMatching(/kind.*missing or unsupported/),
+        },
+      });
+      const message = (error as UnprocessableEntityException).getResponse() as { message: string };
+      for (const kind of ['allow_once', 'allow_always', 'reject_once', 'reject_always']) {
+        expect(message.message).toContain(kind);
+      }
+      expect(message.message).toContain('unchanged');
+      expect(message.message).toContain('no verdict');
+      expect(message.message).toContain('runner/adapter');
       await flushMicrotasks();
-      expect(result.status).toBe('rejected');
-      expect(result.verdictOptionId).toBe('reject');
-      expect(topicService.sendMessage).toHaveBeenCalledWith(
-        'topic-1',
-        SYSTEM_ACTOR_ID,
-        ActorType.SYSTEM,
-        expect.objectContaining({
-          content: 'Tianyu 已拒绝了座位 kimi-1 的审批请求',
-          type: MessageType.SYSTEM,
-        }),
-      );
+      expect(request).toEqual(before);
+      expect(permReqRepo.save).not.toHaveBeenCalled();
+      expect(seatRepo.findOne).not.toHaveBeenCalled();
+      expect(seatRepo.save).not.toHaveBeenCalled();
+      expect(registry.sendToRunner).not.toHaveBeenCalled();
+      expect(topicService.sendMessage).not.toHaveBeenCalled();
+      expect(topicService.join).not.toHaveBeenCalled();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it('裁决（TOPIC-PERM 收口）：editor 参与方（非 creator 非 admin）→ 403，裁决保持 creator-only', async () => {
@@ -3351,6 +3433,20 @@ describe('RoundtableService', () => {
       ).rejects.toMatchObject({ response: { code: ErrorCode.PERMISSION_DENIED } });
       expect(permReqRepo.save).not.toHaveBeenCalled();
       expect(registry.sendToRunner).not.toHaveBeenCalled();
+    });
+
+    it.each(['admin', 'ownerProxy'])('人类治理身份 %s 仍可裁决', async (role) => {
+      topicService.findById.mockResolvedValue({ id: 'topic-1', creatorId: 'other-creator' });
+      ownerProxy.isOwnerProxy.mockResolvedValue(role === 'ownerProxy');
+      const actor = role === 'admin' ? HUMAN_ADMIN_ACTOR : HUMAN_ACTOR;
+      const result = await service.verdictPermissionRequest(
+        'pr-1',
+        { optionId: 'approve_once' },
+        actor,
+      );
+      await flushMicrotasks();
+      expect(result).toMatchObject({ status: 'approved', resolvedBy: actor.id });
+      expect(permService.ensureCan).toHaveBeenCalledWith(expect.anything(), actor, 'write');
     });
 
     it('重复裁决（非 pending）→ 409 ConflictException，不落库不下行', async () => {
@@ -3421,6 +3517,34 @@ describe('RoundtableService', () => {
           type: MessageType.SYSTEM,
         }),
       );
+    });
+
+    it('runner 离线返回 false → warning，已知 reject kind 仍落库/公告/审计', async () => {
+      const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
+      registry.sendToRunner.mockReturnValue(false);
+      try {
+        const result = await service.verdictPermissionRequest(
+          'pr-1',
+          { optionId: 'reject' },
+          HUMAN_ACTOR,
+        );
+        await flushMicrotasks();
+        expect(result.status).toBe('rejected');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('verdict 下行失败'));
+        expect(mockAuditService.log).toHaveBeenCalledWith(
+          expect.objectContaining({
+            newData: expect.objectContaining({ status: 'rejected' }),
+          }),
+        );
+        expect(topicService.sendMessage).toHaveBeenCalledWith(
+          'topic-1',
+          SYSTEM_ACTOR_ID,
+          ActorType.SYSTEM,
+          expect.objectContaining({ content: 'Tianyu 已拒绝了座位 kimi-1 的审批请求' }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it('座位行缺失 → 下行跳过，公告回退 seatId 标识', async () => {

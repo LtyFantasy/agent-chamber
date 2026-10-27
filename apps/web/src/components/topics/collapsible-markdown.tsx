@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/ui-design-system.md §6.1（消息内 Markdown 渲染层级 + 长消息折叠模式）
- *   - 补充: docs/frontend-architecture.md §3.2.3（话题详情页消息流）
+ *   - 主文档: docs/frontend/ui-design-system.md §6.1（消息内 Markdown 渲染层级 + 长消息折叠模式）
+ *   - 补充: docs/frontend/frontend-architecture.md §3.2.3（话题详情页消息流）
  *
  * [踩坑索引]
  *   - 折叠阈值按渲染后高度测量（useLayoutEffect + scrollHeight），不按字符数——

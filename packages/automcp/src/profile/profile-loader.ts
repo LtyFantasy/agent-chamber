@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/automcp.md §4
+ *   - 主文档: docs/integrations/automcp.md §4
  *   - 补充: AGENTS.md §7 (关键数字速查)
  *
  * [踩坑索引] -
@@ -98,7 +98,42 @@ export async function loadProfile(profilePath: string): Promise<ToolProfile> {
     tags: parseStringArray(profile.tags, 'tags'),
     include: parseStringArray(profile.include, 'include'),
     exclude: parseStringArray(profile.exclude, 'exclude'),
+    excludeCustomTools: parseCustomToolNames(profile.excludeCustomTools),
   };
+}
+
+/**
+ * 解析 `excludeCustomTools`（精确工具名排除表）
+ *
+ * 与 `parseStringArray` 的差异：工具名是**精确匹配**的封闭集合键，空串/纯空白
+ * 既不可能命中任何工具，又会让校验误以为"配置了排除"——直接报错，避免拼写事故
+ * 被静默吞掉（与运行期的未知工具名校验同一条防线，此处挡住结构性错误）。
+ *
+ * @param value - 原始 JSON 字段值
+ * @returns 工具名数组；未配置时 undefined
+ * @throws 非数组、非字符串项、空名时抛错
+ */
+function parseCustomToolNames(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('Profile field "excludeCustomTools" must be an array of strings');
+  }
+
+  const result = value.map((item) => {
+    if (typeof item !== 'string') {
+      throw new Error('Profile field "excludeCustomTools" must be an array of strings');
+    }
+    if (item.trim() === '') {
+      throw new Error('Profile field "excludeCustomTools" must not contain empty tool names');
+    }
+    return item;
+  });
+
+  // 去重保序：重复项不影响语义，但会让"排除 N 个"的日志与配置难以对账
+  return result.length > 0 ? [...new Set(result)] : undefined;
 }
 
 /**

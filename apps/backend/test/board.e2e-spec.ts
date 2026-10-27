@@ -28,6 +28,12 @@ describe('BoardController (e2e)', () => {
   const boardId = '00000000-0000-0000-0000-000000000001';
   const listId = '00000000-0000-0000-0000-000000000010';
   const actorId = '00000000-0000-0000-0000-000000000005';
+  /**
+   * dummy guard 注入的 actor id（test-setup.ts:210，`req.user.userId`）——**与上面的
+   * `actorId` 形状不同**（0000-4000 段）。夹具里凡要用"creator 短路"表达"actor 拥有该资源"
+   * 的地方，creatorId 必须用这个值，否则 BoardPolicy 的 isCreator 恒为假。
+   */
+  const guardActorId = '00000000-0000-4000-8000-000000000005';
 
   beforeEach(async () => {
     ({ app, mockRepos } = await createTestingApp());
@@ -47,6 +53,31 @@ describe('BoardController (e2e)', () => {
       status: 'active',
       deletedAt: null,
       actor: { status: 'active' },
+    });
+
+    // ── F4-2：TaskPolicy / resolveTaskBoard 的 list→board 归属判定改走**定主键重载**
+    // （createQueryBuilder + withDeleted + addSelect('board.deletedAt')），不再走 findOne。
+    // 本套件夹具只喂了 `BoardList.findOne`，不接管 QB 的话重载恒 null ⇒ Policy 掉进
+    // "真缺失"分支全拒（/tasks/:id/report、/tasks/:id/description 等写端点变 403）。
+    // 这里让重载**镜像本套件夹具的 findOne 结果**（同一份语义 ⇒ 既有用例零改动）；
+    // 需要区分两条通道的套件（task-permission）才显式接管 getOne。
+    // ⚠️ **覆盖边界（复审 MINOR-4）**：接管的是**全局 getOne**（且忽略 WHERE/select 实参）——
+    // 本套件其他依赖过滤语义的 QB 查询（如 status→mappedStatus 吸附的
+    // `board_id + mapped_status` 查询）在 mock 下会拿到**同一行**。当前那些路径只看
+    // "有没有行"（吸附未命中即不改 listId），拿到同一行不构成假绿；**将来新增依赖
+    // "过滤后为空 / 命不命中"的断言时，必须改为按 where 实参分发**，否则会得假结果。
+    const baseBoardListQb = mockRepos.BoardList.createQueryBuilder;
+    mockRepos.BoardList.createQueryBuilder = jest.fn((...args: any[]) => {
+      const qb = baseBoardListQb(...args);
+      qb.getOne.mockImplementation(async () => {
+        const row = (await mockRepos.BoardList.findOne({ where: { id: listId } })) as any;
+        // 重载必须带 board 关系（TaskPolicy 靠它判权限）：本套件夹具的 makeList 没有
+        // board 字段，这里补一块**该 actor 自己创建**的板。此前这两个写端点能过，靠的是
+        // 旧代码 `!list?.board → return true`（无板即放行）——那正是 F4-2 收紧掉的兜底放行，
+        // 所以这里的显式归属是**必要修正**，不是为让测试变绿而迁就。
+        return row ? { ...row, board: { ...makeBoard(), creatorId: guardActorId } } : null;
+      });
+      return qb;
     });
   });
 

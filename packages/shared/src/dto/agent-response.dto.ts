@@ -66,11 +66,18 @@ export interface AgentDeletionImpact {
  * 语义与 TopicService.getUnread 对齐（以函数名为锚，不引用易漂的行号）：
  * - 无游标（last_read_message_id IS NULL）或游标消息已软删 → 该 topic 全量未读计数
  *   （未软删 **且非自己发** 的消息）；
- * - 自己发的消息不计入未读：主路径靠「发送即已读」游标（v1.69），SQL 侧再显式排除
- *   sender_id = participant_id，兜住游标缺失/悬空的降级路径（v1.85 同口径收口）；
- * - 仅统计 status IN ('invited','active') 的参与行（left 排除）；
+ * - 自己发的消息不计入未读：SQL 侧显式排除 `sender_id = participant_id`，兜住游标缺失/
+ *   悬空的降级路径（v1.85 同口径收口）。**发送消息不推进游标**（v1.96.0-dev D1 行为变更，
+ *   取代 v1.69「发送即已读」）——游标只经 `POST /topics/:id/read` 或
+ *   `get_topic_digest(markRead=true)` 推进；
+ * - **提及过滤**（v1.96.0-dev D4）：该行 `notification_settings` 开了 `mentions_only` 时，
+ *   只统计提及我（`mentions` 含我的 actor id）或 `@all`（含标量 `"*"`）的消息。
+ *   ⚠️ 存量 `mentions` 全为 `[]`（未回填）——历史 @ 在此模式下永不可见，该事实经
+ *   `PATCH /topics/:id/notification-settings` 的 `hiddenUnreadCount` 与公告披露；
+ * - 仅统计 status IN ('invited','active') 的参与行（left 排除——**leave 会让话题从本
+ *   响应里消失**，故"不想被刷屏"应开 mentions_only 而不是 leave）；
  * - 只列 unreadCount > 0 的 topic，最多 50 条；结果为调用时刻快照
- *   （get_topic_digest 默认 markRead=true 会推进游标清零计数）。
+ *   （get_topic_digest 默认 markRead=true 会推进游标，多轮 drain 语义见 topic 读面）。
  */
 export interface TopicUnreadCount {
   /** 话题 ID */

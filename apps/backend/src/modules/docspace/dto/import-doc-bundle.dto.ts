@@ -81,7 +81,13 @@ export class BundleSpaceMetaDto {
   @MaxLength(100)
   name: string;
 
-  @ApiPropertyOptional({ description: 'Space legend (markdown description)' })
+  // 显式 type + nullable：`string | null` 联合类型经 reflect-metadata 推成 Object，会让
+  // Swagger/automcp 输出 type:object，MCP 通道传字符串必 400（守卫见 swagger-schema.spec.ts）
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: 'Space legend (markdown description)',
+  })
   @IsOptional()
   @IsString()
   description?: string | null;
@@ -125,7 +131,7 @@ export class BundleCategoryItemDto {
   @MaxLength(128)
   slug?: string;
 
-  @ApiPropertyOptional({ description: 'Category description' })
+  @ApiPropertyOptional({ type: String, nullable: true, description: 'Category description' })
   @IsOptional()
   @IsString()
   description?: string | null;
@@ -159,13 +165,20 @@ export class BundleRouteItemDto {
   @MaxLength(200)
   intent: string;
 
-  @ApiPropertyOptional({ description: 'Route group (nullable)', maxLength: 100 })
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: 'Route group (nullable)',
+    maxLength: 100,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(100)
   category?: string | null;
 
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
     description: 'Primary doc path (resolved to docId on import)',
     maxLength: 512,
   })
@@ -175,6 +188,8 @@ export class BundleRouteItemDto {
   primaryDocPath?: string | null;
 
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
     description: 'Primary doc heading anchor (exact heading_path)',
     maxLength: 512,
   })
@@ -183,19 +198,31 @@ export class BundleRouteItemDto {
   @MaxLength(512)
   primaryHeadingPath?: string | null;
 
-  @ApiPropertyOptional({ description: 'Secondary doc path (nullable)', maxLength: 512 })
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: 'Secondary doc path (nullable)',
+    maxLength: 512,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(512)
   secondaryDocPath?: string | null;
 
-  @ApiPropertyOptional({ description: 'Secondary doc heading anchor (nullable)', maxLength: 512 })
+  @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    description: 'Secondary doc heading anchor (nullable)',
+    maxLength: 512,
+  })
   @IsOptional()
   @IsString()
   @MaxLength(512)
   secondaryHeadingPath?: string | null;
 
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
     description: 'Code entry (repo-relative path or glob pattern)',
     maxLength: 512,
   })
@@ -255,6 +282,8 @@ export class BundleDocItemDto {
    * 旧/新服务端皆不报错（formatVersion 1/2 都声明该字段；roundtrip 兼容）。
    */
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
     description: 'Original payload SHA-256 (informational, ignored on import; nullable)',
   })
   @IsOptional()

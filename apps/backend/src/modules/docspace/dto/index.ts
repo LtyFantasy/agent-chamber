@@ -30,6 +30,10 @@ export { UpsertDiagramDto } from './upsert-diagram.dto';
 export { PatchDiagramDto, DiagramPatchItemDto } from './patch-diagram.dto';
 export { ValidateDiagramDto, ValidateDiagramPatchItemDto } from './validate-diagram.dto';
 export { DiagramHtmlQueryDto } from './diagram-html-query.dto';
+// DocSpace 元数据治理 3 期（v1.92.0-dev）：存量 rename/merge + orphan 诊断
+export { RenameDocTagsDto } from './rename-doc-tags.dto';
+export { MergeDocCategoryDto } from './merge-doc-category.dto';
+export { QueryOrphanDocsDto } from './query-orphan-docs.dto';
 export {
   ImportDocBundleDto,
   BundleSpaceMetaDto,

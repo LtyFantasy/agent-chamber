@@ -1,29 +1,43 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2.1 (Account / Auth / Agent)
- *   - 补充: docs/roundtable-design.md §7 (安全边界: runner 用普通 agent API Key 拨出,
- *     WS 握手认证与 HTTP guard 共用本服务)
- *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md 决策 9（AgentPayload 携带
- *     keyPrefix——多 key 粒度缓解，认证上下文供审计 newData，非明文）
+ * [功能概念]
+ *   - HTTP / WS 共用的 API Key 身份认证与认证遥测
  *
- * [踩坑索引] A3-1b(actor.deletedAt死代码)
+ * [代码职责]
+ *   - 校验 Key 与 Agent 状态，原样返回认证上下文，并写入使用/活跃时间
  *
- * [铁律关联] #9(代理层透传) #11(注释) #20(契约即设计)
+ * [权威文档]
+ *   - 主文档: DocSpace Agent Chamber / docs/architecture.md §3.2.1 Account Module
+ *   - 补充: 同空间 docs/api-definition.md §2.1 — 认证与 scopes 判定边界
+ *   - 补充: 同空间 docs/modules/roundtable-design.md §7 — runner 使用普通 Agent API Key
  *
- * [详细踩坑]（最多 5 条）
- *   A3-1b: `agent.actor?.deletedAt` 检查是死代码——Actor.deletedAt 是 @DeleteDateColumn
- *         ({ select: false })，正常 findOne 恒 undefined；软删 agent 的拦截语义实际由
- *         actor 行被 eager LEFT JOIN 软删过滤（agent.actor = null → status 检查失败）承担。
- *         2026-08-26 统一批 A3-1b 删除该分支（revokedReason 见 agent.service.ts A3-1）。
- *         见 plans/rictor-swamp-thing-hulkling.md §2 R1
+ * [关键不变量]
+ *   - 本服务只做**认证**并把 `api_keys.permissions` 原样透传进 `AgentPayload.permissions`
+ *     （**不做**任何权限判定）。scopes 的判定与执行在
+ *     `common/guards/api-key-scope.guard.ts` + `common/utils/api-key-scope.ts`（HTTP）与
+ *     `modules/roundtable/runner.gateway.ts`（WS 握手）三处，共用同一工具函数。
+ *     ⚠️ 禁止在本服务内加"顺手"的 scope 检查或收窄 permissions——那会造成双源漂移。
+ *   - 遥测只按 id 更新 lastUsedAt / lastActiveAt，不改变查询快照、不保存旧关系图。
+ *     Key 写同步 await 且失败传播；Agent 写异步 catch，不阻塞认证返回。
+ *
+ * [关联代码]
+ *   - apps/backend/src/common/guards/api-key-scope.guard.ts — HTTP 授权
+ *   - apps/backend/src/common/utils/api-key-scope.ts — scopes 判定单源
+ *   - apps/backend/src/modules/roundtable/runner.gateway.ts — WS 握手授权
+ *   - apps/backend/src/common/services/api-key-auth.service.spec.ts — 遥测与失败时序回归
+ *
+ * [持久踩坑]
+ *   - A3-1b(actor.deletedAt死代码): select:false 使正常查询的 deletedAt 恒 undefined；
+ *     软删 Actor 被 eager LEFT JOIN 过滤，actor=null 由 status 校验拒绝。
+ *     详情: 同空间 docs/architecture.md §3.2.1；apps/backend/src/modules/agent/agent.service.ts A3-1。
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 import { Injectable, UnauthorizedException } from '@nestjs/common';
@@ -136,13 +150,11 @@ export class ApiKeyAuthService {
       });
     }
 
-    // Update last used
-    apiKey.lastUsedAt = new Date();
-    await this.apiKeyRepo.save(apiKey);
+    /** 只写使用时间，避免旧 Key 快照回写吊销等生命周期字段；保留同步失败语义。 */
+    await this.apiKeyRepo.update(apiKey.id, { lastUsedAt: new Date() });
 
-    // Update agent lastActiveAt asynchronously (non-blocking)
-    agent.lastActiveAt = new Date();
-    this.agentRepo.save(agent).catch(() => {});
+    /** 不保存旧 Agent / Actor 关系图；活跃时间仍异步写入，失败不阻塞认证返回。 */
+    this.agentRepo.update(agent.id, { lastActiveAt: new Date() }).catch(() => {});
 
     return {
       id: agent.id,

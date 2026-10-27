@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
- *   - 补充: docs/roundtable-design.md §8 (opencode ACP 行为档案, 1.18.9 实测 2026-08-14——
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
+ *   - 补充: docs/modules/roundtable-design.md §8 (opencode ACP 行为档案, 1.18.9 实测 2026-08-14——
  *           configOptions 地面真相 model+mode(build/plan) / 权限经 OPENCODE_CONFIG_CONTENT
  *           钉死 / authMethods=opencode-login / loadSession=true)
  *

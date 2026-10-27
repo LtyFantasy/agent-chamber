@@ -4,17 +4,19 @@
  * =============================================================================
  * [功能概念]
  *   - 经验库（Experience Base）读写面：录入 / 检索三路融合 / 分面 / 详情 / 反馈计数联动 /
- *     编辑（乐观锁 + 回落）/ 质量终审 / 软删 / 零命中埋点
+ *     编辑（乐观锁 + 回落）/ 质量终审 / 软删 / 零命中埋点 / **判定补跑（admin backfill）**
  *
  * [代码职责]
  *   - 全部业务规则的执行点：归一化 → 闸门 → 限流 → 幂等 → 持久化 → 计数联动 → 审计
  *   - `baseQuery()` 是**列表/分面/词表三处查询口径的唯一收口**（软删 + 过期 + suspect）
  *   - 反馈计数三列与反馈行的**同事务原子迁移**（铁律 #18 不变量的守门人）
+ *   - `backfillJudgments()` 是判别管线的**第三个调用点**（batch 编排，判权/互斥/计数在此）
  *
  * [权威文档]
- *   - 主文档: .kimi/plans/plan-experience-base.md §1.2（反馈不变量）/§2（匹配契约）/
- *     §3（API 契约）/§6（治理与审计）/§8（观测）
- *   - 补充: 线上 DocSpace `docs/api-definition.md` — 经验库章（错误码→消费者动作表）
+ *   - 主文档: 线上 Agent Chamber DocSpace `docs/modules/experience-base.md` §6（治理）/
+ *     §8（匹配契约）/§9（观测）/§12（可选判别、缓存与日志）/§12.2（补跑）
+ *   - 补充: 线上 DocSpace `docs/api-definition.md` §18 — 经验库端点与反馈不变量；
+ *     §18.2/§18.7/§18.15 — 录入、编辑、补跑及错误码→消费者动作
  *
  * [关键不变量]
  *   1. **匹配语义**：signals/domains 是 `&&` ANY-overlap（**禁 `= ANY`**，实测 Seq Scan
@@ -25,28 +27,39 @@
  *      归一化（`?signals=ECONNREFUSED` 必须能命中库里的小写值）
  *   4. **录入恒 unverified**：录入者取 `@CurrentActor()`，DTO 不收 quality/createdBy
  *      （徽章洗白防线的第一道物理隔离）
- *   5. **内容改写 → quality 回落 unverified + 清 verified_by/at**：只有
+ *   5. **verified 内容改写 → unverified + 清 verified_by/at，suspect 保持粘性**：只有
  *      title/summary/content/signals 四个内容类字段触发；intent/domains/env/expiresAt
- *      改元数据不触发（plan §3 逐字段列明）
+ *      改元数据不触发（线上 docs/api-definition.md §18.7 逐字段列明）
  *   6. **反馈计数三列与反馈行同事务**：单语句原子 UPDATE（**禁
  *      `repository.increment()`**——那会顶 `updated_at`，让"反馈"变成"内容更新"）、
  *      手写 `deleted_at IS NULL`、RETURNING 取终值；rowCount=0 → 13000
  *   7. **反馈不顶 `updated_at`**：反馈不是内容编辑，顶了会让 `sort=recent` 被反馈刷屏
  *      （该列刻意不进任何索引亦同源）
  *   8. **异常与日志不回显正文**：错误 message/审计载荷只出现 id、标题、字段名与计数，
- *      **永不出现 content 正文**（含密钥闸门命中处）
+ *      **永不出现 content 正文**。密钥闸门 400 只允许回显**字段路径**（`signals[0]` /
+ *      `env.os`）与**模式类别名**，绝不回显命中 token 本体（不变量 #8 的红线）
  *   9. **零命中埋点 fail-open**：埋点写失败只记日志，绝不阻断检索
  *   10. **本批不进全局 /search、不发 events/SSE、不扩 ResourceType/EventType**（plan §3
  *       末段明文决策）——代码里零接线，故本服务不注入 EventEmitter/SseService
+ *   11. **密钥闸门三层扫描，缺一层就是静默变弱**：① 请求体原值逐字段（客户端下标）；
+ *       ② 归一化/落库值兜底（`normalized.` / `stored.` 前缀，防 `ASK_ABC` 归一化后成
+ *       真前缀、防未触碰的存量文本）；③ 逐字段无命中时回退 `join('\n')`（跨字段拆分
+ *       形态，路径标 `(cross-field)`）。三层的报告口径见 `scanTextForSecrets`
+ *   12. **判别专用准备 + evaluate 局部 fail-open**：provider=none 在专用 IO 前短路；
+ *       内容四字段变化同业务事务清 judgment 缓存，元数据编辑保留；判别在提交后运行。
+ *       业务重复提示/事务/正式 search-facets 字典/补跑选取与计数错误仍传播。
  *
  * [关联代码]
- *   - experience.controller.ts — 8 端点的守卫布局与原始查询串形态守卫
+ *   - experience.controller.ts — 14 端点的守卫布局与原始查询串形态守卫
+ *     （条目 8 + 成员 4 + 判断日志 1 + 判定补跑 1）
  *   - experience.constants.ts — 全部阈值/上限/闸门模式的单源
  *   - dto/*.dto.ts — 格式校验（本服务的所有入参都已过层 1）
  *   - common/services/idempotency.helper.ts — 录入幂等（**复用，禁内联分叉**）
  *   - common/services/owner-proxy.service.ts — 编辑/删除的作者判定（owner 代理）
  *   - modules/audit/audit.service.ts — 三处插桩（终审 / 软删 / 越权尝试），fail-open
  *   - database/entities/{experience-entry,experience-feedback,experience-search-event}.entity.ts
+ *   - experience.service.spec.ts / test/experience-judgment-boundary.e2e-spec.ts —
+ *     深拷贝缓存持久态、提交顺序与受控 HTTP 错误边界
  *
  * [持久踩坑]
  *   EXPERIENCE-FEEDBACK-CONFLICT-TARGET(仲裁者): 改判路径的冲突目标必须是
@@ -70,6 +83,9 @@
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图
  *   □ 已核对 [关键不变量]：新增查询路径必须走 baseQuery（否则口径分叉）
+ *     ——**明示例外**：判定补跑的选取集**不**走 baseQuery（它要的正是"judgment IS NULL"的
+ *     条目，且 suspect 必须**纳入**：判定本就早于终审）。同类豁免先例见 findOne/update 的
+ *     按 id 查询（只过滤软删）。除补跑外新增任何读路径仍须走 baseQuery。
  *   □ 反馈/计数相关的断言变松 = 铁律 #18 护栏失效（e2e 有六条不变量钉住）
  *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  * =============================================================================
@@ -91,10 +107,12 @@ import {
   EXPERIENCE_ENV_KEYS,
   EXPERIENCE_FEEDBACK_OUTCOME,
   EXPERIENCE_INTENTS,
+  EXPERIENCE_JUDGMENT_OPERATION,
   EXPERIENCE_QUALITIES,
   EXPERIENCE_QUALITY,
   EXPERIENCE_ZERO_HIT_HINT,
   ErrorCode,
+  ActorType,
   type ExperienceAppliedFilters,
   type ExperienceCreatorFacet,
   type ExperienceDetail,
@@ -103,6 +121,7 @@ import {
   type ExperienceFacetsResponse,
   type ExperienceFeedbackOutcome,
   type ExperienceFeedbackResponse,
+  type ExperienceJudgmentsBackfillResponse,
   type ExperienceListResponse,
   type ExperienceQualityReviewResponse,
   type ExperienceSummary,
@@ -147,10 +166,12 @@ import {
   EXPERIENCE_DUPLICATE_CANDIDATE_LIMIT,
   EXPERIENCE_DUPLICATE_TITLE_SIMILARITY,
   EXPERIENCE_IDEMPOTENCY_ENTITY_TYPE,
+  EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT,
   EXPERIENCE_MISSING_VERIFICATION_WARNING,
   EXPERIENCE_RANK_WEIGHTS,
   resolveCreateRateLimit,
   EXPERIENCE_SCORE_FLOOR,
+  EXPERIENCE_SECRET_PATTERN_LABELS,
   EXPERIENCE_SECRET_PATTERNS,
   EXPERIENCE_VERIFICATION_SECTION_PATTERN,
 } from './experience.constants';
@@ -162,7 +183,9 @@ import { ExperienceMemberService } from './experience-member.service';
 import type { ViewerReviewState } from './experience-member.service';
 import { ExperienceJudgmentService } from './experience-judgment.service';
 import type { ExperienceCheckInput } from './judgment/judgment-provider.interface';
+import { safeErrorTag } from '../judgment/judgment-payload';
 import type {
+  BackfillJudgmentsDto,
   CreateExperienceDto,
   QueryExperienceDto,
   ReportExperienceFeedbackDto,
@@ -235,6 +258,23 @@ interface PgUniqueViolation {
 }
 
 /**
+ * 补跑判定的"**这条已经尝试过判定**"谓词（`EXISTS` 子查询体；别名 `e` = 选取集条目）。
+ *
+ * 两个消费者共用这一份，**不许各写一遍**：
+ * - 选取集排序的主键（未尝试优先，见 `selectBackfillBatch`）；
+ * - 批后二计数（`countBackfillNulls` 的 `EXISTS` 分支）。
+ *
+ * ⚠️ **`j.operation` 条件不可省**：`experience_judgments` 是**多操作表**
+ * （`record_check` / `rerank` / `autotag`）——只按 `experience_id` 计数/排序，将来别的操作的
+ * 日志行会被当成"这条判过了"，**静默腐蚀进度与计数且零报错**（autotag 上线即触发）。
+ * 操作名走**绑定参数**（值域单源 = shared `EXPERIENCE_JUDGMENT_OPERATION`），
+ * 调用方必须 `setParameter('recordCheckOperation', ...)`。
+ */
+const BACKFILL_TRIED_EXISTS_SQL =
+  'EXISTS (SELECT 1 FROM experience_judgments j ' +
+  'WHERE j.experience_id = e.id AND j.operation = :recordCheckOperation)';
+
+/**
  * 经验库服务。
  *
  * 分层（铁律 #21）：DTO 管**格式正确性**（类型/长度/词表/数组元素形状）；本服务管
@@ -260,6 +300,19 @@ export class ExperienceService {
    * 阈值的写法因此必须在 app 引导前设置 env（照 USAGE_FLUSH_INTERVAL_MS 先例）。
    */
   private readonly createRateLimit: number = resolveCreateRateLimit();
+
+  /**
+   * 判定补跑的**进程内互斥**（single-flight）。
+   *
+   * 为什么必须：快照写用的是**版本守卫**（`WHERE id=$1 AND updated_at=$2`）而判定写
+   * **不触碰 `updated_at`**——并发两批会拿同一份守卫文本**双双写成功**（各自 rowCount=1），
+   * 后果是条目**重复出境**（两倍配额消耗）+ 双日志行（语料被灌水）。
+   *
+   * 范围明文取舍：进程内内存（重启清零、**不跨实例共享**）——单实例部署下即充分
+   * （nginx 单 upstream）。多副本部署时护栏退化为 ×N（与三级成本闸同一前提）。
+   * 用 try/finally 释放：一次异常不得把本进程的补跑**永久锁死**。
+   */
+  private backfillRunning = false;
 
   constructor(
     @InjectRepository(ExperienceEntry)
@@ -416,22 +469,20 @@ export class ExperienceService {
     // ⑧ 判别（plan §3.5）：**事务外**、响应之前完成——judgment 是录入响应的一个键。
     //    判定失败/被限流/provider 未启用都只是让这个键为 null，**绝不影响录入成功**。
     //    幂等重放刻意走不到这里（上面已 return）：重放从快照列回填，不重判。
-    const judgment = await this.judgments.evaluateAndPersist({
-      mode: 'create',
-      entryId,
-      actor,
-      input: await this.buildJudgmentInput({
-        title,
-        summary,
-        content: dto.content,
-        signals,
-        domains,
-        env,
-        intent: dto.intent,
-        duplicateCandidates: possibleDuplicates.slice(0, EXPERIENCE_DUPLICATE_CANDIDATE_LIMIT),
-      }),
-      expectedUpdatedAtText: entryUpdatedAtText,
-    });
+    const judgment = await this.evaluateOptionalJudgment(
+      { mode: 'create', entryId, actor, expectedUpdatedAtText: entryUpdatedAtText },
+      () =>
+        this.buildJudgmentInput({
+          title,
+          summary,
+          content: dto.content,
+          signals,
+          domains,
+          env,
+          intent: dto.intent,
+          duplicateCandidates: possibleDuplicates.slice(0, EXPERIENCE_DUPLICATE_CANDIDATE_LIMIT),
+        }),
+    );
 
     return { ...payload, id: entryId, judgment };
   }
@@ -455,6 +506,27 @@ export class ExperienceService {
       .where('e.id = :id', { id: replay.id })
       .getOne();
     return { ...replay, judgment: row?.judgment ?? null, idempotentReplay: true };
+  }
+
+  /**
+   * 可选判别边界：未启用时不准备输入；启用时仅兜住专用准备与执行。
+   * 业务事务、重复软提示、正式响应字典及补跑选取/计数均由调用方保留原错误语义。
+   * @param params 原判别参数（不含尚未准备的 input）
+   * @param prepareInput 惰性专用输入准备，调用者应在业务提交之后传入
+   * @returns 成功判别快照，或 null（无结论）；准备失败可能尚未生成判别日志
+   */
+  private async evaluateOptionalJudgment(
+    params: Omit<Parameters<ExperienceJudgmentService['evaluateAndPersist']>[0], 'input'>,
+    prepareInput: () => Promise<ExperienceCheckInput>,
+  ): Promise<ExperienceJudgment | null> {
+    if (!this.judgments.providerEnabled) return null;
+    try {
+      return await this.judgments.evaluateAndPersist({ ...params, input: await prepareInput() });
+    } catch (err: unknown) {
+      // 只记分类标签，异常 message 可能夹带 SQL 参数、输入正文或上游原文。
+      this.logger.warn(`optional experience judgment failed (fail-open): ${safeErrorTag(err)}`);
+      return null;
+    }
   }
 
   /**
@@ -968,6 +1040,10 @@ export class ExperienceService {
           entry.verifiedAt = null;
         }
 
+        // 缓存只描述旧内容：清除必须与业务改写同事务，即使 none/准备失败也不能残留。
+        // 纯元数据编辑不进入此分支，继续保留既有判断快照。
+        if (changed) entry.judgment = null;
+
         const savedEntry = await manager.save(entry);
         // 版本守卫基准取库内原文（同上 create 的理由：JS 毫秒 vs PG 微秒）
         const [{ updated_at: updatedAtText }] = (await manager.query(
@@ -1010,23 +1086,21 @@ export class ExperienceService {
     //    响应里的 judgment 与 updatedAt 必须与库内一致，客户端才敢立刻用新 token 再 PATCH。
     let judgment: ExperienceJudgment | null = saved.judgment ?? null;
     if (contentChanged) {
-      judgment = await this.judgments.evaluateAndPersist({
-        mode: 'update',
-        entryId: saved.id,
-        actor,
-        input: await this.buildJudgmentInput({
-          title: saved.title,
-          summary: saved.summary,
-          content: saved.content,
-          signals: saved.signals,
-          domains: saved.domains,
-          env: saved.env,
-          intent: saved.intent,
-          duplicateCandidates: await this.findDuplicateCandidates(saved.title, saved.signals),
-        }),
-        // 版本守卫基准 = 本次 update 事务产出的 updatedAt 库内原文（快照写不触碰它，故与响应一致）
-        expectedUpdatedAtText: updatedAtText,
-      });
+      judgment = await this.evaluateOptionalJudgment(
+        // 版本守卫保留本次事务产出的微秒原文；判别本身不顶 updatedAt。
+        { mode: 'update', entryId: saved.id, actor, expectedUpdatedAtText: updatedAtText },
+        async () =>
+          this.buildJudgmentInput({
+            title: saved.title,
+            summary: saved.summary,
+            content: saved.content,
+            signals: saved.signals,
+            domains: saved.domains,
+            env: saved.env,
+            intent: saved.intent,
+            duplicateCandidates: await this.findDuplicateCandidates(saved.title, saved.signals),
+          }),
+      );
     }
 
     // 第二期：PATCH 响应与详情同形（viewer 字段含在内）——服务端单源判定，web 不做计算。
@@ -1036,6 +1110,261 @@ export class ExperienceService {
     // （漏掉就会让 PATCH 返回裸 UUID 而 GET 返回名字 —— 同形不变量当场破裂）
     const profiles = await this.resolveEntryProfiles([saved]);
     return this.toDetail(saved, viewer, profiles, judgment);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 判定补跑（人类 admin 专属；POST /experiences/judgments/backfill）
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * 判定补跑：对 `judgment IS NULL` 的存量条目分批补跑机器判定（**人类 admin 专属**）。
+   *
+   * 用途 = "中途才开启判别服务"的通用动线（生产实证：40/111 条为空 = JEV 上线前录入的 12 条
+   * + 地区封锁期判定失败的 28 条）。判定原本只挂在录入/编辑两个时机，没有补跑路径。
+   *
+   * ## 执行序（顺序有语义，勿调换）
+   *
+   * ① `isAdmin` 判权（403/1009，message 按身份类别分叉）→ ② single-flight（在跑 → 409/9001）
+   * → ③ **选取集查询先行**（`scanned` 在任何跳过分支之前就是真值，provider 未启用时同样真实）
+   * → ④ provider 未启用则**跳过判定循环**直接进批后计数 → ⑤ 逐条**串行**判定 → ⑥ 批后三 COUNT
+   * → ⑦ `try/finally` 释放 single-flight。
+   *
+   * ## 判权为什么是 1009 而不是本模块惯用的 13004
+   *
+   * 13004 的标准文案（`reviewForbidden`）指引"去要个 owner/reviewer 角色即可"——而补跑
+   * **没有任何可授予的角色**（admin 专属），照抄那句话会把调用方引向死路。1009 =
+   * "身份类别本就不该调"，语义更准（service 抛 1009 有仓内先例：memory/roundtable 各服务）。
+   *
+   * ## 契约要点（详见 shared `ExperienceJudgmentsBackfillResponse` 的字段 JSDoc）
+   *
+   * - 收敛判据 = `providerEnabled === true && scanned === 0`；`providerEnabled === false`
+   *   是**重启级配置事实**（重试永远无效）；
+   * - 一批撞三级闸**至多落 1 条 skipped 日志行**，其余被闸条目落在 `noLogNulls`
+   *   （查日志空页 ≠ 没尝试过）；失败原因查 `GET /experiences/judgments?experienceId=`；
+   * - 某批 `ok === 0 && scanned > 0` ⇒ **先停一轮按 status 查因**再决定重试
+   *   （429/529 要求退避，timeout 可重试）；
+   * - 选取集排序 = **未尝试优先，同状态内最旧先补**：恒失败的条目（如上游 451）不会被每批
+   *   反复投喂占头，批次进度单调（论证见 `selectBackfillBatch` 的 JSDoc）；
+   * - **不历史清算**：已判条目（judgment 非空）永不在选取集内，不重判。
+   *
+   * 配额与墙钟：三级闸照常约束补跑（无旁路），actor 桶与 admin 自身的录入/编辑判定共用
+   * （连被拒也计数）；串行单条 ≤8s + 每条一次全表 trgm，`limit=100` 最坏 ≈13 分钟。客户端
+   * 超时**不取消批次**，重调安全（已判条目自动脱离选取集）。
+   *
+   * @param dto 补跑参数（`limit` 缺省 20 / 上限 100；DTO 已过格式校验）
+   * @param actor 当前统一身份（须为人类 admin；同时是日志行的 actor——归因由它承担）
+   * @returns 补跑响应（`ExperienceJudgmentsBackfillResponse`）
+   * @throws ForbiddenException 403/1009（agent 或非 admin 人类）
+   * @throws ConflictException 409/9001（本进程已有补跑批次在跑）
+   */
+  async backfillJudgments(
+    dto: BackfillJudgmentsDto,
+    actor: UnifiedActor,
+  ): Promise<ExperienceJudgmentsBackfillResponse> {
+    // ① 判权（收口在 service：controller 只用与模块同形的 JwtOrApiKeyGuard）
+    this.assertBackfillAdmin(actor);
+
+    // ② single-flight：并发两批会重复出境 + 双日志行（见 backfillRunning 注释）
+    if (this.backfillRunning) {
+      throw new ConflictException({
+        message:
+          'Another judgment backfill batch is already running in this process — read its ' +
+          'response (stop when `scanned` reaches 0) before calling again. Batches are serial by ' +
+          'design: they share the same actor quota bucket and the same snapshot version-guard. ' +
+          '本进程已有补跑批次在跑，等待其返回后再重调（禁止并发）',
+        code: ErrorCode.RESOURCE_CONFLICT,
+      });
+    }
+    this.backfillRunning = true;
+    try {
+      const limit = dto.limit ?? EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT;
+
+      // ③ 选取集查询**先行**：`scanned` 必须在任何跳过分支之前就是真值——一个恒为 0 的假
+      //    `scanned` 会让调用方把"provider 没启用"误读成"补跑完成"。
+      const { entities, updatedAtTexts } = await this.selectBackfillBatch(limit);
+
+      // ④ provider 未启用：判定循环整体跳过（重试无效），但 `scanned` 与批后计数照常真实。
+      const notJudgedExperienceIds: string[] = [];
+      let ok = 0;
+      if (this.judgments.providerEnabled) {
+        // ⑤ 严格串行：判定含网络等待 + 每条一次全表 trgm，并发化会同时放大上游压力与
+        //    配额消耗，而补跑本来就是后台动线（不追求吞吐）。
+        for (let i = 0; i < entities.length; i += 1) {
+          const snapshot = await this.runBackfillJudgment(entities[i], updatedAtTexts[i], actor);
+          if (snapshot) ok += 1;
+          else notJudgedExperienceIds.push(entities[i].id);
+        }
+      } else {
+        for (const entry of entities) notJudgedExperienceIds.push(entry.id);
+      }
+
+      // ⑥ 批后三 COUNT：作用域与恒等式见 shared 响应类型的字段 JSDoc
+      //    （noLogNulls + failedNulls = 全部非过期 NULL，+ expiredNulls = 全部 NULL）
+      const noLogNulls = await this.countBackfillNulls('NOT EXISTS');
+      const failedNulls = await this.countBackfillNulls('EXISTS');
+      const expiredNulls = await this.countExpiredNullEntries();
+
+      return {
+        providerEnabled: this.judgments.providerEnabled,
+        scanned: entities.length,
+        ok,
+        notJudged: notJudgedExperienceIds.length,
+        noLogNulls,
+        failedNulls,
+        expiredNulls,
+        notJudgedExperienceIds,
+      };
+    } finally {
+      // ⑦ 无论成败都释放互斥（否则一次异常会把本进程的补跑永久锁死）
+      this.backfillRunning = false;
+    }
+  }
+
+  /**
+   * 补跑判权（人类 admin 专属；403/1009）。message **按身份类别分叉**——两类被拒者的
+   * "下一步该做什么"完全不同：agent 该转请人类 admin，非 admin 人类该去要 admin 角色。
+   *
+   * 口径与 `experience-actor.ts` 的 `isAdmin` 单源（人类 ∧ ADMIN，与 RolesGuard 同口径）。
+   */
+  private assertBackfillAdmin(actor: UnifiedActor): void {
+    if (isAdmin(actor)) return;
+    throw new ForbiddenException({
+      message:
+        actor.type === ActorType.AGENT
+          ? 'This endpoint is not for agents — judgment backfill is a human admin action ' +
+            '(it consumes the shared judgment quota and the egress budget). Ask a human admin ' +
+            'to run it. 本端点不面向 agent，转请人类 admin'
+          : 'This endpoint requires the admin role — there is no role to grant here ' +
+            '(unlike final review, which accepts a space owner/reviewer). Ask an admin to run ' +
+            'it. 本端点需 admin 角色（补跑无可授予的角色）',
+      code: ErrorCode.PERMISSION_DENIED,
+    });
+  }
+
+  /**
+   * 选取集查询（补跑批）：软删排除 + `judgment IS NULL` + 非过期。
+   *
+   * 排序 = **未尝试优先，同状态内最旧先补**：
+   * ① `EXISTS(... record_check 日志行) ASC`（false 在前 ⇒ 从未判过的先补）；
+   * ② `created_at ASC`；③ `id ASC`（全序，批次边界确定）。
+   *
+   * 为什么主排序键不是单纯的 `created_at ASC`：恒失败的条目（生产实证：上游地区封锁期的
+   * 28 条 451）**永远最老、永远占住批次头部**——既让 `scanned === 0` 不可达（收敛判据失效），
+   * 又把每批配额反复烧在同一批头部条目上（进度停滞）。未尝试优先 ⇒ **每批进度单调**：
+   * 先把"从未判过"的池子抽干，失败复投才成为批次主体（此时调用方按 status 查因就有意义了）。
+   * 代价 = 每批排序要算一次相关子查询（候选集是全量 NULL 条目，非分页扫描；NULL 集规模 = 存量
+   * 待补条目数，本场景量级极小）；换来的单调收敛比排序开销重要得多。
+   *
+   * ⚠️ **刻意不走 `baseQuery`**（文件头 [修改检查] 的明示例外）：补跑要的正是"judgment 为
+   * NULL"的条目，且 **suspect 必须纳入**——判定本来就发生在终审之前，suppress 只影响读面。
+   * 过期排除与 baseQuery 同口径（过期条目永不进入补跑）。
+   *
+   * 版本守卫基准与实体**一把取**（`getRawAndEntities`）：`updated_at::text` 的**库内原文**
+   * 只有 PG 侧能产出（JS Date 只有毫秒，`WHERE updated_at = '…247Z'` 与库内 `…247612+00`
+   * 永不相等 ⇒ 快照 100% 被守卫挡回）。先例见本文件 `fetchPage` 的 raw+entities 用法。
+   *
+   * @param limit 本批条数（已由 DTO 校验为 1..100 的整数）
+   * @returns 实体列表 + 与 entities **按索引一一对应**的 `updated_at::text` 原文
+   */
+  private async selectBackfillBatch(
+    limit: number,
+  ): Promise<{ entities: ExperienceEntry[]; updatedAtTexts: string[] }> {
+    const { entities, raw } = await this.entryRepo
+      .createQueryBuilder('e')
+      .addSelect('e.updated_at::text', 'updated_at_text')
+      .where('e.deleted_at IS NULL')
+      .andWhere('e.judgment IS NULL')
+      .andWhere('(e.expires_at IS NULL OR e.expires_at > now())')
+      // 主排序键：未尝试过的在前（见上方 JSDoc 的"每批进度单调"论证）。谓词与批后计数同款
+      // （只计 `record_check`，多操作表防腐蚀），操作名同走绑定参数。
+      .orderBy(BACKFILL_TRIED_EXISTS_SQL, 'ASC')
+      .addOrderBy('e.created_at', 'ASC')
+      .addOrderBy('e.id', 'ASC')
+      .setParameter('recordCheckOperation', EXPERIENCE_JUDGMENT_OPERATION.RECORD_CHECK)
+      .limit(limit)
+      .getRawAndEntities();
+
+    return {
+      entities,
+      updatedAtTexts: (raw as Array<{ updated_at_text: string }>).map((row) => row.updated_at_text),
+    };
+  }
+
+  /**
+   * 单条补跑判定（装配判定输入 → 调判别管线）。
+   *
+   * 复用 `evaluateAndPersist` 的 **`mode:'create'`**：补跑对象的快照天然是 NULL，失败时
+   * **不需要**走 update 模式的清快照分支（那条分支写的正是同一个 NULL）。管线本体
+   * （三级闸 / 版本守卫 / 日志落库 / fail-open）零改动复用。
+   *
+   * @param entry 选取集里的一条（其字段即判定输入）
+   * @param expectedUpdatedAtText 该条的 `updated_at::text` 库内原文（版本守卫基准）
+   * @param actor 触发者（须为 admin；同时是日志行的 actor）
+   * @returns 落库成功的判定快照，或 null（未判成功）
+   */
+  private async runBackfillJudgment(
+    entry: ExperienceEntry,
+    expectedUpdatedAtText: string,
+    actor: UnifiedActor,
+  ): Promise<ExperienceJudgment | null> {
+    return this.evaluateOptionalJudgment(
+      { mode: 'create', entryId: entry.id, actor, expectedUpdatedAtText },
+      async () =>
+        this.buildJudgmentInput({
+          title: entry.title,
+          summary: entry.summary,
+          content: entry.content,
+          signals: entry.signals,
+          domains: entry.domains,
+          env: entry.env,
+          intent: entry.intent,
+          duplicateCandidates: await this.findDuplicateCandidates(entry.title, entry.signals),
+        }),
+    );
+  }
+
+  /**
+   * 批后计数：非过期 NULL 条目中**有/无** `record_check` 日志行的条数（`EXISTS` / `NOT EXISTS`）。
+   *
+   * 谓词体与选取集排序**共用** `BACKFILL_TRIED_EXISTS_SQL`（单源，含"操作名不可省"的论证）：
+   * 两处若各写一遍，将来加一个日志操作就会让"排序认为未尝试"与"计数认为已尝试"静默分叉。
+   *
+   * 作用域 = **补跑选取集**（非软删 + NULL + 未过期）的**全量**，不限于本批——恒等式
+   * `noLogNulls + failedNulls = 全部非过期 NULL` 即由此成立。
+   *
+   * 写法：`getCount()` 会整体替换选择列表（不受实体列 addSelect 污染），谓词里 `e.` 别名
+   * 直接可用（照 baseQuery 的手写列名惯例）。
+   *
+   * @param mode `EXISTS` = 已判过但没落快照；`NOT EXISTS` = 从未判定（或日志被有界记账吞掉）
+   * @returns 该分支的条数
+   */
+  private countBackfillNulls(mode: 'EXISTS' | 'NOT EXISTS'): Promise<number> {
+    // 操作名走**绑定参数**而非内联字面量：值域单源 = shared EXPERIENCE_JUDGMENT_OPERATION
+    const predicate =
+      mode === 'EXISTS' ? BACKFILL_TRIED_EXISTS_SQL : `NOT ${BACKFILL_TRIED_EXISTS_SQL}`;
+    return this.entryRepo
+      .createQueryBuilder('e')
+      .where('e.deleted_at IS NULL')
+      .andWhere('e.judgment IS NULL')
+      .andWhere('(e.expires_at IS NULL OR e.expires_at > now())')
+      .andWhere(predicate)
+      .setParameter('recordCheckOperation', EXPERIENCE_JUDGMENT_OPERATION.RECORD_CHECK)
+      .getCount();
+  }
+
+  /**
+   * 批后计数：**已过期**且 NULL 的条数（**选取集之外**，纯知会）。
+   *
+   * 为什么单独统计：这批条目**永不进入补跑**（过期排除），但它们确实还是 NULL——不分开
+   * 呈现，"存量还剩多少"就永远不为 0，收敛判据被过期条目永久污染。
+   */
+  private countExpiredNullEntries(): Promise<number> {
+    return this.entryRepo
+      .createQueryBuilder('e')
+      .where('e.deleted_at IS NULL')
+      .andWhere('e.judgment IS NULL')
+      .andWhere('e.expires_at IS NOT NULL AND e.expires_at <= now()')
+      .getCount();
   }
 
   /**
@@ -1152,7 +1481,11 @@ export class ExperienceService {
    */
   private baseQuery(alias: string, filters: NormalizedQuery): SelectQueryBuilder<ExperienceEntry> {
     const qb = this.entryRepo.createQueryBuilder(alias);
-    // 软删排除：queryBuilder 不走 TypeORM 的 @DeleteDateColumn 自动过滤，必须手写
+    // 软删谓词**显式手写**（冗余但有意）：TypeORM 0.3.x 的 `createWhereExpression()` 对
+    // 带 @DeleteDateColumn 的实体在 select 查询里**会自己追加** `<alias>.deleted_at IS NULL`
+    // （实测 0.3.30：QueryBuilder.js 的 "non-deleted" 分支），且 `withDeleted()` 一旦被调用就
+    // 会撤掉它。手写这一句的作用是**把口径钉在本方法里**（不依赖 ORM 版本/`withDeleted` 状态，
+    // 生成的 SQL 也自解释、便于断言），而不是"不写就会泄露软删行"——别把它读成 ORM 的缺失补偿。
     qb.where(`${alias}.deleted_at IS NULL`);
     if (!filters.includeExpired) {
       qb.andWhere(`(${alias}.expires_at IS NULL OR ${alias}.expires_at > now())`);
@@ -1875,19 +2208,139 @@ export function normalizeEnv(env: ExperienceEnv | undefined): ExperienceEnv {
 }
 
 /**
+ * 一个扫描单元：可写文本 + 它的**字段路径**（400 定位信息）。
+ *
+ * `path` 只由字段名/下标构成（`signals[0]` / `env.os` / `stored.signals[1]`），**绝不含
+ * 内容**——它是 400 文案可安全回显的部分（不变量 #8 只禁止回显命中 token 本体）。
+ */
+interface SecretScanField {
+  /** 字段路径，如 `title` / `signals[0]` / `env.os` */
+  path: string;
+  value: string | null | undefined;
+}
+
+/**
+ * 400 文案里除主命中外最多列出的其它命中字段数（message 长度硬边界）。
+ *
+ * 超出部分用 `and N more` 汇总：否则调用方修完列出的 5 个又吃一次 400，仍不知道总数。
+ */
+const SECRET_SCAN_EXTRA_FIELD_LIMIT = 5;
+
+/**
+ * 跨字段回退命中的字段路径占位。
+ *
+ * 拼接后无法还原命中落在哪个字段（可能横跨两个字段），故**不强行定位**——如实说
+ * 「跨字段」比猜一个错字段更有用。
+ */
+const SECRET_SCAN_CROSS_FIELD_PATH = '(cross-field)';
+
+/**
  * 密钥闸门的**扫描集合**（create 与 PATCH 共用一处，防两处漏字段）。
  *
  * 覆盖全部可写文本面：title / summary / content / signals 元素 / domains 元素 /
- * sourceProject / env 值。
+ * sourceProject / env 值（env 带键名，便于 400 直接指出 `env.tool`）。
+ *
+ * @param pathPrefix 路径前缀：`''` = 客户端请求口径；`'normalized.'` / `'stored.'` =
+ *   归一化/落库口径（400 文案据此区分两种下标语义）
  */
-function scanTextForSecrets(texts: readonly (string | null | undefined)[]): void {
-  const haystack = texts.filter((t): t is string => typeof t === 'string').join('\n');
-  const hitIndex = EXPERIENCE_SECRET_PATTERNS.findIndex((pattern) => pattern.test(haystack));
-  if (hitIndex === -1) return;
-  throw new BadRequestException({
+function secretScanFields(
+  dto: {
+    title: string;
+    summary: string;
+    content: string;
+    signals: string[];
+    domains?: string[] | null;
+    sourceProject?: string | null;
+    env?: ExperienceEnv | null;
+  },
+  pathPrefix = '',
+): SecretScanField[] {
+  return [
+    { path: `${pathPrefix}title`, value: dto.title },
+    { path: `${pathPrefix}summary`, value: dto.summary },
+    { path: `${pathPrefix}content`, value: dto.content },
+    ...dto.signals.map((value, index) => ({ path: `${pathPrefix}signals[${index}]`, value })),
+    ...(dto.domains ?? []).map((value, index) => ({
+      path: `${pathPrefix}domains[${index}]`,
+      value,
+    })),
+    { path: `${pathPrefix}sourceProject`, value: dto.sourceProject },
+    ...Object.entries(dto.env ?? {}).map(([key, value]) => ({
+      path: `${pathPrefix}env.${key}`,
+      value,
+    })),
+  ];
+}
+
+/**
+ * PATCH 请求体**原值**的扫描集合（只取本次请求实际提供的受闸字段）。
+ *
+ * 为什么需要它（评审 m1）：合并值是**归一化 + 去重**后的存储口径，下标与客户端原数组
+ * 对不上（`['a','A','ask_abc']` 归一化后命中项在 `[1]`，客户端看来是 `[2]`）。定位信息
+ * 必须按客户端口径给，否则调用方依然要对不上号。
+ */
+function touchedSecretScanFields(dto: {
+  title?: unknown;
+  summary?: unknown;
+  content?: unknown;
+  signals?: unknown;
+  domains?: unknown;
+  env?: unknown;
+  sourceProject?: unknown;
+}): SecretScanField[] {
+  const fields: SecretScanField[] = [];
+  const pushScalar = (path: string, value: unknown): void => {
+    if (typeof value === 'string') fields.push({ path, value });
+  };
+  const pushArray = (path: string, value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    value.forEach((item, index) => {
+      if (typeof item === 'string') fields.push({ path: `${path}[${index}]`, value: item });
+    });
+  };
+  if (dto.title !== undefined) pushScalar('title', dto.title);
+  if (dto.summary !== undefined) pushScalar('summary', dto.summary);
+  if (dto.content !== undefined) pushScalar('content', dto.content);
+  if (dto.signals !== undefined) pushArray('signals', dto.signals);
+  if (dto.domains !== undefined) pushArray('domains', dto.domains);
+  if (dto.sourceProject !== undefined) pushScalar('sourceProject', dto.sourceProject);
+  if (dto.env !== undefined && dto.env !== null && typeof dto.env === 'object') {
+    for (const [key, value] of Object.entries(dto.env as Record<string, unknown>)) {
+      pushScalar(`env.${key}`, value);
+    }
+  }
+  return fields;
+}
+
+/**
+ * 构造密钥闸门的 400 异常（文案单源）。
+ *
+ * 文案结构（**有意扩展，已登记**）：旧版是
+ *   `... (matched pattern #N of 7: API key / private key / password assignment). `
+ * 本批保留冒号后的原句，只把终止符 `)` 改成 `; category "..."; field "..."…). `——
+ * 定位信息必须进同一个括号。消费方若用正则锚 `assignment\)` 会失配，这是**刻意的
+ * 契约扩展**（改动登记见线上 `docs/api-definition.md` §18.2）。
+ */
+function buildSecretGateError(params: {
+  patternIndex: number;
+  fieldPath: string;
+  otherPaths?: readonly string[];
+  remainingCount?: number;
+}): BadRequestException {
+  const otherPaths = params.otherPaths ?? [];
+  const remaining = params.remainingCount ?? 0;
+  const othersClause =
+    otherPaths.length > 0
+      ? `; other fields also matched: ${otherPaths.map((path) => `"${path}"`).join(', ')}` +
+        (remaining > 0 ? ` and ${remaining} more` : '')
+      : '';
+  const label = EXPERIENCE_SECRET_PATTERN_LABELS[params.patternIndex] ?? 'credential pattern';
+
+  return new BadRequestException({
     message:
-      `The entry looks like it contains a credential (matched pattern #${hitIndex + 1} of ` +
-      `${EXPERIENCE_SECRET_PATTERNS.length}: API key / private key / password assignment). ` +
+      `The entry looks like it contains a credential (matched pattern #${params.patternIndex + 1} of ` +
+      `${EXPERIENCE_SECRET_PATTERNS.length}: API key / private key / password assignment; ` +
+      `category "${label}"; field "${params.fieldPath}"${othersClause}). ` +
       'The experience base is readable by EVERY authenticated actor across projects, so secrets ' +
       'must never be recorded here. Redact the value (e.g. `password=<redacted>`) and resend. ' +
       '禁止录入密钥或 PII——请脱敏后重发',
@@ -1896,10 +2349,66 @@ function scanTextForSecrets(texts: readonly (string | null | undefined)[]): void
 }
 
 /**
+ * 逐字段跑密钥模式；命中即抛 400（**带字段路径定位**），无命中再跑一次**跨字段回退**。
+ *
+ * 为什么逐字段而不是拼接成单一 haystack（任务 `77bf7dd8`）：拼接后正则只知道"这段文本
+ * 有密钥"，不知道**哪个字段**——调用方只能二分瞎试，这是排障效率的生死线。
+ *
+ * 为什么还要保留拼接扫描（评审 M1）：逐字段只看单字段，**跨字段拼接**的形态会漏拦
+ * （`content: '-----BEGIN RSA'` + 相邻的 `signals` 元素 `'PRIVATE KEY-----'`）。安全闸
+ * 不许静默变弱，故逐字段无命中时用 `join('\n')` 等价回退一次（与旧实现同口径）；此时
+ * 无法还原字段，路径标 `(cross-field)`。
+ *
+ * 报告口径：
+ * - **主命中** = 模式编号最小的那一处（与原拼接实现的 `findIndex` 语义一致——旧文案的
+ *   `matched pattern #N` 仍可对照），编号相同则取字段声明序在前者；
+ * - 文案追加 `category` 与 `field`，并列出其它命中字段（只列路径，最多 5 个 + `and N more`）；
+ * - **不回显命中 token 本体**（不变量 #8）：路径 + 类别名是全部可回显信息。
+ */
+function scanTextForSecrets(fields: readonly SecretScanField[]): void {
+  const hits: Array<{ path: string; patternIndex: number }> = [];
+  for (const { path, value } of fields) {
+    if (typeof value !== 'string' || value.length === 0) continue;
+    const patternIndex = EXPERIENCE_SECRET_PATTERNS.findIndex((pattern) => pattern.test(value));
+    if (patternIndex === -1) continue;
+    hits.push({ path, patternIndex });
+  }
+
+  if (hits.length > 0) {
+    const primary = hits.reduce((best, hit) => (hit.patternIndex < best.patternIndex ? hit : best));
+    const others = hits.filter((hit) => hit !== primary);
+    throw buildSecretGateError({
+      patternIndex: primary.patternIndex,
+      fieldPath: primary.path,
+      otherPaths: others.slice(0, SECRET_SCAN_EXTRA_FIELD_LIMIT).map((hit) => hit.path),
+      remainingCount: Math.max(0, others.length - SECRET_SCAN_EXTRA_FIELD_LIMIT),
+    });
+  }
+
+  // 跨字段回退（评审 M1）：与旧实现同口径的 join('\n') 拼接扫描。逐字段无命中才跑，
+  // 录入/编辑都是低频写路径，多扫一遍的代价可忽略。
+  const haystack = fields
+    .map((field) => field.value)
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .join('\n');
+  const crossFieldIndex = EXPERIENCE_SECRET_PATTERNS.findIndex((pattern) => pattern.test(haystack));
+  if (crossFieldIndex === -1) return;
+  throw buildSecretGateError({
+    patternIndex: crossFieldIndex,
+    fieldPath: SECRET_SCAN_CROSS_FIELD_PATH,
+  });
+}
+
+/**
  * 密钥闸门（plan §3，**录入通道**）：命中任一模式即 400 拒绝写入。
  *
- * ⚠️ message **不回显命中位置的内容**（不变量 #8）——只说命中了哪一类模式，否则 400
- * 响应本身就成了密钥回显通道（比日志泄漏更糟：它会被客户端记录）。
+ * ⚠️ message **不回显命中位置的内容**（不变量 #8）——只说命中了哪一类模式、在哪个字段
+ * （字段路径），否则 400 响应本身就成了密钥回显通道（比日志泄漏更糟：它会被客户端记录）。
+ *
+ * 扫描两遍（评审 m4）：① 原始请求值（路径下标 = **客户端口径**）；② **归一化后的落库
+ * 值**兜底——三条前缀模式是小写锚定，`ASK_ABC` / `SK-ABC` 原始形态不命中，但归一化会
+ * 把它变成真前缀形态落库；不扫第二遍就是"过闸后被归一化成密钥"的静默漏洞。第二遍的
+ * 路径带 `normalized.` 前缀（去重会让下标与客户端原数组不同，必须标明口径）。
  */
 export function assertNoSecretPatterns(dto: {
   title: string;
@@ -1910,15 +2419,21 @@ export function assertNoSecretPatterns(dto: {
   sourceProject?: string;
   env?: ExperienceEnv;
 }): void {
-  scanTextForSecrets([
-    dto.title,
-    dto.summary,
-    dto.content,
-    ...dto.signals,
-    ...(dto.domains ?? []),
-    dto.sourceProject ?? '',
-    ...Object.values(dto.env ?? {}),
-  ]);
+  scanTextForSecrets(secretScanFields(dto));
+  scanTextForSecrets(
+    secretScanFields(
+      {
+        title: dto.title,
+        summary: dto.summary,
+        content: dto.content,
+        signals: normalizeElements(dto.signals),
+        domains: normalizeElements(dto.domains ?? []),
+        sourceProject: dto.sourceProject?.trim() ? dto.sourceProject.trim() : null,
+        env: normalizeEnv(dto.env),
+      },
+      'normalized.',
+    ),
+  );
 }
 
 /** PATCH 的受闸字段判定（这些字段任一出现在请求体里 ⇒ 需要跑密钥闸门） */
@@ -1951,7 +2466,12 @@ function touchesSecretGatedField(dto: {
  * 何时跑：仅当请求体触碰了任一受闸字段（title/summary/content/signals/domains/env/
  * sourceProject）——纯元数据编辑（intent/expiresAt）不因历史遗留文本被拦。
  *
- * ⚠️ 调用点必须**在字段合并之后**（此时入参就是最终落库值），不要传 DTO 原值——
+ * 扫描顺序（评审 m1，两层口径）：
+ * ① 请求体**原值**逐字段（路径下标 = **客户端口径**，与 create 一致）；
+ * ② 归一化**合并值**兜底（覆盖：未触碰字段的存量文本、归一化后才成形的形态），路径带
+ *    `stored.` 前缀标明存储口径（去重会让下标与客户端原数组不同）。
+ *
+ * ⚠️ 调用点必须**在字段合并之后**（此时 `merged` 就是最终落库值），不要传 DTO 原值——
  * 只改了一部分字段时，未改字段的旧值同样要参与扫描。
  */
 export function assertNoSecretPatternsMerged(
@@ -1967,15 +2487,8 @@ export function assertNoSecretPatternsMerged(
   },
 ): void {
   if (!touchesSecretGatedField(dto)) return;
-  scanTextForSecrets([
-    merged.title,
-    merged.summary,
-    merged.content,
-    ...merged.signals,
-    ...merged.domains,
-    merged.sourceProject ?? '',
-    ...Object.values(merged.env ?? {}),
-  ]);
+  scanTextForSecrets(touchedSecretScanFields(dto));
+  scanTextForSecrets(secretScanFields(merged, 'stored.'));
 }
 
 /** update 通道的**非清空**字段：显式 null 一律拒绝（只有 sourceProject/expiresAt 可 null 清空） */

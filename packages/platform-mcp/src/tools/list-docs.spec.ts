@@ -209,36 +209,24 @@ describe('list_docs', () => {
     expect(params).not.toHaveProperty('sort');
   });
 
-  it('未知参数硬护栏：白名单外的非空键 → error + failedStep=validate_args，零请求', async () => {
-    // v1.89.0-dev 批次 A：automcp 运行时零参数校验，白名单外的键此前被静默丢弃——
-    // 现在响亮拒绝（"猜错参数却以为生效"是 Agent 侧的高频事故形态）
-    const request = mockRequest();
-
-    const result = await listDocsTool.handler(
-      { spaceName: 'My Docs', updated_at: '2026-09-30' }, // 典型猜错：snake_case 拼法
-      ctx(),
-    );
-
-    expect(result.isError).toBe(true);
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error).toBe(true);
-    expect(body.failedStep).toBe('validate_args');
-    expect(body.message).toBe('unknown parameter updated_at');
-    // 关键：护栏在解析空间之前短路 ⇒ 不发任何 HTTP 请求
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it('未知参数硬护栏：空值不算传参（空串/null 不触发）', async () => {
+  it('未知键不再由本工具拦截（中央校验在 automcp；handler 只读声明键，未知键不进 query）', async () => {
+    // 白名单护栏已上移到 automcp executeToolCall → validateToolArguments（MCP-ARG-1）。
+    // 本用例锁定分层事实：绕过 automcp 直接调 handler 时未知键不会报错，只会被丢弃
+    // —— 这正是中央校验必须存在、且不能退回"各工具自建护栏"的原因
     const request = mockRequest();
     request.mockResolvedValueOnce({
       items: [{ id: 'sp-1', name: 'My Docs', slug: 'my-docs' }],
     });
     request.mockResolvedValueOnce(docListEnvelope());
 
-    const result = await listDocsTool.handler({ spaceName: 'My Docs', foo: '', bar: null }, ctx());
+    const result = await listDocsTool.handler(
+      { spaceName: 'My Docs', updated_at: '2026-09-30' },
+      ctx(),
+    );
 
     expect(result.isError).toBeFalsy();
-    expect(request).toHaveBeenCalledTimes(2);
+    const params = request.mock.calls[1][2].params as Record<string, unknown>;
+    expect(params).not.toHaveProperty('updated_at');
   });
 
   it('slim=true → 只保留 path/title/updatedAt，分页元信息保留', async () => {

@@ -28,9 +28,12 @@ import { ResourceValidator } from '../../common/resource-validator';
 import { EventService } from '../event/event.service';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
 import { AuditService } from '../audit/audit.service';
+import { HintDedupService } from '../hints/hint-dedup.service';
 
 describe('DocSpaceService', () => {
   let service: DocSpaceService;
+  /** hint 去重窗口（2 期，v1.92.0-dev）：真实例（内存 TTL Map） */
+  let hintDedup: HintDedupService;
   let spaceRepo: jest.Mocked<Repository<DocSpace>>;
   let memberRepo: jest.Mocked<Repository<DocSpaceMember>>;
   let categoryRepo: jest.Mocked<Repository<DocCategory>>;
@@ -146,6 +149,11 @@ describe('DocSpaceService', () => {
         transaction: jest.fn((fn: any) =>
           fn({
             createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+            // 评审 M2：removeCategory 事务内**先** FOR UPDATE 锁 category 行（锁序与
+            // mergeCategory 的 categories→docs 对齐），故 manager 需提供 getRepository
+            getRepository: jest.fn(() => ({
+              createQueryBuilder: jest.fn(() => createMockQueryBuilder([], 0)),
+            })),
           }),
         ),
       },
@@ -263,6 +271,8 @@ describe('DocSpaceService', () => {
       assertActorUsable: jest.fn().mockResolvedValue(undefined),
     };
 
+    hintDedup = new HintDedupService();
+
     service = new DocSpaceService(
       spaceRepo,
       memberRepo,
@@ -281,6 +291,7 @@ describe('DocSpaceService', () => {
       eventService as unknown as EventService,
       mockActorProfileService as unknown as ActorProfileService,
       mockAuditService as unknown as AuditService,
+      hintDedup,
     );
   });
 
@@ -660,6 +671,242 @@ describe('DocSpaceService', () => {
 
       const saved = await service.update('space-1', { name: 'New Name' });
       expect(saved.settings.overviewFilter).toEqual({ excludeTypes: ['memory'] });
+    });
+
+    // ── 空间词表三键（v1.92.0-dev，DocSpace 元数据治理 1 期）──────────────
+
+    it('persists docTypes/canonicalTags/pathTypes into settings', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+
+      const saved = await service.update('space-1', {
+        docTypes: ['guide', 'reference'],
+        canonicalTags: [{ value: 'npc', aliases: ['NPC'] }],
+        pathTypes: [{ pathPrefix: 'memory/', docType: 'memory' }],
+      });
+
+      expect(saved.settings.docTypes).toEqual(['guide', 'reference']);
+      expect(saved.settings.canonicalTags).toEqual([{ value: 'npc', aliases: ['NPC'] }]);
+      expect(saved.settings.pathTypes).toEqual([{ pathPrefix: 'memory/', docType: 'memory' }]);
+      // 与既有键互不覆盖
+      expect(saved.settings.visibility).toBe(Visibility.OPEN);
+    });
+
+    it('single-key update preserves the other two vocabulary keys (merge)', async () => {
+      spaceRepo.findOne.mockResolvedValue(
+        makeSpace({
+          settings: {
+            visibility: Visibility.OPEN,
+            docTypes: ['guide'],
+            canonicalTags: [{ value: 'npc', aliases: [] }],
+            pathTypes: [{ pathPrefix: 'memory/', docType: 'memory' }],
+          },
+        }),
+      );
+
+      const saved = await service.update('space-1', { docTypes: ['note'] });
+      expect(saved.settings.docTypes).toEqual(['note']);
+      expect(saved.settings.canonicalTags).toEqual([{ value: 'npc', aliases: [] }]);
+      expect(saved.settings.pathTypes).toEqual([{ pathPrefix: 'memory/', docType: 'memory' }]);
+    });
+
+    it('explicit null clears a vocabulary key (字段出现即采用)', async () => {
+      spaceRepo.findOne.mockResolvedValue(
+        makeSpace({
+          settings: {
+            visibility: Visibility.OPEN,
+            docTypes: ['guide'],
+            canonicalTags: [{ value: 'npc', aliases: [] }],
+          },
+        }),
+      );
+
+      const saved = await service.update('space-1', { canonicalTags: null });
+      expect(saved.settings.canonicalTags).toBeUndefined();
+      expect(saved.settings.docTypes).toEqual(['guide']);
+    });
+
+    it('rejects duplicate canonical values (ci) with 422 + conflicts, zero write', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+
+      await expect(
+        service.update('space-1', {
+          canonicalTags: [
+            { value: 'npc', aliases: [] },
+            { value: 'NPC', aliases: [] },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+          data: {
+            conflicts: expect.arrayContaining([
+              expect.objectContaining({ field: 'canonicalTags', kind: 'duplicate_canonical' }),
+            ]),
+          },
+        },
+      });
+      expect(spaceRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('rejects alias clashing with another entry alias with 422', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+
+      await expect(
+        service.update('space-1', {
+          canonicalTags: [
+            { value: 'alpha', aliases: ['shared'] },
+            { value: 'beta', aliases: ['Shared'] },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+          data: {
+            conflicts: expect.arrayContaining([
+              expect.objectContaining({ kind: 'alias_conflict' }),
+            ]),
+          },
+        },
+      });
+    });
+
+    it('rejects alias clashing with another entry canonical with 422', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+
+      await expect(
+        service.update('space-1', {
+          canonicalTags: [
+            { value: 'alpha', aliases: ['beta'] },
+            { value: 'beta', aliases: [] },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+          data: {
+            conflicts: expect.arrayContaining([
+              expect.objectContaining({ kind: 'alias_canonical_conflict' }),
+            ]),
+          },
+        },
+      });
+    });
+
+    it('rejects duplicate docTypes (ci) with 422', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      await expect(
+        service.update('space-1', { docTypes: ['guide', 'Guide'] }),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID } });
+    });
+
+    it('rejects duplicate pathPrefix with 422', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      await expect(
+        service.update('space-1', {
+          pathTypes: [
+            { pathPrefix: 'memory/', docType: 'memory' },
+            { pathPrefix: 'memory/', docType: 'note' },
+          ],
+        }),
+      ).rejects.toMatchObject({ response: { code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID } });
+    });
+
+    it('accepts alias equal to its own canonical (no conflict)', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const saved = await service.update('space-1', {
+        canonicalTags: [{ value: 'npc', aliases: ['NPC', 'npc'] }],
+      });
+      expect(saved.settings.canonicalTags).toEqual([{ value: 'npc', aliases: ['NPC', 'npc'] }]);
+    });
+
+    it('trims declared values before storing (F4: store trim form, aligned with matching side)', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const saved = await service.update('space-1', {
+        docTypes: [' guide '],
+        canonicalTags: [{ value: '  npc  ', aliases: [' NPC '] }],
+        pathTypes: [{ pathPrefix: ' memory/ ', docType: ' memory ' }],
+      });
+      expect(saved.settings.docTypes).toEqual(['guide']);
+      expect(saved.settings.canonicalTags).toEqual([{ value: 'npc', aliases: ['NPC'] }]);
+      expect(saved.settings.pathTypes).toEqual([{ pathPrefix: 'memory/', docType: 'memory' }]);
+    });
+
+    it('rejects whitespace-only declarations with 422 empty_value (F4)', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      await expect(
+        service.update('space-1', { canonicalTags: [{ value: '   ', aliases: [] }] }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+          data: {
+            conflicts: expect.arrayContaining([
+              expect.objectContaining({ field: 'canonicalTags', kind: 'empty_value', index: 0 }),
+            ]),
+          },
+        },
+      });
+      expect(spaceRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('pathTypes conflict carries self-correctable info (F6: indices + docTypes)', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      await expect(
+        service.update('space-1', {
+          pathTypes: [
+            { pathPrefix: 'memory/', docType: 'memory' },
+            { pathPrefix: 'docs/', docType: 'guide' },
+            { pathPrefix: 'memory/', docType: 'note' },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.DOC_SPACE_VOCABULARY_INVALID,
+          data: {
+            conflicts: [
+              {
+                field: 'pathTypes',
+                kind: 'duplicate_prefix',
+                value: 'memory/',
+                index: 2,
+                conflictingIndex: 0,
+                docType: 'note',
+                conflictingDocType: 'memory',
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('accepts canonicalTags entries without aliases (F5: aliases optional)', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const saved = await service.update('space-1', {
+        canonicalTags: [{ value: 'npc' } as never],
+      });
+      expect(saved.settings.canonicalTags).toEqual([{ value: 'npc', aliases: [] }]);
+    });
+
+    it('explicit null on all three keys deletes them (DTO null three-state)', async () => {
+      spaceRepo.findOne.mockResolvedValue(
+        makeSpace({
+          settings: {
+            visibility: Visibility.OPEN,
+            docTypes: ['guide'],
+            canonicalTags: [{ value: 'npc', aliases: [] }],
+            pathTypes: [{ pathPrefix: 'memory/', docType: 'memory' }],
+          },
+        }),
+      );
+
+      const saved = await service.update('space-1', {
+        docTypes: null,
+        canonicalTags: null,
+        pathTypes: null,
+      });
+      expect(saved.settings.docTypes).toBeUndefined();
+      expect(saved.settings.canonicalTags).toBeUndefined();
+      expect(saved.settings.pathTypes).toBeUndefined();
+      expect(saved.settings.visibility).toBe(Visibility.OPEN);
     });
   });
 
@@ -1072,13 +1319,40 @@ describe('DocSpaceService', () => {
   });
 
   describe('removeCategory', () => {
-    it('sets doc.categoryId to null and soft-deletes category', async () => {
+    it('sets doc.categoryId to null and soft-deletes category（并**先锁 category 行**——评审 M2）', async () => {
       const cat = makeCategory();
       categoryRepo.findOne.mockResolvedValue(cat);
+
+      // 记录调用序：锁（setLock）必须发生在 UPDATE 之前（锁序与 mergeCategory 对齐）
+      const calls: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lockQb: any = createMockQueryBuilder([], 0);
+      lockQb.withDeleted = jest.fn(() => lockQb);
+      lockQb.setLock = jest.fn(() => {
+        calls.push('lock');
+        return lockQb;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const txQb: any = createMockQueryBuilder([], 0);
+      txQb.update = jest.fn(() => {
+        calls.push('update');
+        return txQb;
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (categoryRepo.manager.transaction as any).mockImplementation((fn: any) =>
+        fn({
+          createQueryBuilder: jest.fn(() => txQb),
+          getRepository: jest.fn(() => ({ createQueryBuilder: jest.fn(() => lockQb) })),
+        }),
+      );
 
       await service.removeCategory('cat-1');
       // Transaction was called
       expect(categoryRepo.manager.transaction).toHaveBeenCalled();
+      // minor-2：锁查询带 withDeleted（锁序不变量须覆盖含软删行，与 lockCategoryRows 同形）
+      expect(lockQb.withDeleted).toHaveBeenCalled();
+      expect(lockQb.setLock).toHaveBeenCalledWith('pessimistic_write');
+      expect(calls).toEqual(['lock', 'update', 'update']);
     });
   });
 
@@ -1300,6 +1574,135 @@ describe('DocSpaceService', () => {
       expect(result.truncated).toBe(true);
       expect(result.uncategorized.length).toBeGreaterThan(0);
       expect(result.uncategorized.length).toBeLessThan(50);
+    });
+
+    // ─── 阶段三：截断续读码 docs_overview_truncated（决策 9）─────────────
+
+    /** 造 n 条「摘要 500 字」的文档（CJK≈500 token/条；缺省 cap 20000 ⇒ 50 条即截断） */
+    const manyHeavyDocs = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `doc-${i}`,
+        spaceId: 'space-1',
+        categoryId: null,
+        path: `p${i}.md`,
+        title: `T${i}`,
+        summary: '摘'.repeat(500),
+        docType: null,
+        diagramType: null,
+        renderedHtml: null,
+        renderMeta: null,
+        tags: [],
+        source: 'native',
+        contentHash: null,
+        sourceSha: null,
+        sectionCount: 1,
+        tokenEstimate: 600,
+        linkHealth: null,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        deletedAt: null,
+      })) as Doc[];
+
+    const setupHeavyOverview = () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(manyHeavyDocs(50));
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+    };
+
+    it('截断 ∧ 未显式传 maxTokens → 附挂 docs_overview_truncated（data 四字段 + 最便宜下一步）', async () => {
+      setupHeavyOverview();
+
+      const result = await service.getOverview('space-1', {}, 'agent-1');
+
+      expect(result.truncated).toBe(true);
+      const hints = (result as { hints?: Array<Record<string, unknown>> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0]).toMatchObject({
+        code: 'docs_overview_truncated',
+        status: 'suggestion',
+        data: {
+          section: 'docs',
+          totalCount: 50,
+          suggestedTool: 'get_docs_overview',
+          // 最便宜下一步 = catalog 投影（豁免截断，一次拿全目录）
+          suggestedParams: { catalog: true },
+        },
+      });
+      expect((hints?.[0].data as { returnedCount: number }).returnedCount).toBe(
+        result.docsReturned,
+      );
+    });
+
+    it('**参数存在性判据**：调用方显式传 maxTokens → 同样截断但不附挂（自己管预算）', async () => {
+      setupHeavyOverview();
+
+      const result = await service.getOverview('space-1', { maxTokens: 500 }, 'agent-1');
+
+      expect(result.truncated).toBe(true);
+      expect((result as { hints?: unknown[] }).hints).toBeUndefined();
+    });
+
+    it('catalog 模式豁免截断 ⇒ 不附挂（truncated 恒 false）', async () => {
+      setupHeavyOverview();
+
+      const result = await service.getOverview('space-1', { catalog: true }, 'agent-1');
+
+      expect(result.truncated).toBe(false);
+      expect((result as { hints?: unknown[] }).hints).toBeUndefined();
+    });
+
+    it('未截断 → 键不出现（信封不变量：禁空数组）', async () => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue(manyHeavyDocs(2));
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+
+      const result = await service.getOverview('space-1', {}, 'agent-1');
+
+      expect(result.truncated).toBe(false);
+      expect(result).not.toHaveProperty('hints');
+    });
+
+    it('**运行期**窗口 = 注册表声明的 24h（P1-1：DOC_HINT_PROFILE.ttlOf 接线后 23h 仍压制）', async () => {
+      setupHeavyOverview();
+
+      jest.useFakeTimers();
+      try {
+        const first = await service.getOverview('space-1', {}, 'agent-1');
+        expect((first as { hints?: unknown[] }).hints).toHaveLength(1);
+
+        // +23h 仍压制（缺 ttlOf 钩子 ⇒ 6h 缺省 ⇒ 这里会放行 = P1-1 回归锁）
+        jest.advanceTimersByTime(23 * 60 * 60 * 1000);
+        const second = await service.getOverview('space-1', {}, 'agent-1');
+        expect((second as { hints?: unknown[] }).hints).toBeUndefined();
+
+        jest.advanceTimersByTime(2 * 60 * 60 * 1000);
+        const third = await service.getOverview('space-1', {}, 'agent-1');
+        expect((third as { hints?: unknown[] }).hints).toHaveLength(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('去重窗口按 actor 分档：同 actor 第二次被压制，换个 actor 照常送达', async () => {
+      setupHeavyOverview();
+
+      const first = await service.getOverview('space-1', {}, 'agent-1');
+      expect((first as { hints?: unknown[] }).hints).toHaveLength(1);
+
+      const second = await service.getOverview('space-1', {}, 'agent-1');
+      expect((second as { hints?: unknown[] }).hints).toBeUndefined();
+
+      const other = await service.getOverview('space-1', {}, 'agent-2');
+      expect((other as { hints?: unknown[] }).hints).toHaveLength(1);
     });
 
     it('文档截断时 docsTotal/docsReturned 透出全量与实返（截断元数据）', async () => {
@@ -1986,6 +2389,132 @@ describe('DocSpaceService', () => {
       expect(result.routesTruncated).toBe(true);
       // broken 路由在被截断掉的尾部，但空间级统计仍计入
       expect(result.totalBrokenRoutes).toBe(1);
+    });
+
+    // ─── overview routes 段截断 hint（docs_overview_routes_truncated） ────
+
+    /** 造 n 条路由行（策展序 = sortOrder）——routes 段截断用例的最小夹具 */
+    const makeRouteRows = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `r${i}`,
+        spaceId: 'space-1',
+        intent: `意图 ${i}`,
+        category: null,
+        primaryDocId: 'doc-1',
+        primaryHeadingPath: null,
+        secondaryDocId: null,
+        secondaryHeadingPath: null,
+        codeEntry: null,
+        sortOrder: i,
+        createdBy: 'user-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })) as unknown as DocRoute[];
+
+    /** 装配「无文档 + 给定路由行」的 overview 前置（docs 段不截断，隔离 routes 段判定） */
+    const setupRoutesOnly = (routeRows: DocRoute[]) => {
+      spaceRepo.findOne.mockResolvedValue(makeSpace());
+      const catQb = createMockQueryBuilder([], 0);
+      catQb.getMany = jest.fn().mockResolvedValue([]);
+      categoryRepo.createQueryBuilder.mockReturnValue(catQb);
+      const docQb = createMockQueryBuilder([], 0);
+      docQb.getMany = jest.fn().mockResolvedValue([]);
+      docRepo.createQueryBuilder.mockReturnValue(docQb);
+      routeRepo.find.mockResolvedValue(routeRows);
+    };
+
+    it('routesTruncated=true ⇒ 附挂 docs_overview_routes_truncated（data 五字段 + 分页入口）', async () => {
+      setupRoutesOnly(makeRouteRows(51));
+
+      const result = await service.getOverview('space-1', {}, 'agent-routes-1');
+
+      expect(result.routesTruncated).toBe(true);
+      const hints = (result as { hints?: Array<Record<string, unknown>> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0]).toMatchObject({
+        code: 'docs_overview_routes_truncated',
+        status: 'suggestion',
+        data: {
+          section: 'routes',
+          returnedCount: 50,
+          totalCount: 51,
+          suggestedTool: 'list_doc_routes',
+          suggestedParams: { page: 1, pageSize: 100 },
+        },
+      });
+    });
+
+    it('catalog 模式下 routes 截断 ⇒ 仍附挂 routes hint，且**无** docs 段 hint（两段独立）', async () => {
+      setupRoutesOnly(makeRouteRows(51));
+
+      // catalog 只豁免 **docs 段** 的 maxTokens 截断；routes 段的 50 条防爆闸与投影无关
+      const result = await service.getOverview('space-1', { catalog: true }, 'agent-routes-2');
+
+      expect(result.routesTruncated).toBe(true);
+      const hints = (result as { hints?: Array<{ code: string }> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0].code).toBe('docs_overview_routes_truncated');
+      // docs 段未截断（catalog 豁免 / 本次无文档）⇒ 兄弟码不出现
+      expect(hints?.some((hint) => hint.code === 'docs_overview_truncated')).toBe(false);
+    });
+
+    it('routesTruncated=false（≤50 条）⇒ 键不出现（信封不变量：禁空数组）', async () => {
+      setupRoutesOnly(makeRouteRows(3));
+
+      const result = await service.getOverview('space-1', {}, 'agent-routes-3');
+
+      expect(result.routesTruncated).toBe(false);
+      expect(result).not.toHaveProperty('hints');
+    });
+
+    it('docs 段与 routes 段**同时**截断 ⇒ 两码并存且次序 docs(16) → routes(17)', async () => {
+      // 重文档（docs 段必被 maxTokens 截断）+ 51 条路由（routes 段触防爆闸）
+      setupHeavyOverview();
+      routeRepo.find.mockResolvedValue(makeRouteRows(51));
+
+      const result = await service.getOverview('space-1', {}, 'agent-both-1');
+
+      expect(result.truncated).toBe(true);
+      expect(result.routesTruncated).toBe(true);
+      const hints = (result as { hints?: Array<{ code: string; data?: Record<string, unknown> }> })
+        .hints;
+      expect(hints).toHaveLength(2);
+      // 两个截断段各自独立判定 ⇒ 同一次 emitHints 里两条候选；次序 = DOC_HINT_PRIORITY 单源
+      expect(hints?.map((hint) => hint.code)).toEqual([
+        'docs_overview_truncated',
+        'docs_overview_routes_truncated',
+      ]);
+      expect(hints?.[0].data).toMatchObject({ section: 'docs' });
+      expect(hints?.[1].data).toMatchObject({
+        section: 'routes',
+        returnedCount: 50,
+        totalCount: 51,
+      });
+    });
+
+    it('显式传 maxTokens ⇒ docs 码被抑制（调用方自管预算），routes 码照发（两段独立）', async () => {
+      setupHeavyOverview();
+      routeRepo.find.mockResolvedValue(makeRouteRows(51));
+
+      const result = await service.getOverview('space-1', { maxTokens: 500 }, 'agent-both-2');
+
+      expect(result.truncated).toBe(true);
+      const hints = (result as { hints?: Array<{ code: string }> }).hints;
+      expect(hints).toHaveLength(1);
+      expect(hints?.[0].code).toBe('docs_overview_routes_truncated');
+    });
+
+    it('includeRoutes=false ⇒ routes 段不内嵌（routesTruncated=undefined）⇒ 不发 routes 码', async () => {
+      setupHeavyOverview();
+      // 库里虽有 51 条，但未内嵌 ⇒ 判据（标记位本身）不成立，不发 routes 码
+      routeRepo.find.mockResolvedValue(makeRouteRows(51));
+
+      const result = await service.getOverview('space-1', { includeRoutes: false }, 'agent-both-3');
+
+      expect(result).not.toHaveProperty('routes');
+      const hints = (result as { hints?: Array<{ code: string }> }).hints;
+      // docs 段仍截断 ⇒ 只剩 docs 码
+      expect(hints?.map((hint) => hint.code)).toEqual(['docs_overview_truncated']);
     });
 
     // ─── v1.42 批次 C1 路由健康透出（health 导航投影 + totalBrokenRoutes 省略键语义） ────

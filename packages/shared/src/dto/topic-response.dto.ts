@@ -19,7 +19,7 @@ import type { AttachmentTtl } from '../constants';
 export interface TopicSettings {
   /** 可见性（settings 冗余副本；顶层 visibility 是权威出口） */
   visibility?: Visibility;
-  /** 圆桌唤醒策略（设计 docs/roundtable-design.md §6） */
+  /** 圆桌唤醒策略（设计 docs/modules/roundtable-design.md §6） */
   wakePolicy?: WakePolicy;
   /** 圆桌安全阀阈值（§6） */
   maxRoundsWithoutHuman?: number;
@@ -64,14 +64,14 @@ export interface Topic {
   /** 话题状态（值域单源 TopicStatus，2026-08-31 起删 draft/voting 死值） */
   status: TopicStatus;
   /**
-   * 话题类型：normal（普通，缺省）/ roundtable（圆桌，设计 docs/roundtable-design.md §5）。
+   * 话题类型：normal（普通，缺省）/ roundtable（圆桌，设计 docs/modules/roundtable-design.md §5）。
    * 由 topics.kind 列透传（entity spread 自动带上），web/digest 据此渲染圆桌 UI。
    */
   kind?: TopicKind;
   /**
    * 圆桌唤醒策略 effective 值（派生字段，仅详情视图且 kind='roundtable' 时返回）：
    * settings.wakePolicy 显式值优先，缺省 'mention'——与 roundtable.service
-   * resolveWakePolicy 同规（设计 docs/roundtable-design.md §6 路由与唤醒策略）。
+   * resolveWakePolicy 同规（设计 docs/modules/roundtable-design.md §6 路由与唤醒策略）。
    * normal topic 不输出该字段。
    */
   wakePolicy?: WakePolicy;
@@ -114,8 +114,11 @@ export interface TopicDetail extends Topic {
   invitedAgentIds?: string[];
   /** 参与者列表（status≠'left' 的全部行，透出 role+status+actor 公开信息） */
   participants?: TopicParticipant[];
-  /** 未读消息数 */
-  unreadCount?: number;
+  // ⚠️ 已删除的 `unreadCount` 死字段（v1.96.0-dev 未读语义批 D8）。
+  // 历史上本字段从未被任何生产路径写入（topic 详情不计算未读），web 端也零处读取
+  // `topic.unreadCount`——未读数只经 `GET /topics/:id/messages/unread`（`UnreadSummary`）
+  // 与 `GET /agents/me/unread` 两个读面暴露。保留此注记是为了让消费方在升级时能看懂
+  // 为什么旧字段消失了：**不要**再往详情响应里加未读计数，未读口径有专门的读面。
   /** 看板数量 */
   boardCount?: number;
   /** 任务数量 */
@@ -197,7 +200,7 @@ export interface Message {
   /** 发送者头像 */
   senderAvatar?: string;
   /**
-   * 圆桌座位标签（座位子身份展示语义，设计 docs/roundtable-design.md §6/§7）：
+   * 圆桌座位标签（座位子身份展示语义，设计 docs/modules/roundtable-design.md §6/§7）：
    * 仅透传 metadata.seatLabel 单键，不透全量 metadata（隐私/体积）；无该键时字段缺省。
    * badge 是展示层语义，权限边界仍是 actor 级。
    */
@@ -239,6 +242,82 @@ export interface Message {
 }
 
 /**
+ * 发送消息响应（POST /topics/:id/messages，v1.96.0-dev 未读语义批 D2）。
+ *
+ * **独立接口，不 extends Message**——发送响应与消息读投影是**两个不同的契约面**，
+ * 强制让它们同源会把各自的空值语义搅在一起（照实声明才不骗调用方）：
+ * - `replyTo` 在发送响应里是 `string | null`（实体列可空，无回复时为 null）；
+ * - `senderAvatar` 是 `string | null`（无头像恒 null，不是缺键）；
+ * - `type` 恒存在（写路径有 `dto.type || CHAT` 兜底），而 `Message.type` 是可选；
+ * - `deletedAt` 不出现在发送响应（刚写入的消息不可能已软删）。
+ *
+ * 幂等重放（同 clientRequestId 二次提交）返回**同一形状** + `idempotentReplay: true`，
+ * 调用方据此区分"新写入"与"重放既有结果"。
+ */
+export interface SendMessageResponse {
+  /** 消息 ID */
+  id: string;
+  /** 所属话题 ID */
+  topicId: string;
+  /** 发送者 ID */
+  senderId: string;
+  /** 发送者类型 */
+  senderType: 'human' | 'agent' | 'system';
+  /** 发送者名称 */
+  senderName: string;
+  /** 发送者头像；无头像恒 null（不是缺键） */
+  senderAvatar: string | null;
+  /**
+   * 圆桌座位标签：仅透传 metadata.seatLabel 单键（设计 docs/modules/roundtable-design.md §6/§7）；
+   * 无该键时**字面缺键**（条件展开，不落 null）。
+   */
+  seatLabel?: string;
+  /** 圆桌主脑座位标记：仅 metadata.seatCoordinator === true 时条件展开 */
+  seatCoordinator?: boolean;
+  /** 消息内容 */
+  content: string;
+  /** 回复的消息 ID；无回复时为 null */
+  replyTo: string | null;
+  /** 消息类型（写路径有 CHAT 兜底，恒存在） */
+  type: MessageType;
+  /** 创建时间 */
+  createdAt: string | Date;
+  /** 附件投影：恒存在数组（无附件 = []），与 Message.attachments 同规 */
+  attachments: MessageAttachment[];
+  /**
+   * 本次发送后，**发送者自己**在话题级的未读数（他人发的、我未读的条数）。
+   *
+   * 契约（三处契约面逐字统一，见 api-definition / spec / @ApiOperation）：
+   * 响应时刻快照；按我自己的 notification_settings 计算（开启 mentions_only 时只数
+   * 提及我的消息）；自发消息永不计入；**对已有参与者行的发送不改变它**（D1：发送不推进
+   * 游标）；若本次发送是本话题**首次发言**（无参与者行、OPEN 话题 auto-join），游标在
+   * 本条消息初始化 → 响应为 0、加入前历史不计入（join 语义，非故障）。
+   *
+   * **可选 = fail-open**：计算失败时省略该键（省略 ≠ 0，也 ≠ 无未读）——发送本身已成功，
+   * 不得因附带统计失败而让调用方误判发送失败。调用方需要强一致读数时走
+   * `GET /topics/:id/messages/unread`。
+   */
+  unreadCount?: number;
+  /**
+   * 本条消息解析出的提及列表（参与者 actor id + 广播令牌 `"*"`）。
+   *
+   * 提取规则：@参与者显示名（名字→id 多值映射）、`@all` → `"*"`、replyTo 父消息
+   * 发送者（父 sender 是本发送者/系统哨兵/无参与者行时跳过）。id 一律小写。
+   * **可选 = fail-open**：提取失败时省略该键（省略 ≠ 无提及），发送本身不受影响。
+   *
+   * 已知边界（如实声明，勿当 bug）：改名后旧名 @ 不命中；含空格的名字可能漏提；
+   * 兜底名（Unknown Agent / System）不可 @；**圆桌座位 label 不计入**（座位是子身份，
+   * 未读面按 actor 计）。
+   *
+   * ⚠️ 参与者 leave 期间的 @ **不会**进其未读汇总（未读只统计 invited/active 行）；
+   * re-join 后该消息才在其未读中生效。
+   */
+  mentions?: string[];
+  /** 幂等重放标记：仅同 clientRequestId 重放时条件展开为 true */
+  idempotentReplay?: boolean;
+}
+
+/**
  * 未读消息摘要与增量消息
  */
 export interface UnreadSummary {
@@ -255,4 +334,12 @@ export interface UnreadSummary {
   messages: Message[];
   /** 是否还有更多未读消息（unreadCount > messages.length） */
   hasMore: boolean;
+  /**
+   * 本响应采用的提及过滤模式（v1.96.0-dev 未读语义批 D4）：true = 调用方在本话题
+   * 开启了 `mentions_only`，`unreadCount` 只统计**提及我（或 @all）**的消息。
+   *
+   * 恒存在（所有返回分支都带）：调用方据此知道自己看到的是哪种口径，不必再读设置。
+   * 设置本身经 `PATCH /topics/:id/notification-settings` 读写。
+   */
+  mentionsOnly: boolean;
 }

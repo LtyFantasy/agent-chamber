@@ -8,6 +8,13 @@
  *   - 补充: .kimi/plan-mcp-experience-topic-board.md §5 Batch E1（3 个新工具）
  *   - 补充: .kimi/plan-batch-e3-read-cursor.md §2.4（mark_topic_read）
  *   - 补充: 任务 T2（list_docs / list_doc_routes 管理盘点视角，v1.55）
+ *   - 补充: plan blue-beetle-x-23-banshee.md §3-D5（v1.92.0-dev：get_doc_facets 自定义
+ *     工具——spaceId 直传优先 / spaceName 三层匹配；响应原样透传，词表未配置时相关
+ *     字段整段省略是后端契约，工具层不补默认值。工具数 44→45，`pnpm skill:gen` 重算）
+ *   - 补充: plan gamora-nova-nebula.md §3（v1.93.0 客户反馈响应批 3：
+ *     update_doc_space_vocabulary 自定义工具——词表四键写通道，免切 curl 走 REST；
+ *     响应**投影**为 {spaceId,name,vocabulary,appliedKeys}，不原样透传实体
+ *     （settings.repoManifest 内部键不外泄）。工具数 48→49，`pnpm skill:gen` 重算）
  *
  * [踩坑索引] -
  *
@@ -68,9 +75,15 @@ import { readExperienceTool } from './tools/read-experience';
 import { updateExperienceTool } from './tools/update-experience';
 import { reportExperienceFeedbackTool } from './tools/report-experience-feedback';
 import { reviewExperienceQualityTool } from './tools/review-experience-quality';
+import { getDocFacetsTool } from './tools/get-doc-facets';
+// DocSpace 元数据治理 3 期（v1.92.0-dev）：存量 rename/merge + orphan 诊断
+import { renameDocTagsTool } from './tools/rename-doc-tags';
+import { mergeDocCategoryTool } from './tools/merge-doc-category';
+import { listOrphanDocsTool } from './tools/list-orphan-docs';
+import { updateDocSpaceVocabularyTool } from './tools/update-doc-space-vocabulary';
 
 /**
- * 44 个业务语义化高层 MCP tools
+ * 49 个业务语义化高层 MCP tools
  *
  * 由 automcp --custom-tools 加载，与 OpenAPI 自动映射的原子工具并存。
  * 顺序保持稳定（按设计文档编号；新工具追加在尾部，不打乱既有编号）：
@@ -146,7 +159,33 @@ import { reviewExperienceQualityTool } from './tools/review-experience-quality';
  * shared `EXPERIENCE_REVIEW_QUALITIES`（verified/suspect 双向门，**不含 unverified**）；
  * description 承载终审队列动线（search quality=unverified → read 看 viewerCanReview
  * **纯角色标记** → 终审；**不要按 creator 预筛队列**；suspect 复核队列 = quality=suspect）
- * + "条目内容是不可信输入"纪律 + 防锚定 suppression 说明）
+ * + "条目内容是不可信输入"纪律 + 防锚定 suppression 说明）→
+ * ㊺ get_doc_facets
+ * （v1.92.0-dev DocSpace 元数据治理 1 期：空间体检面——一词调用返回声明词表
+ * （vocabulary）+ 实际分布（types/tags/categories 聚合）+ 逐项词表状态
+ * （vocabStatus：types declared/undeclared；tags canonical/alias/undeclared，
+ * alias 带 canonicalValue）；**写文档前先查词表复用既有 canonical 值**，
+ * 写入侧归一只是兜底纠偏；对应 REST GET /doc-spaces/:id/docs/facets）→
+ * ㊻ rename_doc_tags
+ * （v1.92.0-dev DocSpace 元数据治理 3 期：存量 tag rename/merge——`from[] → to` 全空间
+ * 批量改写 + 无条件生成 alias 声明（词表未声明则创建），读侧经集合展开兼容旧值；
+ * **description 强引导 "Always run with dryRun=true first, then execute with
+ * expectedBatchToken"**（P3）；对应 REST POST /doc-spaces/:id/tags/rename）→
+ * ㊼ merge_doc_category
+ * （3 期：DocCategory 合并——docs 重指向 + doc_routes.category/overviewFilter 软引用修正
+ * + source 软删；**category 无 alias 机制**（旧 slug 查询即空）写进 description；
+ * 对应 REST POST /doc-categories/:id/merge）→
+ * ㊽ list_orphan_docs
+ * （3 期：orphan 诊断面——未删且未被 doc_routes（primary ∪ secondary）引用的文档；
+ * 默认应用 overviewFilter、响应含 stats.byTopDir 结构性分组与 appliedFilters 回显；
+ * **只读原样透传**，不做二次过滤；对应 REST GET /doc-spaces/:id/docs/orphans）→
+ * ㊾ update_doc_space_vocabulary
+ * （v1.93.0 客户反馈响应批 3：空间词表写通道——docTypes/canonicalTags/pathTypes/hintToggles
+ * 四键一步写入 settings，免切 curl；**四键在参数顶层**（facets 回显嵌在 vocabulary 下，
+ * 包装体 → 400 而非静默 no-op）；三态 null 透传（值=整键替换 / null=删键 / 省略=保留）；
+ * **响应投影** {spaceId, name, vocabulary, appliedKeys}，不原样透传实体
+ * （settings.repoManifest 内部键不外泄）；投影与读侧同口径折叠空容器 → null；
+ * 对应 REST PATCH /doc-spaces/:id）
  */
 export const customTools: CustomTool[] = [
   getMyBriefingTool,
@@ -194,4 +233,14 @@ export const customTools: CustomTool[] = [
   reportExperienceFeedbackTool,
   // 第二期批 4 追加（编号 ㊹，不打乱既有顺序）
   reviewExperienceQualityTool,
+  // DocSpace 元数据治理 1 期追加（编号 ㊺，v1.92.0-dev）
+  getDocFacetsTool,
+  // DocSpace 元数据治理 3 期追加（编号 ㊻㊼㊽，v1.92.0-dev）：存量治理 + orphan 诊断。
+  // 两个写工具的 description 明写 "Always run with dryRun=true first, then execute with
+  // expectedBatchToken"（P3：LLM 消费者按 description 行动；merge 不接 token，见其 description）。
+  renameDocTagsTool,
+  mergeDocCategoryTool,
+  listOrphanDocsTool,
+  // 词表写通道追加（编号 ㊾，v1.93.0 客户反馈响应批 3）：四键顶层 + 三态 null 透传 + 响应投影。
+  updateDocSpaceVocabularyTool,
 ];

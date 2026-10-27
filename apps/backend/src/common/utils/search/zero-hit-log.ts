@@ -19,7 +19,7 @@
  *
  * [权威文档]
  *   - 主文档: 检索中文根治计划终稿 v1.5 §2.6（零命中引导与可观测）
- *   - 补充: 线上 DocSpace `docs/experience-base.md` — 脱敏纪律（同一脱敏族）
+ *   - 补充: 线上 DocSpace `docs/modules/experience-base.md` — 脱敏纪律（同一脱敏族）
  *
  * [关键不变量]
  *   - **日志行只允许一个 JSON 对象**：`buildZeroHitLogLine` / `buildWeakHitLogLine`

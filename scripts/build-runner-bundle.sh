@@ -91,6 +91,9 @@ while IFS= read -r link; do
       info "内联逃逸符号链接: ${link#"$STAGING"/} → $target"
       rm "$link"
       cp -r "$target" "$link"
+      # 部署期快照目录（deploy.sh 的 <dist>-prev，无缝发版用）不是运行时产物：
+      # 带进 bundle 会多一份上一版 dist 徒增体积/引发困惑，就地剔除
+      rm -rf "$link/dist-prev"
       ;;
   esac
 done < <(find "$STAGING/node_modules" -type l)
@@ -125,6 +128,7 @@ tar czf "$OUT_DIR/roundtable-runner.tar.gz" \
   --exclude='src' \
   --exclude='tsconfig.json' \
   --exclude='jest.config.js' \
+  --exclude='dist-prev' \
   .
 
 # ---------- 6. 配套资产：install-runner.sh + 对接指南 ----------

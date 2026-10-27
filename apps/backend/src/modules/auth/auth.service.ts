@@ -8,12 +8,25 @@
  *   - 活动日志插桩: plan shadowcat-sunspot-catwoman.md Phase 2（login/logout/register，
  *     actor=操作者语义决策 8，refresh 显式排除）
  *
- * [踩坑索引] （暂无重大踩坑）
+ * [踩坑索引] LEFTJOIN-SOFTDEL(左连接空虚满足软删过滤——软删用户登录 fail-open)
  *
- * [铁律关联] #11(代理层透传)
+ * [铁律关联] #11(代理层透传) #23(ORM 语义须真 PG 覆盖)
  *
  * [详细踩坑]（最多 5 条）
- *   （暂无）
+ *   LEFTJOIN-SOFTDEL: 软删标记只在 actors 行上（Actor.deletedAt 是 @DeleteDateColumn），
+ *         TypeORM 把软删条件塞进 JOIN 的 **ON 子句**。login 原用 leftJoinAndSelect(actor)，
+ *         左连接下 ON 不匹配不丢行（actor 列全 NULL）→ user.actor=null → user.entity.ts
+ *         `get status()` 回落 'active' → 停用/软删判据永不触发：**软删用户用原密码登录
+ *         返回 200 + 签发 token + 写假 LOGIN 审计行**（卡 e6926d73）；refresh 同病且
+ *         顺序错（先 revoke 旧 token 再查 user → 失败白烧用户 token）。
+ *         修复：login 改 innerJoinAndSelect（ON 不命中丢行）+ 显式 `!user.actor` 二层；
+ *         refresh 把 user 门前移到 revoke 之前，判据 `!user.actor || status !== ACTIVE`。
+ *         ⚠️ 禁止用 `user.actor.deletedAt` / `user.deletedAt` 当判据——@DeleteDateColumn
+ *         ({select:false}) 该列永不进 SELECT，恒 undefined 是死代码（A3-1b 先例
+ *         api-key-auth.service.ts:16-21）。
+ *         同族修复与真 PG 覆盖：user.service.ts `findAll`/`findAllLightweight`（同 join 形状）、
+ *         test/soft-deleted-login.e2e-spec.ts、test/admin-user-delete.e2e-spec.ts
+ *         （mock 单测桩掉 queryBuilder，证不了 SQL 语义——铁律 #23）。
  *
  * [修改检查]
  *   □ 已读 [设计文档] 确认修改符合设计意图
@@ -106,14 +119,26 @@ export class AuthService {
   }
 
   async login(dto: LoginDto): Promise<AuthResponse> {
+    // 软删用户 fail-open 修复（卡 e6926d73，LEFTJOIN-SOFTDEL 踩坑条）：
+    // 软删标记只在 actors 行上（Actor.deletedAt 是 @DeleteDateColumn），TypeORM 把软删
+    // 条件（actor.deleted_at IS NULL）注入 JOIN 的 **ON 子句**；旧写法 leftJoinAndSelect
+    // 下 ON 不匹配**不丢行**（actor 列全 NULL）→ user.actor=null → user.entity.ts get
+    // status() 回落 'active' → 下方 `status !== ACTIVE` 判据永不触发：软删用户用原密码
+    // 仍能登录、拿到 token 并写出假审计行（生产实证失败模式）。
+    // 改 innerJoinAndSelect：ON 不命中即丢行 → 落 `!user` → 401。
     const user = await this.userRepo
       .createQueryBuilder('user')
-      .leftJoinAndSelect('user.actor', 'actor')
+      .innerJoinAndSelect('user.actor', 'actor')
       .addSelect('user.passwordHash')
       .where('user.email = :email', { email: dto.email })
       .getOne();
 
-    if (!user || !user.passwordHash) {
+    // `!user.actor` 是第二层（不因 innerJoin 而冗余）：Actor 行缺失只可能来自软删过滤
+    // 被改回 leftJoin（回归哨兵，见 auth.service.spec「actor: null」负例），且它同时
+    // 封掉 status getter 的 'active' 回落——判据不落在 getter 上，避免再度 fail-open。
+    // 401 文案保持 'Invalid credentials'（不泄露"账号已删"，防账号枚举）；code 保持
+    // TOKEN_INVALID，绝不回 AGENT_DISABLED。
+    if (!user || !user.actor || !user.passwordHash) {
       throw new UnauthorizedException({
         message: 'Invalid credentials',
         code: ErrorCode.TOKEN_INVALID,
@@ -176,17 +201,28 @@ export class AuthService {
       });
     }
 
-    // Revoke old token
-    refreshToken.revokedAt = new Date();
-    await this.refreshTokenRepo.save(refreshToken);
-
+    // 顺序修正（卡 e6926d73，sec P2）：user 存在性/状态门**前移到吊销旧 token 之前**。
+    // 旧实现先 revoke 旧 token（原 :191-193）再查 user（原 :195），任何后续失败
+    // （用户已软删/已停用）都把用户 token 白烧掉——用户重试即 401，等于被静默登出。
+    //
+    // 软删判定由 eager 关系的 join 语义承担：`findOne` 走 FindOptionsUtils，对 eager
+    // 关系（User.actor 为 eager:true）生成 leftJoin，TypeORM 把软删条件塞进 ON 子句，
+    // 软删时 actor 列全 NULL → `!user.actor` 命中。（软删**不**改 actors.status，
+    // 故 status 判据单独不足以拦下。）
+    // ⚠️ 禁止把 `user.actor.deletedAt` 写成判据：Actor.deletedAt 是
+    // @DeleteDateColumn({ select: false })，该列永不进 SELECT，取值恒 undefined =
+    // 死代码（A3-1b 先例 api-key-auth.service.ts:16-21）。
     const user = await this.userRepo.findOne({ where: { id: refreshToken.userId } });
-    if (!user) {
+    if (!user || !user.actor || user.actor.status !== AgentStatus.ACTIVE) {
       throw new UnauthorizedException({
         message: 'User not found',
         code: ErrorCode.TOKEN_INVALID,
       });
     }
+
+    // Revoke old token（仅在用户仍有效、且新 token 即将签发前执行）
+    refreshToken.revokedAt = new Date();
+    await this.refreshTokenRepo.save(refreshToken);
 
     return this.generateTokens(user);
   }

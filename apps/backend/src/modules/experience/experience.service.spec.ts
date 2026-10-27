@@ -6,7 +6,13 @@ import {
   HttpException,
   NotFoundException,
 } from '@nestjs/common';
-import { ActorType, ErrorCode, UserRole, type ExperienceEnv } from '@agent-chamber/shared';
+import {
+  ActorType,
+  ErrorCode,
+  UserRole,
+  type ExperienceEnv,
+  type ExperienceJudgment,
+} from '@agent-chamber/shared';
 import { ExperienceService } from './experience.service';
 import * as svc from './experience.service';
 import { ExperienceEntry } from '../../database/entities/experience-entry.entity';
@@ -14,7 +20,10 @@ import { ExperienceFeedback } from '../../database/entities/experience-feedback.
 import {
   EXPERIENCE_CREATE_RATE_LIMIT_PER_WINDOW,
   EXPERIENCE_DUPLICATE_TITLE_SIMILARITY,
+  EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT,
   EXPERIENCE_SCORE_FLOOR,
+  EXPERIENCE_SECRET_PATTERN_LABELS,
+  EXPERIENCE_SECRET_PATTERNS,
   EXPERIENCE_SUMMARY_MAX_LENGTH,
 } from './experience.constants';
 import type { CreateExperienceDto, QueryExperienceDto, UpdateExperienceDto } from './dto';
@@ -127,8 +136,11 @@ describe('ExperienceService', () => {
    * 分工：判定接线/版本守卫/落库纪律在 `experience-judgment.service.spec.ts` 里逐条测；
    * 本文件只断言 **ExperienceService 正确委派**（传对 mode/entryId/version 基准）与
    * "判定结果如何进响应"（judgment 键、幂等回填、失败置 null）。
+   *
+   * `providerEnabled`（补跑编排读的 getter）在生产是**取值即时的 getter**，mock 用普通布尔
+   * 字段等价——补跑用例据此翻成 false 验证"未启用时 scanned 仍为真值"。
    */
-  let judgments: { evaluateAndPersist: jest.Mock };
+  let judgments: { evaluateAndPersist: jest.Mock; providerEnabled: boolean };
   /**
    * 本次用例里 entryRepo.createQueryBuilder 产出的**全部** builder（按创建顺序）。
    *
@@ -211,7 +223,7 @@ describe('ExperienceService', () => {
       assertReviewIdentity: jest.fn(),
       assertCanReview: jest.fn().mockResolvedValue(undefined),
     };
-    judgments = { evaluateAndPersist: jest.fn().mockResolvedValue(null) };
+    judgments = { evaluateAndPersist: jest.fn().mockResolvedValue(null), providerEnabled: true };
     installQueryBuilders();
     // manager.getRepository 按实体分派：Feedback 路径用 feedbackRepo（断言面），其余（幂等
     // 记录）用 managerRepo——两条路径的仓储 mock 分离，断言互不串味
@@ -477,6 +489,313 @@ describe('ExperienceService', () => {
       }
       expect(message).toContain('credential');
       expect(message).not.toContain('supersecretvalue');
+    });
+
+    // ══════════════════════════════════════════════════════════════
+    // 边界矩阵 + 400 定位（任务 77bf7dd8）
+    // ══════════════════════════════════════════════════════════════
+
+    /** 取 400 的 message 文本（`getResponse()` 是 `{message, code}` 对象） */
+    function secretGateMessage(dto: Parameters<typeof svc.assertNoSecretPatterns>[0]): string {
+      try {
+        svc.assertNoSecretPatterns(dto);
+      } catch (err) {
+        return ((err as BadRequestException).getResponse() as { message: string }).message;
+      }
+      throw new Error('expected the secret gate to reject, but it passed');
+    }
+
+    /** 合法基底（只覆盖要测的字段，其余保持无命中形态） */
+    const cleanDto = {
+      title: 'T',
+      summary: 'S',
+      content: 'How verified: x',
+      signals: ['x'],
+    };
+
+    /**
+     * 左边界回归矩阵（**必须放行**，任务 `77bf7dd8`）。
+     *
+     * 三条前缀模式按子串匹配会命中词中前缀：`background-task-timeout` 的
+     * `ta|sk-timeout`（#2）、`task_retry` 的 `ta|sk_retry`（#2）、`task_x` 的
+     * `ta|sk_x`（#1）。这些是运维高频词——误伤一次就把正常排障笔记打成 400
+     * （意见箱 2026-10-15 报告的原样复现）。修法 = `(?<![A-Za-z0-9])` 左边界。
+     */
+    const opsWords = [
+      'background-task-timeout',
+      'task-timeout',
+      'flask-error',
+      'disk-usage',
+      'risk-assessment',
+      'desk-job',
+      'multi-task-runner',
+      'task_retry',
+      'task_timeout',
+      'disk_usage',
+      'flask_error',
+      'subtask_x',
+    ];
+
+    it.each(opsWords)('kebab/snake 运维词放行（signals）：%s', (word) => {
+      expect(() => svc.assertNoSecretPatterns({ ...cleanDto, signals: [word] })).not.toThrow();
+    });
+
+    it.each(opsWords)('kebab/snake 运维词在**各字段**均放行：%s', (word) => {
+      expect(() =>
+        svc.assertNoSecretPatterns({
+          title: `note ${word}`,
+          summary: `note ${word}`,
+          content: `## Fix\n${word}`,
+          signals: ['ok'],
+          domains: [word],
+          sourceProject: word,
+          env: { tool: word },
+        }),
+      ).not.toThrow();
+    });
+
+    /**
+     * 收紧方向的反向护栏（**必须命中**）：左边界只能排除"词中前缀"，真实 key 的
+     * 前置字符恒为开头 / 空白 / 换行 / `=` / 引号 / `:`——全部仍须 400。
+     * 若这条矩阵变红，说明收紧过度（放过真 key 比误伤更糟）。
+     */
+    const boundaryPositives: [string, string][] = [
+      ['字符串开头 ask_', 'ask_abcdef123456'],
+      ['等号后 ask_', 'KEY=ask_abcdef123456'],
+      ['引号内 ask_', '{"key":"ask_abcdef123456"}'],
+      ['换行后 ask_', 'line1\nask_abcdef123456'],
+      ['下划线前置 ask_', '_ask_abcdef123456'],
+      ['字符串开头 sk-', 'sk-abcdef123456'],
+      ['冒号后 sk-', 'token:sk-abcdef123456'],
+      ['空格前置 sk-（Bearer 头）', 'Bearer sk-abcdef123456'],
+      ['tab 前置 sk-', '\tsk-abcdef123456'],
+      ['CJK 相邻 sk-（非字母数字，视为边界）', '密钥sk-abcdef123456'],
+      ['连字符前置 sk-', '-sk-abcdef123456'],
+      ['字符串开头 apikey_', 'apikey_abcdef123456'],
+      ['等号后 apikey_', 'TYPESAFE_API_KEY=apikey_abcdef123456'],
+    ];
+
+    it.each(boundaryPositives)('真实边界形态仍 400（%s）', (_label, content) => {
+      expect(() => svc.assertNoSecretPatterns({ ...cleanDto, content })).toThrow(
+        BadRequestException,
+      );
+    });
+
+    /**
+     * 行为翻转钉（评审 m3）：这些过去会命中（子串匹配），现在**必须放行**。
+     * 单独成组是为了「将来有人把 lookbehind 改宽/删掉」时立刻变红。
+     */
+    const flippedNegatives = ['xsk-abc', 'xask_abc', 'mask-abc'];
+
+    it.each(flippedNegatives)('词中前缀现在放行（行为翻转钉）：%s', (word) => {
+      expect(() => svc.assertNoSecretPatterns({ ...cleanDto, signals: [word] })).not.toThrow();
+    });
+
+    it('类别名表与模式表**同长同序**（7 项逐项断言）', () => {
+      expect(EXPERIENCE_SECRET_PATTERN_LABELS).toHaveLength(EXPERIENCE_SECRET_PATTERNS.length);
+      // 逐项钉住关键 token：重排模式却不改标签、或插队新增模式，都会在这里变红
+      const expectedTokens = ['ask_', 'sk-', 'PEM', 'password', 'age secret', 'PuTTY', 'apikey_'];
+      expectedTokens.forEach((token, index) => {
+        expect(EXPERIENCE_SECRET_PATTERN_LABELS[index]).toContain(token);
+      });
+    });
+
+    it('400 文案保留旧措辞半句（契约扩展只追加、不改写原句）', () => {
+      const message = secretGateMessage({ ...cleanDto, signals: ['ask_abcdef'] });
+      // 旧版半句原样在场：消费方若 parse `matched pattern #N` 或该类别串，仍能命中
+      expect(message).toContain(
+        `matched pattern #1 of ${EXPERIENCE_SECRET_PATTERNS.length}: ` +
+          'API key / private key / password assignment',
+      );
+      // 扩展部分（终止符 `).` → `; category ...; field ...).`）紧随其后
+      expect(message).toContain('; category "API key prefix (ask_)"; field "signals[0]"');
+    });
+
+    /**
+     * 定位矩阵：每个可写字段位置都必须自带字段路径（排障第一信息）。
+     *
+     * 这是本任务的第二个缺陷修复点——旧实现把全部字段 join 成单一 haystack，
+     * 正则命中后**无法还原是哪个字段**，调用方只能二分瞎试。
+     */
+    const localized: [string, Record<string, unknown>, string, number][] = [
+      ['title', { title: 'leak ask_abcdef' }, 'field "title"', 1],
+      ['summary', { summary: 'dsn password=abc' }, 'field "summary"', 4],
+      ['content', { content: '## Fix\nsk-abcdef' }, 'field "content"', 2],
+      ['signals[1]', { signals: ['ok', 'apikey_abcdef'] }, 'field "signals[1]"', 7],
+      ['domains[0]', { domains: ['ask_abcdef'] }, 'field "domains[0]"', 1],
+      ['sourceProject', { sourceProject: 'sk-abcdef' }, 'field "sourceProject"', 2],
+      ['env.os', { env: { os: 'password=abc' } }, 'field "env.os"', 4],
+    ];
+
+    it.each(localized)(
+      '400 定位：%s 命中 → message 带字段路径与类别名',
+      (_label, override, expectedField, patternNo) => {
+        const message = secretGateMessage({ ...cleanDto, ...override });
+        // 既有措辞结构保持不变（消费方可能 parse `matched pattern #N`）
+        expect(message).toContain(
+          `matched pattern #${patternNo} of ${EXPERIENCE_SECRET_PATTERNS.length}`,
+        );
+        expect(message).toContain(expectedField);
+        expect(message).toContain('category "');
+      },
+    );
+
+    it('多处命中：主命中取**模式编号最小**者（与旧 join 语义一致），其余字段只列路径', () => {
+      const message = secretGateMessage({
+        ...cleanDto,
+        content: '## Fix\npassword=abc',
+        signals: ['ask_abcdef'],
+      });
+      expect(message).toContain('matched pattern #1 of');
+      expect(message).toContain('field "signals[0]"');
+      expect(message).toContain('other fields also matched: "content"');
+    });
+
+    it('定位信息**只含字段路径与类别名**，不回显命中 token 本体', () => {
+      const message = secretGateMessage({
+        ...cleanDto,
+        signals: ['ok', 'sk-TOPSECRETVALUE'],
+      });
+      expect(message).toContain('field "signals[1]"');
+      expect(message).toContain('category "API key prefix (sk-)"');
+      expect(message).not.toContain('TOPSECRETVALUE');
+    });
+
+    /**
+     * 跨字段回退（评审 M1）：逐字段扫描后，**拆分到两个字段**的凭据形态会漏拦。
+     * 安全闸不许静默变弱——回退跑一次 `join('\n')` 扫描（与旧实现同口径），
+     * 命中时如实标 `(cross-field)`，不猜字段。
+     */
+    it('跨字段拼接仍拦（评审 M1）：PEM 头拆在两个字段', () => {
+      const message = secretGateMessage({
+        ...cleanDto,
+        content: '-----BEGIN RSA',
+        signals: ['PRIVATE KEY-----'],
+      });
+      expect(message).toContain('matched pattern #3 of');
+      expect(message).toContain('field "(cross-field)"');
+    });
+
+    it('跨字段拼接仍拦（评审 M1）：password 与 =x 拆在两个相邻字段', () => {
+      const message = secretGateMessage({
+        ...cleanDto,
+        content: 'dsn password',
+        signals: ['=hunter2'],
+      });
+      expect(message).toContain('matched pattern #4 of');
+      expect(message).toContain('field "(cross-field)"');
+    });
+
+    it('跨字段回退**不**误伤拼接后的运维词（边界语义一致）', () => {
+      expect(() =>
+        svc.assertNoSecretPatterns({
+          ...cleanDto,
+          content: 'background-task',
+          signals: ['-timeout'],
+        }),
+      ).not.toThrow();
+    });
+
+    it('其它命中字段超过 5 个时追加 `and N more`（评审 m3）', () => {
+      const message = secretGateMessage({
+        title: 'ask_abcdef',
+        summary: 'ask_abcdef',
+        content: 'ask_abcdef',
+        signals: ['ask_abcdef', 'ask_abcdef', 'ask_abcdef'],
+        domains: ['ask_abcdef'],
+      });
+      // 7 处命中：主命中 title，其余 6 处 → 列 5 个 + "and 1 more"
+      expect(message).toContain('other fields also matched:');
+      expect(message).toContain('and 1 more');
+    });
+
+    /**
+     * 归一化兜底（评审 m4）：三条前缀模式是**小写锚定**，`ASK_ABC` 原始形态不命中，
+     * 但 normalizeElements 会把它小写化成 `ask_abc` **落库**——若不扫归一化值，
+     * 就是"过闸后变成密钥"的静默漏洞。
+     */
+    it('create 归一化兜底：ASK_ABC 过原始闸后被小写化，仍须拦（评审 m4）', () => {
+      const message = secretGateMessage({ ...cleanDto, signals: ['ASK_ABC'] });
+      expect(message).toContain('matched pattern #1 of');
+      expect(message).toContain('field "normalized.signals[0]"');
+    });
+
+    it('create 归一化兜底：SK-ABC 大写形态同样拦（评审 m4）', () => {
+      const message = secretGateMessage({ ...cleanDto, env: { tool: 'SK-ABC' } });
+      expect(message).toContain('matched pattern #2 of');
+      expect(message).toContain('field "normalized.env.tool"');
+    });
+
+    /**
+     * PATCH 下标口径（评审 m1）：请求体原值先扫，下标 = **客户端原数组**；
+     * 归一化合并值只作兜底，路径带 `stored.` 前缀。
+     */
+    it('PATCH 定位下标 = 客户端原数组口径（归一化去重不改变报出的下标）', () => {
+      let message = '';
+      try {
+        svc.assertNoSecretPatternsMerged(
+          { signals: ['a', 'A', 'ask_abcdef'] },
+          {
+            title: 'T',
+            summary: 'S',
+            content: 'How verified: x',
+            // 归一化/去重后的存储口径：命中项在下标 1（客户端原数组是 2）
+            signals: ['a', 'ask_abcdef'],
+            domains: [],
+            sourceProject: null,
+            env: {},
+          },
+        );
+      } catch (err) {
+        message = ((err as BadRequestException).getResponse() as { message: string }).message;
+      }
+      expect(message).toContain('field "signals[2]"');
+      expect(message).not.toContain('stored.signals');
+    });
+
+    it('PATCH 存量值兜底：未触碰字段的旧文本仍被拦，路径带 stored. 前缀', () => {
+      let message = '';
+      try {
+        svc.assertNoSecretPatternsMerged(
+          // 本次只改 content（干净）；env.tool 是库里的旧文本
+          { content: 'clean content' },
+          {
+            title: 'T',
+            summary: 'S',
+            content: 'clean content',
+            signals: ['ok'],
+            domains: [],
+            sourceProject: null,
+            env: { tool: 'password=abc' },
+          },
+        );
+      } catch (err) {
+        message = ((err as BadRequestException).getResponse() as { message: string }).message;
+      }
+      expect(message).toContain('field "stored.env.tool"');
+      expect(message).toContain('matched pattern #4 of');
+    });
+
+    it('编辑通道（合并值）同样带字段定位', () => {
+      let message = '';
+      try {
+        svc.assertNoSecretPatternsMerged(
+          { signals: ['ok', 'ask_abcdef'] },
+          {
+            title: 'T',
+            summary: 'S',
+            content: 'How verified: x',
+            signals: ['ok', 'ask_abcdef'],
+            domains: [],
+            sourceProject: null,
+            env: {},
+          },
+        );
+      } catch (err) {
+        message = ((err as BadRequestException).getResponse() as { message: string }).message;
+      }
+      expect(message).toContain('field "signals[1]"');
+      expect(message).toContain('matched pattern #1 of');
     });
 
     it('闸门在**限流之前**：命中密钥的请求不消耗配额', async () => {
@@ -2071,7 +2390,7 @@ describe('ExperienceService', () => {
       expect(detail.judgment).toEqual(judgment);
     });
 
-    it('update：重判失败 → 响应 judgment=null（库内快照由判别服务置 NULL）', async () => {
+    it('update：重判失败 → 响应 judgment=null（业务事务已清旧缓存）', async () => {
       const entry = primeEntry({ judgment: judgment as never });
       judgments.evaluateAndPersist.mockResolvedValue(null);
 
@@ -2079,6 +2398,328 @@ describe('ExperienceService', () => {
       expect(detail.judgment).toBeNull();
       expect(entry.content).toBe('rewritten');
     });
+  });
+
+  describe('B5 optional judgment boundary', () => {
+    /** 有效旧快照，先证明普通读者可见，防 reviewer suppression 使缓存测试假绿。 */
+    const oldJudgment: ExperienceJudgment = {
+      provider: 'typesafe',
+      model: 'fixture-v1',
+      judgedAt: '2026-09-21T10:00:00.000Z',
+      completeness: { level: 'complete', confidence: 0.9 },
+      reusability: null,
+      signalQuality: null,
+      duplicate: null,
+      intentSuggestion: null,
+      domainSuggestion: null,
+      admissionSuggestion: null,
+    };
+
+    /** 每次读都深拷贝；仅事务提交复制 pending 到 raw，避免对象别名伪造缓存失效。 */
+    function statefulEntry() {
+      let raw = makeEntry({
+        createdById: humanActor.id,
+        createdByType: ActorType.HUMAN,
+        judgment: structuredClone(oldJudgment),
+      });
+      let pending: ExperienceEntry | undefined;
+      const order: string[] = [];
+      entryRepo.createQueryBuilder = jest.fn(() => {
+        const qb = makeQueryBuilder();
+        qb.getOne.mockImplementation(async () => structuredClone(raw));
+        return qb;
+      });
+      entryTxRepo.createQueryBuilder = jest.fn(() => {
+        const qb = makeQueryBuilder();
+        qb.getOne.mockImplementation(async () => structuredClone(raw));
+        return qb;
+      });
+      manager.save.mockImplementation(async (entry: ExperienceEntry) => {
+        order.push('save');
+        pending = structuredClone(entry);
+        return structuredClone(entry);
+      });
+      dataSource.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+        pending = undefined;
+        try {
+          const result = await fn(manager);
+          if (pending) raw = structuredClone(pending);
+          order.push('commit');
+          return result;
+        } catch (error) {
+          pending = undefined;
+          order.push('rollback');
+          throw error;
+        }
+      });
+      return { raw: () => structuredClone(raw), order };
+    }
+
+    it('none skips create dedicated input IO while keeping business duplicate hints', async () => {
+      judgments.providerEnabled = false;
+      const duplicates = [{ id: OTHER_UUID, title: 'Existing', quality: 'verified' }];
+      const candidates = jest
+        .spyOn(service as any, 'findDuplicateCandidates')
+        .mockResolvedValue(duplicates);
+      const prepare = jest.spyOn(service as any, 'buildJudgmentInput');
+      const result = await service.create(baseCreate(), humanActor);
+      expect(result).toMatchObject({ id: UUID, possibleDuplicates: duplicates, judgment: null });
+      expect(candidates).toHaveBeenCalledTimes(1);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(dataSource.query).not.toHaveBeenCalled();
+      expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it.each(['domains', 'evaluate'])(
+      'create %s failure returns successful saved entry and null',
+      async (failureAt) => {
+        const error = Object.assign(new Error('fixture private input must not appear in warning'), {
+          code: 'FIXTURE',
+        });
+        if (failureAt === 'domains') dataSource.query.mockRejectedValue(error);
+        else judgments.evaluateAndPersist.mockRejectedValue(error);
+        const warn = jest
+          .spyOn((service as any).logger, 'warn')
+          .mockImplementation(() => undefined);
+        try {
+          const result = await service.create(baseCreate(), humanActor);
+          expect(result).toMatchObject({ id: UUID, judgment: null });
+          expect(manager.save).toHaveBeenCalledWith(expect.objectContaining({ title: 'T' }));
+          expect(warn).toHaveBeenCalledWith(expect.stringContaining('Error/FIXTURE'));
+          expect(warn.mock.calls.flat().join(' ')).not.toContain(error.message);
+        } finally {
+          warn.mockRestore();
+        }
+      },
+    );
+
+    it.each(['none', 'candidates', 'domains', 'evaluate'])(
+      'content update %s clears raw cache before optional work and fresh GET',
+      async (failureAt) => {
+        const state = statefulEntry();
+        const initial = await service.findOne(UUID, humanActor);
+        expect(initial).toMatchObject({
+          judgment: oldJudgment,
+          viewerCanReview: false,
+          judgmentSuppressed: false,
+        });
+        const candidates = jest
+          .spyOn(service as any, 'findDuplicateCandidates')
+          .mockImplementation(async () => {
+            state.order.push('candidates');
+            expect(state.order).toContain('commit');
+            if (failureAt === 'candidates') throw new Error('candidate fixture failure');
+            return [];
+          });
+        const prepare = jest.spyOn(service as any, 'buildJudgmentInput');
+        dataSource.query.mockImplementation(async () => {
+          state.order.push('prepare');
+          expect(state.order).toContain('commit');
+          if (failureAt === 'domains') throw new Error('domain fixture failure');
+          return [];
+        });
+        judgments.providerEnabled = failureAt !== 'none';
+        judgments.evaluateAndPersist.mockImplementation(async () => {
+          state.order.push('evaluate');
+          expect(state.order).toContain('commit');
+          if (failureAt === 'evaluate') throw new Error('evaluation fixture failure');
+          return null;
+        });
+        const result = await service.update(
+          UUID,
+          {
+            expectedUpdatedAt: state.raw().updatedAt.toISOString(),
+            content: 'changed body',
+          } as UpdateExperienceDto,
+          humanActor,
+        );
+        expect(manager.save).toHaveBeenCalledWith(
+          expect.objectContaining({ content: 'changed body', judgment: null }),
+        );
+        expect(state.raw()).toMatchObject({ content: 'changed body', judgment: null });
+        expect(result).toMatchObject({
+          judgment: null,
+          viewerCanReview: false,
+          judgmentSuppressed: false,
+        });
+        const fresh = await service.findOne(UUID, humanActor);
+        expect(fresh).toMatchObject({
+          content: 'changed body',
+          judgment: null,
+          viewerCanReview: false,
+          judgmentSuppressed: false,
+        });
+        expect(state.order.slice(0, 2)).toEqual(['save', 'commit']);
+        if (failureAt === 'none') {
+          expect(candidates).not.toHaveBeenCalled();
+          expect(prepare).not.toHaveBeenCalled();
+          expect(dataSource.query).not.toHaveBeenCalled();
+          expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+        }
+      },
+    );
+
+    it.each([{ title: 'New title' }, { summary: 'New summary' }, { signals: ['new-signal'] }])(
+      'all original content fields clear cache: %j',
+      async (change) => {
+        const state = statefulEntry();
+        judgments.providerEnabled = false;
+        await service.update(
+          UUID,
+          {
+            expectedUpdatedAt: state.raw().updatedAt.toISOString(),
+            ...change,
+          } as UpdateExperienceDto,
+          humanActor,
+        );
+        expect(state.raw().judgment).toBeNull();
+        expect(manager.save).toHaveBeenCalledWith(expect.objectContaining({ judgment: null }));
+      },
+    );
+
+    it('metadata-only edit preserves raw old cache and ordinary fresh GET', async () => {
+      const state = statefulEntry();
+      await service.update(
+        UUID,
+        {
+          expectedUpdatedAt: state.raw().updatedAt.toISOString(),
+          intent: 'howto',
+        } as UpdateExperienceDto,
+        humanActor,
+      );
+      expect(manager.save).toHaveBeenCalledWith(expect.objectContaining({ judgment: oldJudgment }));
+      expect(state.raw().judgment).toEqual(oldJudgment);
+      expect(await service.findOne(UUID, humanActor)).toMatchObject({
+        judgment: oldJudgment,
+        viewerCanReview: false,
+        judgmentSuppressed: false,
+      });
+      expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it('enabled success preserves mode/microsecond guard and executes after commit', async () => {
+      const state = statefulEntry();
+      judgments.evaluateAndPersist.mockImplementation(async (params) => {
+        expect(state.order).toEqual(['save', 'commit']);
+        expect(params).toMatchObject({
+          mode: 'update',
+          entryId: UUID,
+          expectedUpdatedAtText: UPDATED_AT_TEXT,
+        });
+        return oldJudgment;
+      });
+      const result = await service.update(
+        UUID,
+        {
+          expectedUpdatedAt: state.raw().updatedAt.toISOString(),
+          content: 'changed body',
+        } as UpdateExperienceDto,
+        humanActor,
+      );
+      expect(result.judgment).toEqual(oldJudgment);
+    });
+
+    it.each(['duplicate', 'transaction', 'version-query'])(
+      'create business %s failure still propagates',
+      async (failureAt) => {
+        const error = new Error('business fixture failure');
+        if (failureAt === 'duplicate')
+          jest.spyOn(service as any, 'findDuplicateCandidates').mockRejectedValue(error);
+        if (failureAt === 'transaction') dataSource.transaction.mockRejectedValue(error);
+        if (failureAt === 'version-query') manager.query.mockRejectedValue(error);
+        await expect(service.create(baseCreate(), humanActor)).rejects.toBe(error);
+        expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['search', 'facets'] as const)(
+      '%s response dictionary failure is not optional',
+      async (method) => {
+        judgments.providerEnabled = false;
+        const error = new Error('response dictionary failure');
+        dataSource.query.mockRejectedValue(error);
+        await expect(service[method]({} as QueryExperienceDto, humanActor)).rejects.toBe(error);
+      },
+    );
+
+    it.each(['permission', 'version'] as const)(
+      'update business %s failure still propagates before optional work',
+      async (failureAt) => {
+        const state = statefulEntry();
+        const actor = failureAt === 'permission' ? agentActor : humanActor;
+        await expect(
+          service.update(
+            UUID,
+            {
+              expectedUpdatedAt:
+                failureAt === 'version'
+                  ? '2020-01-01T00:00:00Z'
+                  : state.raw().updatedAt.toISOString(),
+              content: 'changed',
+            } as UpdateExperienceDto,
+            actor,
+          ),
+        ).rejects.toBeInstanceOf(
+          failureAt === 'permission' ? ForbiddenException : ConflictException,
+        );
+        expect(state.raw().judgment).toEqual(oldJudgment);
+        expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['candidates', 'domains', 'evaluate'])(
+      'backfill per-item %s failure continues and releases flight',
+      async (failureAt) => {
+        const rows = [makeEntry(), makeEntry({ id: OTHER_UUID })];
+        jest
+          .spyOn(service as any, 'selectBackfillBatch')
+          .mockResolvedValue({
+            entities: rows,
+            updatedAtTexts: [UPDATED_AT_TEXT, UPDATED_AT_TEXT],
+          });
+        jest.spyOn(service as any, 'countBackfillNulls').mockResolvedValue(1);
+        jest.spyOn(service as any, 'countExpiredNullEntries').mockResolvedValue(0);
+        const candidates = jest
+          .spyOn(service as any, 'findDuplicateCandidates')
+          .mockResolvedValue([]);
+        if (failureAt === 'candidates')
+          candidates.mockRejectedValueOnce(new Error('candidate failure'));
+        if (failureAt === 'domains')
+          dataSource.query.mockRejectedValueOnce(new Error('domain failure'));
+        judgments.evaluateAndPersist.mockResolvedValue(oldJudgment);
+        if (failureAt === 'evaluate')
+          judgments.evaluateAndPersist.mockRejectedValueOnce(new Error('evaluate failure'));
+        const result = await service.backfillJudgments({}, adminActor);
+        expect(result).toMatchObject({
+          scanned: 2,
+          ok: 1,
+          notJudged: 1,
+          notJudgedExperienceIds: [UUID],
+        });
+        await expect(service.backfillJudgments({}, adminActor)).resolves.toMatchObject({
+          scanned: 2,
+          ok: 2,
+        });
+      },
+    );
+
+    it.each(['select', 'count'])(
+      'backfill %s business failure propagates and releases flight',
+      async (failureAt) => {
+        const select = jest
+          .spyOn(service as any, 'selectBackfillBatch')
+          .mockResolvedValue({ entities: [], updatedAtTexts: [] });
+        const count = jest.spyOn(service as any, 'countBackfillNulls').mockResolvedValue(0);
+        jest.spyOn(service as any, 'countExpiredNullEntries').mockResolvedValue(0);
+        const error = new Error('backfill business failure');
+        if (failureAt === 'select') select.mockRejectedValueOnce(error);
+        else count.mockRejectedValueOnce(error);
+        await expect(service.backfillJudgments({}, adminActor)).rejects.toBe(error);
+        await expect(service.backfillJudgments({}, adminActor)).resolves.toMatchObject({
+          scanned: 0,
+        });
+      },
+    );
   });
 
   // ══════════════════════════════════════════════════════════════════
@@ -2386,6 +3027,281 @@ describe('ExperienceService', () => {
       const res = await service.facets({} as QueryExperienceDto, adminActor);
 
       expect(res.byCreator?.[0].createdByName).toBeNull();
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // 判定补跑（admin backfill；POST /experiences/judgments/backfill）
+  // ══════════════════════════════════════════════════════════════════
+
+  describe('判定补跑（admin backfill）', () => {
+    /**
+     * 装配补跑专用 queryBuilder 序列。
+     *
+     * 本方法的 createQueryBuilder 调用面：① 选取集（`getRawAndEntities` + `limit`）② 每
+     * 条的 `buildJudgmentInput`/`findDuplicateCandidates`（各 1 个）③ 批后三个 `getCount`。
+     * 计数 builder **按谓词内容**分派（`NOT EXISTS` / `EXISTS` / 其余=过期），而不是按
+     * 序号——选中集之后每条判定的 builder 数量会变，按序号认领会在加一条用例时静默错位。
+     *
+     * @param opts.entities 选取集返回的实体
+     * @param opts.updatedAtTexts 与 entities 按索引一一对应的 `updated_at::text` 原文
+     * @param opts.counts 批后三计数 [noLogNulls, failedNulls, expiredNulls]
+     * @returns 按创建顺序的全部 builder（`[0]` 恒为选取集）
+     */
+    function installBackfillBuilders(
+      opts: {
+        entities?: ExperienceEntry[];
+        updatedAtTexts?: string[];
+        counts?: [number, number, number];
+      } = {},
+    ): Record<string, jest.Mock>[] {
+      const entities = opts.entities ?? [];
+      const counts = opts.counts ?? [0, 0, 0];
+      const qbs: Record<string, jest.Mock>[] = [];
+      entryRepo.createQueryBuilder = jest.fn(() => {
+        const qb = makeQueryBuilder({ entities });
+        qb.getRawAndEntities = jest.fn().mockResolvedValue({
+          entities,
+          raw: entities.map((_, i) => ({
+            updated_at_text: opts.updatedAtTexts?.[i] ?? UPDATED_AT_TEXT,
+          })),
+        });
+        qb.getCount = jest.fn(async () => {
+          const sql = predicates(qb).join(' | ');
+          if (sql.includes('NOT EXISTS')) return counts[0];
+          if (sql.includes('EXISTS')) return counts[1];
+          return counts[2];
+        });
+        qbs.push(qb);
+        return qb;
+      });
+      return qbs;
+    }
+
+    it('判权：agent → 403/1009（文案指向"转请人类 admin"），且零查询', async () => {
+      await expect(service.backfillJudgments({}, agentActor)).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.PERMISSION_DENIED,
+          message: expect.stringContaining('not for agents'),
+        },
+      });
+      expect(entryRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+    });
+
+    it('判权：非 admin 人类 → 403/1009（文案分叉："需 admin 角色"），且零查询', async () => {
+      await expect(service.backfillJudgments({}, humanActor)).rejects.toMatchObject({
+        response: {
+          code: ErrorCode.PERMISSION_DENIED,
+          message: expect.stringContaining('requires the admin role'),
+        },
+      });
+      expect(entryRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+
+    it('选取集：软删/已判/过期排除 + **suspect 纳入**（不走 baseQuery）+ 未尝试优先 + limit', async () => {
+      const qbs = installBackfillBuilders({ entities: [] });
+
+      await service.backfillJudgments({ limit: 5 }, adminActor);
+
+      const sql = predicates(qbs[0]).join(' | ');
+      expect(sql).toContain('e.deleted_at IS NULL');
+      expect(sql).toContain('e.judgment IS NULL');
+      expect(sql).toContain('(e.expires_at IS NULL OR e.expires_at > now())');
+      // suspect 必须纳入：baseQuery 的排除谓词一个字都不能出现在这里
+      expect(sql).not.toContain('suspectQuality');
+      expect(sql).not.toContain('quality');
+      // 排序主键 = **未尝试优先**：EXISTS(record_check 日志行) ASC（false 在前）。
+      // ⚠️ 主键**不是** created_at——恒失败条目（如上游 451）若按 created_at 排会永远占住批次
+      // 头部 ⇒ scanned===0 不可达 + 每批配额重复烧在同一批头部条目上（详见实现 JSDoc）。
+      const primaryOrder = (qbs[0].orderBy as jest.Mock).mock.calls[0];
+      expect(primaryOrder[0]).toContain('EXISTS (SELECT 1 FROM experience_judgments j');
+      expect(primaryOrder[0]).toContain('j.operation = :recordCheckOperation');
+      expect(primaryOrder[1]).toBe('ASC'); // ASC = 未尝试(false) 排前
+      // 与批后计数**共用同一份谓词**（单源；两处各写一遍会在新增日志操作时静默分叉）
+      expect(param(qbs[0], 'recordCheckOperation')).toBe('record_check');
+      // 同状态内最旧先补 + 全序兜底（批次边界确定）
+      expect(qbs[0].addOrderBy).toHaveBeenCalledWith('e.created_at', 'ASC');
+      expect(qbs[0].addOrderBy).toHaveBeenCalledWith('e.id', 'ASC');
+      expect(qbs[0].limit).toHaveBeenCalledWith(5);
+      expect(qbs[0].addSelect).toHaveBeenCalledWith('e.updated_at::text', 'updated_at_text');
+      expect(qbs[0].getRawAndEntities).toHaveBeenCalled();
+      expect(qbs[0].getCount).not.toHaveBeenCalled(); // 选取集不用 getCount
+    });
+
+    it('limit 缺省 = 常量缺省值（不落魔数字面量）', async () => {
+      const qbs = installBackfillBuilders({ entities: [] });
+
+      await service.backfillJudgments({}, adminActor);
+
+      expect(qbs[0].limit).toHaveBeenCalledWith(EXPERIENCE_JUDGMENT_BACKFILL_DEFAULT_LIMIT);
+    });
+
+    it('provider 未启用（N1 回归）：scanned **仍为真值**、判定循环整体跳过，批后计数照常', async () => {
+      judgments.providerEnabled = false;
+      const qbs = installBackfillBuilders({
+        entities: [
+          makeEntry({ title: 'a' }),
+          makeEntry({ id: OTHER_UUID, title: 'b' }),
+          makeEntry({ id: STRANGER_UUID, title: 'c' }),
+        ],
+        counts: [3, 0, 2],
+      });
+
+      const res = await service.backfillJudgments({ limit: 3 }, adminActor);
+
+      expect(res.providerEnabled).toBe(false);
+      // 关键回归：scanned 是"选取集真实条数"，不是恒 0 的假值（否则调用方会把
+      // "provider 没配好"误读成"补跑完成"）
+      expect(res.scanned).toBe(3);
+      expect(res.ok).toBe(0);
+      expect(res.notJudged).toBe(3);
+      expect(res.notJudgedExperienceIds).toEqual([UUID, OTHER_UUID, STRANGER_UUID]);
+      expect(res.notJudgedExperienceIds).toHaveLength(res.notJudged); // 恒等式
+      expect(judgments.evaluateAndPersist).not.toHaveBeenCalled();
+      // 批后三计数与 providerEnabled 无关（存量面照常呈现）
+      expect(qbs.filter((qb) => (qb.getCount as jest.Mock).mock.calls.length > 0)).toHaveLength(3);
+      expect(res.noLogNulls).toBe(3);
+      expect(res.failedNulls).toBe(0);
+      expect(res.expiredNulls).toBe(2);
+    });
+
+    it('**严格串行**逐条判定 + ok/notJudged 恒等式（中间一条失败不中断后续）', async () => {
+      const timeline: string[] = [];
+      judgments.evaluateAndPersist.mockImplementation(async (params: { entryId: string }) => {
+        timeline.push(`start:${params.entryId}`);
+        await new Promise((r) => setImmediate(r));
+        timeline.push(`end:${params.entryId}`);
+        return params.entryId === OTHER_UUID ? null : { model: `m-${params.entryId}` };
+      });
+      installBackfillBuilders({
+        entities: [makeEntry(), makeEntry({ id: OTHER_UUID }), makeEntry({ id: STRANGER_UUID })],
+        updatedAtTexts: ['t-a', 't-b', 't-c'],
+        counts: [1, 0, 0],
+      });
+
+      const res = await service.backfillJudgments({ limit: 3 }, adminActor);
+
+      // 串行证据：每一条的 start/end 严格嵌套（无并发交叠）
+      expect(timeline).toEqual([
+        `start:${UUID}`,
+        `end:${UUID}`,
+        `start:${OTHER_UUID}`,
+        `end:${OTHER_UUID}`,
+        `start:${STRANGER_UUID}`,
+        `end:${STRANGER_UUID}`,
+      ]);
+      expect(res.scanned).toBe(3);
+      expect(res.ok).toBe(2);
+      expect(res.notJudged).toBe(1);
+      expect(res.notJudgedExperienceIds).toEqual([OTHER_UUID]);
+      expect(res.notJudgedExperienceIds).toHaveLength(res.notJudged);
+    });
+
+    it('每条带自己的版本守卫基准与 mode=create（一把取不错位；失败不清快照）', async () => {
+      const calls: Array<{ entryId: string; mode: string; expectedUpdatedAtText: string }> = [];
+      judgments.evaluateAndPersist.mockImplementation(
+        async (params: { entryId: string; mode: string; expectedUpdatedAtText: string }) => {
+          calls.push(params);
+          return { model: 'ok' };
+        },
+      );
+      installBackfillBuilders({
+        entities: [makeEntry(), makeEntry({ id: OTHER_UUID })],
+        updatedAtTexts: ['guard-a', 'guard-b'],
+      });
+
+      await service.backfillJudgments({ limit: 2 }, adminActor);
+
+      // 基准必须与实体**按索引对应**（错位 = 把守卫打到别的行上，快照静默写不进去）
+      expect(calls.map((c) => c.expectedUpdatedAtText)).toEqual(['guard-a', 'guard-b']);
+      // mode 恒 create：补跑对象的快照天然 NULL，无需 update 模式的清快照分支
+      expect(calls.every((c) => c.mode === 'create')).toBe(true);
+      // actor 透传（日志行的 actor 列 = 触发者，归因由它承担）
+      expect(judgments.evaluateAndPersist.mock.calls[0][0].actor).toBe(adminActor);
+    });
+
+    it('批后三 COUNT：EXISTS / NOT EXISTS 子查询**必须带 operation 条件**，过期计数单独收口', async () => {
+      const qbs = installBackfillBuilders({
+        entities: [],
+        counts: [4, 2, 3],
+      });
+
+      const res = await service.backfillJudgments({ limit: 1 }, adminActor);
+
+      const countQbs = qbs.filter((qb) => (qb.getCount as jest.Mock).mock.calls.length > 0);
+      expect(countQbs).toHaveLength(3);
+      const [noLogQb, failedQb, expiredQb] = countQbs;
+
+      const noLogSql = predicates(noLogQb).join(' | ');
+      const failedSql = predicates(failedQb).join(' | ');
+      expect(noLogSql).toContain('NOT EXISTS (SELECT 1 FROM experience_judgments j');
+      expect(failedSql).toContain('EXISTS (SELECT 1 FROM experience_judgments j');
+      expect(failedSql).not.toContain('NOT EXISTS');
+      // 多操作表（record_check / rerank / autotag）——少了这个条件，别的操作的日志行会被
+      // 算成"这条判过了"，静默腐蚀计数（autotag 上线即触发）
+      for (const sql of [noLogSql, failedSql]) {
+        expect(sql).toContain('j.operation = :recordCheckOperation');
+      }
+      expect(param(noLogQb, 'recordCheckOperation')).toBe('record_check');
+      expect(param(failedQb, 'recordCheckOperation')).toBe('record_check');
+
+      // 过期计数：作用域 = 选取集**之外**（已过期且 NULL），谓词与选取集互斥
+      const expiredSql = predicates(expiredQb).join(' | ');
+      expect(expiredSql).toContain('e.expires_at IS NOT NULL AND e.expires_at <= now()');
+      expect(expiredSql).not.toContain('EXISTS');
+
+      // 三计数**原样透出**（本用例只钉形状与透传：`getCount` 被 mock，取值不是真值）。
+      // 真值与"互斥穷尽"恒等式由 e2e 在真库上**直查**钉住（experience.e2e-spec.ts ⑳
+      // 「批后三计数与穷尽恒等式」用例：noLogNulls+failedNulls === 非过期 NULL 总数，
+      // failedNulls === 有 record_check 日志行的那些，且与 expiredNulls 互斥）。
+      expect(res.noLogNulls).toBe(4);
+      expect(res.failedNulls).toBe(2);
+      expect(res.expiredNulls).toBe(3);
+    });
+
+    it('single-flight：并发第二枪 → 409/9001；第一批结束后可重调', async () => {
+      let release: (v: ExperienceJudgment | null) => void = () => undefined;
+      judgments.evaluateAndPersist.mockImplementation(
+        () =>
+          new Promise<ExperienceJudgment | null>((resolve) => {
+            release = resolve;
+          }),
+      );
+      installBackfillBuilders({ entities: [makeEntry()] });
+
+      const first = service.backfillJudgments({ limit: 1 }, adminActor);
+      // 等第一枪真的进入判定（否则第二枪可能抢在 backfillRunning 置位之前）
+      for (let i = 0; i < 50 && judgments.evaluateAndPersist.mock.calls.length === 0; i += 1) {
+        await new Promise((r) => setImmediate(r));
+      }
+      expect(judgments.evaluateAndPersist).toHaveBeenCalledTimes(1);
+
+      await expect(service.backfillJudgments({ limit: 1 }, adminActor)).rejects.toMatchObject({
+        response: { code: ErrorCode.RESOURCE_CONFLICT },
+      });
+
+      release(null);
+      await expect(first).resolves.toMatchObject({ scanned: 1, ok: 0, notJudged: 1 });
+
+      // 释放后可重调（finally 生效，不是"一次异常/一批把进程锁死"）
+      judgments.evaluateAndPersist.mockResolvedValue({ model: 'after-release' });
+      await expect(service.backfillJudgments({ limit: 1 }, adminActor)).resolves.toMatchObject({
+        ok: 1,
+      });
+    });
+
+    it('异常也释放 single-flight（try/finally）：失败后第二次调用不被误判为"在跑"', async () => {
+      entryRepo.createQueryBuilder = jest.fn(() => {
+        throw new Error('boom');
+      });
+      await expect(service.backfillJudgments({ limit: 1 }, adminActor)).rejects.toThrow('boom');
+
+      judgments.evaluateAndPersist.mockResolvedValue({ model: 'after-throw' });
+      installBackfillBuilders({ entities: [makeEntry()] });
+      await expect(service.backfillJudgments({ limit: 1 }, adminActor)).resolves.toMatchObject({
+        ok: 1,
+      });
     });
   });
 });

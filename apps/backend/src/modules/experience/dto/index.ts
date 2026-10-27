@@ -6,7 +6,7 @@
 export { CreateExperienceDto } from './create-experience.dto';
 export { UpdateExperienceDto } from './update-experience.dto';
 export { QueryExperienceDto } from './query-experience.dto';
-export { QueryJudgmentDto } from './query-judgment.dto';
+export { QueryJudgmentDto, BackfillJudgmentsDto } from './query-judgment.dto';
 export { ReportExperienceFeedbackDto } from './report-experience-feedback.dto';
 export { AddExperienceMemberDto, UpdateExperienceMemberRoleDto } from './experience-member.dto';
 export {

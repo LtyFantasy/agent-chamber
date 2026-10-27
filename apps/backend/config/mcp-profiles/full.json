@@ -1,6 +1,6 @@
 {
   "name": "Platform Full",
-  "description": "全量工具面（原子 200 = OpenAPI 210 − exclude 10，语义 44，合计 244 tools；数字以运行时 tools/list 为准；排除项 10 = admin 用户管理 4 + audit 2 + monitoring 3 + sse 1），平台管理/低频操作入口；注意：数组 query 参数（如 experiences 的 signals/domains）在原子面为逗号拼接形态，多值过滤请走语义工具 search_experiences",
+  "description": "Full API and semantic tools for this distribution. Inspect tools/list on this MCP entry for the available tools; array query filters can use the corresponding semantic tools.",
   "include": [
     ".*"
   ],
@@ -8,6 +8,8 @@
     "^admin_user_controller_",
     "^audit_controller_",
     "^monitoring_controller_",
-    "^sse_controller_"
+    "^sse_controller_",
+    "^experience_controller_backfill_judgments$",
+    "^memory_controller_.*"
   ]
 }

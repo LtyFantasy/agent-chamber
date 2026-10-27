@@ -1,36 +1,54 @@
 ---
 name: diagrams
-description: 用平台四工具（upsert_diagram / read_diagram / patch_diagram / validate_diagram）创建、修改、修复 Architecture Diagram IR v1 图文档的主教材。覆盖五图型选型路由与最小 IR 骨架、quality_profile（standard/showcase）门规则、创作铁律（一条主链路/≤12 主节点/先自动路由）、422 修复凭据消费分层（details.diagnostics vs details.checks，非 data 键）、patch_diagram 的 RFC 6901/6902 指针教程与 409 冲突 rebase、平台限制（repository 证据拒绝、无视口截屏验收、web 只读）。使用场景：用户要求"画架构图/流程图/时序图/数据流图/状态机图"、修改已有图、修复被渲染门拒绝的图。完整 IR schema 见仓库 packages/diagram/schemas/。
-version: 1.0.0
-updatedAt: 2026-08-30
+description: 用平台 Diagram REST 四端点（PUT /doc-spaces/:id/diagrams、GET/PATCH /docs/:id/diagram、POST /doc-spaces/:id/diagrams/validate）创建、修改、修复 Architecture Diagram IR v1 图文档的主教材。覆盖 spaceName→spaceId / path→docId 的 REST 解析写法、五图型选型路由与最小 IR 骨架、quality_profile（standard/showcase）门规则、创作铁律（一条主链路/≤12 主节点/先自动路由）、422 修复凭据消费分层（REST 信封 `data.diagnostics` vs `data.checks`）、JSON Patch 的 RFC 6901/6902 指针教程与 409 冲突 rebase、平台限制（repository 证据拒绝、无视口截屏验收、web 只读）。使用场景：用户要求"画架构图/流程图/时序图/数据流图/状态机图"、修改已有图、修复被渲染门拒绝的图。完整 IR schema 见仓库 packages/diagram/schemas/。
+version: 2.0.2
+updatedAt: 2026-10-23
 ---
 
-# 画图与改图 — Diagram IR v1（平台四工具）
+# 画图与改图 — Diagram IR v1（REST 四端点）
 
 > **AGENT-DOC-HOOK | 权威文档联动**
 >
-> 本 skill 是「IR 契约三层投放」的 skill+文档层（Agent 学画图契的主教材）；MCP 四工具的描述只是生存指南，完整契约在本文件与 schema。权威事实源按序：
+> **2026-10-20 工具面降级**：`upsert_diagram` / `read_diagram` / `patch_diagram` / `validate_diagram` 已从 worker（`/mcp`）工具面移除，REST 端点是默认路径；`/mcp-full` 仍提供同名语义工具（字段与本文 REST body 同构）。本文以 REST（curl + `X-API-Key`）为教学主线。
 >
-> - **IR schema（契约事实源）**：`<repo-root>/packages/diagram/schemas/`（5 类型 + common；与校验器同源，改契约先改这里；契约事实源在源码仓，安装版无此目录，改动需回源码仓）
-> - **行为事实源（已实现）**：`apps/backend/src/modules/docspace/diagram.controller.ts`（5 端点）、`diagram.service.ts`、`diagram-renderer.service.ts`（门规则）、`doc.service.ts` `parseDiagramIr`（R3 前置拒绝）；`diagram-patch.ts`（指针语义）；MCP 工具 `packages/platform-mcp/src/tools/{upsert,read,patch,validate}-diagram.ts`
-> - **设计决策**：`.kimi/plans/diagram-ir-v1-plan.md`；线上 `docs/api-definition.md` diagram 小节
+> 权威事实源按序：
 >
-> 契约变更流程：schema/API 变更 → 本 skill 同步更新（version bump）→ `~/.agents/skills/diagrams/` 运行时副本由主 Agent 统一复制。
+> - **IR schema（契约事实源）**：`<repo-root>/packages/diagram/schemas/`（5 类型 + common；与校验器同源，改契约先改这里）
+> - **行为事实源（已实现）**：`apps/backend/src/modules/docspace/diagram.controller.ts`（5 端点）、`diagram.service.ts`、`diagram-renderer.service.ts`（门规则）、`doc.service.ts` `parseDiagramIr`（R3 前置拒绝）；`diagram-patch.ts`（指针语义）
+> - **设计决策**：线上 `docs/api-definition.md` diagram 小节
+>
+> 契约变更流程：schema/API 变更 → 本 skill 同步更新（version bump）→ 插件副本由 `scripts/sync-plugin-skills.sh` 同步。
 
 ---
 
-## 0. 四工具总览与定位
+## 0. 四端点总览与定位
 
-用户要一张图时，用 **MCP 四工具**完成全部画图/改图/修图工作流：
+基础地址：`https://<your-platform-host>/api/v1`；认证头：`X-API-Key: <你的 key>`；请求体 `Content-Type: application/json`。
 
-| 工具 | 用途 | 关键点 |
+| 端点 | 用途 | 关键点 |
 |---|---|---|
-| `upsert_diagram` | 创建/整体覆盖一张图（按 spaceName + path） | `ir` 对象直传；服务端规范化 + 全量渲染门，不过不入库；命中既有非图 path 会把它翻转为图文档 |
-| `read_diagram` | 读图：**解析后的 IR 对象** + `contentHash` + render 元数据 | `contentHash` 是 patch/upsert 的乐观锁 token，改图前必读；patch 数组下标以此对象为准 |
-| `patch_diagram` | 原子 JSON patch 改图（RFC 6901/6902 子集） | `expectedContentHash` **必填**；一轮 patch 全过才算数（一败全拒）；409 冲突 → 重读 rebase |
-| `validate_diagram` | dry-run 校验拿修复凭据（零副作用） | 两模式：裸 `ir` 校验 / 存量图预演 `patches`；`ok=false` 时 `diagnostics` 就是修复依据 |
+| `PUT /doc-spaces/:spaceId/diagrams` | 创建/整体覆盖一张图（body 带 `path` + `ir`） | `ir` 对象直传；服务端规范化 + 全量渲染门，不过不入库；命中既有非图 path 会把它翻转为图文档 |
+| `GET /docs/:docId/diagram` | 读图：**解析后的 IR 对象** + `contentHash` + `render` 元数据 | `contentHash` 是 patch/upsert 的乐观锁 token，改图前必读；patch 数组下标以此对象为准 |
+| `PATCH /docs/:docId/diagram` | 原子 JSON patch 改图（RFC 6901/6902 子集） | body = `{patches, expectedContentHash}`；`expectedContentHash` **必填**；一轮 patch 全过才算数（一败全拒）；409 冲突 → 重读 rebase |
+| `POST /doc-spaces/:spaceId/diagrams/validate` | dry-run 校验拿修复凭据（零副作用） | 两模式：裸 `{ir}` 校验 / 存量图预演 `{path|docId, patches?}`；`ok=false` 时 `diagnostics` 就是修复依据 |
 
-人类看图的入口：web 阅读页通过 iframe 挂载渲染快照，**只读预览**（v1 不做 web 编辑，IR 只经 Agent/MCP 写入）。
+### 0.1 REST 定位前置：spaceName → spaceId，path → docId
+
+REST 端点吃的是 UUID；语义工具的 `spaceName` 三层匹配（exact → prefix → substring，大小写不敏感）需要在调用前自己完成：
+
+```bash
+BASE=https://<your-platform-host>/api/v1
+KEY=ask_xxx
+
+# ① 空间名 → spaceId（列出后按 exact → prefix → substring 选；多于一个候选时不要瞎猜）
+curl -s -H "X-API-Key: $KEY" "$BASE/doc-spaces?pageSize=100" | jq '.data.items[] | {id,name}'
+
+# ② 空间内路径 → docId（path 精确匹配）
+curl -s -H "X-API-Key: $KEY" \
+  "$BASE/doc-spaces/$SPACE_ID/docs?path=docs%2Farchitecture.md&pageSize=1" | jq -r '.data.items[0].id'
+```
+
+人类看图的入口：web 阅读页通过 iframe 挂载渲染快照，**只读预览**（v1 不做 web 编辑，IR 只经 API 写入）。`GET /docs/:docId/diagram.html` 返回渲染后的 HTML 快照。
 
 ---
 
@@ -119,10 +137,36 @@ updatedAt: 2026-08-30
 
 ## 3. quality_profile 与门规则（fail-closed）
 
-- `ir.meta.quality_profile`：`standard`（默认）| `showcase`（严格）。**缺省（省略该字段）= 服务端按 `standard` 判定门规则**，生效值记录进 render 元数据——仍请显式写：创作纪律（见 §4 为什么）；**写了非法字面量则被 schema 校验拒**（422 `schema/enum`，"must be equal to one of the allowed values"），改回 `standard`/`showcase` 之一即可。
-- **门规则**：schema/geometry/composition **errors 恒拒**（422，不落库）；**warnings 仅 `showcase` 拒**（showcase 过门 = 0 errors + 0 warnings，与 archify 验收口径一致）；`standard` 下 warnings 不拒写，随响应返回供你自查。
+- `ir.meta.quality_profile`：`standard`（默认）| `showcase`（严格）。**缺省（省略该字段）= 服务端按 `standard` 判定门规则**，生效值记录进 render 元数据——仍请显式写；**写了非法字面量则被 schema 校验拒**（422 `schema/enum`）。
+- **门规则**：schema/geometry/composition **errors 恒拒**（422，不落库）；**warnings 仅 `showcase` 拒**（showcase 过门 = 0 errors + 0 warnings）；`standard` 下 warnings 不拒写，随响应返回供你自查。
 - 写入响应带 `render: {qualityProfile, composition, htmlBytes, htmlSha256, renderedAt}`——`composition` 即当时门用的 errors/warnings 数。
-- 门失败 = 422 `DIAGRAM_VALIDATION_FAILED`，**整单拒绝、零落库**（无文档行/无版本/无事件）。5xx（如 `renderer unavailable`）= 平台基础设施问题，与你的 IR 无关，重试或上报。
+- 门失败 = 422（报文 `code` 为数字 **`10010`**，常量名 `DIAGRAM_VALIDATION_FAILED`），**整单拒绝、零落库**（无文档行/无版本/无事件）。5xx（如 `renderer unavailable`）= 平台基础设施问题，与你的 IR 无关，重试或上报。
+
+### 3.1 写入（upsert）写法
+
+```bash
+# body：path 必填；ir 直传；title/summary/category/tags/expectedContentHash/clientRequestId 可选
+cat > /tmp/diagram-upsert.json <<'JSON'
+{
+  "path": "docs/architecture.md",
+  "title": "系统架构",
+  "ir": { "schema_version": 1, "diagram_type": "architecture",
+          "meta": { "title": "Web 应用架构", "quality_profile": "standard" },
+          "layout": { "mode": "grid" },
+          "components": [
+            { "id": "web", "type": "frontend", "label": "Web 前端", "row": 0, "col": 0 },
+            { "id": "api", "type": "backend", "label": "API 服务", "row": 0, "col": 1 }
+          ],
+          "connections": [ { "from": "web", "to": "api", "label": "HTTPS" } ] }
+}
+JSON
+
+curl -s -X PUT "$BASE/doc-spaces/$SPACE_ID/diagrams" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d @/tmp/diagram-upsert.json | jq
+```
+
+命中既有非图 path 会把该文档**翻转**为图文档；带 `expectedContentHash` 时走乐观锁（不符 → 409 `DOC_CONTENT_CONFLICT`）。
 
 ---
 
@@ -138,20 +182,21 @@ updatedAt: 2026-08-30
 
 ## 5. 修复剧本（422 错误消费）
 
-### 5.1 定位阶段（MCP 工具结果里的键名是 `details`，不是 `data`）
+### 5.1 定位阶段（REST 信封：诊断在 `data` 里，不在 `details`）
 
-422 错误在 MCP 工具结果中形如 `{ error, status: 422, message, code: "DIAGRAM_VALIDATION_FAILED", details: { stage, diagnostics[], checks[], composition, profile } }`。按 `stage` 分层消费：
+平台 REST 统一信封是 `{ code, message, data, timestamp, requestId }`——**没有 `details` 键**。`details` 是 MCP 工具层对 `body.data` 的投影（automcp 侧行为），REST 直调看不到。
+422 响应形如 `{ code: 10010, message, data: { stage, diagnostics[], checks[], composition, profile } }`（`code` 是**数字**；`DIAGRAM_VALIDATION_FAILED` 只是该码的常量名，不在报文里）。按 `data.stage` 分层消费：
 
 | stage | 修复凭据在哪 | 怎么修 |
 |---|---|---|
-| `parse` | `details.diagnostics[]`（code `input/json-parse` / `input/not-object`） | 修 JSON 语法/保证是对象——你的 IR 不是合法 JSON 文本 |
-| `schema` | `details.diagnostics[]`，每条 `{code: "schema/<keyword>", subject, evidence, supportedFixes[]}` | 对每条按 `code` + `subject`（带 `path`/`identity` 定位）逐条修，优先用 `supportedFixes` 给的可执行修法 |
-| `render` | `details.diagnostics[]`（code `layout/*`、`edge/*`、`geometry/*` 等几何/布局约束） | 同上——`layout/constraint` 是渲染器布局约束（如缺 lane `main`、free placement 缺 `pos`），照 `supportedFixes` 或 message 修 |
-| `composition` | **`details.checks[].details` 散文指引**（无结构化 fixes）；错误码形如 `check/<name>` 或组合 issue | 按散文逐条修：重叠/越界、边穿节点、交叉/走廊/贴边、间距/标签 |
+| `parse` | `data.diagnostics[]`（code `input/json-parse` / `input/not-object`） | 修 JSON 语法/保证是对象——你的 IR 不是合法 JSON 文本 |
+| `schema` | `data.diagnostics[]`，每条 `{code: "schema/<keyword>", subject, evidence, supportedFixes[]}` | 对每条按 `code` + `subject`（带 `path`/`identity` 定位）逐条修，优先用 `supportedFixes` 给的可执行修法 |
+| `render` | `data.diagnostics[]`（code `layout/*`、`edge/*`、`geometry/*` 等几何/布局约束） | 同上——`layout/constraint` 是渲染器布局约束（如缺 lane `main`、free placement 缺 `pos`），照 `supportedFixes` 或 message 修 |
+| `composition` | **`data.checks[].details` 散文指引**（无结构化 fixes）；错误码形如 `check/<name>` 或组合 issue | 按散文逐条修：重叠/越界、边穿节点、交叉/走廊/贴边、间距/标签 |
 
-> 平台前置拒绝（stage=`schema`，即使 schema 本身合法）：`meta.repository` 或 `components[].sources` 非空 → code `platform/repository-evidence-unsupported`。**平台渲染环境不设 `ARCHIFY_REPO_ROOT`，仓库证据永不可用——直接移除字段**，别按 supportedFixes 的去试 --repo-root（那在平台上不存在）。见 §7。
+> 平台前置拒绝（stage=`schema`，即使 schema 本身合法）：`meta.repository` 或 `components[].sources` 非空 → code `platform/repository-evidence-unsupported`。**平台渲染环境不设 `ARCHIFY_REPO_ROOT`，仓库证据永不可用——直接移除字段**。见 §7。
 
-### 5.2 修复顺序（validate_diagram ok=false 时）
+### 5.2 修复顺序（validate `ok=false` 时）
 
 1. 修 `meta.quality_profile` 缺失/拼错（先于一切几何——profile 影响 errors/warnings 归类）与 schema 错误；
 2. 修节点重叠/越界（坐标、行/列冲突）；
@@ -159,34 +204,57 @@ updatedAt: 2026-08-30
 4. 修交叉、歧义走廊、贴边跑线、路由节奏；
 5. 修标签间距/遮挡（label↔node → label↔label → label↔route）。
 
-### 5.3 不收敛停手纪律
+### 5.3 validate 两模式（REST）
 
-每轮 `validate` 后只改诊断点名的 `subject`、核对 `evidence`，从 `supportedFixes` 里选；修完再 validate（**错误数必须创新低才继续**）。**连续两轮不收敛（错误数没降）→ 停手**，把剩余 diagnostics 原文如实汇报给用户，不脑补不硬凑。
+```bash
+# 模式 A：裸 IR 校验（space 级端点，必须带 spaceId）
+curl -s -X POST "$BASE/doc-spaces/$SPACE_ID/diagrams/validate" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"ir": { ...你的 IR... }}' | jq '.data|{ok,stage,diagnostics,checks}'
+
+# 模式 B：存量图预演（路径段 `:id` 是 spaceId——ParseUUIDPipe 必填，不能省略；path 或 docId 都只是 body 字段；**docId 必须属于该空间**——跨空间一律 404 `DOC_NOT_FOUND`，与「文档不存在」同文同码，刻意不可区分）
+curl -s -X POST "$BASE/doc-spaces/$SPACE_ID/diagrams/validate" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"path":"docs/architecture.md","patches":[{"op":"replace","path":"/components/0/label","value":"门户"}]}' | jq
+
+curl -s -X POST "$BASE/doc-spaces/$SPACE_ID/diagrams/validate" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"docId\":\"$DOC_ID\",\"patches\":[...]}" | jq
+```
+
+### 5.4 不收敛停手纪律
+
+每轮 validate 后只改诊断点名的 `subject`、核对 `evidence`，从 `supportedFixes` 里选；修完再 validate（**错误数必须创新低才继续**）。**连续两轮不收敛（错误数没降）→ 停手**，把剩余 diagnostics 原文如实汇报给用户，不脑补不硬凑。
 
 ---
 
-## 6. patch_diagram 教程（改图：RFC 6901/6902 子集）
+## 6. 改图教程（PATCH /docs/:docId/diagram，RFC 6901/6902 子集）
 
-改图**不是**重发整份 IR：先 `read_diagram`（拿当前 IR 对象 + `contentHash`），再按 JSON pointer 打补丁，服务端应用后重跑完整渲染门。
+改图**不是**重发整份 IR：先 `GET /docs/:docId/diagram`（拿当前 IR 对象 + `contentHash`），再按 JSON pointer 打补丁，服务端应用后重跑完整渲染门。
+
+```bash
+# ① 读图（拿 ir 与 contentHash）
+curl -s -H "X-API-Key: $KEY" "$BASE/docs/$DOC_ID/diagram" \
+  | jq '.data|{contentHash,diagramType,render}'
+
+# ② 打补丁（expectedContentHash 必填）
+curl -s -X PATCH "$BASE/docs/$DOC_ID/diagram" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"patches\":[{\"op\":\"replace\",\"path\":\"/components/2/label\",\"value\":\"API 网关\"}],\"expectedContentHash\":\"$HASH\"}" | jq
+```
 
 ### 6.1 指针语法（RFC 6901）
 
-- 路径以 `/` 开头，逐段下行：`/components/2/label` = `components` 数组第 2 项（**0-based，等于 read_diagram 返回对象里的下标位置**）的 `label`。
+- 路径以 `/` 开头，逐段下行：`/components/2/label` = `components` 数组第 2 项（**0-based，等于 GET 返回对象里的下标位置**）的 `label`。
 - 三 op：`replace`（改值，目标必须存在）、`add`（加；数组允许下标 == 长度做尾插，也支持 `"-"` 追加标记；对象允许新键）、`remove`（删，目标必须存在）。`replace`/`add` 必须带 `value`（显式 `null` 是合法值）。
-- **根路径（`""` 或 `"/"`）恒拒绝**——整体替换走 `upsert_diagram`，不是 patch。
-- **`~0`/`~1` 转义在 IR 上零触发**：RFC 6901 规定段内 `~` → `~0`、`/` → `~1` 转义，但 IR 的字段名与 id 值都受 `^[a-zA-Z][a-zA-Z0-9_-]*$` 约束，不含这两个字符——**你唯一的高频错点是数组下标数错**（从 `read_diagram` 返回的数组位置数，不是 1-based）。
-
-最小示例（改第 3 个组件的 label）：
-
-```json
-[ { "op": "replace", "path": "/components/2/label", "value": "API 网关" } ]
-```
+- **根路径（`""` 或 `"/"`）恒拒绝**——整体替换走 PUT upsert，不是 patch。
+- **`~0`/`~1` 转义在 IR 上零触发**：IR 的字段名与 id 值都受 `^[a-zA-Z][a-zA-Z0-9_-]*$` 约束，不含这两个字符——**你唯一的高频错点是数组下标数错**（从 GET 返回的数组位置数，不是 1-based）。
 
 ### 6.2 流程与冲突
 
-1. `read_diagram` → `ir` + `contentHash`；
+1. `GET /docs/:docId/diagram` → `ir` + `contentHash`；
 2. 组装 `patches`（可多个，**原子**：一败全拒，全部不生效）；
-3. `patch_diagram { docId|path, patches, expectedContentHash }`——**hash 必填**，缺省工具侧直接拒绝；
+3. `PATCH .../diagram { patches, expectedContentHash }`——**hash 必填**，缺省服务端直接拒绝；
 4. hash 过期（他人在你读之后改过）→ **409 `DOC_CONTENT_CONFLICT`**：重读 → 把补丁 rebase 到新 IR → 重试（这是多 Agent 共改的裁判机制，不是失败，是竞态信号）；
 5. 指针错 → 422 `DIAGRAM_PATCH_FAILED` `{pointer, reason, supportedOps}`；
 6. patch 后的 IR 若渲染门不过 → 422 诊断指向 **patch 后状态**（按 §5 修）。
@@ -196,9 +264,9 @@ updatedAt: 2026-08-30
 ## 7. 平台限制（不可绕行）
 
 - **repository 证据不支持**：`meta.repository` / `components[].sources`（非空）在写入与 validate 时被前置拒绝（422）。"引真实代码"在平台上是做不到的——基于你已验证的事实手工画，别发明证据。
-- **无视口截屏验收**：服务端门 = schema + 几何校验 + 静态 artifact 检查（无 Chrome）。archify 的 `visual-check`（四档桌面视口截屏）**仅本地可用**，平台不会跑它——提交给平台的就是 IR，HTML 是服务端确定性地生成的（同 IR 同 HTML，sha256 可对）。
-- **web 端只读**：阅读页只展示渲染快照，没有编辑入口；任何改动都经四工具。
-- **markdown 通道被锁**：对图文档调 `patch_doc`/`append_doc` 会被 400 拒绝（`DIAGRAM_DOC_TYPE_LOCKED`，指路 patch_diagram/upsert_diagram）；`patch_doc_metadata` 改 docType 触及 diagram 同样拒绝。`read_doc` 仍能读（返回 IR 全文文本），但解析对象/render 元数据走 `read_diagram`。
+- **无视口截屏验收**：服务端门 = schema + 几何校验 + 静态 artifact 检查（无 Chrome）。archify 的 `visual-check` 仅本地可用，平台不会跑它——提交给平台的就是 IR，HTML 是服务端确定性地生成的（同 IR 同 HTML，sha256 可对）。
+- **web 端只读**：阅读页只展示渲染快照，没有编辑入口；任何改动都经 REST（或 `/mcp-full` 的同名工具）。
+- **markdown 通道被锁**：对图文档调 `PATCH /docs/:id/content` / `append` 会被 400 拒绝（`DIAGRAM_DOC_TYPE_LOCKED`）；`patch_doc_metadata` 改 docType 触及 diagram 同样拒绝。`GET /docs/:id` 仍能读（返回 IR 全文文本），但解析对象/render 元数据走 `GET /docs/:id/diagram`。
 - **错误分层铁律**：422 = 你的 IR 要修；500 = 平台渲染器问题（重试/上报），两者不要混淆。
 
 ---
@@ -221,7 +289,8 @@ updatedAt: 2026-08-30
 
 ## 9. 完整工作流示例（走一遍）
 
-1. **画**：选型（§1）→ 按最小骨架写 IR（§1.1）→ 显式 `meta.quality_profile` → `upsert_diagram {spaceName, path, ir}`。
-2. **被拒**：422 → 读 `details`（§5.1）→ 按修复顺序改（§5.2）→ 重试；两轮不收敛停手汇报（§5.3）。
-3. **改**：`read_diagram` → `patch_diagram`（§6）；冲突 409 → rebase 重试。
-4. **交验前**：`validate_diagram` dry-run 确认 `ok:true`（零副作用，可反复跑），再落最终写入。
+1. **定位**：`GET /doc-spaces` 找 spaceId；若图已存在，`GET /doc-spaces/:id/docs?path=...` 找 docId。
+2. **画**：选型（§1）→ 按最小骨架写 IR（§1.1）→ 显式 `meta.quality_profile` → `PUT /doc-spaces/:spaceId/diagrams {path, ir}`（§3.1）。
+3. **被拒**：422 → 读 `data`（§5.1）→ 按修复顺序改（§5.2）→ 重试；两轮不收敛停手汇报（§5.4）。
+4. **改**：`GET /docs/:docId/diagram` → `PATCH /docs/:docId/diagram`（§6）；冲突 409 → rebase 重试。
+5. **交验前**：`POST /doc-spaces/:spaceId/diagrams/validate` dry-run 确认 `ok:true`（零副作用，可反复跑），再落最终写入。

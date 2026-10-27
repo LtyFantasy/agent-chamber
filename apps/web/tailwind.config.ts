@@ -3,7 +3,7 @@ import type { Config } from 'tailwindcss';
 /**
  * Tailwind 配置 — 「Mission Control」深空暗色主题
  *
- * 关键约定（详见 docs/ui-design-system.md）：
+ * 关键约定（详见 docs/frontend/ui-design-system.md）：
  * 1. 所有颜色映射必须带 `<alpha-value>` 占位符（hsl(var(--x) / <alpha-value>)），
  *    否则 `bg-primary/10` 这类透明度修饰符会被 Tailwind 静默忽略；
  *    CSS 变量值保持空格分隔的 HSL 通道格式（如 `187 92% 55%`）。

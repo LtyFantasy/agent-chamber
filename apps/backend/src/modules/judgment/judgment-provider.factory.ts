@@ -18,7 +18,7 @@
  *        和 fail-fast 文案同源——见 config 的 `JUDGMENT_CAPABILITY_DECLARATIONS`）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（provider 值域
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（provider 值域
  *     `none|typesafe` / 失败标签 / "启用 = 文本出境"声明）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（装配 + 出境声明三处同源）
  *
@@ -101,6 +101,7 @@ const JUDGMENT_CONFIG_FALLBACK: JudgmentConfig = {
   baseUrl: DEFAULT_TYPESAFE_BASE_URL,
   apiKey: null,
   typesafeModel: null,
+  proxyUrl: null,
   timeoutMs: 8000,
   rateLimitPerHour: 60,
   globalRateLimitPerHour: 240,
@@ -137,6 +138,20 @@ function describeEndpoint(absoluteUrl: string): string {
   } catch {
     // 畸形 URL 退化为固定文案（**不打 href**：它可能带 userinfo）
     return '<unparseable endpoint>';
+  }
+}
+
+/**
+ * 诊断用的代理文案：只取 `host:port`。
+ *
+ * `URL.host` **不含 userinfo**——代理 URL 允许带基本认证凭证（`http://user:pass@host:port`），
+ * 启动日志只能见 host:port（与上方端点文案同源纪律；config 层已校验合法性，catch 是兜底）。
+ */
+function describeProxy(proxyUrl: string): string {
+  try {
+    return new URL(proxyUrl).host;
+  } catch {
+    return '<unparseable proxy>';
   }
 }
 
@@ -216,15 +231,19 @@ function createTypesafeProvider(settings: JudgmentConfig): JudgmentProvider {
   // ⚠️ 行首的 `entry judgment ENABLED` 是**沿用下来的运维 grep 契约**（`.env.example` 的
   // "生效自检"与线上 DEPLOY.md 都按它筛行）。判别已通用化，但改这半个字面量会让所有既有
   // 排障指引当场失效——改名属于独立批次（连同文档一起改），本批不动。
+  // proxy= 只在配了专用出口代理时出现（只取 host:port——`URL.host` 不含 userinfo，见
+  // 文件头 userinfo 踩坑；判别流量的实际出口一眼可判）
+  const proxyNote = settings.proxyUrl ? ` proxy=${describeProxy(settings.proxyUrl)}` : '';
   logger.log(
     `entry judgment ENABLED — provider=typesafe model=${model} ` +
-      `endpoint=${describeEndpoint(buildTypesafeSystemoneUrl(settings.baseUrl))}`,
+      `endpoint=${describeEndpoint(buildTypesafeSystemoneUrl(settings.baseUrl))}${proxyNote}`,
   );
   return new TypeSafeJudgmentProvider({
     baseUrl: settings.baseUrl,
     apiKey: settings.apiKey,
     model,
     timeoutMs: settings.timeoutMs,
+    proxyUrl: settings.proxyUrl,
   });
 }
 

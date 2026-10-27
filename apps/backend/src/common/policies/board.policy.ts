@@ -70,6 +70,8 @@ export class BoardPolicy {
   }
 
   // 规则同步：AccessQueryService.computeAccessibleBoardIds — 修改 read 权限条件时必须同步更新 access-query.service.ts
+  // 规则同步（Notifications 二期剖面族）：AccessQueryService.resolveBoardAccess / buildAccessProfile
+  //   ——同一份 read 谓词的"按资源剖面"形态（通知双层判据），改 read 条件同样必须同步它
   async can(actor: UnifiedActor | null, board: Board, action: ResourceAction): Promise<boolean> {
     if (actor?.role === UserRole.ADMIN) return true;
 

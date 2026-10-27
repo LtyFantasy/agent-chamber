@@ -26,7 +26,7 @@
  *
  * [持久踩坑]
  *   MINIO-DEFAULT(品牌默认值): 默认 bucket 名含品牌词，新增/改名时必须同步
- *     oss-rebrand 映射表，否则公开仓泄漏内网配置。详情: docs/oss-dual-repo.md
+ *     oss-rebrand 映射表，否则公开仓泄漏内网配置。详情: docs/integrations/oss-dual-repo.md
  *
  * [修改检查]
  *   □ 已读 [权威文档]，确认修改符合设计意图

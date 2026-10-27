@@ -45,7 +45,7 @@
  *     reloptions 漂移门禁根本不比对，分页全序索引缺失只在翻页时表现为漏行/重复
  *
  * [关联代码]
- *   - src/modules/experience/experience.controller.ts — 12 端点与逐方法守卫
+ *   - src/modules/experience/experience.controller.ts — 14 端点与逐方法守卫
  *   - src/modules/experience/experience.service.ts — 匹配/打分/计数联动/埋点/终审写入/名字投影
  *   - src/modules/experience/experience-member.service.ts — 成员四端点 + 终审资格（纯角色判定）
  *   - src/modules/experience/experience-judgment.service.ts — 判断日志（`actorName` 补名）
@@ -232,6 +232,8 @@ const fakeJudgmentConfig: JudgmentConfig = {
   // 打到生产计费 API 上。用真实公网缺省（api.typesafe.ai）时，这种回归会安静地烧钱。
   baseUrl: 'http://127.0.0.1:1',
   apiKey: 'inline-test-key',
+  // 专用出口代理（TYPESAFE_HTTP(S)_PROXY）：本套件走 fake provider，无出境 ⇒ 恒 null
+  proxyUrl: null,
   // typesafe 下 model 是请求参数；**类型标注**让"漏字段"变成编译期 fail-closed
   typesafeModel: 'jev-latest',
   timeoutMs: 8000,
@@ -900,6 +902,40 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       const res = await createExperience(payload({ content: `## Fix\nDSN: ${secret}` }));
       expect(res.status).toBe(400);
       expect(JSON.stringify(res.body)).not.toContain('supersecret');
+    });
+
+    it('密钥闸门定位（真 PG，任务 77bf7dd8）：kebab 运维词放行；真 key → 400 且带字段路径', async () => {
+      if (!dbAvailable) return;
+      // ① 词中命中回归：`background-task-timeout` 曾因其中的 `sk-t` 被判 API key #2
+      const ok = await createExperience(payload({ signals: [`background-task-timeout-${RUN}`] }));
+      expect(ok.status).toBe(201);
+      created.experienceIds.push((ok.body as Envelope<{ id: string }>).data.id);
+
+      // ② 真 key 形态：400 且 message 指出**字段路径**（不回显 token 本体）
+      const token = 'ask_deadbeef123456';
+      const blocked = await createExperience(payload({ signals: [`sig-${RUN}`, token] }));
+      expect(blocked.status).toBe(400);
+      expect((blocked.body as { code: number }).code).toBe(ErrorCode.VALIDATION_ERROR);
+      const message = (blocked.body as { message: string }).message;
+      // 既有措辞结构保留（消费方可能 parse `matched pattern #N`）
+      expect(message).toContain('matched pattern #1 of');
+      // 定位信息：命中的是 signals 的**第二个元素**
+      expect(message).toContain('field "signals[1]"');
+      expect(JSON.stringify(blocked.body)).not.toContain('deadbeef123456');
+
+      // ③ 跨字段拆分（评审 M1）：PEM 头拆到 content + signals 相邻两字段，仍须 400
+      const split = await createExperience(
+        payload({ content: '## Fix\n-----BEGIN RSA', signals: ['PRIVATE KEY-----'] }),
+      );
+      expect(split.status).toBe(400);
+      expect((split.body as { message: string }).message).toContain('field "(cross-field)"');
+
+      // ④ 归一化兜底（评审 m4）：大写 `ASK_ABC` 过原始闸后被小写化落库，仍须 400
+      const upper = await createExperience(payload({ signals: ['ASK_ABC'] }));
+      expect(upper.status).toBe(400);
+      expect((upper.body as { message: string }).message).toContain(
+        'field "normalized.signals[0]"',
+      );
     });
   });
 
@@ -3228,6 +3264,271 @@ describe('经验库 — 真实 PG + 真实 HTTP 集成（plan §7）', () => {
       const row = data.items.find((i) => i.actorId === agentId);
       expect(row).toBeDefined();
       expect(row?.actorName).toBe(`Exp Agent ${RUN} #1`);
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // ⑳ 判定补跑（POST /experiences/judgments/backfill；人类 admin 专属）
+  // ══════════════════════════════════════════════════════════════════
+
+  describe('⑳ 判定补跑（admin backfill）', () => {
+    const backfill = (query = '', auth: 'agent' | string = 'agent') =>
+      authed(
+        request(app.getHttpServer()).post(`${API_PREFIX}/experiences/judgments/backfill${query}`),
+        auth,
+      );
+
+    /** 响应 data 形状（断言用到的字段） */
+    type BackfillData = {
+      providerEnabled: boolean;
+      scanned: number;
+      ok: number;
+      notJudged: number;
+      noLogNulls: number;
+      failedNulls: number;
+      expiredNulls: number;
+      notJudgedExperienceIds: string[];
+    };
+    /** 从 supertest 响应里取信封 data（结构类型，不引 supertest 的 Response 命名空间） */
+    const dataOf = (res: { body: unknown }): BackfillData =>
+      (res.body as Envelope<BackfillData>).data;
+
+    const judgmentRows = async (
+      experienceId: string,
+    ): Promise<Array<{ status: string; operation: string; actor_id: string | null }>> =>
+      (await ds.query(
+        `SELECT status, operation, actor_id FROM experience_judgments
+          WHERE experience_id = $1 ORDER BY created_at ASC, id ASC`,
+        [experienceId],
+      )) as never;
+
+    const entrySnapshot = async (
+      id: string,
+    ): Promise<{ judgment: Record<string, unknown> | null }> =>
+      (
+        (await ds.query(`SELECT judgment FROM experience_entries WHERE id = $1`, [id])) as Array<{
+          judgment: Record<string, unknown> | null;
+        }>
+      )[0];
+
+    beforeEach(() => fakeJudgment.reset());
+
+    /**
+     * 直插一条 judgment 为 NULL 的条目（补跑选取集的唯一来源：正常录入路径都会当场判定）。
+     *
+     * `ageDays` 决定 `created_at`，**这不是随手取的数**：选取集排序 = 未尝试优先 → 同状态内
+     * `created_at ASC`（越老越先）。本段插入的行**一律是未尝试的**（无 record_check 日志行），
+     * 而"已尝试但仍 NULL"的行（如 ⑰ 的 judge-error 残留）在新的主排序键下**被排到后面**，
+     * 更不会污染。故只有同状态内的次序需要安排：本套件内**逐用例递增** age
+     * （900 → 910 → 920 → 1000 → 1100 → 1200 → 1300），于是每个用例插入的行都比**前面用例
+     * 可能残留的未尝试 NULL 行**更老 ⇒ 恒定被选中，`scanned` 是可断言的确切值。
+     *
+     * @param params.title 标题（带 RUN 便于排查）
+     * @param params.ageDays created_at/updated_at 距今天数（越大越老 ⇒ 同状态内越先被选中）
+     * @param params.expiresAt 时效边界（ISO；传过去时间即"已过期"，用于跳过用例）
+     * @returns 新条目 id（已登记进 created.experienceIds，afterAll 硬删）
+     */
+    async function insertNullEntry(params: {
+      title: string;
+      ageDays: number;
+      expiresAt?: string | null;
+    }): Promise<string> {
+      const rows = (await ds.query(
+        `INSERT INTO experience_entries
+           (title, summary, content, intent, signals, domains, env, quality,
+            created_by_type, created_by_id, source_project, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, 'repair', ARRAY[]::text[], ARRAY[]::text[], '{}'::jsonb, 'unverified',
+                 'agent', $4, $5, $6::timestamptz,
+                 now() - ($7 || ' days')::interval, now() - ($7 || ' days')::interval)
+         RETURNING id`,
+        [
+          params.title,
+          `summary ${RUN}`,
+          '## How verified\ninserted by e2e',
+          agentId,
+          RUN,
+          params.expiresAt ?? null,
+          String(params.ageDays),
+        ],
+      )) as Array<{ id: string }>;
+      const id = rows[0].id;
+      created.experienceIds.push(id);
+      return id;
+    }
+
+    it('admin JWT：补齐 2 条 NULL 存量 → 快照写入 + 日志行 ok（真库全链）', async () => {
+      if (!dbAvailable) return;
+      const older = await insertNullEntry({ title: `bf-older ${RUN}`, ageDays: 900 });
+      const newer = await insertNullEntry({ title: `bf-newer ${RUN}`, ageDays: 901 });
+
+      const res = await backfill('?limit=2', adminToken);
+      expect(res.status).toBe(200);
+      const data = dataOf(res);
+
+      expect(data.providerEnabled).toBe(true);
+      expect(data.scanned).toBe(2);
+      expect(data.ok).toBe(2);
+      expect(data.notJudged).toBe(0);
+      expect(data.notJudgedExperienceIds).toEqual([]);
+      expect(data.notJudgedExperienceIds).toHaveLength(data.notJudged); // 恒等式
+
+      // 真库直查：快照 + 日志行（日志的 actor = 触发补跑的 admin，归因由它承担）
+      for (const id of [older, newer]) {
+        expect((await entrySnapshot(id)).judgment).toMatchObject({ model: 'jev-fake' });
+        const rows = await judgmentRows(id);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          status: 'ok',
+          operation: 'record_check',
+          actor_id: adminUserId,
+        });
+      }
+    });
+
+    it('agent API Key → 403/1009（补跑无角色可授予），且零判定调用', async () => {
+      if (!dbAvailable) return;
+      await insertNullEntry({ title: `bf-agent-denied ${RUN}`, ageDays: 910 });
+      const callsBefore = fakeJudgment.calls.length;
+
+      const res = await backfill('?limit=1', 'agent');
+
+      expect(res.status).toBe(403);
+      expect((res.body as { code: number }).code).toBe(ErrorCode.PERMISSION_DENIED);
+      // 文案分叉：agent 的下一步是"转请人类 admin"（与"需 admin 角色"不同）
+      expect((res.body as { message: string }).message).toContain('not for agents');
+      expect(fakeJudgment.calls.length).toBe(callsBefore);
+    });
+
+    it('非 admin 人类 JWT → 403/1009（文案分叉："需 admin 角色"），且零判定调用', async () => {
+      if (!dbAvailable) return;
+      await insertNullEntry({ title: `bf-human-denied ${RUN}`, ageDays: 920 });
+      const callsBefore = fakeJudgment.calls.length;
+
+      const res = await backfill('?limit=1', editorToken);
+
+      expect(res.status).toBe(403);
+      expect((res.body as { code: number }).code).toBe(ErrorCode.PERMISSION_DENIED);
+      expect((res.body as { message: string }).message).toContain('requires the admin role');
+      expect(fakeJudgment.calls.length).toBe(callsBefore);
+    });
+
+    it('`?limit=1` 字符串形态被 @Type 转成整数：只补 1 条（缺 @Type 会 400）', async () => {
+      if (!dbAvailable) return;
+      const newer = await insertNullEntry({ title: `bf-limit-newer ${RUN}`, ageDays: 1000 });
+      const older = await insertNullEntry({ title: `bf-limit-older ${RUN}`, ageDays: 1001 });
+
+      const res = await backfill('?limit=1', adminToken);
+
+      // 关键回归：query 串来的 `'1'` 若没被 `@Type(() => Number)` 转成数字，`@IsInt` 会直接
+      // 400（不是"200 但补了 2 条"）——本断言同时钉住"转换成功"与"真的只补 1 条"
+      expect(res.status).toBe(200);
+      const data = dataOf(res);
+      expect(data.scanned).toBe(1);
+      expect(data.ok).toBe(1);
+      // 排序 = 未尝试优先（两条都未尝试）→ 同状态内最旧先补：更老的那条（ageDays 更大）先被补
+      expect((await entrySnapshot(older)).judgment).not.toBeNull();
+      expect((await entrySnapshot(newer)).judgment).toBeNull();
+    });
+
+    it('过期条目**跳过**（选取集之外）：只补未过期那条，expiredNulls 照常报数', async () => {
+      if (!dbAvailable) return;
+      const expiredAt = new Date(Date.now() - 86_400_000).toISOString();
+      const expired = await insertNullEntry({
+        title: `bf-expired ${RUN}`,
+        ageDays: 1100,
+        expiresAt: expiredAt,
+      });
+      const valid = await insertNullEntry({ title: `bf-valid ${RUN}`, ageDays: 1101 });
+
+      const res = await backfill('?limit=1', adminToken);
+      expect(res.status).toBe(200);
+      const data = dataOf(res);
+
+      expect(data.scanned).toBe(1); // 过期条目**不计入**选取集（它不是"被跳过"，而是根本不入选）
+      expect(data.ok).toBe(1);
+      expect(data.expiredNulls).toBeGreaterThanOrEqual(1); // 选取集之外的纯知会面
+      expect((await entrySnapshot(valid)).judgment).not.toBeNull();
+      expect((await entrySnapshot(expired)).judgment).toBeNull();
+      expect(await judgmentRows(expired)).toHaveLength(0); // 过期条目根本不该产生日志行
+    });
+
+    it('批后三计数与**穷尽恒等式**（真库直查，非形状断言）', async () => {
+      if (!dbAvailable) return;
+      await insertNullEntry({ title: `bf-counts ${RUN}`, ageDays: 1300 });
+
+      const res = await backfill('?limit=1', adminToken);
+      expect(res.status).toBe(200);
+      const data = dataOf(res);
+
+      /**
+       * 真库真值：NULL 条目按 `extra` 谓词计数。
+       *
+       * ⚠️ 这里**必须直查真库**：单测的 `getCount` 是 mock（只证明"挂了哪些谓词"），
+       * 三计数的**取值**与互斥穷尽只能由真 PG 证伪（铁律 #23 同源——mock 测不出真 SQL 的
+       * 语义）。EXISTS 谓词同样只计 `record_check`（多操作表，见实现注释）。
+       */
+      const nullCount = async (extra: string): Promise<number> => {
+        const rows = (await ds.query(
+          `SELECT count(*)::int AS n FROM experience_entries e
+            WHERE e.deleted_at IS NULL AND e.judgment IS NULL ${extra}`,
+        )) as Array<{ n: number }>;
+        return Number(rows[0].n);
+      };
+      const nonExpiredWhere = 'AND (e.expires_at IS NULL OR e.expires_at > now())';
+      const nonExpired = await nullCount(nonExpiredWhere);
+      const triedButNull = await nullCount(
+        `${nonExpiredWhere}
+           AND EXISTS (SELECT 1 FROM experience_judgments j
+                        WHERE j.experience_id = e.id AND j.operation = 'record_check')`,
+      );
+      const expired = await nullCount('AND e.expires_at IS NOT NULL AND e.expires_at <= now()');
+
+      // ① 二计数互斥且穷尽：noLogNulls + failedNulls = **全部非过期 NULL**
+      expect(data.noLogNulls + data.failedNulls).toBe(nonExpired);
+      // ② 分量各自对上真值（failedNulls = 有日志行仍 NULL；noLogNulls = 其补集）
+      expect(data.failedNulls).toBe(triedButNull);
+      expect(data.noLogNulls).toBe(nonExpired - triedButNull);
+      // ③ expiredNulls 的作用域在选取集**之外**（与上面两个互斥：过期 ∧ 非过期 = 全 NULL）
+      expect(data.expiredNulls).toBe(expired);
+      // 本段前面必有一个永久过期 NULL 行（"过期条目跳过"用例插的），故这里恒 > 0——
+      // 否则 ③ 可能在"两边都是 0"的假绿下通过
+      expect(data.expiredNulls).toBeGreaterThanOrEqual(1);
+      // ④ 穷尽性：三计数之和 = **全部非软删 NULL**（软删条目不在任何计数里）
+      const allNulls = await nullCount('');
+      expect(nonExpired + expired).toBe(allNulls); // 非过期 ∧ 过期 = 全部（两个作用域互补）
+      expect(data.noLogNulls + data.failedNulls + data.expiredNulls).toBe(allNulls);
+    });
+
+    it('并发第二枪 → 409/9001（single-flight 进程内互斥；第一批照常完成）', async () => {
+      if (!dbAvailable) return;
+      await insertNullEntry({ title: `bf-lock ${RUN}`, ageDays: 1200 });
+
+      // 闸门：第一次判定会挂起，等测试放行（fakeJudgment 的一次性闸门）
+      let release: () => void = () => undefined;
+      fakeJudgment.gate = () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        });
+
+      const first = backfill('?limit=1', adminToken).then((r) => r);
+      // 等第一枪真的进入判定（否则第二枪可能抢在互斥置位之前 ⇒ 假绿）
+      for (let i = 0; i < 150 && fakeJudgment.calls.length === 0; i += 1) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(fakeJudgment.calls.length).toBeGreaterThanOrEqual(1);
+
+      try {
+        const second = await backfill('?limit=1', adminToken);
+        expect(second.status).toBe(409);
+        expect((second.body as { code: number }).code).toBe(ErrorCode.RESOURCE_CONFLICT);
+      } finally {
+        // 无论断言是否失败都要放行第一枪：否则该请求永远挂起 → afterAll 关不掉 app
+        release();
+      }
+
+      const firstRes = await first;
+      expect(firstRes.status).toBe(200);
+      expect(dataOf(firstRes).ok).toBe(1);
     });
   });
 });

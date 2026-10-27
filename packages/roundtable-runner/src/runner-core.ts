@@ -3,11 +3,11 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 接口——座位生命周期/单飞行语义)
- *   - 补充: docs/roundtable-design.md §4 (契约②: 控制面信封——seat.inject 下行/seat.event 上行)
- *           docs/roundtable-design.md §6 (会话层规则: prompt 规则头装配, runner 禁改)
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 接口——座位生命周期/单飞行语义)
+ *   - 补充: docs/modules/roundtable-design.md §4 (契约②: 控制面信封——seat.inject 下行/seat.event 上行)
+ *           docs/modules/roundtable-design.md §6 (会话层规则: prompt 规则头装配, runner 禁改)
  *
- * [踩坑索引] ④(getSessionId 漏接→resume 永不生效) ⑤(RT-PERM-1: kind 命名不可信→optionId 直透)
+ * [踩坑索引] ④(getSessionId 漏接→resume 永不生效) ⑤(RT-PERM-1: 执行选项不按 kind 猜测→optionId 直透)
  *              ⑧(R1: 审批缓存裸 requestId 跨座位撞键→codex/kimi 双座位并发审批互相覆盖)
  *
  * [铁律关联] #11(注释) #17(测试契约) #20(契约即设计)
@@ -16,12 +16,11 @@
  *   ④: getSessionId 回调漏接 → state 里 sessionId 读不出 → 每次重启都 session/new，
  *      resume 永不生效（dogfood 验收②疑点根因）。修复：构造 KimiAcpDriver 时把
  *      state.getSessionId 接通为 getSessionId。见 memory/2026-08-07.md §6
- *   ⑤: RT-PERM-1 —— ACP 审批选项的 kind 是厂商自由命名（真机为 allow_once/
- *      allow_always/reject_once），按猜测的 approve_* 做 kind→verdict 双重映射会把
- *      approve 吞成 reject（P0 真机复现：点 Approve for this session 落库
- *      approve_always，agent 端实际被拒）。根治：kind 命名不可信，optionId 才是
- *      稳定键（与 request_permission params 同源）——handleVerdict 反查 option
- *      存在后把 optionId 原样透传 driver，禁止 kind 猜测映射。
+ *   ⑤: RT-PERM-1 —— ACP kind 标准值为 allow_once/allow_always/reject_once/
+ *      reject_always；optionId 是不透明选择键。旧代码按猜测的 approve_* 做 kind→执行
+ *      选项双重映射，把批准吞成拒绝（P0 真机复现：点 Approve for this session 落库
+ *      approve_always，agent 端实际被拒）。handleVerdict 确认选项存在后原样透传
+ *      optionId，不按 kind 猜执行 ID；平台仅按标准 kind 记录批准/拒绝结果（设计 §6）。
  *   ⑧: R1 —— codex 桥反向 RPC id 从 0 自增、kimi 小整数自增，两侧 requestId 同
  *      命名空间；permissions 缓存若以裸 requestId 为 key，双座位并发审批必互相
  *      覆盖、verdict 反查错位（裁决被忽略/审批楔死，RT-PERM-2 的 runner 侧镜像）。
@@ -46,7 +45,7 @@
  * - driver onEvent → 上行 seat.event（ws-client 先落盘再发送）；permission_request 事件
  *   缓存 options（verdict 下行反查 option 真实性用）
  * - seat.permission_verdict → optionId 查缓存 options 确认存在后**原样透传** →
- *   driver.answerPermission（RT-PERM-1：不做 kind→verdict 映射）
+ *   driver.answerPermission（RT-PERM-1：不按 kind 猜执行 ID；平台结果投影另在后端）
  * - seat.cancel → driver.cancel；seat.revoke → driver.stop + 清状态（state + 本地记录）
  *
  * 连接/心跳/对账/重放全在 ws-client；会话映射/游标/未确认队列全在 state-store——
@@ -365,9 +364,8 @@ export class RunnerCore {
    * seat.permission_verdict → answerPermission。
    * 下行 payload 是 optionId（§4 下行表）——通过 permission_request 事件缓存的
    * options 反查确认 option 真实存在（optionId/id 双键匹配），然后**把 optionId
-   * 原样透传 driver**（RT-PERM-1：ACP 标准 kind 是 allow_*，猜测命名的 kind→verdict
-   * 映射曾把 approve 吞成 reject——optionId 才是稳定键，禁止映射；查不到视为审批
-   * 已关闭，忽略）。
+   * 原样透传 driver**（RT-PERM-1：kind 的四种标准值供平台记录结果，不用于猜执行
+   * ID；optionId 是不透明选择键，查不到视为审批已关闭，忽略）。
    * 缓存 key 带 seatId 前缀（R1：requestId 跨座位同命名空间，防并发审批撞键串台）。
    */
   private async handleVerdict(envelope: Envelope): Promise<void> {

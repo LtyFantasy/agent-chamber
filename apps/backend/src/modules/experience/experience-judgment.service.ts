@@ -16,7 +16,7 @@
  * [权威文档]
  *   - 主文档: .kimi/plans/plan-experience-base-p2.md §0（威胁模型：日志 = 正文第二副本）/
  *     §3.5（调用点与写入纪律，四家复核共振项）/§4（消费面：导出姿势、翻案率配对）
- *   - 补充: 线上 DocSpace `docs/experience-base.md` — 判断日志/训练语料章
+ *   - 补充: 线上 DocSpace `docs/modules/experience-base.md` — 判断日志/训练语料章
  *
  * [关键不变量]（改动前逐条想清楚在防什么）
  *   - **日志是事实、快照是缓存**：每次判定（含失败与限流跳过）都写日志行；条目上的
@@ -59,7 +59,8 @@
  *   - modules/judgment/judgment-payload.ts — redaction 基线 / 16KB 硬顶 / 桶键 / 异常标签
  *   - modules/judgment/typesafe.judgment-provider.ts — 实际发包方（失败分类与永不 throw 契约）
  *   - modules/experience/judgment/judgment-rubric.ts — 本能力的 rubric 与白名单归一化
- *   - experience.service.ts — 两个调用点（create 事务后 / update 事务后）+ 详情 suppression
+ *   - experience.service.ts — 三个调用点（create 事务后 / update 事务后 / 补跑编排）
+ *     + 详情 suppression
  *   - database/entities/experience-judgment-record.entity.ts — 日志表契约
  *   - experience-member.service.ts — 判权复用（admin ∪ 空间成员）与 13004 message 单源
  *
@@ -146,8 +147,8 @@ export interface EvaluateAndPersistParams {
 /**
  * 经验库判别服务（判定接线 + 判断日志）。
  *
- * 调用点只有两处（`experience.service.ts` 的 create / update），且都**在写事务提交之后**
- * ——判定涉及 8s 网络等待，绝不能持有行锁（plan §3.5 的"行锁内绝不 await 网络调用"）。
+ * 调用点只有三处（`experience.service.ts` 的 create / update / 补跑编排），且**都在写事务
+ * 提交之后**——判定涉及 8s 网络等待，绝不能持有行锁（plan §3.5 的"行锁内绝不 await 网络调用"）。
  *
  * 与内核的分工：闸门（`JudgmentQuotaService`）与纯函数（redaction / 体积 / 计数）复用内核；
  * **事务内"日志行 + 快照"的编排留在本类**（通用 runner 没有 entryId / 快照语义，见文件头不变量）。
@@ -177,6 +178,20 @@ export class ExperienceJudgmentService {
      */
     private readonly actorProfiles: ActorProfileService,
   ) {}
+
+  /**
+   * 判别 provider 是否启用（`JUDGMENT_PROVIDER=none` → false）。
+   *
+   * 为什么以 getter 暴露给调用方（补跑编排要据此短路判定循环），而不是让调用方自己注入
+   * `JUDGMENT_CONFIG` 判一遍：本服务已是 provider 的**唯一持有者**，多一条 DI 边就多一处
+   * "provider 配置换了但补跑编排没跟着换"的漂移面（且 `provider.enabled` 是**运行时**事实，
+   * env 改了要重启才生效——见 judgment.config 的 rationale）。
+   *
+   * 语义 = **重启级配置事实**：false 时任何重试都不可能改变结果。
+   */
+  get providerEnabled(): boolean {
+    return this.provider.enabled;
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // 判定接线（create / update 共用）

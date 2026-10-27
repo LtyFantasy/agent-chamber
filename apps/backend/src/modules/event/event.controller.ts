@@ -1,25 +1,32 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/architecture.md §3.2.4 (统一事件层)
- *   - 补充: docs/api-definition.md §8. Events
+ * [功能概念]
+ *   - 按 actor 授权的统一事件轮询入口
  *
- * [踩坑索引] B-50(事件轮询越权)
+ * [代码职责]
+ *   - 认证后透传当前 actor 与游标参数；维护 REST/OpenAPI 轮询消费说明
  *
- * [铁律关联] #9(代理层透传) #17(测试契约) #4(文档优先)
+ * [权威文档]
+ *   - 主文档: DocSpace Agent Chamber docs/api-definition.md §8.1 — 轮询消费合同
+ *   - 补充: DocSpace Agent Chamber docs/architecture.md §3.2.4 — 统一事件层
  *
- * [详细踩坑]（最多 5 条）
- *   B-50: GET /events/poll 未按 actor 过滤，返回全平台事件。
- *          修复：poll 接收 @CurrentActor() actor 并透传给 EventService.poll，
- *          Service 层按 accessibleTopicIds / accessibleBoardIds / actorId 做 OR 过滤。
- *          见 Plan §5。
+ * [关键不变量]
+ *   - CurrentActor 必须传给 Service；admin 之外仅返回可读 Topic/Board/DocSpace 或本人事件
+ *   - nextCursor 是不透明 DB 位点，消费者原样回传，不可按时间解析或制造
+ *
+ * [关联代码]
+ *   - apps/backend/src/modules/event/event.service.ts — SQL 授权、分页和游标校验
+ *
+ * [持久踩坑]
+ *   - B-50(越权): 漏传 actor 会破坏授权。详情: docs/api-definition.md §8.1
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 修复 Bug 见 change-checklists.md §8
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 import { Controller, Get, UseGuards, Query } from '@nestjs/common';
@@ -39,14 +46,17 @@ export class EventController {
   @ApiOperation({
     summary: 'Poll events',
     description:
-      'Cursor-based event polling for clients to pull new events. Returns events after the cursor, sorted by cursor in ascending order. Non-admin users only receive events from topics/boards they can access plus their personal events.',
+      'Cursor-based event polling for clients to pull new events. Returns events after the cursor, sorted by cursor in ascending order. Non-admin actors only receive events from accessible topics/boards/DocSpaces (DocSpace events match payload.spaceId), plus their personal events.',
   })
   @ApiQuery({
     name: 'cursor',
     required: false,
     description:
-      "Cursor (microsecond timestamp); only events after it are returned. Pass 'now' to start from the current moment (skip all history). Omit to start from the earliest.",
+      'Opaque monotonic sequence number issued by the database (a bigint decimal string, at most 19 digits) — pass the nextCursor value returned by the previous poll. ' +
+      "'now' starts from the current global high-water mark (the latest cursor in the whole deployment; NOT narrowed by your permissions — you may still be unable to see some of the events that follow it). " +
+      'An empty string is treated as omitted. Any other value (non-numeric, longer than 19 digits, repeated parameter) is rejected with 400 VALIDATION_ERROR.',
     type: String,
+    example: '1792000000123456',
   })
   @ApiQuery({
     name: 'limit',
@@ -58,9 +68,14 @@ export class EventController {
   @ApiResponse({
     status: 200,
     description:
-      'Returns an event list and the next cursor. Response shape: { events: Event[], nextCursor: string }. Pass nextCursor directly as the cursor parameter in the next poll request.',
+      'Returns an event list and the next cursor. Response shape: { events: Event[], nextCursor: string }. nextCursor is ALWAYS a string (never null) — pass it directly as the cursor parameter in the next poll request.',
   })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Invalid cursor: not a numeric string of at most 19 digits, and not the literal "now" (code VALIDATION_ERROR).',
+  })
   async poll(
     @Query() query: { cursor?: string; limit?: number },
     @CurrentActor() actor: UnifiedActor,

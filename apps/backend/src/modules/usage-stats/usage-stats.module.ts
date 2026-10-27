@@ -38,12 +38,13 @@
  *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule, RequestMethod } from '@nestjs/common';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ApiUsageStatsHourly } from '../../database/entities/api-usage-stats-hourly.entity';
 import { User } from '../../database/entities/user.entity';
 import { ApiUsageController } from './api-usage.controller';
+import { ApiUsageNoStoreMiddleware } from './api-usage-no-store.middleware';
 import { ApiUsageQueryService } from './api-usage-query.service';
 import { UsageEventsController } from './usage-events.controller';
 import { UsageStatsBufferService } from './usage-stats-buffer.service';
@@ -75,6 +76,7 @@ import { UsageStatsRetentionService } from './usage-stats-retention.service';
     UsageStatsBufferService,
     ApiUsageQueryService,
     UsageStatsRetentionService,
+    ApiUsageNoStoreMiddleware,
     {
       // 全局采集拦截器：APP_INTERCEPTOR 令牌使注册全局生效，且实例化走 DI
       provide: APP_INTERCEPTOR,
@@ -82,4 +84,16 @@ import { UsageStatsRetentionService } from './usage-stats-retention.service';
     },
   ],
 })
-export class UsageStatsModule {}
+export class UsageStatsModule implements NestModule {
+  /**
+   * 平台查询端点的**全出口** `Cache-Control: no-store`。
+   *
+   * 路径级挂载（只此一条 GET）；与 Memory usage 两读面同款中间件——guard 401/403、
+   * DTO 400、throttler 429 都在 middleware 之后发生，但头已经写好。
+   */
+  configure(consumer: MiddlewareConsumer): void {
+    consumer
+      .apply(ApiUsageNoStoreMiddleware)
+      .forRoutes({ path: 'system/api-usage', method: RequestMethod.GET });
+  }
+}

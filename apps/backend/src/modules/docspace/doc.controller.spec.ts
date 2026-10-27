@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { DocController } from './doc.controller';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocRenameService } from './doc-rename.service';
 import { DocLinksService } from './doc-links.service';
 import { DocSpaceService } from './docspace.service';
 import { DocSearchService } from './doc-search.service';
@@ -10,6 +11,21 @@ import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorType, UserRole, ErrorCode, Visibility } from '@agent-chamber/shared';
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
+
+// 领域事实陈述点（阶段三决策 4）：本套件只验「什么时候陈述 doc.upserted」，不验 hint 装配
+// （装配面在 hint.interceptor / provider 各自的套件；此处只做门控真值表）
+jest.mock('../hints/hint-facts', () => ({ emitFact: jest.fn() }));
+import { emitFact } from '../hints/hint-facts';
+// 凭证扫描挂点（v1.94.0-dev）：与 doc.upserted 事实**同一门控**（评审 P2-1 后含并发败者档），
+// 故在同一真值表里一起断言——扫描器本体/告警行字段封闭由 credential-scan.spec 覆盖
+jest.mock('../hints/credential-scan', () => ({ emitCredentialScanFactIfHit: jest.fn() }));
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
+
+/** `emitFact` 的 mock 视图（jest.mock 的工厂产物类型上仍是函数） */
+const emitFactMock = emitFact as unknown as jest.Mock;
+
+/** `emitCredentialScanFactIfHit` 的 mock 视图 */
+const scanMock = emitCredentialScanFactIfHit as unknown as jest.Mock;
 
 describe('DocController', () => {
   let controller: DocController;
@@ -44,6 +60,12 @@ describe('DocController', () => {
     move: jest.fn(),
   };
 
+  // 存量治理写服务（3 期，v1.92.0-dev）：tags/rename 端点消费 renameTags
+  const mockDocRenameService = {
+    renameTags: jest.fn(),
+    mergeCategory: jest.fn(),
+  };
+
   const mockDocSearchService = {
     search: jest.fn(),
   };
@@ -75,6 +97,7 @@ describe('DocController', () => {
       providers: [
         { provide: DocService, useValue: mockDocService },
         { provide: DocMoveService, useValue: mockDocMoveService },
+        { provide: DocRenameService, useValue: mockDocRenameService },
         { provide: DocLinksService, useValue: mockDocLinksService },
         { provide: DocSearchService, useValue: mockDocSearchService },
         { provide: DocSpaceService, useValue: mockDocSpaceService },
@@ -128,6 +151,57 @@ describe('DocController', () => {
       );
       expect(docService.upsert).not.toHaveBeenCalled();
     });
+
+    // ─── 领域事实 doc.upserted（阶段三决策 4）────────────────────────
+
+    it('真实落库（成功且非 unchanged/rechunked/replay/并发败者）→ 陈述 `doc.upserted` 事实**并**扫描正文', async () => {
+      docSpaceService.findById.mockResolvedValue(space);
+      docService.upsert.mockResolvedValue({
+        id: 'doc-1',
+        path: 'test.md',
+        sectionCount: 1,
+        tokenEstimate: 50,
+      });
+
+      await controller.upsert('space-1', { path: 'test.md', content: '# Hello' }, mockActor);
+
+      expect(emitFactMock).toHaveBeenCalledWith('doc.upserted', {
+        docId: 'doc-1',
+        spaceId: 'space-1',
+      });
+      // 对照面：真实写入时扫描**确实被调**（否则下面各档的「没调」是假绿）
+      expect(scanMock).toHaveBeenCalledTimes(1);
+      expect(scanMock.mock.calls[0]).toEqual([
+        '# Hello',
+        { resourceKind: 'doc', resourceId: 'doc-1', actorId: mockActor.id },
+      ]);
+    });
+
+    it.each([
+      ['unchanged:true（内容未变）', { unchanged: true }],
+      ['仅 rechunked（section 元数据修复，内容没变）', { rechunked: true }],
+      ['幂等 replay（镜像重放）', { idempotentReplay: true }],
+      // **评审 P2-1**：23505 并发败者出口——本请求的 content 未落库，且 result.id 是**胜者**
+      // 的 docId；不跳过会把未写入的正文扫出告警并指到别人的文档上
+      ['23505 并发败者（本请求 content 未落库）', { concurrentWinner: true }],
+    ])(
+      '**%s ⇒ 不陈述事实、不扫描**（防同一份内容重复计入分母 / 防误指资源）',
+      async (_label, flags) => {
+        docSpaceService.findById.mockResolvedValue(space);
+        docService.upsert.mockResolvedValue({
+          id: 'doc-1',
+          path: 'test.md',
+          sectionCount: 1,
+          tokenEstimate: 50,
+          ...flags,
+        });
+
+        await controller.upsert('space-1', { path: 'test.md', content: '# Hello' }, mockActor);
+
+        expect(emitFactMock).not.toHaveBeenCalled();
+        expect(scanMock).not.toHaveBeenCalled();
+      },
+    );
   });
 
   // ─── findAll ──────────────────────────────────────────────
@@ -149,7 +223,8 @@ describe('DocController', () => {
       const query = { page: 1, pageSize: 20 };
       expect(await controller.findAll('space-1', query, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
-      expect(docService.findAll).toHaveBeenCalledWith('space-1', query);
+      // 3 期：controller 透传已加载的 space.settings（tag 过滤的词表 alias 展开数据源，零额外查询）
+      expect(docService.findAll).toHaveBeenCalledWith('space-1', query, space.settings);
     });
   });
 
@@ -198,7 +273,8 @@ describe('DocController', () => {
 
       expect(await controller.findFacets('space-1', mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(space, mockActor, 'read');
-      expect(docService.findFacets).toHaveBeenCalledWith('space-1');
+      // 第 2 参 = space.settings（v1.92.0-dev 词表状态/回显由已持有 space 透传，无新增查询）
+      expect(docService.findFacets).toHaveBeenCalledWith('space-1', space.settings);
     });
   });
 

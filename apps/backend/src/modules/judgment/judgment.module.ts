@@ -13,7 +13,7 @@
  *
  * [权威文档]
  *   - 线上 DocSpace `docs/architecture.md` — 模块清单（判别内核层）
- *   - 线上 DocSpace `docs/experience-base.md` — 判别服务章
+ *   - 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章
  *
  * [关键不变量]
  *   - **本模块刻意不 `ConfigModule.forFeature(judgment)`**：配置注册点是 `app.module.ts` 的

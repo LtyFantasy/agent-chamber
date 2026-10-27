@@ -25,6 +25,55 @@ export function formatDate(date: string | Date | undefined, locale: Locale): str
 }
 
 /**
+ * searchParams 值 → UUID（**形状校验**，三个页面共用的唯一实现）。
+ *
+ * 为什么要拦：后端凡带 `:id` 的路径参数都是 `@IsUUID()`，脏值会被 400 **把整页打进错误态**
+ * （旧链接 / 手输 / 外部分享都可能带脏值）。这里只保证"放进后端 URL 的一定是 UUID 形态的串"，
+ * 合法性与存在性仍由后端裁决（铁律 #21：格式在边界层拦，业务存在性在服务层判）。
+ *
+ * ⚠️ 正则与后端 `@IsUUID()`（validator 的 `all` 模式）等价：版本位 `[1-8]` + variant 位 `[89ab]`，
+ * 外加 nil / max 两个例外——**比后端宽**会让形状像 UUID 的脏值漏过去吃 400，
+ * **比后端严**会误杀合法值。两侧不许各自演化。
+ *
+ * 历史：本函数曾有**三份逐字复制**（`memory/page.tsx`、`memory/[id]/page.tsx`、
+ * `experiences/page.tsx`）。复制体的危险在于"改一处忘两处"表现为静默的行为分歧，
+ * 故提取到通用工具层（本文件不属于任何业务域）。
+ *
+ * @param raw - URL 参数原值（`null` = 未提供）
+ * @returns 合法 UUID 或 `null`（调用方回落"不过滤"/"不选中"）
+ */
+export function parseUuidParam(raw: string | null): string | null {
+  if (!raw) return null;
+  return /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/i.test(
+    raw,
+  )
+    ? raw
+    : null;
+}
+
+/**
+ * searchParams 值 → 白名单枚举（脏值回落 `null`，由调用方选缺省）。
+ *
+ * 为什么要拦：把任意字符串当过滤值发给后端会撞 `@IsIn` 400，**把整页打进错误态**
+ * （旧链接、手输、外部分享的参数都可能带脏值）。这里只做"在不在值域里"的判定，
+ * 值域本身取自 shared 单源常量。
+ *
+ * 历史：与 `parseUuidParam` 一样曾有**两份逐字复制**（`memory/page.tsx`、
+ * `experiences/page.tsx`），图页要用第三次时一并提取（三处副本 = 改一处忘两处的静默分歧）。
+ *
+ * @param raw - URL 参数原值（`null` = 未提供）
+ * @param allowed - 该参数的合法值域（shared 单源常量）
+ * @returns 合法值或 `null`
+ */
+export function parseEnumParam<T extends string>(
+  raw: string | null,
+  allowed: readonly T[],
+): T | null {
+  if (!raw) return null;
+  return (allowed as readonly string[]).includes(raw) ? (raw as T) : null;
+}
+
+/**
  * 按当前语言格式化相对时间（Intl.RelativeTimeFormat，双语自动）。
  * 档位：<60s → "现在/now"；分/时/天对称档位；未来时间（seconds<0）走对称档位（"N 分钟后/in N minutes"）；>30 天回落 formatDate。
  * @param date 时间值；空值返回 '-'。

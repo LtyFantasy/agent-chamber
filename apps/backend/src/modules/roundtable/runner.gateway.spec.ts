@@ -103,6 +103,8 @@ function createMocks() {
       // 坏 key 测试 mockResolvedValueOnce(null)）
       findOne: jest.fn(),
       save: jest.fn(async (row: unknown) => row),
+      /** 认证遥测的列级写返回 Promise；保留 save spy 供整对象写入回归排查。 */
+      update: jest.fn(async () => ({ affected: 1 })),
     },
     agentRepo: {
       findOne: jest.fn(async () => ({
@@ -113,6 +115,8 @@ function createMocks() {
         actor: { status: AgentStatus.ACTIVE, deletedAt: null },
       })),
       save: jest.fn(async (row: unknown) => row),
+      /** Agent 遥测为 fire-and-forget，必须提供可 catch 的 Promise。 */
+      update: jest.fn(async () => ({ affected: 1 })),
     },
     topicService: {
       findById: jest.fn(),
@@ -190,13 +194,15 @@ describe('RunnerGateway (integration, real ws client)', () => {
   /** 每个测试重建 app（mock 闭包状态不跨测试泄漏） */
   async function buildApp(): Promise<void> {
     mocks = createMocks();
-    // 默认有效 API Key（认证通过路径）；坏 key 测试用 mockResolvedValueOnce(null) 覆盖
+    // 默认有效 API Key（认证通过路径）；坏 key 测试用 mockResolvedValueOnce(null) 覆盖。
+    // permissions 必须是合法 scopes（2026-10-16 卡 72566c2e）：WS 握手恒需 write scope，
+    // 缺失/非法形态一律 4401（fail-closed，见 runner.gateway.ts 握手分支）。
     mocks.apiKeyRepo.findOne.mockResolvedValue({
       agentId: 'agent-1',
       revokedAt: null,
       deletedAt: null,
       expiresAt: null,
-      permissions: {},
+      permissions: { scopes: ['read', 'write'] },
       lastUsedAt: null,
     });
     const moduleRefBuilt: TestingModule = await Test.createTestingModule({
@@ -279,6 +285,36 @@ describe('RunnerGateway (integration, real ws client)', () => {
 
     it('坏 key（认证失败）→ close 4401', async () => {
       mocks.apiKeyRepo.findOne.mockResolvedValueOnce(null);
+      const ws = await openSocket(keyHeaders);
+      const closed = await waitForClose(ws);
+      expect(closed.code).toBe(4401);
+    });
+
+    it('只读 key（scopes=[read]）→ close 4401（runner 是写角色；不回显 scope 细节）', async () => {
+      mocks.apiKeyRepo.findOne.mockResolvedValueOnce({
+        agentId: 'agent-1',
+        revokedAt: null,
+        deletedAt: null,
+        expiresAt: null,
+        permissions: { scopes: ['read'] },
+        lastUsedAt: null,
+      });
+      const ws = await openSocket(keyHeaders);
+      const closed = await waitForClose(ws);
+      expect(closed.code).toBe(4401);
+      // 关闭原因与"认证失败"完全同形：不泄露"缺 write scope"这类能力探测信息
+      expect(closed.reason).toBe('invalid API key');
+    });
+
+    it('scopes 缺失（fail-closed）→ close 4401', async () => {
+      mocks.apiKeyRepo.findOne.mockResolvedValueOnce({
+        agentId: 'agent-1',
+        revokedAt: null,
+        deletedAt: null,
+        expiresAt: null,
+        permissions: {},
+        lastUsedAt: null,
+      });
       const ws = await openSocket(keyHeaders);
       const closed = await waitForClose(ws);
       expect(closed.code).toBe(4401);

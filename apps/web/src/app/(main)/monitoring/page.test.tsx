@@ -7,7 +7,7 @@
  * 文案断言用 en.json 快照。
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import MonitoringPage from './page';
 import { Api } from '@/lib/api';
@@ -169,8 +169,9 @@ function makeOverview(overrides: Partial<SystemOverview> = {}): SystemOverview {
   };
 }
 
-function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderPage(
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   return render(
     <QueryClientProvider client={queryClient}>
       <MonitoringPage />
@@ -313,7 +314,7 @@ describe('MonitoringPage', () => {
 
     // 原有 api-logs 区块不受影响
     await waitFor(() => expect(screen.getByText('API Logs')).toBeInTheDocument());
-    expect(screen.getByText('No logs')).toBeInTheDocument();
+    expect(await screen.findByText('No logs')).toBeInTheDocument();
     expect(screen.queryByText('All systems normal')).not.toBeInTheDocument();
   });
 
@@ -370,4 +371,77 @@ describe('MonitoringPage', () => {
     // SSE 连接数渲染
     expect(screen.getByText('5')).toBeInTheDocument();
   });
+});
+
+it('log first error is not an empty log and local retry restores it', async () => {
+  mockApi.getApiLogs.mockRejectedValue(new Error('Network Error'));
+  renderPage();
+  const retry = await screen.findByRole('button', { name: 'common.retry' });
+  expect(screen.queryByText('No logs')).not.toBeInTheDocument();
+  mockApi.getApiLogs.mockResolvedValue({
+    items: [],
+    page: 1,
+    pageSize: 20,
+    totalPages: 0,
+    total: 0,
+    hasPrev: false,
+    hasNext: false,
+    todayCount: 0,
+    uniqueActors: 0,
+  });
+  fireEvent.click(retry);
+  expect(await screen.findByText('No logs')).toBeInTheDocument();
+});
+it('page-two failure never relabels page-one logs, and retry stays on page two', async () => {
+  const first = {
+    items: [
+      {
+        id: 'log-1',
+        action: 'First page action',
+        entityType: 'task',
+        entityId: 'task-1',
+        actorId: null,
+        actorType: null,
+        ipAddress: null,
+        userAgent: null,
+        createdAt: '2026-10-26',
+      },
+    ],
+    page: 1,
+    pageSize: 20,
+    totalPages: 2,
+    total: 21,
+    hasPrev: false,
+    hasNext: true,
+    todayCount: 21,
+    uniqueActors: 1,
+  };
+  mockApi.getApiLogs.mockResolvedValue(first);
+  renderPage();
+  await screen.findByText('First page action');
+  mockApi.getApiLogs.mockRejectedValue(new Error('Network Error'));
+  fireEvent.click(screen.getByRole('button', { name: 'monitoring.nextPage' }));
+  const retry = await screen.findByRole('button', { name: 'common.retry' });
+  expect(screen.queryByText('First page action')).not.toBeInTheDocument();
+  mockApi.getApiLogs.mockResolvedValue({
+    ...first,
+    items: [],
+    page: 2,
+    hasNext: false,
+    hasPrev: true,
+  });
+  fireEvent.click(retry);
+  await screen.findByText('No logs');
+  expect(mockApi.getApiLogs).toHaveBeenLastCalledWith({ page: 2, pageSize: 20 });
+});
+it('cached empty logs remain an empty success with refresh feedback', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  renderPage(client);
+  await screen.findByText('No logs');
+  mockApi.getApiLogs.mockRejectedValue(new Error('Network Error'));
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ['monitoring', 'logs'] });
+  });
+  expect(await screen.findByRole('status')).toHaveTextContent('common.refreshFailed');
+  expect(screen.getByText('No logs')).toBeInTheDocument();
 });

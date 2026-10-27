@@ -162,19 +162,24 @@ export class UpdateExperienceDto {
   @IsOptional()
   @IsString()
   @MaxLength(EXPERIENCE_SOURCE_PROJECT_MAX_LENGTH)
+  // 显式 type：`string | null` 联合类型经 reflect-metadata 推成 Object，仅给 nullable 不足以
+  // 修正（Swagger/automcp 仍输出 type:object，MCP 通道传字符串必 400；守卫见 swagger-schema.spec.ts）
   @ApiPropertyOptional({
-    description: 'New self-reported source project, or explicit `null` to clear it.',
+    type: String,
     nullable: true,
+    description: 'New self-reported source project, or explicit `null` to clear it.',
   })
   sourceProject?: string | null;
 
   @IsOptional()
   @IsISO8601()
   @ApiPropertyOptional({
+    type: String,
+    nullable: true,
+    format: 'date-time',
     description:
       'New expiry boundary (must be in the future), or explicit `null` to make the entry ' +
       'never-expiring.',
-    nullable: true,
   })
   expiresAt?: string | null;
 

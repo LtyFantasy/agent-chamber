@@ -10,7 +10,7 @@
  *
  * [权威文档]
  *   - 主文档: .kimi/plans/plan-experience-base.md §1.2 — 逐列可空性 + 双唯一约束仲裁语义
- *     （对外文档 docs/experience-base.md 与 docs/database.md 的 experience_feedback
+ *     （对外文档 docs/modules/experience-base.md 与 docs/database.md 的 experience_feedback
  *      表节随后续批次上线；两者落地后以线上文档为权威副本）
  *   - 补充: 线上 DocSpace `docs/database.md` — 表结构权威说明
  *

@@ -25,6 +25,13 @@
  *   - 构造函数参数不得增减：三个手工 new AgentService(...) 真 PG e2e 套件
  *     （test/agent-deletion-impact.e2e-spec.ts / agent-unread.e2e-spec.ts /
  *     deleted-actor-projection.e2e-spec.ts）依赖 7 参签名
+ *   - **API Key scopes（卡 72566c2e）**：`permissions` 列形状只经 `buildKeyPermissions`
+ *     构造；**缺省全权的唯一形态是 `scopes === undefined`**，显式空数组一律 400
+ *     （`[]` = 无权限，读侧拒；归一成双权 = 写侧静默加宽，属 fail-open，禁止）；
+ *     findKeys/createKey/resetKey 响应一律经 `projectApiKey` 白名单投影
+ *     （裸实体 spread = keyHash 外泄）；resetKey 新 key scopes = 被吊销集合**交集**，
+ *     永不变宽（空交集回落只读）；`revokeKey(keyId, agentId, …)` 的 agentId 是 BOLA 收窄
+ *     条件，禁止退回单条件按 keyId 查（跨 agent 吊销 = 越权对象级访问）
  *   - heartbeat 是「全列快照」upsert（ON CONFLICT (agent_id) DO UPDATE 全列覆盖）：
  *     省略字段被有意清空，不做逐字段合并（与 topic.service.ts 自动 join 的合并相反）；
  *     created_at 未显式给值 → upsert overwrite 列表不含它 → 首次心跳时间保留
@@ -38,11 +45,18 @@
  *     前端 page.tsx:197 条件渲染，不显示假 "0 tokens"
  *   - findMyUnreadCounts（GET /agents/me/unread）裸 SQL 的未读判据（v1.85）=
  *     未软删 **且 sender_id ≠ 自己**（`m.sender_id <> tp.participant_id` 写在该
- *     LEFT JOIN 的 ON 子句内）；与 TopicService.getUnread 同口径——改任一侧必须
- *     同步另一侧 + test/agent-unread.e2e-spec.ts（真 PG，mock 测不出 SQL 生成）
+ *     LEFT JOIN 的 ON 子句内）；v1.96.0-dev 未读语义批 D4 再追加**提及过滤分支**：
+ *     该行 notification_settings 开了 mentions_only 时，只数「mentions 含我
+ *     （`jsonb_build_array(tp.participant_id::text)`）或 @all（标量 `'"*"'`）」的消息。
+ *     键名单源 = shared NOTIFY_KEY_MENTIONS_ONLY（裸 SQL 模板插值）。
+ *     **模式判定必须写在 ON 子句内**——写进 WHERE 会让未命中提及的 topic 整行消失。
+ *     与 TopicService.getUnread / buildUnreadMessageQb 是同一语义的两个实现点：
+ *     改任一侧必须同步另一侧 + test/agent-unread.e2e-spec.ts（真 PG，mock 测不出 SQL 生成）。
  *
  * [关联代码]
  *   - agent.controller.ts stats/heartbeat — 权限（JwtOrApiKeyGuard + ensureCan 'write'）+ @ApiQuery
+ *   - agent-key-projection.ts — key 响应白名单（findKeys/createKey/resetKey 共同出口）
+ *   - agent-scope-exemptions.ts（config/）— 读语义端点 scope 豁免清单单源
  *   - entities/agent-heartbeat.entity.ts — @Index(['agentId'], { unique: true }) 唯一索引
  *   - dto/agent-heartbeat.dto.ts — 全可选遥测字段 + @IsEnum/@IsISO8601（pipe 层拦格式错）
  *   - packages/shared/src/dto/agent.dto.ts + agent-response.dto.ts — 契约类型
@@ -80,7 +94,7 @@
  */
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import * as crypto from 'crypto';
 import { Agent } from '../../database/entities/agent.entity';
 import { Actor } from '../../database/entities/actor.entity';
@@ -95,6 +109,8 @@ import {
   TaskStatus,
   ParticipantStatus,
   SEAT_LIFECYCLE_STATUS,
+  // 提及过滤键名单源（D4）：与 topic.service 的读谓词/写合并同源，禁止本文件另起字面量
+  NOTIFY_KEY_MENTIONS_ONLY,
 } from '@agent-chamber/shared';
 import type {
   PaginatedResponse,
@@ -102,7 +118,11 @@ import type {
   AgentDeletionImpact,
   AgentStats,
   TopicUnreadCount,
+  ApiKeyScope,
 } from '@agent-chamber/shared';
+import { API_KEY_SCOPE_VALUES } from '@agent-chamber/shared';
+import { resolveKeyScopes } from '../../common/utils/api-key-scope';
+import { projectApiKey } from './agent-key-projection';
 import {
   CreateAgentDto,
   UpdateAgentDto,
@@ -173,6 +193,60 @@ function truncateField(obj: Record<string, unknown>, field: string, maxChars: nu
     obj[field] = (obj[field] as string).slice(0, maxChars);
     obj[`${field}Truncated`] = true;
   }
+}
+
+/**
+ * 缺省 API Key scopes = 全量双权（值域单源 = shared `API_KEY_SCOPE_VALUES`）。
+ * 缺省即全量是**刻意的向后兼容**：存量 47 把生产 key 全部为 `['read','write']`，
+ * 且所有既有调用方（web 表单、automcp）都不传 scopes。
+ */
+const DEFAULT_KEY_SCOPES: readonly ApiKeyScope[] = API_KEY_SCOPE_VALUES;
+
+/**
+ * 构造 `api_keys.permissions` 列值——**该列形状的唯一构造点**（禁止在别处写裸字面量）。
+ *
+ * 三态语义（2026-10-16 卡 72566c2e code-review M3 收紧）：
+ * - `undefined`（**且仅 undefined**）→ 缺省全量双权（向后兼容）；
+ * - 非空数组 → 原样落库；
+ * - **显式空数组 → 400**（不是"缺省"）。空数组的字面意思是"这把 key 没有任何权限"，
+ *   而读侧 `resolveKeyScopes` 对 `[]` 是**拒绝**（fail-closed）。若把 `[]` 归一成双权，
+ *   写侧会把它放大成**最大**权限——正是本卡要消灭的那类 fail-open（静默加宽）。
+ *   要"缺省全权"就省略 `scopes` 字段；要"无权限 key"请另立需求（当前不支持该形态）。
+ *
+ * ⚠️ 本函数的入参已经过 DTO 层 `@IsIn` 值域校验；此处只兜**服务层直调**（e2e / 内部调用）
+ * 的空数组形态，与 DTO 的 `@ArrayNotEmpty` 构成双层防线（铁律 #21）。
+ *
+ * @param scopes 调用方显式指定的 scopes；`undefined` = 缺省
+ * @returns 落库 jsonb 值 `{ scopes: [...] }`
+ * @throws BadRequestException 显式传入空数组（`code = VALIDATION_ERROR`）
+ */
+function buildKeyPermissions(scopes?: readonly ApiKeyScope[]): Record<string, unknown> {
+  if (scopes !== undefined && scopes.length === 0) {
+    throw new BadRequestException({
+      message:
+        "scopes must not be an empty array: an empty scope list means 'no permissions at all', " +
+        'and silently widening it to the default is exactly the fail-open this endpoint must not have. ' +
+        "Omit the 'scopes' field entirely to get the default ['read','write']; a key with no " +
+        'permissions is not supported.',
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+  }
+  return { scopes: [...(scopes ?? DEFAULT_KEY_SCOPES)] };
+}
+
+/**
+ * scopes 集合的**交集**（永不变宽：多把 key 不一致时取最严）。
+ *
+ * 语义：`intersectScopes([['read','write'], ['read']]) === ['read']`。
+ * 入参集合为空（无活跃 key 可继承）→ 返回 `[]`，由调用方按 resetKey 兜底规则回落。
+ *
+ * @param sets 每把被吊销 key 收窄后的 scopes
+ * @returns 交集（保持首个集合的元素顺序）
+ */
+function intersectScopes(sets: readonly (readonly ApiKeyScope[])[]): ApiKeyScope[] {
+  const [first, ...rest] = sets;
+  if (!first) return [];
+  return first.filter((scope) => rest.every((other) => other.includes(scope)));
 }
 
 @Injectable()
@@ -504,10 +578,15 @@ export class AgentService {
    * 语义与 TopicService.getUnread 逐条对齐（以函数名为锚，不引用易漂的行号）：
    * - 无游标（last_read_message_id IS NULL）→ 该 topic 全量未读计数（未软删且非自发）；
    * - 游标消息已软删 → 锚点 join 落空（a.deleted_at IS NULL）→ 降级全量；
-   * - **自己发的消息不计入未读**：主路径靠「发送即已读」游标（v1.69，发送事务内
-   *   单调推进发送者游标），本 SQL 再在 messages 的 ON 条件里加
+   * - **自己发的消息不计入未读**：主路径靠游标（游标只经 markAsRead / digest 推进，
+   *   v1.96.0-dev 起发送不再推进游标——D1），本 SQL 再在 messages 的 ON 条件里加
    *   `m.sender_id <> tp.participant_id`，兜住游标缺失/锚点悬空的降级路径
    *   （v1.85 与 getUnread 同口径收口：两边都显式排自发）；
+   * - **提及过滤（D4，v1.96.0-dev）**：该行 notification_settings 开了 mentions_only 时，
+   *   只统计「提及我（`mentions` 含我的 id）或 `@all`（含标量 `"*"`）」的消息。谓词内联在
+   *   **LEFT JOIN 的 ON 子句**里（不是 WHERE）——ON 条件只决定哪些 m 参与 COUNT，不改变
+   *   参与行本身的可见性（4 参与者矩阵实测：加 ON 条件不改变 COUNT 语义）。若写成 WHERE，
+   *   未命中提及的 topic 会整行消失（与「只列 unreadCount>0」的既有语义混叠，无法区分）。
    * - 仅统计 status IN ('invited','active') 的参与行（left 排除，me/topics 同口径）；
    * - 已软删 topic 排除；只返回 unreadCount > 0 的 topic，最多 50 条
    *   （按未读数 DESC、updated_at DESC 排序，截断安全）。
@@ -519,6 +598,17 @@ export class AgentService {
    * 为什么裸 SQL：跨 topic 聚合 + 行值比较 (created_at, id) 一条 SQL 精确复刻
    * getUnread 语义，避免 N+1 逐 topic 查询；行值比较在 DB 内做（微秒精度，
    * 避免 JS Date 毫秒截断误算锚点自身，同 getUnread 的 E3-fix 注释）。
+   *
+   * 提及谓词的两处 DB 事实（PG 15 实测，与 topic.service buildUnreadMessageQb 同源）：
+   * - 键名走**常量模板插值**（shared NOTIFY_KEY_MENTIONS_ONLY）——裸 SQL 里写不出
+   *   TypeORM 参数绑定，键名是编译期常量故无注入面（值面零插值）；
+   * - 广播令牌用 `'"*"'::jsonb`（数组含标量特例）而不是 `'["*"]'::jsonb`；
+   * - ⚠️ 禁用 `notification_settings->>'mentions_only'::boolean` 这类 cast——脏值 22P02
+   *   报错，`@>` 对脏值零抛错。
+   *
+   * ⚠️ 本 SQL 与 TopicService.getUnread / buildUnreadMessageQb 是**同一语义的两个实现点**：
+   * 改任一侧必须同步另一侧 + 两个真 PG 套件（unread-cursor / agent-unread，mock 测不出
+   * SQL 生成）。
    *
    * @param actorId 当前 actor id
    * @returns TopicUnreadCount[]（无参与/全已读 → 空数组）
@@ -532,6 +622,9 @@ export class AgentService {
        LEFT JOIN messages m ON m.topic_id = tp.topic_id AND m.deleted_at IS NULL
          AND m.sender_id <> tp.participant_id
          AND (a.id IS NULL OR (m.created_at, m.id) > (a.created_at, a.id))
+         AND (NOT (tp.notification_settings @> '{"${NOTIFY_KEY_MENTIONS_ONLY}": true}'::jsonb)
+              OR m.mentions @> jsonb_build_array(tp.participant_id::text)
+              OR m.mentions @> '"*"'::jsonb)
        WHERE tp.participant_id = $1 AND tp.status IN ('${ParticipantStatus.INVITED}','${ParticipantStatus.ACTIVE}')
        GROUP BY t.id, t.title
        HAVING COUNT(m.id) > 0
@@ -740,7 +833,8 @@ export class AgentService {
       keyHash,
       keyPrefix,
       name: 'Default Key',
-      permissions: { scopes: ['read', 'write'] },
+      // scopes：dto.scopes 显式指定优先；缺省双权（向后兼容，见 DEFAULT_KEY_SCOPES 注释）
+      permissions: buildKeyPermissions(dto.scopes),
       createdBy: ownerId,
     });
     await this.apiKeyRepo.save(apiKey);
@@ -858,8 +952,36 @@ export class AgentService {
     };
   }
 
-  async resetKey(id: string) {
+  /**
+   * 重置 API Key：吊销该 agent 全部活跃 key，并签发一把新 key。
+   *
+   * **升格后门修复（2026-10-16 卡 72566c2e，安全评审 PM BLOCK-1）**：本方法原先硬编码
+   * `permissions = { scopes: ['read','write'] }`，于是任何能调到本端点的人都能把手上
+   * 受限凭证换成一枚双权凭证——重置即权限提升。修复后新 key 的 scopes 取值：
+   *   1. `scopes` 显式入参（调用方明确表达意图时优先；controller 已过 ensureCan 'write'）；
+   *   2. 否则 = **被吊销集合 scopes 的交集**（永不变宽：多把不一致时取最严）；
+   *   3. 交集为空（无活跃 key 可继承 / 全部权限形态非法）→ 回落 `['read']`（只读兜底，
+   *      **永不**升格为双权）。无活跃 key 的 agent 想要双权新 key，唯一路径是在入参里显式写。
+   *
+   * 读取被吊销集合必须在 UPDATE **之前**（UPDATE 后 revoked_at 已置位，读不到 scopes）。
+   *
+   * @param id agent id
+   * @param scopes 可选显式 scopes（DTO 层已收窄为值域子集）
+   * @returns 新 key 的对外投影（白名单字段，见 agent-key-projection.ts）+ `apiKey` 明文
+   *          （**唯一一次**返回明文，不可重取）
+   * @throws NotFoundException agent 不存在或已软删（findOne 前置判空，铁律 #22）
+   */
+  async resetKey(id: string, scopes?: readonly ApiKeyScope[]) {
     const agent = await this.findOne(id);
+
+    // 1. 先读将被吊销的活跃 key（含 scopes），用于交集继承——必须在 UPDATE 之前
+    const activeKeys = await this.apiKeyRepo.find({
+      where: { agentId: id, revokedAt: IsNull() },
+    });
+    const inherited = intersectScopes(
+      activeKeys.map((key) => resolveKeyScopes(key.permissions) ?? []),
+    );
+
     // Revoke old keys
     await this.apiKeyRepo
       .createQueryBuilder()
@@ -872,16 +994,20 @@ export class AgentService {
     const keyHash = crypto.createHash('sha256').update(rawKey).digest('hex');
     const keyPrefix = rawKey.substring(0, 8);
 
+    // 优先级：显式入参 > 交集 > 只读兜底（三者都不可能比被吊销集合更宽）
+    const effectiveScopes: readonly ApiKeyScope[] =
+      scopes && scopes.length > 0 ? scopes : inherited.length > 0 ? inherited : ['read'];
+
     const apiKey = this.apiKeyRepo.create({
       agentId: agent.id,
       keyHash,
       keyPrefix,
       name: 'Reset Key',
-      permissions: { scopes: ['read', 'write'] },
+      permissions: buildKeyPermissions(effectiveScopes),
     });
     await this.apiKeyRepo.save(apiKey);
 
-    return { apiKey: rawKey };
+    return { ...projectApiKey(apiKey), apiKey: rawKey };
   }
 
   async toggle(id: string) {
@@ -1114,13 +1240,31 @@ export class AgentService {
     return [fromEff, toEff];
   }
 
+  /**
+   * 列出该 agent 的全部 key（含已吊销），按创建时间倒序。
+   *
+   * 响应经 {@link projectApiKey} **白名单投影**（2026-10-16 卡 72566c2e）：修复前直接返回
+   * 裸实体，`keyHash`（sha256 全文，等于"离线校验 API Key"的字典）随列表外泄。
+   *
+   * @param agentId agent id
+   * @returns 投影数组（字段表见 agent-key-projection.ts）
+   */
   async findKeys(agentId: string) {
-    return this.apiKeyRepo.find({
+    const keys = await this.apiKeyRepo.find({
       where: { agentId },
       order: { createdAt: 'DESC' },
     });
+    return keys.map(projectApiKey);
   }
 
+  /**
+   * 为该 agent 新建一把 API Key。
+   *
+   * @param agentId agent id
+   * @param dto 名称 + 可选 scopes（缺省双权）
+   * @returns 新 key 的对外投影 + `apiKey` 明文（**唯一一次**返回明文，不可重取）
+   * @throws NotFoundException agent 不存在或已软删
+   */
   async createKey(agentId: string, dto: CreateAgentKeyDto) {
     const agent = await this.findOne(agentId);
     const rawKey = `ask_${crypto.randomBytes(24).toString('base64url')}`;
@@ -1132,22 +1276,31 @@ export class AgentService {
       keyHash,
       keyPrefix,
       name: dto.name,
-      permissions: { scopes: ['read', 'write'] },
+      permissions: buildKeyPermissions(dto.scopes),
     });
     await this.apiKeyRepo.save(apiKey);
-    return { ...apiKey, apiKey: rawKey };
+    return { ...projectApiKey(apiKey), apiKey: rawKey };
   }
 
   /**
-   * 吊销指定 API Key（软吊销：revokedAt 置位）
+   * 吊销指定 API Key（软吊销：revokedAt 置位）。
+   *
+   * **BOLA 收窄（2026-10-16 卡 72566c2e，现网 P0）**：修复前按 `id = keyId` 单条件查
+   * （`findOne({ where: { id: keyId } })`），于是 agent A 只要知道 agent B 的 keyId 就能
+   * 用**自己的**凭证吊销别人 agent 的 key（越权对象级访问；`ensureCan` 校验的是路径 `:id`
+   * 那个 agent，与 keyId 的实际归属无关）。修复 = where 收窄为 `{ id: keyId, agentId }`，
+   * 不匹配即 404（与"key 不存在"同形，**不泄露存在性**）；审计在收窄查询**之后**，
+   * 不存在越权写入审计的可能。收窄先例：task.service.ts / task-dependency.service.ts /
+   * topic.service.ts 的同类三兄弟。
    *
    * @param keyId 要吊销的 key id
+   * @param agentId key 必须归属的 agent id（路径参数 `:id`，调用方已过 ensureCan）
    * @param operatorActorId 操作者 actor id（审计用；controller 传入，决策 8 同构）
    * @returns true
-   * @throws NotFoundException key 不存在
+   * @throws NotFoundException key 不存在**或不属于该 agent**（同形 404）
    */
-  async revokeKey(keyId: string, operatorActorId?: string) {
-    const key = await this.apiKeyRepo.findOne({ where: { id: keyId } });
+  async revokeKey(keyId: string, agentId: string, operatorActorId?: string) {
+    const key = await this.apiKeyRepo.findOne({ where: { id: keyId, agentId } });
     if (!key)
       throw new NotFoundException({ message: 'API Key not found', code: ErrorCode.NOT_FOUND });
     key.revokedAt = new Date();

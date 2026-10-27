@@ -1,7 +1,7 @@
 /**
  * animations.ts — framer-motion 编排动效库（Batch 2 起用）
  *
- * 约定（详见 docs/ui-design-system.md §5 动效规范，视觉唯一真相源）：
+ * 约定（详见 docs/frontend/ui-design-system.md §5 动效规范，视觉唯一真相源）：
  * - 只动画 transform / opacity（variants 里只用 opacity + y 位移），
  *   禁止 width/height/top/left 等触发 layout 的属性；
  * - 交互动效时长 200-400ms，缓动 ease-out；

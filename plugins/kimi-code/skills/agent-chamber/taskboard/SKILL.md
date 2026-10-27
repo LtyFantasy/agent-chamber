@@ -1,17 +1,14 @@
 ---
 name: taskboard
-description: 平台任务看板（Board/Kanban）子 skill。覆盖看板/列/任务生命周期、状态管理、指派与工作流自动化。Agent 使用工单系统（接单、流转、汇报）时使用。
-version: 1.4.2
-updatedAt: 2026-09-02
+description: 平台任务看板（Board/Kanban）子 skill。覆盖看板/列/任务生命周期、列≠状态核心认知、成员与权限模型（editor 角色 + 字段级分权）、指派、里程碑、任务语义工具（follow_up_task / report_task_result / create_task / patch_task_description / batch_get_tasks）与工作流自动化。Agent 使用工单系统（接单、流转、汇报）时使用。
+version: 1.7.3
+updatedAt: 2026-10-25
 ---
 
 # 任务看板功能（Board / Kanban）— Agent 工单系统
 
 > 任务看板是 Agent 的工单系统，支持看板 → 列 → 任务卡片三级结构。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
->
-> **Skill 版本**: v1.4.1  
-> **更新日期**: 2026-08-01
 >
 > ⚠️ **敏感操作提醒**：修改/删除任务前，先 `GET /tasks/:id` 核对 `assigneeId` 或创建者身份。
 
@@ -20,7 +17,7 @@ updatedAt: 2026-09-02
 ## 🔄 Agent 会话恢复速查（上下文断裂后）
 
 > Agent session 重置后丢失上下文，以下步骤帮助你在 5 分钟内恢复工作状态。
-> MCP 可用时优先用语义工具 `get_my_briefing` 一调等价（见 [`../SKILL.md`](../SKILL.md#20-会话初始化三连推荐-v1120-起)）。
+> MCP 可用时优先用语义工具 `get_my_briefing` 一调等价（见 [`../SKILL.md`](../SKILL.md#20-会话初始化三连推荐)）。
 
 ```
 Step 1: 确认身份 + 活跃任务 + 最近动态（合并为 briefing 一调）
@@ -50,27 +47,28 @@ Step 4: 增量同步事件（获取断开后平台发生的变化）
 
 > **这是平台最核心的设计决策，也是 Agent 最容易踩的坑。**
 >
-> 平台的**列（List）不是任务状态**。Trello 的"列=状态"心智模型在这里**不适用**。
-> 列只是任务的**物理容器/视图分区**，名字可以任意取（如"开发区""设计区"）。
-> 任务的真实状态由独立的 `status` 字段管理，两者**完全解耦**。
+> 列是任务的**物理容器/视图分区**，任务状态由独立的 `status` 字段管理。
+> **列名本身不推导状态**，可以命名为"开发区"，也可以命名为"进行中"。
+> move 到未配置 `mappedStatus` 的列只改位置；move 到有映射的列会同步状态（见 §3.8）。
 
 | | 列（List） | 状态（Status） |
 |---|---|---|
 | **本质** | 物理容器 / 视图分区 | 任务独立属性 |
 | **命名** | 任意（如"待办区""开发区"） | 固定枚举值（`backlog/todo/in_progress/review/done`） |
-| **如何变更** | `POST /tasks/:id/move { listId }` | `PATCH /tasks/:id { status: "xxx" }` |
-| **关键区别** | **拖拽到其他列 ≠ 改状态** | 需要**显式 PATCH** 才能变更 |
+| **如何变更** | `POST /tasks/:id/move { listId }` | 显式 `PATCH status`，或 move 到有 `mappedStatus` 的列 |
+| **联动条件** | 未映射只改位置；有映射同步状态 | PATCH 的 status 实际变化且找到对应映射列时自动吸附；找不到只改状态 |
 
 ```
-❌ 错误认知（Trello 习惯）：
-   "把任务拖到'已完成'列 → 任务自动变成 done"
+❌ 错误认知：
+   "只凭列名'已完成'，就断定 move 后任务一定是 done"
 
-✅ 正确认知：
-   "把任务拖到'已完成'列 → 只是换了容器，status 还是原来的值
-    必须再调 PATCH /tasks/:id { status: 'done' } 才能真正完成"
+✅ 未映射列：
+   "目标列 mappedStatus=null → move 后 status 保留；若要完成，再 PATCH status='done'"
+✅ 映射列：
+   "目标列 mappedStatus='done' → move 同步 done/完成时间，无需追加 PATCH"
 ```
 
-**一句话**：列决定任务**放在哪里看**，状态决定任务**处于什么阶段**。两者独立管理，不要混为一谈。
+**一句话**：列决定任务**放在哪里看**，状态决定任务**处于什么阶段**；是否联动看 `mappedStatus`，不看列名。
 
 ---
 
@@ -82,7 +80,7 @@ Step 4: 增量同步事件（获取断开后平台发生的变化）
 |---|-----|------|---------|
 | 1 | 按文档调 `PATCH /lists/:id` | 404 | 实际端点是 `PATCH /boards/lists/:id` |
 | 2 | 搜索 API 传 `type=topic` | 400 `type must be one of...` | `type` 支持 `all`/`messages`/`tasks`，不支持 `topic`/`board` |
-| 8 | 列名取成状态名（"待办/进行中/已完成"） | 违反"列≠状态"设计 | 列名应描述视图分区（如"本周冲刺""前端开发"） |
+| 8 | 仅凭列名推导任务 status | 误判 move 是否已改状态 | 状态名可以作列名；读取目标列 mappedStatus 与任务实际 status，不能只看名字 |
 
 ---
 
@@ -90,8 +88,8 @@ Step 4: 增量同步事件（获取断开后平台发生的变化）
 
 - **看板 → 列（泳道） → 任务卡片** 三级结构
 - **列拖拽重排**：调整看板列的顺序
-- **任务跨列拖拽**：将任务从一个列移动到另一个列（**只改 listId，不改 status**）
-- **任务状态机**：`backlog → todo → in_progress → review → done`（可回退到 `blocked`，最终 `archived`）— **状态需显式 PATCH 修改**
+- **任务跨列拖拽**：未映射目标列只改位置；有 `mappedStatus` 时同步状态及既有时间不变量
+- **任务状态机**：`backlog → todo → in_progress → review → done`（可回退到 `blocked`，最终 `archived`）— 显式 PATCH 或映射列 move 都遵循状态规则
 - **任务分配**：指派给 Agent 或人类用户
 - **任务依赖关系**：`blocks`/`relates_to`/`duplicates`，支持循环依赖检测
 - **里程碑/版本**：Sprint 边界、版本进度聚合统计
@@ -104,7 +102,7 @@ Step 4: 增量同步事件（获取断开后平台发生的变化）
 
 ### 2.1 为什么列和状态要解耦？
 
-Agent 协作场景需要灵活性：
+Agent 协作场景需要灵活性；未映射列可用于以下视图分区：
 
 ```
 场景 1：同一 Sprint 内分区
@@ -124,7 +122,8 @@ Agent 协作场景需要灵活性：
 
 ```
 ✅ 创建任务到"待办区"    → 状态默认 backlog
-✅ 拖拽到"开发区"        → 状态保持 backlog（不变！）
+✅ 拖拽到未映射的"开发区" → 状态保持 backlog
+✅ 拖拽到映射 done 的列    → 状态变为 done，completedAt 自动设置，无需额外 PATCH
 ✅ 显式 PATCH status      → 状态变为 in_progress（同时 startedAt 自动设置）
 ✅ 完成后 PATCH status    → 状态变为 done（同时 completedAt 自动设置）
 ```
@@ -132,9 +131,9 @@ Agent 协作场景需要灵活性：
 ### 2.3 错误的使用方式（避免）
 
 ```
-❌ 以为拖拽到"已完成"列 → 任务自动变成 done
+❌ 只看"已完成"列名，不读取 mappedStatus 就宣告任务 done
 ❌ 以为列名必须对应状态 → 限制看板灵活性
-❌ 只改 listId 不改 status → 导致"列是已完成但状态还是 in_progress"
+❌ 移到未映射列后，未核对真实 status 就报告状态已完成
 ```
 
 ---
@@ -147,22 +146,22 @@ Agent 协作场景需要灵活性：
 |------|------|------|
 | `GET` | `/boards` | 看板列表（支持 `topicId` 过滤） |
 | `POST` | `/boards` | 创建看板（可绑定 `topicId`） |
-| `GET` | `/boards/:id` | 看板详情（含列元数据，**不再返回 tasks 数组**） |
+| `GET` | `/boards/:id` | 看板详情（含列元数据，**不返回 tasks 数组**） |
 | `GET` | `/boards/:id/lists` | 获取看板所有列的元数据（含 `taskCount`，不含 tasks） |
 | `GET` | `/boards/:id/lists/:listId/tasks` | 按列分页获取任务列表（默认只返回 backlog 和 in_progress；传 status=all 返回全部） |
 
 > **注意**：`CreateBoardDto` 支持 `lists` 字段，创建看板时可同时传入初始列。也可创建后单独调用 `POST /boards/:id/lists` 添加列。详见 §7 DTO 速查。
 
-> **重要变化**：`GET /boards/:id` 不再返回列下的 `tasks`。要获取任务列表，必须调用 `GET /boards/:id/lists/:listId/tasks`；该接口默认只返回 `backlog` 和 `in_progress` 的任务，如需全部请传 `status=all`。
+> **重要**：`GET /boards/:id` 不返回列下的 `tasks`。要获取任务列表，必须调用 `GET /boards/:id/lists/:listId/tasks`；该接口默认只返回 `backlog` 和 `in_progress` 的任务，如需全部请传 `status=all`。
 
 > **status 默认集差异**：`GET /tasks`（全局任务列表）不传 status = 返回全部状态；`GET /boards/:id/lists/:listId/tasks`（按列查询）不传 status = 默认 `backlog`+`in_progress`。所有端点均支持单值、逗号分隔、数组、`all` 四种传法。
-| `PATCH` | `/boards/:id` | 更新看板（`topicId` 变更会级联更新所有任务） |
+| `PATCH` | `/boards/:id` | 更新看板（`topicId` 变更会级联更新所有任务；字段级分权见 §3.1b） |
 | `DELETE` | `/boards/:id` | 删除看板 |
 
 ### 3.1b 看板权限管理（基于 board_members 关系表）
 
 > 看板成员通过 `board_members` 关系表管理，每条记录包含 `boardId`、`agentId`、`role`（`member` / `editor`）。
-> 以下四个端点**仅看板创建者可调用**，且每次操作均广播对应事件。
+> 以下四个端点**仅看板创建者可调用**（admin 与 owner 代理视同 creator），且每次操作均广播对应事件。
 
 | 方法 | 端点 | 权限要求 | 说明 |
 |------|------|---------|------|
@@ -172,6 +171,15 @@ Agent 协作场景需要灵活性：
 | `POST` | `/boards/:id/remove-editor` | **creator-only** | 删除 `board_members` 对应行（editor 撤销即失权，不再保留 member） |
 
 > **⚠️ 重要**：以上四个端点**仅看板创建者可调用**，均触发对应事件广播。editor 无权管理成员。
+
+#### Board 成员模型契约（BoardDetail）
+
+| 项 | 说明 |
+|------|------|
+| **统一成员字段** | `members: BoardMember[]` — 每项含 `{id, name, type, avatarUrl, role, invitedBy, createdAt}` |
+| **计数字段** | `memberCount` |
+| **creator 成员行** | 创建看板/空间时 creator 自动落成员行（`role=editor`、`invitedBy=null`），成员列表恒含 creator；`remove-editor` / `uninvite-agent` 对 creator → **409 `RESOURCE_CONFLICT`**（不可移除/降级） |
+| **leave 后失读** | 成员离开看板后失去读权限 |
 
 #### Board Editor 权限模型
 
@@ -185,7 +193,7 @@ Agent 协作场景需要灵活性：
 - **editor** 不可以：删除看板、删除他人任务、管理成员（invite/uninvite/add-editor/remove-editor）、修改 topicId/visibility
 - **member** 可以：读看板、读任务、读写自己的任务
 - **member** 不可以：写他人任务、管理成员、修改看板
-- **PATCH /boards/:id** 字段过滤：editor 调用时，只有 `name` 和 `description` 会被后端接受，其他字段会被忽略
+- **PATCH /boards/:id 字段级分权**：内容字段 `name`/`description` editor 可改；结构字段 `topicId`/`visibility`/`invitedAgentIds` 任一出现（**含显式 null**）→ 非 creator/admin **整体 403** 并在消息中列出字段名（不做部分应用）
 
 ### 3.2 列（List）操作
 
@@ -223,16 +231,21 @@ POST /boards/lists/<list-id>/reorder
 | `PATCH` | `/tasks/:id` | 更新任务（**包括 status 变更**）<br>返回: `{ code, data: task }` |
 | `DELETE` | `/tasks/:id` | 删除任务<br>返回: `{ code, data: boolean }` |
 
+> ⚠️ **`PATCH /tasks/:id` 的并发编辑契约（可选乐观锁）**：请求体可带 `expectedUpdatedAt`（值 = `GET /tasks/:id` 详情的 `updatedAt` 原样回传）；显式传入时写入在「一个事务 + 行锁」内完成（锁内重读 → 锁内重跑写权限判定 → 锁内比对 token）。
+> - **不传 = 完全无锁**，这是有意保留的例外（`report_task_result` 内部路径与旧客户端拿不到 token）；**新代码应当总是传**。
+> - 任一并发写（含 `move` / `assign` / `report_task_result`）都会推进 `updated_at` 使 token 失效 → **409 `RESOURCE_CONFLICT`(9001)**，响应体带 `data.currentUpdatedAt`。
+> - 收到 409 时：**重新 `GET /tasks/:id` 拿新 `updatedAt` 再试**；禁止用同一个 token 重试（必然再 409）。无写权限得 403 而非 409（权限在锁内、token 比对之前重跑）。
+
 ### 3.4 任务高级操作
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| `POST` | `/tasks/:id/move` | 移动任务到其他列 `{ listId, order }` — **只改容器位置，不改状态**<br>返回: `{ code, data: task }` |
+| `POST` | `/tasks/:id/move` | 移动任务 `{ listId, order }`；目标列无映射只改位置，有 `mappedStatus` 则同步状态<br>返回: `{ code, data: task }` |
 | `POST` | `/tasks/:id/assign` | 分配任务 `{ assigneeId }`（注：create/update 已支持直接 assign，优先用 update）<br>返回: `{ code, data: task }` |
 | `POST` | `/tasks/:id/comments` | 添加评论<br>返回: `{ code, data: comment }` |
 | `GET` | `/tasks/:id/activities` | 获取活动日志<br>⚠️ 返回 `{ code, data: [...] }` 直接数组，**非标准分页格式** |
 
-> ⚠️ **`POST /tasks/:id/move` 只变更 `listId` 和 `position`，不会修改 `status`。如需同时改状态，需再调 `PATCH /tasks/:id { status: "xxx" }`。**
+> ⚠️ **move 是否改状态取决于目标列 `mappedStatus`**：未映射只变更 `listId`/`position`；有映射同步状态并维护 `startedAt`/`completedAt`（离开 done 清完成时间）。未映射列若还需改状态，再显式 PATCH；不要重复 PATCH 已由映射完成的状态。
 
 ### 3.5 任务依赖关系
 
@@ -251,13 +264,15 @@ POST /boards/lists/<list-id>/reorder
 
 > 里程碑必须关联一个 Board，禁止孤立里程碑。创建时 `boardId` 必填；创建需对 Board 有读权限，编辑/删除需里程碑创建者或 Board 写权限（或 admin）。
 
-| 方法 | 端点 | MCP tool 名称 | 说明 |
+| 方法 | 端点 | MCP tool 名称（worker 面） | 说明 |
 |------|------|--------------|------|
-| `GET` | `/tasks/milestones?boardId=xxx` | `task_controller_find_milestones` | 里程碑列表<br>返回: `{ code, data: { items: [{ id, name, stats }, ...], total, ... } }` |
-| `POST` | `/tasks/milestones` | `task_controller_create_milestone` | 创建里程碑 `{ name, boardId, description?, status?, startDate?, targetDate? }`<br>返回: `{ code, data: milestone }` |
-| `GET` | `/tasks/milestones/:id` | `task_controller_find_milestone` | 里程碑详情（仅返回 milestone + stats，**不含内嵌 tasks**）<br>关联任务用 `GET /tasks?milestoneId=<id>` 分页获取<br>返回: `{ code, data: milestone }` |
-| `PATCH` | `/tasks/milestones/:id` | `task_controller_update_milestone` | 更新里程碑<br>返回: `{ code, data: milestone }` |
-| `DELETE` | `/tasks/milestones/:id` | `task_controller_remove_milestone` | 删除里程碑（级联清空关联任务的 `milestoneId`）<br>返回: `{ code, data: boolean }` |
+| `GET` | `/tasks/milestones?boardId=xxx` | —（已降级，走 REST 或 `/mcp-full`） | 里程碑列表<br>返回: `{ code, data: { items: [{ id, name, stats }, ...], total, ... } }` |
+| `POST` | `/tasks/milestones` | —（仅 `/mcp-full`） | 创建里程碑 `{ name, boardId, description?, status?, startDate?, targetDate? }`<br>返回: `{ code, data: milestone }` |
+| `GET` | `/tasks/milestones/:id` | —（已降级，走 REST 或 `/mcp-full`） | 里程碑详情（仅返回 milestone + stats，**不含内嵌 tasks**）<br>关联任务用 `GET /tasks?milestoneId=<id>` 分页获取<br>返回: `{ code, data: milestone }` |
+| `PATCH` | `/tasks/milestones/:id` | —（仅 `/mcp-full`） | 更新里程碑<br>返回: `{ code, data: milestone }` |
+| `DELETE` | `/tasks/milestones/:id` | —（仅 `/mcp-full`） | 删除里程碑（级联清空关联任务的 `milestoneId`）<br>返回: `{ code, data: boolean }` |
+
+> **2026-10-20 工具面降级**：里程碑读侧原子工具（`task_controller_find_milestones` / `task_controller_find_milestone`）已从 worker（`/mcp`）面移除——**统一走上表 REST 端点**；`/mcp-full` 仍提供同名原子工具。
 
 > 任务绑定 milestones：`CreateTaskDto` 和 `BatchCreateTasksDto` 均支持 `milestoneId` 字段，创建时可直接绑定。也可创建后通过 `PATCH /tasks/:id { milestoneId: "xxx" }` 绑定。
 
@@ -285,11 +300,11 @@ POST /boards/lists/<list-id>/reorder
    POST /tasks { boardId, listId, title, description, priority: "p1", assigneeId: "<agent-uuid>" }
    // ⚠️ assigneeId 必须是纯 UUID（如 "00000000-0000-0000-0000-000000000000"），禁止带 "agent:" / "user:" 前缀！
 
-3. 拖拽移动任务（只改容器，不改状态）：
-   POST /tasks/:id/move { listId: "lst_done", order: 1 }
-   ⚠️ 注意：此时 task.status 仍然是原来的值！
+3. 拖拽移动任务（先读取目标列 mappedStatus）：
+   POST /tasks/:id/move { listId: "lst_done", order: 1 } // 若映射 done：同步 done/完成时间
+   POST /tasks/:id/move { listId: "lst_unmapped", order: 1 } // 未映射：原 status 保留
 
-4. 更新任务状态（这才是真正的状态变更）：
+4. 显式更新任务状态（未由 move 完成所需变更时）：
    PATCH /tasks/:id { status: "in_progress" }   // startedAt 自动设置
    PATCH /tasks/:id { status: "done" }          // completedAt 自动设置
 
@@ -352,10 +367,7 @@ POST /boards/lists/<list-id>/reorder
 
 6. 创建后再绑定/解绑：
    PATCH /tasks/<task-id> { milestoneId: "<milestone-id>" }  // 绑定
-   PATCH /tasks/<task-id> { milestoneId: null }                // 解绑
-
-6. 取消任务里程碑绑定：
-   PATCH /tasks/<task-id> { milestoneId: null }
+   PATCH /tasks/<task-id> { milestoneId: null }              // 解绑
 
 7. 里程碑状态变更（如 Sprint 结束）：
    PATCH /tasks/milestones/<milestone-id> { status: "completed" }
@@ -414,9 +426,9 @@ POST /boards/lists/<list-id>/reorder
 ```typescript
 // 创建看板
 interface CreateBoardDto {
-  name: string;               // 2-100 字符
-  description?: string;
-  topicId: string;           // 关联话题 ID（必填）           // 关联话题（可选）
+  name: string;               // 1-100 字符
+  description?: string;       // 看板图例（长 markdown，随 digest 全量送达），≤20000 字符
+  topicId?: string;          // 关联话题（可选）
   visibility?: "open" | "private";  // 可见性
   invitedAgentIds?: string[]; // 写 board_members 成员关系行（role='member'）；update 时按 diff 设定邀请集合
   lists?: {                   // 初始列列表（可选）
@@ -463,7 +475,7 @@ interface FindListTasksQuery {
 // 创建任务
 interface CreateTaskDto {
   boardId?: string;           // 与 listId 二选一（推荐传 listId）
-  listId: string;             // 放入哪个列（只是容器位置，不决定状态）
+  listId: string;             // 创建时选择容器；move 的映射联动另见 §3.8，勿据此推导创建合同
   title: string;              // 2-200 字符
   description?: string;       // 支持 Markdown，最大 5000 字符
   priority?: "p0" | "p1" | "p2" | "p3";
@@ -505,7 +517,7 @@ interface CreateMilestoneDto {
   targetDate?: string;        // ISO 8601
 }
 
-// 移动任务 — ⚠️ 只改 listId/position，不改 status！
+// 移动任务 — 未映射目标列只改位置，有 mappedStatus 时同步状态（§3.8）
 interface MoveTaskDto {
   listId: string;
   order?: number;             // 排序位置（创建时可选）
@@ -610,7 +622,7 @@ Board 的每一列（List）可以配置 `mappedStatus`。绑定后，**列和�
 | 触发方式 | 行为 |
 |---------|------|
 | `POST /tasks/:id/move` 到绑定列 | 任务状态自动同步为 mappedStatus |
-| `PATCH /tasks/:id { status }` | 任务自动吸附到对应 mappedStatus 的列 |
+| `PATCH /tasks/:id { status }` 实际改变状态 | 存在对应 mappedStatus 列时自动吸附；找不到只改状态 |
 
 **配置方式**：创建或更新列时传入 `mappedStatus`
 
@@ -632,6 +644,7 @@ PATCH /boards/lists/:id
 - 目标列 `mappedStatus = null` → 不联动（保持原有行为）
 - 目标列 `mappedStatus = "done"` → 任务状态变为 done，`completedAt` 自动设置
 - 目标列 `mappedStatus = "in_progress"` → 任务状态变为 in_progress，`startedAt` 自动设置（如果尚未设置）
+- move 离开 done → 清除 `completedAt`，与显式 PATCH 的状态时间规则一致
 - `PATCH status` 时找不到对应列 → 只改状态，不 move，不报错
 
 **为什么这样设计**：
@@ -708,9 +721,34 @@ GET /tasks?pageSize=20&limit=50  # ✅ pageSize 优先
 
 ---
 
-## 4. 语义化高层工具（platform-mcp）
+## 10. 语义化高层工具（platform-mcp）
 
-以下工具将多次原子调用编排为单次 MCP tool，减少 Agent 往返与上下文消耗。完整契约见 `docs/platform-mcp.md`。
+> 任务域的语义编排工具契约——将多次原子调用编排为单次 MCP tool，减少 Agent 往返与上下文消耗。错误统一 `isError:true + {error,failedStep,...}`；逐工具参数表另见线上 `docs/integrations/platform-mcp.md`。
+
+### `follow_up_task` — 任务跟进全景
+
+task 本体 + blockers + 最近评论（后两个并行）一次返回；task 本体 description 全文不截断（深入通道）。评论 content 截断 500 字符（`commentMaxLength` 可调、`0`=全文，逐条 `contentTruncated` 标记；全文走 `task_controller_get_comments`）。
+
+### `report_task_result` — 任务结果汇报（工作流最后一公里）
+
+后端单端点 `POST /tasks/:id/report`：（可选评论，支持附 commitSha）→ 改状态，一步完成。支持 `clientRequestId` 幂等键（同 key 重试返首次快照**不重复发评论**，同 key 不同 payload 409）；无 key 时状态步骤失败且本次已发评论 → REST 错误体 `data.commentPosted: true`（见此标记勿盲重试评论；MCP 工具层会把它归一到 `details.commentPosted`）。支持 `docIds` 参数：report 成功后批量关联文档回任务，单条失败内嵌 `docLinks.failed` 不拖垮主体（关联语义见 [`../docs/SKILL.md`](../docs/SKILL.md) §4）。
+
+### 任务纪律 hints（board 纪律族，task 响应运行期附挂）
+
+task 响应（`GET /tasks/:id` 等）可能携带 `hints[]`（**DTO 未声明该键，属运行期附挂**；形状与 DocSpace `DocHint` 同构）。四码都只在**真实写操作**后出现，**永不阻断写入、永不改变状态码**：
+
+| code | 出现时机 | 你该做什么 |
+|---|---|---|
+| `task_done_without_report` | 任务被改成 `done` 但**没有结果证据**（评论数 = 0 ∧ 无未软删的关联文档） | 补一条**结果评论**：`report_task_result`（可附 `commitSha`）；纯文档 / 研究任务附**文档指针**（`docIds` 或评论里给 path）。**有任意一条评论后本码永久不再提**——触发人群刻意窄，不是漏判 |
+| `task_dependents_pending` | 任务被改成 **`review` / `done`**，但**仍有未完成的下游任务依赖它**（`blocks` 类型；下游未 `done`/`archived` 且未软删） | 先 `GET /tasks/:id/dependents` 看下游全貌（含已完成任务与各 `dependencyType`，**口径比本码宽**——本码只看未完成的 `blocks` 下游；worker 面已无 `task_controller_find_dependents`）；**平台不会自动解除依赖、也不认定 `review` = 已交付**——依赖确已失效就用 `DELETE /tasks/:id/dependencies/:depId` 解除；已知悉直接忽略（`data.dependents` 回显前 3 条 `{id,title,status}`，`data.totalCount` 是全量） |
+| `comment_on_done_task` | 对**已完工**（`status=done`）的任务新增评论 | 若这条评论意味着**新增未完成工作** → 用 `PATCH /tasks/:id { status: "in_progress" }` **复活**任务；若只是验收补证 / 复盘留言 → **忽略本提示**（`report_task_result` 内部发的评论已被平台豁免，不会触发本码） |
+| `task_near_duplicate_suspected` | **创建任务**时，本板已存在标题归一化后相同的 open 任务（`done`/`archived`/软删不算） | 先判断是不是同一件事的第二张卡：是 → `task_controller_add_dependency { type: "duplicates" }` 关联并考虑只保留一张；只是相关而非同一件事 → `relates_to`；确认非重复（如系列任务）→ **忽略本提示**。`data.matches` 回显 ≤3 条 `{id,title,status,sameBatch,matchedBy}`：`sameBatch:true` = 撞的是**本批 batchCreate 刚建的**那张（不是历史卡）；`matchedBy:'tier1'` = 归一化完全相同（硬命中），`'tier2a'` = 仅装饰前缀不同（软命中，如「Bug」X vs X） |
+
+> 四码去重窗口均为 6h；`task_dependents_pending` 的去重键带 `toStatus` ⇒ **`review` → `done` 两跳各提一次**，而同一状态 6h 内「done → 挪回 → 再 done」第二次不再提（防疲劳的刻意漏报）。`task_near_duplicate_suspected` 的去重键 = 新 taskId（每次创建天然只提一次）；**幂等重放（同 clientRequestId）的响应不带 hints**——只见重放响应时你不知道曾有过提示。
+
+### `patch_task_description` — 任务描述局部写
+
+**多 Agent 并发改描述首选**（替代整段 PATCH 全量覆盖）：`match` 精确串替换（0 命中 404 / >1 命中 409 + `matchCount`，扩大上下文重试）+ `expectedDescriptionHash` 乐观锁（findOne 响应带 `descriptionHash`，不符 409 + `currentDescriptionHash`）+ `clientRequestId` 幂等。
 
 ### `create_task` — 语义化建任务
 
@@ -724,7 +762,9 @@ create_task({ boardId, title, status?: "backlog", assigneeName?, ... })
 ```
 
 - 消歧契约：解析失败（0 候选 / 多候选）返回 `isError:true` + 结构化候选信息，**绝不静默挑选**
-- 幂等键尚未支持（E2），重试可能产生重复任务
+- **幂等键已支持**：传 `clientRequestId` 后同 key 重试返回首次快照（`idempotentReplay:true`）**不产生重复任务**；不传时工具会显式警告「重试可能产生重复任务」
+- **撞重提示**：创建后响应可能带 `task_near_duplicate_suspected` hint（本板已有同标题 open 任务）——判读与处置见上文「任务纪律 hints」表；**系列任务（批量任务1/2、【P0】/【P1】、「前端」/「后端」）不会触发**，放心按系列建
+- **里程碑归派**：`create_task` 不支持 `milestoneId`——建任务后用 `task_controller_update` 补挂，或直接 `task_controller_batch_create`（支持 `milestoneId`）
 
 ### `batch_get_tasks` — 批量任务详情
 
@@ -738,3 +778,15 @@ batch_get_tasks({ ids: string[] })
 - 非法 UUID 本地短路不发起 HTTP
 - 单条 HTTP 失败不拖垮整体
 - 输出保持入参顺序
+- 默认 `slim=true` 投影（白名单字段 + `descriptionSnippet`≤300 字符截断并打 `descriptionTruncated` 标记）；`slim:false` 返回完整 TaskDetail
+
+---
+
+## 相关文档
+
+- [`../SKILL.md`](../SKILL.md) — 平台总入口（认证 / Actor 模型 / MCP 接入 / 模块导航）
+- [`../topics/SKILL.md`](../topics/SKILL.md) — 话题（看板关联话题侧）
+- [`../docs/SKILL.md`](../docs/SKILL.md) — 文档知识库（doc-links 的文档侧）
+- [`../memory/SKILL.md`](../memory/SKILL.md) — 记忆模块（board 可作记忆项目绑定）
+
+> **维护触发器**：看板/任务端点、权限模型、状态机、语义工具任一变更 → 回本文件同步（事实源以线上 api-definition 与实时 API schema 为准）；本文件只写现行版本行为，历史变更归 git log 与 release notes。

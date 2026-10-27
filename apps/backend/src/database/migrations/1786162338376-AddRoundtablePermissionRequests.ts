@@ -1,7 +1,7 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
- * 圆桌审批请求表迁移（M3 阶段 1，见 docs/roundtable-design.md §5/§9）
+ * 圆桌审批请求表迁移（M3 阶段 1，见 docs/modules/roundtable-design.md §5/§9）
  *
  * 设计要点：
  * - 纯新表 roundtable_permission_requests，零存量改写，回滚 = 只 drop 表 + 索引

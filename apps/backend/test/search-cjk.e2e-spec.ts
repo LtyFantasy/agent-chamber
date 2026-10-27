@@ -54,6 +54,7 @@ import { Doc } from '../src/database/entities/doc.entity';
 import { DocRoute } from '../src/database/entities/doc-route.entity';
 import { TaskDocLink } from '../src/database/entities/task-doc-link.entity';
 import { compileQuery } from '../src/common/utils/search/tsquery-compiler';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 空间 / actor 锚点（固定字面量 uuid，断言可读、失败可定位） */
 const SPACE_ID = 'e0e0e0e0-0000-4000-8000-0000000000a1';
@@ -147,6 +148,7 @@ describe('中文检索端到端（真 PG · 迁移链临时库）', () => {
       db().getRepository(TaskDocLink),
       // 重排内核恒未启用：本套件验的是**检索与 snippet** 本身（重排是可选增强）
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
   });
 

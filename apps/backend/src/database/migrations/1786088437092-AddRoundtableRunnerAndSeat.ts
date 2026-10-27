@@ -1,7 +1,7 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
- * 圆桌 runner / 座位两表迁移（M1 提前落地，见 docs/roundtable-design.md §5/§9）
+ * 圆桌 runner / 座位两表迁移（M1 提前落地，见 docs/modules/roundtable-design.md §5/§9）
  *
  * 设计要点：
  * - 纯新表：roundtable_runners + roundtable_seats，零存量改写，回滚 = 只 drop 两表 + 索引

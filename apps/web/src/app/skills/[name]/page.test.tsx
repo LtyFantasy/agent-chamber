@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import SkillDetailPage from './page';
 import { Api } from '@/lib/api';
@@ -87,9 +87,10 @@ const subsFixture = [
   },
 ];
 
-function renderPage() {
+function renderPage(
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   // retry: false —— 查询失败立即进入 isError，避免默认 3 次重试拖慢断言
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <SkillDetailPage />
@@ -159,13 +160,49 @@ describe('SkillDetailPage', () => {
   });
 
   it('Skill 不存在时渲染 404 提示', async () => {
-    mockApi.get.mockRejectedValue(new Error('not found'));
+    mockApi.get.mockRejectedValue({ response: { status: 404 } });
 
     renderPage();
 
     await waitFor(() => {
       expect(screen.getByText('Skill not found')).toBeInTheDocument();
     });
+  });
+
+  it('网络失败不是404，重试只恢复主资源', async () => {
+    mockApi.get.mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    const retry = await screen.findByRole('button', { name: 'common.retry' });
+    expect(screen.queryByText('Skill not found')).not.toBeInTheDocument();
+    mockApi.get.mockResolvedValue(skillFixture);
+    fireEvent.click(retry);
+    expect(await screen.findByText(/# Main Skill Content/)).toBeInTheDocument();
+  });
+
+  it('后台失败保留主内容与选择的子内容', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderPage(client);
+    fireEvent.click(await screen.findByRole('button', { name: /topics/ }));
+    await screen.findByText(/# Topics Sub Content/);
+    mockApi.get.mockRejectedValue(new Error('Network Error'));
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['skills', 'detail'] });
+    });
+    expect(await screen.findByRole('status')).toBeInTheDocument();
+    expect(screen.getByText(/# Topics Sub Content/)).toBeInTheDocument();
+  });
+
+  it('子内容初错可局部重试，未选择时不发请求', async () => {
+    mockApi.getSub.mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    await screen.findByText(/# Main Skill Content/);
+    expect(mockApi.getSub).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /topics/ }));
+    const retry = await screen.findByRole('button', { name: 'common.retry' });
+    mockApi.getSub.mockResolvedValue({ content: 'Recovered child' });
+    fireEvent.click(retry);
+    expect(await screen.findByText('Recovered child')).toBeInTheDocument();
+    expect(mockApi.get).toHaveBeenCalledTimes(1);
   });
 
   it('复制的安装命令显式传 -n（非默认 skill 不会被装错目录）', async () => {

@@ -1,5 +1,5 @@
 /**
- * 注入消息体（r3 冻结 schema）与沉默哨兵测试（docs/roundtable-design.md §4）
+ * 注入消息体（r3 冻结 schema）与沉默哨兵测试（docs/modules/roundtable-design.md §4）
  */
 import {
   assembleInjectBody,

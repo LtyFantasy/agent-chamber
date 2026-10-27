@@ -22,6 +22,8 @@ const MAIN_SEARCH_THRESHOLD = 8;
  * 三段式布局（R4）：SheetContent 内 flex flex-col h-full，滚动区 flex-1 overflow-y-auto，
  * footer shrink-0 border-t——主操作（邀请成员 / 确认邀请）永远可达，根治移动端沉底。
  *
+ * 读取失败反馈经 feedbackSlot 常驻于两个视图；topSlot 的座位管理仍只属于主视图。
+ * 权威合同：DocSpace Agent Chamber / docs/frontend/frontend-architecture.md §12。
  * 组件纯受控：不发自家请求；视图状态机 / 选择集 / 搜索词是内部 state，其余数据全走 props。
  * 视图重置（R4）：Sheet 关闭（onOpenChange(false)）→ 回主视图 + 清空选择，再打开永远是主视图。
  * 邀请提交（R2）：await onInvite —— 全成功 → 切回主视图 + 清空选择；任一失败 → 留在
@@ -43,6 +45,7 @@ export function MembersSheet({
   onCancelInvite,
   renderRowExtra,
   topSlot,
+  feedbackSlot,
   inviting,
 }: MembersSheetProps) {
   const t = useTranslations('members');
@@ -116,142 +119,150 @@ export function MembersSheet({
 
   return (
     <Sheet open={open} onOpenChange={handleOpenChange}>
-      {view === 'main' ? (
-        <div className="flex h-full flex-col">
-          {/* 头部（shrink-0）：topSlot + 标题/计数 + 搜索（≥8 活跃成员才渲染） */}
-          <div className="shrink-0 space-y-3">
-            {topSlot}
-            <SheetHeader className="pr-8">
-              <SheetTitle>{labels.title}</SheetTitle>
-              <SheetDescription data-testid="members-count">{countSummary}</SheetDescription>
-            </SheetHeader>
-            {showMainSearch && (
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  type="text"
-                  value={mainQuery}
-                  onChange={(e) => setMainQuery(e.target.value)}
-                  placeholder={t('searchMembers')}
-                  className="pl-9"
-                  data-testid="members-search"
-                />
-              </div>
-            )}
-          </div>
-
-          {/* 唯一滚动区（flex-1 overflow-y-auto）：成员列表 / 空态 / 已邀请区 */}
-          <div className="mt-3 flex-1 overflow-y-auto pr-1">
-            {members.length === 0 ? (
-              /* 空态：统一虚线框 + 引导文案（指向底部邀请按钮） */
-              <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                <p>{t('emptyTitle')}</p>
-                <p className="mt-1">{t('emptyDesc')}</p>
-              </div>
-            ) : filteredMembers.length === 0 ? (
-              <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-                {t('noSearchResults')}
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {filteredMembers.map((member) => (
-                  <MemberRow
-                    key={member.actorId}
-                    member={member}
-                    labels={labels}
-                    capabilities={capabilities}
-                    onRemove={onRemove}
-                    onChangeRole={onChangeRole}
-                    onTransferCreator={onTransferCreator}
-                    renderRowExtra={renderRowExtra}
-                  />
-                ))}
-              </div>
-            )}
-
-            {/* 已邀请区（仅 topic 传 invited）：有内容才显示、可折叠默认展开；
-                取消邀请 X 单次点击不加确认（对象尚未成为成员，误点可重邀——有意设计） */}
-            {invited && invited.length > 0 && (
-              <div className="mt-4">
-                <button
-                  type="button"
-                  data-testid="invited-toggle"
-                  aria-expanded={invitedOpen}
-                  onClick={() => setInvitedOpen((v) => !v)}
-                  className="flex items-center gap-1 text-sm font-medium text-foreground"
-                >
-                  <ChevronDown
-                    className={cn('h-4 w-4 transition-transform', invitedOpen ? '' : '-rotate-90')}
-                  />
-                  {t('invitedSection', { count: invited.length })}
-                </button>
-                {invitedOpen && (
-                  <div className="mt-2 space-y-2">
-                    {invited.map((m) => (
-                      <div
-                        key={m.actorId}
-                        data-testid={`invited-row-${m.actorId}`}
-                        className="flex items-center gap-3 rounded-lg border p-2.5"
-                      >
-                        <Avatar
-                          src={m.avatarUrl ?? undefined}
-                          fallback={m.name}
-                          size="sm"
-                          actorType={m.actorType}
-                          seed={m.actorId}
-                        />
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-medium">{m.name}</p>
-                          <p className="truncate text-xs text-muted-foreground">
-                            {labels.typeLabels[m.actorType] ?? m.actorType} ·{' '}
-                            {labels.roleLabels[m.role] ?? m.role}
-                          </p>
-                        </div>
-                        {capabilities.cancelInvite && (
-                          <button
-                            type="button"
-                            data-testid={`cancel-invite-${m.actorId}`}
-                            aria-label={t('cancelInviteAria', { name: m.name })}
-                            onClick={() => onCancelInvite?.(m.actorId)}
-                            className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                          >
-                            <X className="h-4 w-4" />
-                          </button>
-                        )}
-                      </div>
-                    ))}
+      <div className="flex h-full flex-col">
+        <div className="shrink-0">{feedbackSlot}</div>
+        <div className="min-h-0 flex-1">
+          {view === 'main' ? (
+            <div className="flex h-full flex-col">
+              {/* 头部（shrink-0）：topSlot + 标题/计数 + 搜索（≥8 活跃成员才渲染） */}
+              <div className="shrink-0 space-y-3">
+                {topSlot}
+                <SheetHeader className="pr-8">
+                  <SheetTitle>{labels.title}</SheetTitle>
+                  <SheetDescription data-testid="members-count">{countSummary}</SheetDescription>
+                </SheetHeader>
+                {showMainSearch && (
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      type="text"
+                      value={mainQuery}
+                      onChange={(e) => setMainQuery(e.target.value)}
+                      placeholder={t('searchMembers')}
+                      className="pl-9"
+                      data-testid="members-search"
+                    />
                   </div>
                 )}
               </div>
-            )}
-          </div>
 
-          {/* sticky footer（shrink-0 border-t）：全宽「邀请成员」主按钮——根治移动端入口沉底 */}
-          {capabilities.invite !== false && (
-            <div className="shrink-0 border-t p-3">
-              <Button
-                type="button"
-                className="w-full"
-                onClick={() => setView('invite')}
-                data-testid="open-invite"
-              >
-                <UserPlus className="mr-1 h-4 w-4" />
-                {t('invite')}
-              </Button>
+              {/* 唯一滚动区（flex-1 overflow-y-auto）：成员列表 / 空态 / 已邀请区 */}
+              <div className="mt-3 flex-1 overflow-y-auto pr-1">
+                {members.length === 0 ? (
+                  /* 空态：统一虚线框 + 引导文案（指向底部邀请按钮） */
+                  <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+                    <p>{t('emptyTitle')}</p>
+                    <p className="mt-1">{t('emptyDesc')}</p>
+                  </div>
+                ) : filteredMembers.length === 0 ? (
+                  <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+                    {t('noSearchResults')}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {filteredMembers.map((member) => (
+                      <MemberRow
+                        key={member.actorId}
+                        member={member}
+                        labels={labels}
+                        capabilities={capabilities}
+                        onRemove={onRemove}
+                        onChangeRole={onChangeRole}
+                        onTransferCreator={onTransferCreator}
+                        renderRowExtra={renderRowExtra}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                {/* 已邀请区（仅 topic 传 invited）：有内容才显示、可折叠默认展开；
+                取消邀请 X 单次点击不加确认（对象尚未成为成员，误点可重邀——有意设计） */}
+                {invited && invited.length > 0 && (
+                  <div className="mt-4">
+                    <button
+                      type="button"
+                      data-testid="invited-toggle"
+                      aria-expanded={invitedOpen}
+                      onClick={() => setInvitedOpen((v) => !v)}
+                      className="flex items-center gap-1 text-sm font-medium text-foreground"
+                    >
+                      <ChevronDown
+                        className={cn(
+                          'h-4 w-4 transition-transform',
+                          invitedOpen ? '' : '-rotate-90',
+                        )}
+                      />
+                      {t('invitedSection', { count: invited.length })}
+                    </button>
+                    {invitedOpen && (
+                      <div className="mt-2 space-y-2">
+                        {invited.map((m) => (
+                          <div
+                            key={m.actorId}
+                            data-testid={`invited-row-${m.actorId}`}
+                            className="flex items-center gap-3 rounded-lg border p-2.5"
+                          >
+                            <Avatar
+                              src={m.avatarUrl ?? undefined}
+                              fallback={m.name}
+                              size="sm"
+                              actorType={m.actorType}
+                              seed={m.actorId}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-medium">{m.name}</p>
+                              <p className="truncate text-xs text-muted-foreground">
+                                {labels.typeLabels[m.actorType] ?? m.actorType} ·{' '}
+                                {labels.roleLabels[m.role] ?? m.role}
+                              </p>
+                            </div>
+                            {capabilities.cancelInvite && (
+                              <button
+                                type="button"
+                                data-testid={`cancel-invite-${m.actorId}`}
+                                aria-label={t('cancelInviteAria', { name: m.name })}
+                                onClick={() => onCancelInvite?.(m.actorId)}
+                                className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                              >
+                                <X className="h-4 w-4" />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* sticky footer（shrink-0 border-t）：全宽「邀请成员」主按钮——根治移动端入口沉底 */}
+              {capabilities.invite !== false && (
+                <div className="shrink-0 border-t p-3">
+                  <Button
+                    type="button"
+                    className="w-full"
+                    onClick={() => setView('invite')}
+                    data-testid="open-invite"
+                  >
+                    <UserPlus className="mr-1 h-4 w-4" />
+                    {t('invite')}
+                  </Button>
+                </div>
+              )}
             </div>
+          ) : (
+            <InvitePanel
+              candidates={candidates}
+              humanCandidates={humanCandidates}
+              selectedIds={selectedIds}
+              onToggle={handleToggle}
+              onBack={handleBack}
+              onSubmit={() => void handleInvite()}
+              inviting={inviting}
+            />
           )}
         </div>
-      ) : (
-        <InvitePanel
-          candidates={candidates}
-          humanCandidates={humanCandidates}
-          selectedIds={selectedIds}
-          onToggle={handleToggle}
-          onBack={handleBack}
-          onSubmit={() => void handleInvite()}
-          inviting={inviting}
-        />
-      )}
+      </div>
     </Sheet>
   );
 }

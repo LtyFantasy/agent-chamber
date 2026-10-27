@@ -22,6 +22,19 @@ import type { ExperienceCheckInput } from '../experience/judgment/judgment-rubri
 import { buildTypesafeSystemoneUrl } from './judgment.transport';
 import { TypeSafeJudgmentProvider } from './typesafe.judgment-provider';
 
+/**
+ * undici 自带 fetch 的 mock（代理路径专用——transport 在配 proxyUrl 时切到 undici fetch，
+ * 直连仍走全局 fetch；两条 fetch 路径分别 mock，互不污染）。
+ *
+ * 用 `jest.requireActual` 保留 ProxyAgent 等真实导出（dispatcher 实例断言依赖真构造器），
+ * 只把 `fetch` 换成可控 mock。
+ */
+const undiciFetchMock = jest.fn();
+jest.mock('undici', () => {
+  const actual = jest.requireActual('undici') as Record<string, unknown>;
+  return { ...actual, fetch: (...args: unknown[]) => undiciFetchMock(...args) };
+});
+
 const BASE_URL = 'https://api.typesafe.test/';
 /** 合成假 key（前缀是公开形态，后缀全合成；绝不含真实 Key 任何连续片段） */
 const API_KEY = 'apikey_' + 'A1b2c3d4e5'.repeat(4);
@@ -128,6 +141,7 @@ describe('TypeSafeJudgmentProvider', () => {
 
   beforeEach(() => {
     fetchMock = jest.fn();
+    undiciFetchMock.mockReset();
     (globalThis as { fetch: unknown }).fetch = fetchMock;
     provider = new TypeSafeJudgmentProvider({
       baseUrl: BASE_URL,
@@ -174,6 +188,34 @@ describe('TypeSafeJudgmentProvider', () => {
       expect(outcome.request.model).toBe(REQUEST_MODEL);
       expect(Object.keys(outcome.request).sort()).toEqual(['model', 'questions', 'state']);
       expectNoLeak(outcome);
+    });
+
+    it('专用出口代理：配了 proxyUrl ⇒ undici fetch init 带 dispatcher（同 URL 缓存复用）；未配 ⇒ 全局 fetch 无 dispatcher 字段', async () => {
+      fetchMock.mockResolvedValue(new Response(officialPayload(), { status: 200 }));
+      await provider.run(experienceRecordCheckCapability, INPUT);
+      const directInit = fetchMock.mock.calls[0] as [string, RequestInit];
+      // 未配置 = 直连：走全局 fetch、init 不得带 dispatcher 字段（走全局默认调度器）
+      expect('dispatcher' in (directInit[1] as object)).toBe(false);
+      expect(undiciFetchMock).not.toHaveBeenCalled();
+
+      const proxied = new TypeSafeJudgmentProvider({
+        baseUrl: BASE_URL,
+        apiKey: API_KEY,
+        model: REQUEST_MODEL,
+        timeoutMs: 8000,
+        proxyUrl: 'http://127.0.0.1:8001',
+      });
+      // 配了 proxyUrl = 代理路径走 undici 自带 fetch（与 ProxyAgent 同版配对，见 transport 文件头）
+      undiciFetchMock.mockResolvedValue(new Response(officialPayload(), { status: 200 }));
+      await proxied.run(experienceRecordCheckCapability, INPUT);
+      await proxied.run(experienceRecordCheckCapability, INPUT);
+      // 全局 fetch 一次没调（代理流量不打直连通道）
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const first = undiciFetchMock.mock.calls[0] as [string, RequestInit & { dispatcher?: unknown }];
+      const second = undiciFetchMock.mock.calls[1] as [string, RequestInit & { dispatcher?: unknown }];
+      expect(first[1].dispatcher).toBeDefined();
+      // ProxyAgent 进程内缓存：同一代理 URL 的两次判定复用同一 dispatcher（连接池不失效）
+      expect(second[1].dispatcher).toBe(first[1].dispatcher);
     });
 
     it('ok：七维归一化 + **快照 model 取响应自报**（≠ 请求模型）', async () => {

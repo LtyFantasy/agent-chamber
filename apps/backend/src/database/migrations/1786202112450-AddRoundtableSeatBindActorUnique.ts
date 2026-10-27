@@ -1,7 +1,7 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
- * 圆桌座位「一 agent 一 topic 一 active 座位」唯一约束（r17 拍板，docs/roundtable-design.md §12）
+ * 圆桌座位「一 agent 一 topic 一 active 座位」唯一约束（r17 拍板，docs/modules/roundtable-design.md §12）
  *
  * 背景：r17 身份粒度定稿——一个 agent ≈ 一个 workspace 身份，「同 actor 同桌多座位」方案
  * 废除；一个 agent 在一张 topic 里只能有一个 active 座位（removed 软删豁免：移除后可重建）。

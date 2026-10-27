@@ -61,6 +61,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Api } from '@/lib/api';
+import { errorMessageOf } from '@/lib/error-message';
 import { confirm } from '@/lib/notify';
 import { useNotificationStore } from '@/stores/notification.store';
 import { Visibility } from '@/types';
@@ -464,10 +465,7 @@ export function ImportBundleDialog({
       setPhase('done');
       onImported();
     } catch (err) {
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      setImportErrorMessage(
-        axiosErr?.response?.data?.message || axiosErr?.message || t('error.fallback'),
-      );
+      setImportErrorMessage(errorMessageOf(err, t('error.fallback')));
       setPhase('error');
     }
   }, [bundle, onImported, overwriteSpaceMeta, spaceId, t]);

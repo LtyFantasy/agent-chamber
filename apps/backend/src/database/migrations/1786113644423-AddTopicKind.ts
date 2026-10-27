@@ -1,7 +1,7 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
- * topics 表增列 kind（圆桌 M2 阶段 1，见 docs/roundtable-design.md §5）
+ * topics 表增列 kind（圆桌 M2 阶段 1，见 docs/modules/roundtable-design.md §5）
  *
  * 设计要点：
  * - 单列表加列：`kind varchar NOT NULL DEFAULT 'normal'`，存量行零感知（迁移兼容铁律：

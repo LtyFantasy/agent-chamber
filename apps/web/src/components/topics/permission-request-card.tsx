@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页消息流——审批裁决卡片）
- *   - 补充: docs/roundtable-design.md §6（审批可见性/裁决）+ docs/api-definition.md §7a
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页消息流——审批裁决卡片）
+ *   - 补充: docs/modules/roundtable-design.md §6（审批可见性/裁决）+ docs/api-definition.md §7a
  *
  * [踩坑索引]
  *   - tool/options 是 jsonb 原样透传，**形状未冻结**：tool 宽松读 name/title 兜底

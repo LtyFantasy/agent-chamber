@@ -58,6 +58,8 @@ export class AddAgentHeartbeatUniqueAgentId1788439433261 implements MigrationInt
   public async down(queryRunner: QueryRunner): Promise<void> {
     // 恢复非唯一索引（可逆；重复 agent_id 的写入路径在 revert 后重新放开，属预期）
     await queryRunner.query(`DROP INDEX "public"."IDX_f53c992915f2952916e0b73b03"`);
-    await queryRunner.query(`CREATE INDEX "IDX_f53c992915f2952916e0b73b03" ON "agent_heartbeats" ("agent_id") `);
+    await queryRunner.query(
+      `CREATE INDEX "IDX_f53c992915f2952916e0b73b03" ON "agent_heartbeats" ("agent_id") `,
+    );
   }
 }

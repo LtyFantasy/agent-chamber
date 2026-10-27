@@ -8,10 +8,11 @@
  * 文案断言用 en.json 快照；Api/auth store 全 mock（页面级测试不触网络）。
  */
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import TopicsPage from './page';
 import { Api } from '@/lib/api';
+import { useNotificationStore } from '@/stores/notification.store';
 
 /** topics/common 命名空间英语文案快照（同 en.json；未收录键回落为 key 本身） */
 const messages: Record<string, string> = {
@@ -52,8 +53,16 @@ const messages: Record<string, string> = {
   'topics.form.attachmentTtl7d': '7 days (default)',
   'topics.form.attachmentTtl30d': '30 days',
   'topics.form.attachmentTtlNever': 'Never expire',
+  'topics.loadErrorTitle': 'Failed to load topics',
+  'topics.loadErrorDesc': 'Check your connection and try again.',
+  'topics.noTopics': 'No topics',
+  'topics.noTopicsDesc': 'Create your first topic',
+  'topics.createError': 'Failed to create the topic. Please try again.',
+  'topics.updateError': 'Failed to update the topic. Please try again.',
+  'topics.deleteError': 'Failed to delete the topic. Please try again.',
   'common.cancel': 'Cancel',
   'common.save': 'Save',
+  'common.retry': 'Retry',
 };
 
 jest.mock('next-intl', () => ({
@@ -101,6 +110,7 @@ jest.mock('@/stores/auth.store', () => ({
 const mockList = Api.topics.list as jest.Mock;
 const mockGetUnread = Api.topics.getUnread as jest.Mock;
 const mockCreate = Api.topics.create as jest.Mock;
+const mockDelete = Api.topics.delete as jest.Mock;
 const mockUpdate = Api.topics.update as jest.Mock;
 const mockGetById = Api.topics.getById as jest.Mock;
 
@@ -130,11 +140,14 @@ function renderPage() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <TopicsPage />
     </QueryClientProvider>,
   );
+  // 连 client 一起返回：R-2 用例要断言「刷新真的失败了（isError）但旧 data 仍在」——
+  // 只靠界面断言无法区分"没失败"与"失败但被判据正确拦住"（鉴别力靠 isError 这一句）
+  return { ...view, queryClient };
 }
 
 beforeEach(() => {
@@ -167,8 +180,11 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
       target: { value: '新话题' },
     });
     // footer 提交钮（dialog 内第二个 Create Topic 按钮）
-    const buttons = screen.getAllByRole('button', { name: 'Create Topic' });
-    fireEvent.click(buttons[buttons.length - 1]);
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
 
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     // mutationFn 第一参数是表单 payload（第二参数是 react-query 内部选项，不断言）
@@ -199,8 +215,11 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
     fireEvent.change(screen.getByPlaceholderText('Topic title'), {
       target: { value: '圆桌测试' },
     });
-    const buttons = screen.getAllByRole('button', { name: 'Create Topic' });
-    fireEvent.click(buttons[buttons.length - 1]);
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
 
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     expect(mockCreate.mock.calls[0][0]).toEqual(
@@ -223,8 +242,11 @@ describe('创建 dialog kind 分支（v1.49.0）', () => {
     fireEvent.change(screen.getByPlaceholderText('Topic title'), {
       target: { value: '圆桌测试' },
     });
-    const buttons = screen.getAllByRole('button', { name: 'Create Topic' });
-    fireEvent.click(buttons[buttons.length - 1]);
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
 
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     expect(mockCreate.mock.calls[0][0]).toEqual(
@@ -265,8 +287,11 @@ describe('附件有效期下拉（v1.90.0-dev 附件 TTL 批 §2 B3.5）', () =>
     fireEvent.change(screen.getByPlaceholderText('Topic title'), {
       target: { value: '永久附件桌' },
     });
-    const buttons = screen.getAllByRole('button', { name: 'Create Topic' });
-    fireEvent.click(buttons[buttons.length - 1]);
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
 
     await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
     expect(mockCreate.mock.calls[0][0]).toEqual(
@@ -286,8 +311,11 @@ describe('附件有效期下拉（v1.90.0-dev 附件 TTL 批 §2 B3.5）', () =>
     await screen.findByText('圆桌会议');
 
     // 第一张卡片的铅笔（卡片操作区第一个按钮）
-    const allButtons = screen.getAllByRole('button');
-    fireEvent.click(allButtons[1]);
+    fireEvent.click(
+      within(screen.getByRole('link', { name: /普通话题/ })).getByRole('button', {
+        name: 'common.edit',
+      }),
+    );
 
     const select = (await screen.findByTestId('edit-attachment-ttl')) as HTMLSelectElement;
     await waitFor(() => expect(select).toHaveValue('30d'));
@@ -307,9 +335,205 @@ describe('附件有效期下拉（v1.90.0-dev 附件 TTL 批 §2 B3.5）', () =>
     renderPage();
     await screen.findByText('圆桌会议');
 
-    fireEvent.click(screen.getAllByRole('button')[1]);
+    fireEvent.click(
+      within(screen.getByRole('link', { name: /普通话题/ })).getByRole('button', {
+        name: 'common.edit',
+      }),
+    );
 
     const select = (await screen.findByTestId('edit-attachment-ttl')) as HTMLSelectElement;
     await waitFor(() => expect(select).toHaveValue('7d'));
   });
+});
+
+describe('TopicsPage 错误态与 mutation 失败提示（卡 240c74d6）', () => {
+  beforeEach(() => {
+    // toast 断言直读通知 store；清空避免用例间串味
+    useNotificationStore.setState({ toasts: [], alerts: [] });
+  });
+
+  it('首载失败（500）→ 可见错误态 + 重试按钮；文案走本地兜底（不显示 5xx 服务端措辞）', async () => {
+    mockList.mockRejectedValue({
+      response: { status: 500, data: { code: 500, message: 'QueryFailedError: relation "x"' } },
+    });
+    renderPage();
+
+    expect(await screen.findByTestId('topics-list-error')).toBeInTheDocument();
+    expect(screen.getByText('Failed to load topics')).toBeInTheDocument();
+    expect(screen.getByText('Check your connection and try again.')).toBeInTheDocument();
+    expect(screen.queryByText('QueryFailedError: relation "x"')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    // 失败不得与空态混成一个样子（否则用户读到的是"没有话题"）
+    expect(screen.queryByText('No topics')).not.toBeInTheDocument();
+  });
+
+  it('断网（无 response）→ 错误态；4xx + 业务码 → 透传服务端 message', async () => {
+    mockList.mockRejectedValue(new Error('Network Error'));
+    const { unmount } = renderPage();
+    expect(await screen.findByTestId('topics-list-error')).toBeInTheDocument();
+    expect(screen.queryByText('Network Error')).not.toBeInTheDocument();
+    unmount();
+
+    mockList.mockRejectedValue({
+      response: { status: 403, data: { code: 1009, message: 'you are not in this topic' } },
+    });
+    renderPage();
+    expect(await screen.findByText('you are not in this topic')).toBeInTheDocument();
+  });
+
+  it('创建失败（断网）→ toast 兜底文案，不出现 axios 英文原文', async () => {
+    mockCreate.mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Topic' }));
+
+    fireEvent.change(screen.getByPlaceholderText('Topic title'), { target: { value: '新话题' } });
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
+
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      const toasts = useNotificationStore.getState().toasts;
+      expect(toasts).toHaveLength(1);
+      expect(toasts[0].title).toBe('Failed to create the topic. Please try again.');
+      expect(toasts[0].title).not.toContain('Network Error');
+      expect(toasts[0].variant).toBe('error');
+    });
+  });
+
+  it('创建失败（4xx 业务原因）→ toast 透传服务端 message', async () => {
+    mockCreate.mockRejectedValue({
+      response: { status: 400, data: { code: 9000, message: 'title should not be empty' } },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Topic' }));
+
+    fireEvent.change(screen.getByPlaceholderText('Topic title'), { target: { value: '空标题' } });
+    fireEvent.click(
+      within(
+        screen.getByRole('heading', { name: 'Create Topic' }).parentElement!.parentElement!,
+      ).getByRole('button', { name: 'Create Topic' }),
+    );
+
+    await waitFor(() => {
+      expect(useNotificationStore.getState().toasts[0]?.title).toBe('title should not be empty');
+    });
+  });
+
+  it('编辑入口的详情拉取失败 → toast（不再是被吞掉的未处理 Promise 拒绝）', async () => {
+    mockGetById.mockRejectedValue(new Error('Network Error'));
+    renderPage();
+    await screen.findByText('圆桌会议');
+
+    // 第一张卡片的铅笔
+    fireEvent.click(
+      within(screen.getByRole('link', { name: /普通话题/ })).getByRole('button', {
+        name: 'common.edit',
+      }),
+    );
+
+    await waitFor(() => {
+      const toasts = useNotificationStore.getState().toasts;
+      expect(toasts).toHaveLength(1);
+      expect(toasts[0].title).toBe('Check your connection and try again.');
+    });
+    // 编辑 dialog 不该被打开（没有详情可编辑）
+    expect(screen.queryByTestId('edit-attachment-ttl')).not.toBeInTheDocument();
+  });
+
+  // ── R-2 鉴别性用例（reviewer M1）─────────────────────────────────────────────
+  // 上面各条都只在「刷新失败**且从未成功过**」下验证错误态：把判据从
+  // `isError && data === undefined` 改成 `topics.length === 0` 后照样全绿——即无人能拦住
+  // 这个回归。本条走 memory 页 R-2 的形态：**首载成功但列表为空 → refetch 失败**，断言空态
+  // （含创建 CTA）不被错误态接管（零话题用户正是空态入口的主目标）。
+  it('R-2 零话题用户：首载成功但列表为空 → refetch 失败 ⇒ 空态不被错误态接管', async () => {
+    mockList.mockResolvedValueOnce({ items: [], total: 0 });
+    const { queryClient, rerender } = renderPage();
+    /** 重渲染用工厂：每次返回**新元素对象**——复用同一个 element 对象会被 React 直接
+        bailout 跳过重渲染，那等于没重渲染（实测过的坑，见下方注释） */
+    const renderTree = () => (
+      <QueryClientProvider client={queryClient}>
+        <TopicsPage />
+      </QueryClientProvider>
+    );
+    expect(await screen.findByText('No topics')).toBeInTheDocument();
+
+    mockList.mockRejectedValue(new Error('Network Error'));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: ['topics', 'list'] });
+    });
+    // ⚠️ **显式重渲染（且必须是新元素对象）**：RQ 把失败通知投递给 observer 是**异步调度**的
+    // （实测通知落不落地取决于并发时序，单跑/合跑结果都不同），直接读 DOM 会读到上一帧——
+    // 那样把判据改回 `topics.length === 0` 也照样"通过"。而 `rerender(同一个 element 对象)`
+    // 会被 React bailout 跳过 ⇒ 同样读不到新判据。二者叠加就是本用例鉴别力的全部来源。
+    rerender(renderTree());
+
+    // 先证明"刷新真的失败了且旧 data 仍在"——否则本用例可能只是没跑到那条分支
+    const state = queryClient.getQueryState(['topics', 'list']);
+    // QueryState 上没有 isError（那是 observer 结果上的派生布尔），状态机字段是 status
+    expect(state?.status).toBe('error');
+    expect(state?.data).toEqual({ items: [], total: 0 });
+
+    // R-2：`isError && data={items:[]}` 不得触发错误态，否则空态 CTA 整棵被卸载
+    expect(screen.queryByTestId('topics-list-error')).toBeNull();
+    expect(screen.getByText('No topics')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Create Topic' }).length).toBeGreaterThan(0);
+  });
+});
+
+it('topic update failure retains the edited fields and retries', async () => {
+  useNotificationStore.setState({ toasts: [], alerts: [] });
+  mockGetById.mockResolvedValue({ ...NORMAL_TOPIC, description: 'Original description' });
+  mockUpdate.mockRejectedValue(new Error('Network Error'));
+  renderPage();
+  await screen.findByText('普通话题');
+  fireEvent.click(
+    within(screen.getByRole('link', { name: /普通话题/ })).getByRole('button', {
+      name: 'common.edit',
+    }),
+  );
+  fireEvent.change(await screen.findByDisplayValue('普通话题'), {
+    target: { value: 'Keep topic title' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() =>
+    expect(useNotificationStore.getState().toasts[0]?.title).toBe(messages['topics.updateError']),
+  );
+  expect(screen.getByDisplayValue('Keep topic title')).toBeInTheDocument();
+  mockUpdate.mockResolvedValue({});
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() =>
+    expect(screen.queryByDisplayValue('Keep topic title')).not.toBeInTheDocument(),
+  );
+  expect(mockUpdate).toHaveBeenCalledTimes(2);
+});
+it('topic delete failure keeps the confirmation target and retries', async () => {
+  useNotificationStore.setState({ toasts: [], alerts: [] });
+  mockDelete.mockRejectedValue(new Error('Network Error'));
+  renderPage();
+  await screen.findByText('普通话题');
+  fireEvent.click(
+    within(screen.getByRole('link', { name: /普通话题/ })).getByRole('button', {
+      name: 'common.delete',
+    }),
+  );
+  const dialog = within(
+    screen.getByRole('heading', { name: 'topics.delete.confirmTitle' }).parentElement!
+      .parentElement!,
+  );
+  fireEvent.click(dialog.getByRole('button', { name: 'common.delete' }));
+  await waitFor(() =>
+    expect(useNotificationStore.getState().toasts[0]?.title).toBe(messages['topics.deleteError']),
+  );
+  expect(screen.getByRole('heading', { name: 'topics.delete.confirmTitle' })).toBeInTheDocument();
+  mockDelete.mockResolvedValue({});
+  fireEvent.click(dialog.getByRole('button', { name: 'common.delete' }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('heading', { name: 'topics.delete.confirmTitle' }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(mockDelete).toHaveBeenCalledTimes(2);
 });

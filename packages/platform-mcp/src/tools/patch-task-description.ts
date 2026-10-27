@@ -43,7 +43,10 @@ export const patchTaskDescriptionTool: CustomTool = {
     description:
       'Patch a task description via exact substring replacement (match mode) — the ' +
       'preferred channel for concurrent multi-agent description edits, replacing ' +
-      'whole-description PATCH. oldString must match exactly once: 0 matches → 404, ' +
+      'whole-description PATCH. Matching is byte-exact including leading ' +
+      'whitespace/indentation (the server never trims) — copy oldString verbatim from ' +
+      'the task detail response; hand-typed indentation is unreliable and fails with 0 ' +
+      'matches. oldString must match exactly once: 0 matches → 404, ' +
       '>1 matches → 409 with matchCount (expand context and retry). newString may be ' +
       'empty to delete the fragment. Optional expectedDescriptionHash (capture from the ' +
       'task detail response descriptionHash) is an optimistic-lock precondition: ' +
@@ -60,6 +63,8 @@ export const patchTaskDescriptionTool: CustomTool = {
           type: 'string',
           description:
             'Exact substring to replace in the task description (required, non-empty). ' +
+            'Byte-exact including leading whitespace/indentation — copy verbatim from ' +
+            'the task detail response, do not hand-type indentation. ' +
             '0 matches → 404; >1 matches → 409 with matchCount.',
         },
         newString: {

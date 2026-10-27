@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/ui-design-system.md §6.1（消息内 Markdown 渲染层级）
- *   - 补充: docs/frontend-architecture.md §8.5（/docs 板块约定）
+ *   - 主文档: docs/frontend/ui-design-system.md §6.1（消息内 Markdown 渲染层级）
+ *   - 补充: docs/frontend/frontend-architecture.md §8.5（/docs 板块约定）
  *
  * [踩坑索引]
  *   - 本文件必须位于 Tailwind content 扫描范围内（tailwind.config.ts 已补

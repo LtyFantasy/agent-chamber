@@ -85,6 +85,8 @@ export interface MembersSheetProps {
   renderRowExtra?: (member: MemberItem) => ReactNode;
   /** 顶部扩展插槽（圆桌 SeatManagement 等；主视图头部最上方） */
   topSlot?: ReactNode;
+  /** Page-owned query feedback stays visible in both main and invite views; it owns no selection state. */
+  feedbackSlot?: ReactNode;
   /** 邀请提交 pending：footer 按钮 loading + disabled（防重复提交） */
   inviting?: boolean;
 }

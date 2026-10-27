@@ -16,7 +16,7 @@
  * 覆盖在 docspace-bundle.e2e-spec.ts（铁律 #23：mock 测不出 SQL 生成）。
  */
 import { createHash } from 'crypto';
-import { DataSource, EntityManager } from 'typeorm';
+import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { ActorType } from '@agent-chamber/shared';
 import { AttachmentAccessService } from './attachment-access.service';
 import { AttachmentService } from './attachment.service';
@@ -485,6 +485,65 @@ describe('AttachmentService bundle 媒体门面', () => {
       expect(result.failures).toHaveLength(2);
       expect(result.failures[0].reason).toContain('already bound to another doc');
       expect(result.failures[1].reason).toContain('not found');
+    });
+  });
+
+  // ─── per-item 错误文案消毒（F4 项5 复审 MAJOR-1）──────────────────────────
+  //
+  // 为什么在 attachments 侧也要钉：media.failed[].reason 与 docspace 的 docs 段写在
+  // **同一个** POST /doc-spaces/:id/bundle 响应里，两段文案策略分叉就是 PG 原文泄露面。
+  describe('per-item 错误文案消毒（media 段，F4 项5 复审 MAJOR-1）', () => {
+    it('PG 唯一约束冲突 → 固定文案 Resource conflict；表名/约束名不进 reason', async () => {
+      storage.putObject.mockRejectedValueOnce(
+        new QueryFailedError(
+          'INSERT',
+          [],
+          Object.assign(
+            new Error(
+              'duplicate key value violates unique constraint "attachments_object_key_key"',
+            ),
+            { code: '23505' },
+          ),
+        ),
+      );
+
+      const result = await service.importFromBundle(makeInput([makeItem()]));
+
+      expect(result.failed).toHaveLength(1);
+      expect(result.failed[0].reason).toBe('Resource conflict');
+      expect(result.failed[0].reason).not.toMatch(
+        /relation|constraint|violates|attachments_object_key_key/i,
+      );
+    });
+
+    it('bindBundleMedia 遇 PG uuid 语法错 → 固定文案 Invalid UUID format；用户输入回显不进 reason', async () => {
+      attachmentRepo.findOne.mockResolvedValueOnce(makeRow({ id: 'att-9', docId: null }));
+      attachmentRepo.update.mockRejectedValueOnce(
+        new QueryFailedError(
+          'UPDATE',
+          [],
+          Object.assign(new Error('invalid input syntax for type uuid: "not-a-uuid-from-user"'), {
+            code: '22P02',
+          }),
+        ),
+      );
+
+      const result = await service.bindBundleMedia([
+        {
+          attachmentId: 'att-9',
+          docId: 'doc-x',
+          sourceAttachmentId: 's9',
+          docPath: 'docs/a.md',
+          originalName: 'a.png',
+        },
+      ]);
+
+      expect(result.bound).toBe(0);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0].reason).toBe('Invalid UUID format');
+      expect(result.failures[0].reason).not.toMatch(
+        /relation|constraint|violates|invalid input syntax|not-a-uuid-from-user/i,
+      );
     });
   });
 });

@@ -32,6 +32,7 @@ import { Doc } from '../../src/database/entities/doc.entity';
 import { DocRoute } from '../../src/database/entities/doc-route.entity';
 import { TaskDocLink } from '../../src/database/entities/task-doc-link.entity';
 import { DOC_SEARCH_POSITIONAL_ORDER_HINT } from '@agent-chamber/shared';
+import { HintDedupService } from '../../src/modules/hints/hint-dedup.service';
 
 /** fixture 锚点 id（本套件内部固定值） */
 const SPACE_ID = 'a3a3a3a3-0000-4000-8000-0000000000e1';
@@ -55,6 +56,7 @@ describe('单 CJK 字查询路径（真 PG · 真 DocSearchService 入口）', (
       db.getRepository(DocRoute),
       db.getRepository(TaskDocLink),
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
     await db.query(`INSERT INTO doc_spaces (id, name, slug, creator_id) VALUES ($1, $2, $3, $4)`, [
       SPACE_ID,

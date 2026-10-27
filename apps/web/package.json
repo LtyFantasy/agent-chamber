@@ -6,13 +6,15 @@
     "dev": "next dev -p 8742",
     "build": "next build",
     "postbuild": "node scripts/postbuild.js",
+    "build:shadow": "DIST_DIR=.next-new next build && DIST_DIR=.next-new node scripts/postbuild.js",
     "start": "next start",
-    "lint": "eslint \"src/**/*.{ts,tsx}\" --fix --max-warnings 100",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" --max-warnings 100",
     "format": "prettier --write \"src/**/*.{ts,tsx}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx}\"",
     "test": "pnpm format:check && jest",
     "test:watch": "jest --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:fix": "eslint \"src/**/*.{ts,tsx}\" --fix --max-warnings 100"
   },
   "dependencies": {
     "@agent-chamber/roundtable-protocol": "workspace:*",

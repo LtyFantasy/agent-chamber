@@ -50,9 +50,18 @@ export class Message {
   @Column({ type: 'varchar', length: 20, default: 'markdown', name: 'content_format' })
   contentFormat: string;
 
+  /**
+   * 提及列表（v1.96.0-dev 未读语义批 D3 起为**写时提取**的事实）。
+   *
+   * 元素 = 参与者 actor id（小写）+ 广播令牌 `"*"`（`@all`）。写入侧恒为数组
+   * （提取失败写 `[]`，绝不写 null——jsonb 列 NOT NULL，null 会 23502）。
+   *
+   * ⚠️ 存量语义：v1.96.0-dev 之前本列**零消费**，全部存量消息都是 `[]`
+   * （含历史 81 条带 @ 的消息）——**不回填**（D8）。故按本列过滤时，历史 @ 永不可见，
+   * 该事实经 `hiddenUnreadCount` + 公告对外披露。
+   */
   @Column({ type: 'jsonb', default: [] })
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  mentions: Record<string, any>[];
+  mentions: string[];
 
   @Column({ type: 'jsonb', default: {} })
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

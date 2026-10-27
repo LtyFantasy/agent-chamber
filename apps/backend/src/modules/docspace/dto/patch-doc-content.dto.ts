@@ -41,8 +41,10 @@ export class PatchDocContentDto {
     description:
       "Exact substring to replace, matched against the document's full=true content " +
       '(GET /docs/:id/content?full=true — NOT the default rendering, which drops the ' +
-      'first title heading). 0 matches → 404; multiple matches → 409 + matchCount ' +
-      '(expand with more context); exactly 1 match → replaced.',
+      'first title heading). Byte-exact including leading whitespace/indentation (the ' +
+      'server never trims) — copy verbatim from read_doc / full=true output; hand-typed ' +
+      'indentation is the most common 0-match cause. 0 matches → 404; multiple matches ' +
+      '→ 409 + matchCount (expand with more context); exactly 1 match → replaced.',
   })
   @IsString()
   @IsNotEmpty()

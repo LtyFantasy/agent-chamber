@@ -13,7 +13,7 @@
  *     /§3（反馈端点契约与 409 三分类动作表）/§4（工具契约：语义措辞与重复反馈语义）
  *   - 补充: apps/backend/src/modules/experience/dto/report-experience-feedback.dto.ts —
  *     outcome 语义与幂等键必填的真值来源
- *   - ⚠️ 批 5 上线线上 `docs/experience-base.md` 后，权威文档指针改为该线上文档
+ *   - ⚠️ 批 5 上线线上 `docs/modules/experience-base.md` 后，权威文档指针改为该线上文档
  *
  * [关键不变量]
  *   - **`outcome` 语义 = 「应用之后是否有效」**，**不是**「搜索是否命中」（plan §1.2）：

@@ -31,6 +31,8 @@ describe('ExperienceController', () => {
     update: jest.fn(),
     reviewQuality: jest.fn(),
     remove: jest.fn(),
+    /** 判定补跑（人类 admin 专属；判权收口在 service，controller 只透传） */
+    backfillJudgments: jest.fn(),
   };
   const mockMemberService = {
     listMembers: jest.fn(),
@@ -67,7 +69,7 @@ describe('ExperienceController', () => {
     return guards.map((g) => g?.name ?? g?.constructor?.name ?? '');
   }
 
-  /** 全部 12 个端点的方法名（少一个就是契约缺口） */
+  /** 全部 14 个端点的方法名（少一个就是契约缺口） */
   const ALL_ENDPOINTS = [
     // 条目面（第一期 8）
     'create',
@@ -85,6 +87,8 @@ describe('ExperienceController', () => {
     'removeMember',
     // 判断日志（第二期批 3）
     'listJudgments',
+    // 判定补跑（人类 admin 专属；判权在 service）
+    'backfillJudgments',
   ] as const;
 
   // ─── ① 逐方法守卫链 ─────────────────────────────────────────────
@@ -94,7 +98,7 @@ describe('ExperienceController', () => {
     expect(Reflect.getMetadata(ROLES_KEY, ExperienceController)).toBeUndefined();
   });
 
-  it('全部 13 端点逐一声明 JwtOrApiKeyGuard（方法级，禁类级）', () => {
+  it('全部 14 端点逐一声明 JwtOrApiKeyGuard（方法级，禁类级）', () => {
     const proto = ExperienceController.prototype as unknown as Record<string, unknown>;
     for (const name of ALL_ENDPOINTS) {
       expect(guardNames(proto[name])).toEqual(['JwtOrApiKeyGuard']);
@@ -123,6 +127,10 @@ describe('ExperienceController', () => {
     expect(idx('removeMember')).toBeLessThan(idx('remove'));
     // judgments 与 members 同族：字面量段必须先于 `GET /:id`（否则被当成 :id 值撞 ParseUUIDPipe）
     expect(idx('listJudgments')).toBeLessThan(idx('findOne'));
+    // 判定补跑同样以字面量段开头（`POST judgments/backfill`）——`POST :id/feedback` 段数相同，
+    // 声明顺序反了会被它抢先匹配（把 judgments 当成 :id 值撞 ParseUUIDPipe 400）
+    expect(idx('backfillJudgments')).toBeLessThan(idx('findOne'));
+    expect(idx('backfillJudgments')).toBeLessThan(idx('feedback'));
   });
 
   // ─── 参数形态守卫 + 透传 ────────────────────────────────────────
@@ -179,6 +187,7 @@ describe('ExperienceController', () => {
     mockService.update.mockResolvedValue({ id });
     mockService.reviewQuality.mockResolvedValue({ id, quality: 'verified' });
     mockService.remove.mockResolvedValue(undefined);
+    mockService.backfillJudgments.mockResolvedValue({ providerEnabled: true, scanned: 0 });
 
     await controller.create(createDto, actor);
     await controller.facets(query, actor, { originalUrl: '/api/v1/experiences/facets' } as Request);
@@ -187,6 +196,8 @@ describe('ExperienceController', () => {
     await controller.update(id, updateDto, actor);
     await controller.reviewQuality(id, qualityDto, actor);
     await expect(controller.remove(id, actor)).resolves.toEqual({ deleted: true, id });
+    const backfillDto = { limit: 5 } as never;
+    await controller.backfillJudgments(backfillDto, actor);
 
     expect(mockService.create).toHaveBeenCalledWith(createDto, actor);
     expect(mockService.facets).toHaveBeenCalledWith(query, actor);
@@ -196,6 +207,8 @@ describe('ExperienceController', () => {
     expect(mockService.update).toHaveBeenCalledWith(id, updateDto, actor);
     expect(mockService.reviewQuality).toHaveBeenCalledWith(id, qualityDto, actor);
     expect(mockService.remove).toHaveBeenCalledWith(id, actor);
+    // 判定补跑：controller 不含任何判权/编排逻辑，原样透传 dto + actor（403/1009 在 service 抛）
+    expect(mockService.backfillJudgments).toHaveBeenCalledWith(backfillDto, actor);
   });
 
   it('成员面四端点把路径参数 / dto / actor 原样透传成员服务（含幂等状态码映射）', async () => {
@@ -242,7 +255,7 @@ describe('ExperienceController', () => {
     expect(mockJudgmentService.listJudgments).toHaveBeenCalledWith(query, actor);
   });
 
-  it('全部 13 个端点都在（少一个就是契约缺口）', () => {
+  it('全部 14 个端点都在（少一个就是契约缺口）', () => {
     const proto = ExperienceController.prototype as unknown as Record<string, unknown>;
     for (const name of ALL_ENDPOINTS) {
       expect(typeof proto[name]).toBe('function');

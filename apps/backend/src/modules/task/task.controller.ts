@@ -9,7 +9,7 @@
  *     service 层插桩点=create/update/patchDescription/addComment/addDocLink（有内部
  *     调用方 batchCreate/reportResult），其余 controller 层决策 2；batch 不单独记）
  *
- * [踩坑索引] B-50(列表权限过滤) D5(权限盲区) B-42(单对象返回null) B-49(softDelete500) P1-1(findOne载荷瘦身)
+ * [踩坑索引] B-50(列表权限过滤) D5(权限盲区) B-42(单对象返回null) B-49(softDelete500) P1-1(findOne载荷瘦身) F4-2(move 须把完整 actor 透传给 service)
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #9(代理层透传)
  *
@@ -360,7 +360,11 @@ export class TaskController {
     description:
       'Update task info. Request body is Partial<CreateTaskDto>.' +
       'Supports direct updates to assigneeId / assigneeType without calling a separate assign endpoint.' +
-      'Agents can only update tasks assigned to themselves. Returns TaskDetailDto.',
+      'Agents can only update tasks assigned to themselves. Returns TaskDetailDto.' +
+      'Optional optimistic lock: pass expectedUpdatedAt (the updatedAt from GET /tasks/:id) to make ' +
+      'the write conditional — any concurrent writer (including move / assign / report) bumps ' +
+      'updated_at and invalidates the token, yielding 409 with data.currentUpdatedAt. ' +
+      'Omitting expectedUpdatedAt means NO LOCK AT ALL; new clients should always send it.',
   })
   @ApiParam({ name: 'id', description: 'Task ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Task updated' })
@@ -371,14 +375,28 @@ export class TaskController {
     description: 'Forbidden (not a board participant or agent lacks update permission)',
   })
   @ApiResponse({ status: 404, description: 'Task not found' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'expectedUpdatedAt mismatch — the task was modified by another writer since the token was ' +
+      'captured. Re-read the task (GET /tasks/:id) and retry with the fresh updatedAt; retrying with ' +
+      'the same token will keep failing. Body carries data.currentUpdatedAt. ' +
+      'A caller without write permission gets 403, not 409 (permission is re-checked inside the lock, ' +
+      'before the token comparison).',
+  })
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateTaskDto,
     @CurrentActor() actor: UnifiedActor,
   ) {
+    // 第一份快照的权限判定（快失败：明显无权的请求不必进事务/拿行锁）。
+    // ⚠️ 它**不是充分条件**——并发 move 可在本次判定与加锁之间把任务换到当前 actor
+    // 无写权的 board，故 service 在乐观锁路径内会基于**锁定行**重跑同一判定
+    // （TOCTOU，卡 09ffa9a8）；这里保留是为了让无并发场景走便宜的路径、并保持
+    // 「无 token 时行为与修复前逐字一致」。
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
-    return this.taskService.update(id, dto, actor.id, actor.type);
+    return this.taskService.update(id, dto, actor.id, actor.type, actor);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -471,10 +489,14 @@ export class TaskController {
   ) {
     const task = await this.taskService.findById(id);
     await this.permService.ensureCan(task, actor, 'write');
-    const result = await this.taskService.move(id, dto, actor.id, actor.type);
-    // 审计（Phase 2）：UPDATE + task（move）；controller 层（move 无 actor 参数，
-    // 决策 2）；newData 白名单 {taskId, title, fromListId, toListId, status? 前后值}
-    // （决策 6；position 不入）
+    // actor 第 5 参（F4-2/V2-N2）：service 需要它在**跨板** move 时施加目标板 write 门；
+    // 传 `@CurrentActor()` 原对象 = 完整 {id,type,role}——迷你对象会丢 role 使
+    // BoardPolicy 的 admin bypass 静默失效（A-C2）。
+    const result = await this.taskService.move(id, dto, actor.id, actor.type, actor);
+    // 审计（Phase 2）：UPDATE + task（move）；controller 层（审计是**出口**职责，
+    // 与 service 的授权判定分离——move 现已有 actor 参数，但审计仍留在 controller：
+    // 它记录的是"HTTP 请求做成了什么"，与 service 内部是否复用该方法无关）；newData
+    // 白名单 {taskId, title, fromListId, toListId, status? 前后值}（决策 6；position 不入）
     await this.auditService.log({
       action: AuditAction.UPDATE,
       entityType: AUDIT_ENTITY_TYPE.TASK,

@@ -26,6 +26,7 @@ import { JudgmentQuotaService } from '../src/modules/judgment/judgment-quota.ser
 import { JudgmentRunnerService } from '../src/modules/judgment/judgment-runner.service';
 import { docSearchRerankCapability } from '../src/modules/docspace/rerank/doc-search-rerank';
 import type { JudgmentConfig } from '../src/config/judgment.config';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 const DB_CONFIG = {
   host: process.env.TEST_DB_HOST ?? '127.0.0.1',
@@ -55,6 +56,8 @@ function configOf(overrides: Partial<JudgmentConfig> = {}): JudgmentConfig {
     provider: 'typesafe',
     baseUrl: 'http://127.0.0.1:1', // 钉本机不可路由端口：万一接线回归，绝不打到生产计费 API
     apiKey: 'inline-test-key',
+    // 专用出口代理（TYPESAFE_HTTP(S)_PROXY）：本套件走 fake provider，无出境 ⇒ 恒 null
+    proxyUrl: null,
     typesafeModel: 'jev-latest',
     timeoutMs: 5000,
     rateLimitPerHour: 100000,
@@ -128,6 +131,7 @@ describe('DocSpace 搜索重排 — 真实 PG（迁移链临时库）', () => {
       db.getRepository(DocRoute),
       db.getRepository(TaskDocLink),
       judgment,
+      new HintDedupService(),
     );
     const internal = built as unknown as {
       buildScoredQuery: (...args: unknown[]) => unknown;

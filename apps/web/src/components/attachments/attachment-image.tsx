@@ -19,7 +19,7 @@
  *     按「附件内容 URL」持有/归还（见 [关键不变量]）
  *
  * [权威文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（消息渲染）— 附件图片加载与预览宿主
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（消息渲染）— 附件图片加载与预览宿主
  *   - 补充: docs/api-definition.md §Attachments（读取链路全鉴权，拒绝 capability URL）
  *
  * [关键不变量]

@@ -505,7 +505,7 @@ export interface ExperienceJudgment {
    *
    * ⚠️ **observe-only：永不自动 gate**。消费方**不得**据此自动拒绝录入、自动改写条目或
    * 自动升降 quality——它只供作者自省（改内容/删除）与终审人参考。未来形态（录入时
-   * `reject` 即拒收的硬门槛）是独立批次，前置条件 = 校准数据量（线上 `docs/experience-base.md`
+   * `reject` 即拒收的硬门槛）是独立批次，前置条件 = 校准数据量（线上 `docs/modules/experience-base.md`
    * §9 翻案率配对一致率）达标 + 阈值策略评审。
    */
   admissionSuggestion: {
@@ -646,4 +646,93 @@ export interface ExperienceJudgmentsResponse {
   page: number;
   /** 每页条数（服务端上限 50） */
   pageSize: number;
+}
+
+// ─── 判定补跑（admin backfill）────────────────────────────
+
+/**
+ * 判定补跑响应（`POST /experiences/judgments/backfill`；**人类 admin 专属**）。
+ *
+ * 用途 = 把 `judgment IS NULL` 的存量条目分批补跑机器判定（"中途开启判别服务"的通用动线），
+ * 让自部署方不必历史清算、也不必等条目被编辑触发重判。
+ *
+ * ## 选取集与排序
+ *
+ * 选取集 = `deleted_at IS NULL AND judgment IS NULL AND (expires_at IS NULL OR expires_at > now())`
+ * （**软删与过期排除；suspect 纳入**——判定本就早于终审）。
+ *
+ * 排序 = **未尝试优先，同状态内最旧先补**：先取"无 `record_check` 日志行"的条目（从未判过），
+ * 同状态内再按 `created_at ASC, id ASC`。这样**恒失败的条目**（如上游地区封锁期的 HTTP 451）
+ * 不会永远占住批次头部——否则 `scanned === 0` 不可达，且每批配额都烧在同一批头部条目上。
+ * 效果 = **每批进度单调**：未尝试池抽干后，批次才由失败复投组成（此时按日志 status 查因才有意义）。
+ *
+ * ## 收敛判据（停止条件）
+ *
+ * **`providerEnabled === true && scanned === 0`** ⟺ 补跑完成（选取集已空）。
+ * - `providerEnabled === false` = **配置态终止**：JUDGMENT_PROVIDER=none 是重启级事实，
+ *   重试永远无效——配好 provider（typesafe + 密钥）并重启进程再来；
+ * - 若某批 **`ok === 0` 且 `scanned > 0`**：**先停一轮**，按 `GET /experiences/judgments`
+ *   的 status 查明原因再决定是否重试（HTTP 429/529 是上游要求退避，`timeout` 可直接重试）。
+ *   不要假定"再打一次只会撞同一面墙"。
+ *
+ * ## 三计数互斥穷尽（**作用域务必分清**）
+ *
+ * - `noLogNulls` / `failedNulls` 的作用域 = **补跑选取集内**（即"非软删 + judgment IS NULL +
+ *   未过期"的全量，**不限于本批**）；
+ * - `expiredNulls` 的作用域 = **选取集之外**（已过期且 NULL，纯知会——它们永不进入补跑）；
+ * - 恒等式：`noLogNulls + failedNulls` = **全部非过期 NULL**；再加 `expiredNulls` = **全部
+ *   NULL**。**软删条目不计入任何计数**（它们既不在选取集内，也不在过期知会里）。
+ */
+export interface ExperienceJudgmentsBackfillResponse {
+  /**
+   * 判别 provider 是否启用（`JUDGMENT_PROVIDER=none` → false）。
+   *
+   * **重启级配置事实**：false 时任何重试都不可能改变结果——须配置 provider（typesafe +
+   * 密钥）并**重启进程**；重启同时清零三级配额桶。
+   */
+  providerEnabled: boolean;
+  /**
+   * 本批**选中**条数（选取集查询先行 ⇒ 全路径真实，provider 未启用时也是真值）。
+   *
+   * `scanned === 0`（且 providerEnabled）即收敛完成；不要把 `ok === 0` 当收敛判据
+   * （`scanned > 0` 时的 `ok === 0` 是"本批全没过"，要查因）。
+   */
+  scanned: number;
+  /** 本批产生并落库快照的条数（版本守卫丢弃的不计——那只留日志行） */
+  ok: number;
+  /**
+   * 本批**未产生快照**的条数：error / timeout / 配额 skipped / 守卫丢弃 / fail-open 的并集。
+   *
+   * ⚠️ **skipped 至多一条**：一批撞三级闸时**至多写 1 条 `skipped` 日志行**（有界记账，
+   * 每「闸级别 + 能力 + actor」每 1h 窗口一条），其余被闸条目**落在 `noLogNulls`**——查日志
+   * 看到空页**不代表没尝试过**。那唯一一条的 `request.reason` 标明撞的是哪一级闸
+   * （actor / capability / global）。
+   */
+  notJudged: number;
+  /**
+   * 批后统计（**选取集内**）：既无 `record_check` 日志行、judgment 仍为 NULL 的条数。
+   *
+   * 语义 = "从未判定"或"日志行被有界记账吞掉/失败无日志"——判失败**且落过行**的条目不算在
+   * 这里（见 `failedNulls`）。谓词只计 `operation='record_check'` 的行（日志表是多操作表）。
+   */
+  noLogNulls: number;
+  /**
+   * 批后统计（**选取集内**）：**已有** `record_check` 日志行（判过：error / timeout / 被闸 /
+   * 守卫丢弃）但 judgment 仍为 NULL 的条数。谓词同 `noLogNulls`，只计 `operation='record_check'`。
+   */
+  failedNulls: number;
+  /**
+   * 批后统计（**选取集之外**）：已过期且 judgment 为 NULL 的条数（纯知会）。
+   *
+   * 这批条目**永不进入补跑**（过期排除），但它们仍是 NULL——把"非过期还剩多少"与
+   * "过期存量"分开呈现，收敛判据才不会被过期条目永久污染。
+   */
+  expiredNulls: number;
+  /**
+   * 本批未产生快照的条目 id 列表（与 `notJudged` **同一集合**）。
+   *
+   * 恒等式：`notJudgedExperienceIds.length === notJudged`。键名与日志面 `experienceId`
+   * **逐字一致**，可直接喂 `GET /experiences/judgments?experienceId=<id>` 查失败原因。
+   */
+  notJudgedExperienceIds: string[];
 }

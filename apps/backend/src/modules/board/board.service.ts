@@ -12,7 +12,7 @@
  *   MINE-QUERY(v1.70): findAll 收到 mine=true 走 AccessQueryService.getMyBoardIds
  *         （creator+member 去 open 源，admin 不短路）。缓存键 board:mine:<actorKey> 前缀隔离。
  *
- * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create/update补齐)
+ * [踩坑索引] B-45(reorder返回null) B-41(列表页任务统计0/0) B-5(可见性缺失) B-6(可见性继承缺失) D5(权限迁移) B-50(列表权限过滤) B-52(creator缺成员行) R1(公共解析收口) A2.5(写入口assertActorUsable) A2.5b(移除入口不拦截+create/update补齐) V2-N2(reorderTasks 是批量跨板搬运通道/removeList.moveTasksTo 亦然)
  *
  * [铁律关联] #18(不变量检查) #4(文档优先) #12(文档联动)
  *
@@ -52,7 +52,7 @@
  *   □ 修复 Bug 见 change-checklists.md §8
  * =============================================================================
  */
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, IsNull, Not } from 'typeorm';
 import { Board } from '../../database/entities/board.entity';
@@ -92,6 +92,17 @@ import { AccessQueryService } from '../../common/services/access-query.service';
 import { ResourceValidator } from '../../common/resource-validator';
 import { UnifiedActor } from '../../common/types/actor.types';
 import { ActorProfileService, ActorProfile } from '../../common/services/actor-profile.service';
+// hint 基建（阶段三决策 9）：截断续读码走统一去重窗口 + 埋点（@Global HintsModule）
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
+// 信封条目类型（board 码不在 docspace `DocHintCode` 里 —— 运行期附挂，见 board-hint.constants）
+import type { HintEnvelopeItem } from '../hints/hint-core';
+import {
+  BOARD_HINT_PROFILE,
+  buildBoardDigestTruncatedHint,
+  type BoardDigestTruncatedSection,
+  type BoardHintCode,
+} from './board-hint.constants';
 import { BoardList } from '../../database/entities/board-list.entity';
 import { Task } from '../../database/entities/task.entity';
 import { TaskService } from '../task/task.service';
@@ -115,6 +126,9 @@ import {
 
 @Injectable()
 export class BoardService {
+  /** 日志源（hint 埋点的落行归属；与 docspace 消费方同款用法） */
+  private readonly logger = new Logger(BoardService.name);
+
   constructor(
     @InjectRepository(Board)
     private boardRepo: Repository<Board>,
@@ -151,6 +165,9 @@ export class BoardService {
     @InjectRepository(Message)
     private messageRepo: Repository<Message>,
     private readonly actorProfileService: ActorProfileService,
+    // hint 基建（阶段三决策 9）：截断续读码的去重窗口（@Global HintsModule 单例；
+    // 与 docspace 五消费方共享同一份窗口）
+    private readonly hintDedup: HintDedupService,
   ) {}
 
   /**
@@ -545,9 +562,16 @@ export class BoardService {
    *
    * @param boardId - 看板 ID（Controller 层已做权限检查 + findById 判空）
    * @param query   - 各段 limit 与 includeDescription（缺省值在此应用）
-   * @returns 实时装配的 BoardDigest
+   * @param actorId - 触发者 actor id（**截断续读码的去重键维度**，阶段三决策 9；缺省
+   *   `'system'` = 未认证路径——controller 必须把它透传下来，否则一个 actor 看过就把
+   *   所有 actor 压掉）
+   * @returns 实时装配的 BoardDigest（截断时附挂 `hints`，运行期字段，DTO 不声明）
    */
-  async getDigest(boardId: string, query?: BoardDigestQueryDto): Promise<BoardDigest> {
+  async getDigest(
+    boardId: string,
+    query?: BoardDigestQueryDto,
+    actorId?: string,
+  ): Promise<BoardDigest> {
     const board = await this.findById(boardId);
 
     // 缺省值应用：DTO 只做格式校验（铁律 #21），业务缺省在 service 层
@@ -896,6 +920,71 @@ export class BoardService {
       docsTruncated ||
       versionsTruncated;
 
+    // ── 截断续读 hint（阶段三决策 9）：**教学定位**，不是每次提醒 ──
+    // 判据 = 该段被截断 **且调用方未显式传该段 limit**（参数**存在性**判断；`limit=0`
+    // 是「显式要求空段」，`xxxTruncated` 的既有语义已把它排除在截断判定之外）。
+    // **只取首个命中的段**——这是**构造层的选择**：本段只构造一条候选（段优先级见下），
+    // 不是「靠去重键挡住多候选」。理由 = 本码的去重键是 `(actor, code, boardId)`（不随段变化）
+    // ⇒ 多段候选即使全部构造出来，同一响应里也只有一条能送达（内核的「同响应同键只取首条」
+    // 是第二道防线），其余只会多落无用埋点（`reason=null` 的压制行），污染「窗口压制」反事实面。
+    // 段的优先级 = nextUp（下一步做什么）> docs（知识在哪）> risks > recentDone > versions
+    // ：全量信息被截时，前两段缺失的代价最大。
+    const truncatedSegment = ((): {
+      section: BoardDigestTruncatedSection;
+      returnedCount: number;
+      totalCount: number;
+    } | null => {
+      if (nextUpTruncated && query?.openLimit === undefined) {
+        return { section: 'nextUp', returnedCount: nextUp.length, totalCount: nextUpAll.length };
+      }
+      if (docsTruncated && query?.docsLimit === undefined) {
+        return {
+          section: 'docs',
+          returnedCount: docs?.recentlyUpdated.length ?? 0,
+          totalCount: docsTotal ?? 0,
+        };
+      }
+      if (risksTruncated && query?.riskLimit === undefined) {
+        return { section: 'risks', returnedCount: risks.length, totalCount: risksTotal };
+      }
+      if (recentDoneTruncated && query?.doneLimit === undefined) {
+        return {
+          section: 'recentDone',
+          returnedCount: recentDone.length,
+          totalCount: recentDoneTotal,
+        };
+      }
+      if (versionsTruncated && query?.versionLimit === undefined) {
+        return {
+          section: 'versions',
+          returnedCount: versionsHistory.length,
+          totalCount: versionsTotal,
+        };
+      }
+      return null;
+    })();
+    const hints: HintEnvelopeItem<BoardHintCode>[] | undefined = truncatedSegment
+      ? emitHints<BoardHintCode>(
+          this.logger,
+          this.hintDedup,
+          [
+            buildBoardDigestTruncatedHint(
+              board.id,
+              truncatedSegment.section,
+              truncatedSegment.returnedCount,
+              truncatedSegment.totalCount,
+            ),
+          ],
+          {
+            surface: 'board_digest',
+            // spaceId 不在本码的语境里（board 与 DocSpace 是不同实体；docs 段才有空间归属）
+            spaceId: null,
+            actorId: actorId ?? 'system',
+          },
+          { profile: BOARD_HINT_PROFILE },
+        )
+      : undefined;
+
     // 最终投影：剔除内部 assigneeId，统一填充 assigneeName + assigneeDeletedAt（软删信号）
     const projectRisk = (r: DigestRiskRow): BoardDigestRisk => {
       const { assigneeId, ...rest } = r;
@@ -957,6 +1046,9 @@ export class BoardService {
       docs,
       ...(docsTotal !== undefined ? { docsTotal } : {}),
       truncated,
+      // 截断续读 hint（运行期附挂；BoardDigest DTO 不声明该键——缺省不落键，
+      // 信封不变量：禁空数组）
+      ...(hints ? { hints } : {}),
     };
   }
 
@@ -1490,7 +1582,7 @@ export class BoardService {
     return { ...saved };
   }
 
-  async removeList(id: string, moveTasksTo?: string) {
+  async removeList(id: string, moveTasksTo?: string, actor?: UnifiedActor) {
     const list = await this.listRepo.findOne({ where: { id }, relations: ['tasks'] });
     if (!list)
       throw new NotFoundException({ message: 'List not found', code: ErrorCode.LIST_NOT_FOUND });
@@ -1504,6 +1596,11 @@ export class BoardService {
       }
       // 校验目标列真实存在，避免任务被转移到幽灵列（Phase 2）
       await this.resourceValidator.exists(this.listRepo, moveTasksTo, ErrorCode.LIST_NOT_FOUND);
+      // 跨板写族闭合（V2-N2 / S-N2）：**仅当目标列属于另一个 board 时**才要求对该目标板
+      // write —— 否则「板 A 的 editor 删自己板内的列」可以把 A 的任务批量倾倒进无权板 B
+      // （注入越权）。同板流转不施加（只认调用方已通过的板 write，A-C2/P-N1 的同款短路）。
+      // 任务此刻都在被删列 `list` 里，故「当前列」= list.id。
+      await this.taskService.assertCrossBoardPlacement(actor, moveTasksTo, list.id);
       // 批量转移任务到目标列
       for (const task of list.tasks) {
         await this.taskRepo.update(task.id, { listId: moveTasksTo, position: 0 });
@@ -1514,10 +1611,40 @@ export class BoardService {
     return true;
   }
 
-  async reorderTasks(listId: string, dto: ReorderTasksDto) {
+  async reorderTasks(listId: string, dto: ReorderTasksDto, actor?: UnifiedActor) {
     const list = await this.listRepo.findOne({ where: { id: listId } });
     if (!list)
       throw new NotFoundException({ message: 'List not found', code: ErrorCode.LIST_NOT_FOUND });
+
+    // 跨板写族闭合（V2-N2 / S-N2 —— 本 wave **最重**的一项）：reorderTasks 把每个 item 的
+    // list_id 直接写成 listId，于是它同时是一条**批量跨板搬运**通道。controller 只校验了
+    // 目标板 write（`ensureCan(board of listId, 'write')`），对「任务原本躺在哪个板」零校验
+    // —— 有目标板 write 的人可以把**无权私板**里的任务批量拉进自己板，等于绕过该私板的
+    // read 判定（S-N2：批量拉取外板任务 = 外泄）。
+    //
+    // ⚠️ 门的方向与 update/move/removeList **相反**：那三处防「注入无权板」（门落在目标
+    // 板），此处防「从无权板取出」（门落在 item 的**当前列**所属板）。两端用的是同一谓词
+    // （assertCanPlaceTaskInList = "能否在该列所属板写"），只是作用端不同，故复用同一门。
+    // 跨板判定按 item 的当前列分组去重，同板 item 短路（A-C2/P-N1）。
+    //
+    // ⚠️ **门判据集合必须覆盖写入集合**（复审 C1）：写入循环是 `taskRepo.update(id, …)`，
+    // 而 TypeORM 的 UpdateQueryBuilder **不追加 `deleted_at IS NULL`**（软删只是读侧过滤），
+    // 故它对**软删任务**同样生效。若这里用默认的 `find`（过滤软删），body 里塞一个软删任务
+    // id（原属无权私板）就会：find 查不到 → 不过门 → update 照改其 list_id → 200 绕过门。
+    // 因此本查询**必须 `withDeleted: true`**，与写入集合对齐（无外泄/无 restore 路径，
+    // 但不变量破口的成本远低于一条 withDeleted）。
+    const taskIds = dto.tasks.map((item) => item.id);
+    const rows = taskIds.length
+      ? await this.taskRepo.find({
+          where: { id: In(taskIds) },
+          select: ['id', 'listId'],
+          withDeleted: true,
+        })
+      : [];
+    for (const currentListId of new Set(rows.map((row) => row.listId))) {
+      await this.taskService.assertCrossBoardPlacement(actor, currentListId, listId);
+    }
+
     for (const item of dto.tasks) {
       await this.taskRepo.update(item.id, { position: item.position, listId });
     }

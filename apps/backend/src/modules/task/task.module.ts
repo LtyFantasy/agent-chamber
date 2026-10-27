@@ -24,6 +24,7 @@ import { TopicParticipant } from '../../database/entities/topic-participant.enti
 import { EventModule } from '../event/event.module';
 import { AuditModule } from '../audit/audit.module';
 import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
+import { TaskHygieneHintProvider } from './task-hygiene-hint.provider';
 
 @Module({
   imports: [
@@ -49,8 +50,19 @@ import { DocSpacePolicy } from '../../common/policies/doc-space.policy';
     EventModule,
     AuditModule,
   ],
-  providers: [TaskService, TaskDependencyService, MilestoneService, DocSpacePolicy],
+  providers: [
+    TaskService,
+    TaskDependencyService,
+    MilestoneService,
+    DocSpacePolicy,
+    // 阶段三：task 纪律族 hint provider（hint 拦截器按事实袋求值；
+    // **必须在本模块 provide**——它的 Repository 依赖全部来自本模块 forFeature）
+    TaskHygieneHintProvider,
+  ],
   controllers: [TaskController],
-  exports: [TaskService, TaskDependencyService, MilestoneService],
+  // `TaskHygieneHintProvider` 的导出是**功能性**的（不是惯例）：AppModule 的
+  // `HINT_FACT_PROVIDERS` 工厂（config/app-hint-provider-chain.ts 单源）按类引用注入它，
+  // 撤销导出 = 启动期 DI 红（与 MemoryModule 导出 MemoryNominationHintProvider 同款）
+  exports: [TaskService, TaskDependencyService, MilestoneService, TaskHygieneHintProvider],
 })
 export class TaskModule {}

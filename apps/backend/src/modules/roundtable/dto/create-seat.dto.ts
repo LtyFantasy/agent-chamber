@@ -4,7 +4,7 @@
  * 双层校验（铁律 #21）：本 DTO 只做格式正确性（UUID/枚举/长度），
  * topic 存在性与权限校验在 RoundtableService（findById + ensureCan）。
  *
- * 字段语义出处：docs/roundtable-design.md §5（roundtable_seats 表）/ §3（SeatConfig）。
+ * 字段语义出处：docs/modules/roundtable-design.md §5（roundtable_seats 表）/ §3（SeatConfig）。
  */
 import {
   IsBoolean,

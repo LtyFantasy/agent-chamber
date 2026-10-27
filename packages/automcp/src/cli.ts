@@ -144,6 +144,13 @@ program
           process.stdout.write('[automcp] WARNING: No tools mapped. Check your filters.\n');
         }
         process.stdout.write(`[automcp] ${result.toolCount} tools registered\n`);
+        // profile.excludeCustomTools 命中时单独打一行：总数差额本身无法区分
+        // "模块导出少了" 与 "被 profile 主动降级"，排查工具面时必须一眼看清。
+        if (result.customToolsExcluded > 0) {
+          process.stdout.write(
+            `[automcp] ${result.customToolsExcluded} custom tool(s) excluded by profile\n`,
+          );
+        }
         process.stdout.write(`[automcp] Server running at ${result.url}\n`);
 
         // ─── 4. 优雅关闭 ───

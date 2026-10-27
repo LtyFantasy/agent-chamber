@@ -60,6 +60,23 @@ describe('DocSpaceController (e2e)', () => {
       deletedAt: null,
       actor: { status: 'active' },
     });
+
+    // ── F4-2：TaskPolicy 的 list→board 归属判定改走**定主键重载**
+    // （createQueryBuilder + withDeleted + addSelect('board.deletedAt')），不再走 findOne。
+    // 本套件夹具只喂了 `BoardList.findOne`（且 makeBoardList 自带 board 关系），不接管 QB
+    // 的话重载恒 null ⇒ Policy 掉进"真缺失"分支全拒（POST /tasks/:id/doc-links 变 403）。
+    // 这里让重载镜像夹具的 findOne 结果，既有用例语义零改动。
+    // ⚠️ **覆盖边界（复审 MINOR-4）**：接管的是**全局 getOne**（且忽略 WHERE/select 实参），
+    // 本套件其他依赖过滤语义的 BoardList QB 查询在 mock 下会拿到同一行；当前无此类断言，
+    // 将来新增"过滤后为空 / 命不命中"的用例时必须改为按 where 实参分发。
+    const baseBoardListQb = mockRepos.BoardList.createQueryBuilder;
+    mockRepos.BoardList.createQueryBuilder = jest.fn((...args: any[]) => {
+      const qb = baseBoardListQb(...args);
+      qb.getOne.mockImplementation(async () =>
+        mockRepos.BoardList.findOne({ where: { id: listId } }),
+      );
+      return qb;
+    });
   });
 
   afterEach(async () => {
@@ -193,6 +210,7 @@ describe('DocSpaceController (e2e)', () => {
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       orWhere: jest.fn().mockReturnThis(),
+      setLock: jest.fn().mockReturnThis(),
       setParameter: jest.fn().mockReturnThis(),
       setParameters: jest.fn().mockReturnThis(),
       orderBy: jest.fn().mockReturnThis(),
@@ -372,6 +390,57 @@ describe('DocSpaceController (e2e)', () => {
         expect(res.body.data).toHaveProperty('sectionCount');
       });
   });
+
+  it.each([false, true])(
+    'PUT existing document — A2 locked locator / 409 propagation (missing=%s)',
+    async (missing) => {
+      mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+      mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+      const before = makeDoc({ contentHash: 'old-hash' });
+      const fresh = makeDoc({ contentHash: 'fresh-hash', tags: ['fresh'] });
+      const beforeQb = genericQb({ getOne: jest.fn().mockResolvedValue(before) });
+      const poolQb = genericQb();
+      const lockQb = genericQb({ getOne: jest.fn().mockResolvedValue(missing ? null : fresh) });
+      const sectionQb = genericQb();
+      mockRepos.Doc.createQueryBuilder
+        .mockReturnValueOnce(beforeQb)
+        .mockReturnValueOnce(poolQb)
+        .mockReturnValue(lockQb);
+      mockRepos.Doc.save.mockImplementation(async (doc: any) => doc);
+      mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+      mockRepos.DocSection.create.mockImplementation((section: any) => section);
+      mockRepos.DocVersion.createQueryBuilder.mockReturnValue(genericQb());
+      mockRepos.DocVersion.create.mockImplementation((version: any) => version);
+      // 事务按实体分派真实形状的桩，不能把 Doc 当成 sections/versions 仓储。
+      mockRepos.Doc.manager.getRepository = jest.fn((entity: any) => mockRepos[entity.name]);
+      mockRepos.DocSpace.createQueryBuilder.mockReturnValue(genericQb());
+
+      const response = await request(app.getHttpServer())
+        .put(`/doc-spaces/${spaceId}/docs`)
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ path: 'test.md', content: '# A2\n\nChanged body.' })
+        .expect(missing ? 409 : 200);
+      expect(lockQb.setLock).toHaveBeenCalledWith('pessimistic_write');
+      expect(lockQb.where).toHaveBeenCalledWith('d.id = :id', { id: docId });
+      expect(lockQb.andWhere).toHaveBeenCalledWith('d.space_id = :spaceId', { spaceId });
+      expect(lockQb.andWhere).toHaveBeenCalledWith('d.path = :path', { path: 'test.md' });
+      expect(lockQb.andWhere).toHaveBeenCalledWith('d.deleted_at IS NULL');
+      if (missing) {
+        expect(response.body).toMatchObject({
+          code: ErrorCode.DOC_CONTENT_CONFLICT,
+          data: { currentContentHash: null },
+        });
+        expect(sectionQb.execute).not.toHaveBeenCalled();
+      } else {
+        expect(mockRepos.Doc.save).toHaveBeenCalledWith(
+          expect.objectContaining({ tags: ['fresh'] }),
+        );
+        expect(lockQb.getOne.mock.invocationCallOrder[0]).toBeLessThan(
+          sectionQb.execute.mock.invocationCallOrder[0],
+        );
+      }
+    },
+  );
 
   // ─── Test 2b: PUT upsert sourceSha last-verified 刷新（v1.42 B6） ───
 
@@ -687,6 +756,47 @@ describe('DocSpaceController (e2e)', () => {
         expect(res.body.data.sections[0].content).toBe('设置正文');
         // 越界 position 单独列出（部分失败友好）
         expect(res.body.data.missing).toEqual([9]);
+      });
+  });
+
+  it('GET /docs/:id — 200：outline 每节携带 sectionHash（v1.93.0 批 2 读侧接线）', async () => {
+    // 本层只验 HTTP 接线（字段进得了响应体）；**口径一致性**（outline hash === positions[]
+    // hash，同一公式派生）由真实 PG 套件 docspace-patch.e2e-spec.ts 的批 2 用例证明——
+    // 本文件 crypto 被全局 mock 成常量，两侧恒等无判别力。
+    const docQb = genericQb({
+      getOne: jest.fn().mockResolvedValue(makeDoc({ tokenEstimate: 5000 })),
+    });
+    mockRepos.Doc.createQueryBuilder.mockReturnValue(docQb);
+    mockRepos.DocSpace.findOne.mockResolvedValue(makeSpace());
+    mockRepos.DocSpaceMember.findOne.mockResolvedValue(null);
+
+    const sectionQb = genericQb({
+      getMany: jest.fn().mockResolvedValue([
+        makeSection({ position: 0, headingPath: '你好世界', headingLevel: 1, content: '文首正文' }),
+        makeSection({
+          position: 1,
+          headingPath: '你好世界 § 设置',
+          headingLevel: 2,
+          content: '设置正文',
+        }),
+      ]),
+    });
+    mockRepos.DocSection.createQueryBuilder.mockReturnValue(sectionQb);
+
+    return request(app.getHttpServer())
+      .get(`/docs/${docId}`)
+      .set('Authorization', `Bearer ${authToken}`)
+      .expect(200)
+      .expect((res: any) => {
+        // tokenEstimate=5000 > 阈值 → 保持 outline（不内联全文）
+        expect(res.body.data.mode).toBe('outline');
+        const sections = res.body.data.sections;
+        expect(sections.map((s: any) => s.position)).toEqual([0, 1]);
+        // 派生的 sectionHash 进响应体（crypto 被 mock 成常量，此处只断「有值」）
+        expect(sections[0].sectionHash).toBe('mocked-hash');
+        expect(sections[1].sectionHash).toBe('mocked-hash');
+        // 响应体仍精简：派生用的 content 列不外泄
+        expect(sections[0].content).toBeUndefined();
       });
   });
 
@@ -2064,6 +2174,22 @@ describe('DocSpaceController (e2e)', () => {
         // 截断保留策展序头部，尾部走分页端点获取
         expect(res.body.data.routes[0].intent).toBe('我要了解第 0 号功能');
         expect(res.body.data.routes[49].intent).toBe('我要了解第 49 号功能');
+        // routes 段截断 ⇒ 附挂抓全教学 hint（真 hint 接线：去重窗口单例在 app 内）
+        const hints = res.body.data.hints as
+          | Array<{ code: string; data?: Record<string, unknown> }>
+          | undefined;
+        expect(hints).toHaveLength(1);
+        expect(hints?.[0]).toMatchObject({
+          code: 'docs_overview_routes_truncated',
+          status: 'suggestion',
+          data: {
+            section: 'routes',
+            returnedCount: 50,
+            totalCount: 51,
+            suggestedTool: 'list_doc_routes',
+            suggestedParams: { page: 1, pageSize: 100 },
+          },
+        });
       });
   });
 

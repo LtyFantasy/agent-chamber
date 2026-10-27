@@ -1,34 +1,48 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.4（看板详情页-任务详情抽屉）
- *   - 补充: docs/ui-design-system.md §3（overlay 抽屉先例）
- *
- * [踩坑索引] （暂无）
- *
- * [铁律关联] #1(暗色主题-单套令牌) #4(表单脏状态-本地useState) #5(看板刷新-显式回调)
- *
- * [详细踩坑]（暂无）
- *
- * [修改检查]（固定模板，不逐文件定制）
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #11）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ * [功能概念] 任务详情读取、局部恢复与草稿所有权
+ * [代码职责] 独立页与看板抽屉共用的详情/依赖/评论/活动面板。
+ * [权威文档] DocSpace Agent Chamber: docs/frontend/frontend-architecture.md §8.2–8.3、§12。
+ * [关键不变量] 同 taskId dirty 草稿跨失败及成功重读保留；换 taskId 重置所有编辑状态；
+ *   七字段统一 Save，仅发相对 accepted 的 diff 与 token；冲突先显式 GET、核对后再保存。
+ *   写响应不是完整 GET；提交后输入按字段保留；旧 task 的副作用不可作用于新 task。
+ *   辅助查询失败不可伪造空值；独立页只由面板显示缓存刷新提示。
+ *   操作失败使用领域 fallback 提示一次，并保留输入/选择及已有依赖/关联供再次操作。
+ * [关联代码] app/(main)/tasks/[id]/page.tsx；app/(main)/boards/[id]/page.tsx。
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 
 'use client';
 
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useLocale, useTranslations } from 'next-intl';
-import { Priority, TaskStatus } from '@agent-chamber/shared';
 import { AgentStatus, ActivityAction } from '@/types';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import {
+  EMPTY_TASK_DRAFT,
+  draftFromTask,
+  changedFields,
+  buildTaskPatch,
+  mergeDraftFields,
+  taskTokenOf,
+  isEditableTaskRead,
+  isTaskVersionConflict,
+  mergeTaskWrite,
+  type TaskEditValues,
+  type TaskEditField,
+} from './task-editor';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { formatDate, formatRelativeTime } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -49,10 +63,20 @@ import {
   MessageCircle,
   FileText,
 } from 'lucide-react';
-import type { Milestone as MilestoneType, TaskDependencyItem, Comment, Activity } from '@/types';
+import type {
+  Milestone as MilestoneType,
+  TaskDependencyItem,
+  Comment,
+  Activity,
+  TaskDetail,
+  UpdateTaskRequest,
+} from '@/types';
 import { DocPicker } from '@/components/docs/doc-picker';
 import { TaskPicker, type TaskPick } from '@/components/tasks/task-picker';
-import { confirm } from '@/lib/notify';
+import { confirm, toast } from '@/lib/notify';
+
+/** Only a completed explicit read permits the next confirmed Save during recovery. */
+const REVIEW_READY = 'review';
 
 /** 组件 Props */
 export interface TaskDetailPanelProps {
@@ -78,7 +102,12 @@ export interface TaskDetailPanelProps {
  * 看板右侧抽屉与独立页 /tasks/:id 共用同一个组件，根治双实现漂移。
  * 顶部 Tab 分页：详情/依赖/评论/活动；评论/活动/依赖 Tab 激活才发请求（懒加载）。
  */
-export function TaskDetailPanel({
+/** A task identity owns all form, comment and dependency selection state. */
+export function TaskDetailPanel(props: TaskDetailPanelProps) {
+  return <TaskDetailContent key={props.taskId} {...props} />;
+}
+
+function TaskDetailContent({
   taskId,
   onChanged,
   onNavigateTask,
@@ -90,6 +119,7 @@ export function TaskDetailPanel({
   const queryClient = useQueryClient();
   const router = useRouter();
   const t = useTranslations('tasks');
+  const tRead = useTranslations('common');
   const locale = useLocale();
   const tGlobal = useTranslations();
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
@@ -107,112 +137,149 @@ export function TaskDetailPanel({
   // ── 数据查询 ────────────────────────────────────
 
   /** 任务详情（始终加载） */
-  const { data: task, isLoading: taskLoading } = useQuery({
+  const taskQuery = useQuery({
     queryKey: ['tasks', 'detail', taskId],
     queryFn: () => Api.tasks.getById(taskId),
     enabled: !!taskId,
   });
+  const { data: task, isLoading: taskLoading } = taskQuery;
 
   /** Agent 列表（分配人下拉用） */
-  const { data: agentsData } = useQuery({
+  const agentsQuery = useQuery({
     queryKey: ['agents', 'list'],
     // listAll 循环翻页拉全：单页 pageSize:100 在 >100 个 agent 时静默丢数据（评审 M-e 同类缺口 B6）
     queryFn: () => Api.agents.listAll(),
   });
+  const { data: agentsData } = agentsQuery;
   const activeAgents = (agentsData ?? []).filter((a) => a.status === AgentStatus.ACTIVE);
 
   /** 看板详情（「所在列」显示 +「在看板中查看」链接） */
-  const { data: boardData } = useQuery({
+  const boardQuery = useQuery({
     queryKey: ['boards', 'detail', task?.boardId],
     queryFn: () => Api.boards.getById(task!.boardId!),
     enabled: !!task?.boardId,
   });
+  const { data: boardData } = boardQuery;
 
   /** 关联话题（「所属话题」链接） */
-  const { data: topicData } = useQuery({
+  const topicQuery = useQuery({
     queryKey: ['topics', 'detail', task?.topicId],
     queryFn: () => Api.topics.getById(task!.topicId!),
     enabled: !!task?.topicId,
   });
+  const { data: topicData } = topicQuery;
 
   /** 里程碑列表（详情 Tab 激活才拉） */
-  const { data: milestonesData } = useQuery({
+  const milestonesQuery = useQuery({
     queryKey: ['milestones', 'list', task?.boardId],
     queryFn: () => Api.tasks.getMilestones({ boardId: task!.boardId!, pageSize: 100 }),
     enabled: activeTab === 'detail' && !!task?.boardId,
   });
+  const { data: milestonesData } = milestonesQuery;
 
   /** 评论（评论 Tab 激活才拉） */
-  const { data: commentsData } = useQuery({
+  const commentsQuery = useQuery({
     queryKey: ['tasks', 'comments', taskId],
     queryFn: () => Api.tasks.getComments(taskId),
     enabled: activeTab === 'comments' && !!taskId,
   });
+  const { data: commentsData } = commentsQuery;
 
   /** 活动日志（活动 Tab 激活才拉） */
-  const { data: activitiesData } = useQuery({
+  const activitiesQuery = useQuery({
     queryKey: ['tasks', 'activities', taskId],
     queryFn: () => Api.tasks.getActivities(taskId),
     enabled: activeTab === 'activities' && !!taskId,
   });
+  const { data: activitiesData } = activitiesQuery;
 
   /** 依赖列表（依赖 Tab 激活才拉） */
-  const { data: dependenciesData } = useQuery({
+  const dependenciesQuery = useQuery({
     queryKey: ['tasks', 'dependencies', taskId],
     queryFn: () => Api.tasks.getDependencies(taskId),
     enabled: activeTab === 'dependencies' && !!taskId,
   });
+  const { data: dependenciesData } = dependenciesQuery;
 
   /** 阻塞项列表（依赖 Tab 激活才拉） */
-  const { data: blockersData } = useQuery({
+  const blockersQuery = useQuery({
     queryKey: ['tasks', 'blockers', taskId],
     queryFn: () => Api.tasks.getBlockers(taskId),
     enabled: activeTab === 'dependencies' && !!taskId,
   });
+  const { data: blockersData } = blockersQuery;
 
   // ── 表单脏状态（本地 useState，不继承 setQueryData 旧坑） ──
 
-  const [draftTitle, setDraftTitle] = useState('');
-  const [draftDescription, setDraftDescription] = useState('');
-  const [draftStatus, setDraftStatus] = useState<string>('todo');
-  const [draftPriority, setDraftPriority] = useState<string>('p2');
-  const [draftAssigneeId, setDraftAssigneeId] = useState('');
-  const [draftLabels, setDraftLabels] = useState<string[]>([]);
-  /** 标签输入框当前文本（回车/逗号确认为一个标签） */
-  const [labelInput, setLabelInput] = useState('');
-
-  /** task 加载完成后同步服务端数据到本地草稿 */
+  const [draft, setDraft] = useState<TaskEditValues>(EMPTY_TASK_DRAFT);
+  /** A baseline is an edit projection, not a claim that a PATCH returned the full GET view. */
+  const [accepted, setAccepted] = useState<{ values: TaskEditValues; token: string | null }>();
+  /** Recovery stays outside tabs; review alone permits the next explicit Save. */
+  type Recovery = {
+    kind: 'conflict' | 'readFailed' | 'savedNeedsRead' | 'invalidBaseline' | 'review';
+    latest?: TaskEditValues;
+  };
+  const [recovery, setRecovery] = useState<Recovery | null>(null);
+  const recoveryRef = useRef<Recovery | null>(null);
+  const publishRecovery = useCallback((next: Recovery | null) => {
+    recoveryRef.current = next;
+    setRecovery(next);
+  }, []);
+  const [writeBusy, setWriteBusy] = useState(false);
+  const [readBusy, setReadBusy] = useState(false);
+  /** Event-time locks close the gap before React publishes disabled controls. */
+  const writePendingRef = useRef(false);
+  const readPendingRef = useRef(false);
+  const aliveRef = useRef(true);
   useEffect(() => {
-    if (task) {
-      setDraftTitle(task.title);
-      setDraftDescription(task.description || '');
-      setDraftStatus(task.status);
-      setDraftPriority(task.priority);
-      setDraftAssigneeId(task.assigneeId || '');
-      setDraftLabels(task.labels ?? []);
-    }
-  }, [task]);
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
+  const draftRef = useRef(draft);
+  const acceptedRef = useRef(accepted);
+  // Continuations observe committed inputs, never a speculative render.
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+    acceptedRef.current = accepted;
+  }, [draft, accepted]);
+  const isDirty = !!accepted && changedFields(draft, accepted.values).length > 0;
+  /** Labels have their own unconfirmed input text; only confirmed chips are part of the draft. */
+  const [labelInput, setLabelInput] = useState('');
+  const editDraft = <K extends TaskEditField>(field: K, value: TaskEditValues[K]) =>
+    setDraft((previous) => ({ ...previous, [field]: value }));
+  const {
+    title: draftTitle,
+    description: draftDescription,
+    status: draftStatus,
+    priority: draftPriority,
+    assigneeId: draftAssigneeId,
+    labels: draftLabels,
+  } = draft;
+  const setDraftTitle = (value: string) => editDraft('title', value);
+  const setDraftDescription = (value: string) => editDraft('description', value);
+  const setDraftStatus = (value: string) => editDraft('status', value);
+  const setDraftPriority = (value: string) => editDraft('priority', value);
+  const setDraftAssigneeId = (value: string) => editDraft('assigneeId', value);
+  const setDraftLabels = (value: string[]) => editDraft('labels', value);
 
-  /** 计算是否有未保存修改 */
-  const isDirty = useMemo(() => {
-    if (!task) return false;
-    return (
-      draftTitle !== task.title ||
-      draftDescription !== (task.description || '') ||
-      draftStatus !== task.status ||
-      draftPriority !== task.priority ||
-      draftAssigneeId !== (task.assigneeId || '') ||
-      JSON.stringify(draftLabels) !== JSON.stringify(task.labels ?? [])
-    );
-  }, [
-    task,
-    draftTitle,
-    draftDescription,
-    draftStatus,
-    draftPriority,
-    draftAssigneeId,
-    draftLabels,
-  ]);
+  /** Clean reads may advance the baseline; dirty drafts and explicit recovery own their version. */
+  useEffect(() => {
+    if (
+      !task ||
+      isDirty ||
+      writePendingRef.current ||
+      readPendingRef.current ||
+      recoveryRef.current
+    )
+      return;
+    const values = draftFromTask(task);
+    const token = isEditableTaskRead(task, taskId) ? taskTokenOf(task) : null;
+    setAccepted({ values, token });
+    setDraft(values);
+    if (!token) publishRecovery({ kind: 'invalidBaseline' });
+  }, [task, taskId, isDirty, writeBusy, publishRecovery]);
 
   /** 通知父级脏状态变化（用于关闭抽屉 confirm 拦截） */
   useEffect(() => {
@@ -221,21 +288,85 @@ export function TaskDetailPanel({
 
   // ── Mutations ────────────────────────────────────
 
-  /** 保存任务 */
+  /** Freeze the event's identity, baseline and submitted inputs for all async continuations. */
+  type Submission = {
+    taskId: string;
+    baseline: TaskEditValues;
+    submitted: TaskEditValues;
+    patch: UpdateTaskRequest;
+  };
   const updateMutation = useMutation({
-    mutationFn: (data: {
-      title: string;
-      description?: string;
-      priority: Priority;
-      status: TaskStatus;
-      assigneeId?: string;
-      labels?: string[];
-    }) => Api.tasks.update(taskId, data),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['tasks', 'detail', taskId] });
-      onChanged?.();
+    mutationFn: async (submission: Submission) => {
+      // Reuse Query cancellation so a pre-write GET cannot later republish an obsolete snapshot.
+      await queryClient.cancelQueries({
+        queryKey: ['tasks', 'detail', submission.taskId],
+        exact: true,
+      });
+      return Api.tasks.update(submission.taskId, submission.patch);
+    },
+    onSuccess: async (saved, submission) => {
+      const queryKey = ['tasks', 'detail', submission.taskId];
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      const matchingResponse = saved && saved.id === submission.taskId;
+      if (matchingResponse) {
+        queryClient.setQueryData<TaskDetail>(queryKey, (previous) =>
+          mergeTaskWrite(previous, saved),
+        );
+      }
+      if (aliveRef.current) {
+        const values = matchingResponse
+          ? draftFromTask(saved, submission.submitted)
+          : submission.submitted;
+        const token =
+          matchingResponse && isEditableTaskRead(saved, submission.taskId)
+            ? taskTokenOf(saved)
+            : null;
+        setAccepted({ values, token });
+        setDraft(mergeDraftFields(draftRef.current, submission.submitted, values));
+        publishRecovery(token ? null : { kind: 'savedNeedsRead' });
+        onChanged?.();
+      }
+      // A successful old-task write still invalidates A, even after its editor has unmounted for B.
+      void queryClient.invalidateQueries({ queryKey, exact: true });
+    },
+    onError: (err) => {
+      if (!aliveRef.current) return;
+      if (isTaskVersionConflict(err)) publishRecovery({ kind: 'conflict' });
+      else toast.error({ title: errorMessageOf(err, t('saveFailed')) });
+    },
+    onSettled: () => {
+      writePendingRef.current = false;
+      if (aliveRef.current) setWriteBusy(false);
     },
   });
+
+  /** Only an explicit real GET can recover a missing or conflicted version; errors never supply tokens. */
+  const readLatest = async () => {
+    if (readPendingRef.current || writePendingRef.current) return;
+    readPendingRef.current = true;
+    setReadBusy(true);
+    const original = acceptedRef.current?.values ?? draftRef.current;
+    const queryKey = ['tasks', 'detail', taskId];
+    try {
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      const latest = await Api.tasks.getById(taskId);
+      if (!isEditableTaskRead(latest, taskId)) throw new Error('Invalid task edit snapshot');
+      if (!aliveRef.current) return;
+      // Cancel background work started while the explicit read was pending before publishing its result.
+      await queryClient.cancelQueries({ queryKey, exact: true });
+      if (!aliveRef.current) return;
+      const values = draftFromTask(latest);
+      setDraft(mergeDraftFields(draftRef.current, original, values));
+      setAccepted({ values, token: taskTokenOf(latest) });
+      queryClient.setQueryData(queryKey, latest);
+      publishRecovery({ kind: 'review', latest: values });
+    } catch {
+      if (aliveRef.current) publishRecovery({ kind: 'readFailed' });
+    } finally {
+      readPendingRef.current = false;
+      if (aliveRef.current) setReadBusy(false);
+    }
+  };
 
   /** 删除任务 */
   const deleteMutation = useMutation({
@@ -243,16 +374,7 @@ export function TaskDetailPanel({
     onSuccess: () => {
       onChanged?.();
     },
-  });
-
-  /** 更新里程碑 */
-  const updateMilestoneMutation = useMutation({
-    mutationFn: (milestoneId: string | null) =>
-      Api.tasks.update(taskId, { milestoneId: milestoneId || undefined }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['tasks', 'detail', taskId] });
-      onChanged?.();
-    },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('deleteFailed')) }),
   });
 
   /** 添加评论 */
@@ -263,6 +385,7 @@ export function TaskDetailPanel({
       void queryClient.invalidateQueries({ queryKey: ['tasks', 'comments', taskId] });
       setCommentText('');
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('comment.addFailed')) }),
   });
 
   /** 添加依赖（U5：搜索选择器替代裸 UUID 输入） */
@@ -277,10 +400,7 @@ export function TaskDetailPanel({
       onChanged?.();
     },
     onError: (err: unknown) => {
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      const msg =
-        axiosErr?.response?.data?.message || axiosErr?.message || t('dependency.addFailed');
-      alert(msg);
+      toast.error({ title: errorMessageOf(err, t('dependency.addFailed')) });
     },
   });
 
@@ -292,6 +412,7 @@ export function TaskDetailPanel({
       void queryClient.invalidateQueries({ queryKey: ['tasks', 'blockers', taskId] });
       onChanged?.();
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('dependency.removeFailed')) }),
   });
 
   /** 关联文档：添加（幂等） */
@@ -301,9 +422,7 @@ export function TaskDetailPanel({
       void queryClient.invalidateQueries({ queryKey: ['tasks', 'detail', taskId] });
     },
     onError: (err: unknown) => {
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      const msg = axiosErr?.response?.data?.message || axiosErr?.message || t('docs.addFailed');
-      alert(msg);
+      toast.error({ title: errorMessageOf(err, t('docs.addFailed')) });
     },
   });
 
@@ -313,6 +432,7 @@ export function TaskDetailPanel({
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['tasks', 'detail', taskId] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('docs.removeFailed')) }),
   });
 
   // ── 派生数据 ────────────────────────────────────
@@ -334,30 +454,73 @@ export function TaskDetailPanel({
   const blockers: TaskDependencyItem[] = Array.isArray(blockersData) ? blockersData : [];
   const listName =
     boardData?.lists?.find((l: { id: string; name: string }) => l.id === task?.listId)?.name ||
+    task?.listName ||
     t('unknownList');
 
-  /** 保存操作 */
+  /** A sparse payload preserves unedited concurrent fields after explicit conflict recovery. */
   const handleSave = () => {
-    if (!task) return;
-    const payload: {
-      title: string;
-      description?: string;
-      priority: Priority;
-      status: TaskStatus;
-      assigneeId?: string;
-      labels?: string[];
-    } = {
-      title: draftTitle,
-      description: draftDescription || undefined,
-      priority: draftPriority as Priority,
-      status: draftStatus as TaskStatus,
-      labels: draftLabels,
-    };
-    if (draftAssigneeId) {
-      payload.assigneeId = draftAssigneeId;
+    const baseline = acceptedRef.current;
+    if (
+      !baseline?.token ||
+      writePendingRef.current ||
+      readPendingRef.current ||
+      (recoveryRef.current && recoveryRef.current.kind !== REVIEW_READY)
+    )
+      return;
+    const submitted = { ...draftRef.current, labels: [...draftRef.current.labels] };
+    const patch = buildTaskPatch(submitted, baseline.values, baseline.token);
+    if (!patch) {
+      publishRecovery(null);
+      return;
     }
-    updateMutation.mutate(payload);
+    writePendingRef.current = true;
+    setWriteBusy(true);
+    updateMutation.mutate({ taskId, baseline: baseline.values, submitted, patch });
   };
+
+  /** Field labels and explicit empty values make the narrow server-value disclosure actionable. */
+  const fieldLabels: Record<TaskEditField, string> = {
+    title: t('form.title'),
+    description: t('form.description'),
+    status: t('form.status'),
+    priority: t('form.priority'),
+    assigneeId: t('form.assignee'),
+    labels: t('form.labels'),
+    milestoneId: t('form.milestone'),
+  };
+  const serverValue = (values: TaskEditValues, field: TaskEditField) => {
+    const value = values[field];
+    if (field === 'status') {
+      const labels: Record<string, string> = {
+        backlog: t('status.backlog'),
+        todo: t('status.todo'),
+        in_progress: t('status.in_progress'),
+        review: t('status.review'),
+        done: t('status.done'),
+        blocked: t('status.blocked'),
+        archived: t('status.archived'),
+      };
+      return labels[values.status] || values.status;
+    }
+    if (field === 'priority') {
+      const labels: Record<string, string> = {
+        p0: t('priority.p0'),
+        p1: t('priority.p1'),
+        p2: t('priority.p2'),
+        p3: t('priority.p3'),
+      };
+      return labels[values.priority] || values.priority;
+    }
+    if (field === 'assigneeId' && values.assigneeId)
+      return agentsData?.find((agent) => agent.id === values.assigneeId)?.name || values.assigneeId;
+    if (field === 'milestoneId' && values.milestoneId)
+      return (
+        milestonesData?.items.find((milestone) => milestone.id === values.milestoneId)?.name ||
+        values.milestoneId
+      );
+    return (Array.isArray(value) ? value.join(', ') : value) || t('editor.emptyValue');
+  };
+  const reviewFields = recovery?.latest ? changedFields(draft, recovery.latest) : [];
 
   /** 发送评论 */
   const handleAddComment = () => {
@@ -366,6 +529,19 @@ export function TaskDetailPanel({
   };
 
   // ── 加载态 ──────────────────────────────────────
+
+  if (taskQuery.isError && task === undefined)
+    return (
+      <QueryFeedback
+        message={
+          httpStatusOf(taskQuery.error) === 404
+            ? t('notFound')
+            : errorMessageOf(taskQuery.error, tRead('loadFailed'))
+        }
+        onRetry={() => void taskQuery.refetch()}
+        busy={taskQuery.isFetching}
+      />
+    );
 
   if (taskLoading || !task) {
     return (
@@ -379,6 +555,51 @@ export function TaskDetailPanel({
 
   return (
     <div className="h-full flex flex-col">
+      {recovery && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-busy={readBusy}
+          className="shrink-0 space-y-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 mb-3 text-sm"
+        >
+          <p>{t(`editor.${recovery.kind}`)}</p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void readLatest()}
+            isLoading={readBusy}
+            disabled={writeBusy}
+          >
+            {t('editor.readLatest')}
+          </Button>
+          {recovery.latest && reviewFields.length > 0 && (
+            <details>
+              <summary className="cursor-pointer">{t('editor.latestValues')}</summary>
+              <dl className="mt-2 space-y-2 max-h-48 overflow-y-auto">
+                {reviewFields.map((field) => (
+                  <div key={field}>
+                    <dt className="font-medium">{fieldLabels[field]}</dt>
+                    <dd className="whitespace-pre-wrap break-words">
+                      {serverValue(recovery.latest!, field)}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </details>
+          )}
+        </div>
+      )}
+      {taskQuery.isError && (
+        <QueryFeedback
+          compact={taskQuery.data !== undefined}
+          message={errorMessageOf(
+            taskQuery.error,
+            tRead(taskQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void taskQuery.refetch()}
+          busy={taskQuery.isFetching}
+        />
+      )}
       {/* ── 头部（固定） ── */}
       <div className="shrink-0 space-y-2">
         {/* 导航栈返回按钮 */}
@@ -488,12 +709,30 @@ export function TaskDetailPanel({
                 <Users className="h-3 w-3" />
                 {t('form.assignee')}
               </label>
+              {agentsQuery.isError && (
+                <QueryFeedback
+                  compact={agentsQuery.data !== undefined}
+                  message={errorMessageOf(
+                    agentsQuery.error,
+                    tRead(agentsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                  )}
+                  onRetry={() => void agentsQuery.refetch()}
+                  busy={agentsQuery.isFetching}
+                />
+              )}
               <select
+                disabled={agentsData === undefined}
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 value={draftAssigneeId}
                 onChange={(e) => setDraftAssigneeId(e.target.value)}
               >
-                <option value="">{t('form.unassigned')}</option>
+                {agentsData === undefined ? (
+                  <option value={draftAssigneeId}>
+                    {task.assigneeName || draftAssigneeId || t('form.unassigned')}
+                  </option>
+                ) : (
+                  <option value="">{t('form.unassigned')}</option>
+                )}
                 {activeAgents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
                     {agent.name}
@@ -508,13 +747,36 @@ export function TaskDetailPanel({
                 <Milestone className="h-3 w-3" />
                 {t('form.milestone')}
               </label>
+              {milestonesQuery.isError && (
+                <QueryFeedback
+                  compact={milestonesQuery.data !== undefined}
+                  message={errorMessageOf(
+                    milestonesQuery.error,
+                    tRead(milestonesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                  )}
+                  onRetry={() => void milestonesQuery.refetch()}
+                  busy={milestonesQuery.isFetching}
+                />
+              )}
               <select
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                value={task.milestoneId || ''}
-                onChange={(e) => updateMilestoneMutation.mutate(e.target.value || null)}
-                disabled={updateMilestoneMutation.isPending}
+                aria-label={t('form.milestone')}
+                value={draft.milestoneId}
+                onChange={(e) => editDraft('milestoneId', e.target.value)}
+                disabled={milestonesData === undefined}
               >
-                <option value="">{t('form.unassigned')}</option>
+                {milestonesData === undefined ? (
+                  <option value={draft.milestoneId}>
+                    {draft.milestoneId || t('form.unassigned')}
+                  </option>
+                ) : (
+                  <option value="">{t('form.unassigned')}</option>
+                )}
+                {milestonesData !== undefined &&
+                  draft.milestoneId &&
+                  !(milestonesData.items ?? []).some(
+                    (m: MilestoneType) => m.id === draft.milestoneId,
+                  ) && <option value={draft.milestoneId}>{draft.milestoneId}</option>}
                 {(milestonesData?.items ?? []).map((m: MilestoneType) => (
                   <option key={m.id} value={m.id}>
                     {m.name}
@@ -522,6 +784,8 @@ export function TaskDetailPanel({
                 ))}
               </select>
             </div>
+
+            <p className="text-xs text-muted-foreground">{t('editor.milestoneHint')}</p>
 
             {/* 标签（可编辑：回车/逗号添加，点 × 移除，随保存提交） */}
             <div className="space-y-2">
@@ -591,7 +855,18 @@ export function TaskDetailPanel({
                 )}
                 <div className="flex items-center justify-between">
                   <span className="text-muted-foreground">{t('attributes.list')}</span>
-                  <span>{listName}</span>
+                  {(boardData !== undefined || task.listName) && <span>{listName}</span>}
+                  {boardQuery.isError && (
+                    <QueryFeedback
+                      compact={boardQuery.data !== undefined}
+                      message={errorMessageOf(
+                        boardQuery.error,
+                        tRead(boardQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                      )}
+                      onRetry={() => void boardQuery.refetch()}
+                      busy={boardQuery.isFetching}
+                    />
+                  )}
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-muted-foreground">{t('attributes.createdAt')}</span>
@@ -602,6 +877,17 @@ export function TaskDetailPanel({
                     <span className="text-muted-foreground">{t('attributes.updatedAt')}</span>
                     <span>{formatDate(task.updatedAt, locale)}</span>
                   </div>
+                )}
+                {topicQuery.isError && (
+                  <QueryFeedback
+                    compact={topicQuery.data !== undefined}
+                    message={errorMessageOf(
+                      topicQuery.error,
+                      tRead(topicQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                    )}
+                    onRetry={() => void topicQuery.refetch()}
+                    busy={topicQuery.isFetching}
+                  />
                 )}
                 {task.topicId && topicData && (
                   <div className="flex items-center justify-between">
@@ -654,15 +940,7 @@ export function TaskDetailPanel({
                             const detail = await Api.docs.getDoc(docLink.docId);
                             router.push(`/docs/${detail.spaceId}?doc=${docLink.docId}`);
                           } catch (err) {
-                            const axiosErr = err as {
-                              response?: { data?: { message?: string } };
-                              message?: string;
-                            };
-                            alert(
-                              axiosErr?.response?.data?.message ||
-                                axiosErr?.message ||
-                                t('docs.openFailed'),
-                            );
+                            toast.error({ title: errorMessageOf(err, t('docs.openFailed')) });
                           }
                         }}
                         className="flex items-center gap-1 hover:text-primary"
@@ -675,6 +953,7 @@ export function TaskDetailPanel({
                         onClick={() => removeDocLinkMutation.mutate(docLink.docId)}
                         className="text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
                         title={t('docs.remove')}
+                        aria-label={t('docs.remove')}
                       >
                         <X className="h-3 w-3" />
                       </button>
@@ -692,10 +971,37 @@ export function TaskDetailPanel({
 
           {/* 依赖 Tab */}
           <TabsContent value="dependencies" className="mt-0 space-y-4">
+            {dependenciesQuery.isError && (
+              <QueryFeedback
+                compact={dependenciesQuery.data !== undefined}
+                message={errorMessageOf(
+                  dependenciesQuery.error,
+                  tRead(dependenciesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void dependenciesQuery.refetch()}
+                busy={dependenciesQuery.isFetching}
+              />
+            )}
+            {blockersQuery.isError && (
+              <QueryFeedback
+                compact={blockersQuery.data !== undefined}
+                message={errorMessageOf(
+                  blockersQuery.error,
+                  tRead(blockersQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void blockersQuery.refetch()}
+                busy={blockersQuery.isFetching}
+              />
+            )}
             {/* 计数仅在内容区显示 */}
-            <div className="text-xs text-muted-foreground">
-              {t('dependency.summary', { blocked: blockers.length, depends: dependencies.length })}
-            </div>
+            {dependenciesData !== undefined && blockersData !== undefined && (
+              <div className="text-xs text-muted-foreground">
+                {t('dependency.summary', {
+                  blocked: blockers.length,
+                  depends: dependencies.length,
+                })}
+              </div>
+            )}
 
             {/* 阻塞中 */}
             {blockers.length > 0 && (
@@ -726,6 +1032,7 @@ export function TaskDetailPanel({
                         onClick={() => removeDependencyMutation.mutate(dep.id)}
                         className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity ml-2"
                         title={t('dependency.remove')}
+                        aria-label={t('dependency.remove')}
                       >
                         <X className="h-3 w-3" />
                       </button>
@@ -761,6 +1068,7 @@ export function TaskDetailPanel({
                         onClick={() => removeDependencyMutation.mutate(dep.id)}
                         className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity ml-2"
                         title={t('dependency.remove')}
+                        aria-label={t('dependency.remove')}
                       >
                         <X className="h-3 w-3" />
                       </button>
@@ -791,6 +1099,7 @@ export function TaskDetailPanel({
               </select>
               <Button
                 size="sm"
+                aria-label={tGlobal('common.create')}
                 onClick={() => {
                   if (!depPick) return;
                   addDependencyMutation.mutate(
@@ -813,13 +1122,30 @@ export function TaskDetailPanel({
 
           {/* 评论 Tab */}
           <TabsContent value="comments" className="mt-0 space-y-4">
+            {commentsQuery.isError && (
+              <QueryFeedback
+                compact={commentsQuery.data !== undefined}
+                message={errorMessageOf(
+                  commentsQuery.error,
+                  tRead(commentsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void commentsQuery.refetch()}
+                busy={commentsQuery.isFetching}
+              />
+            )}
             {/* 计数仅在内容区显示 */}
-            <div className="text-xs text-muted-foreground">
-              {t('comment.count', { count: comments.length })}
-            </div>
+            {commentsData !== undefined && (
+              <div className="text-xs text-muted-foreground">
+                {t('comment.count', { count: comments.length })}
+              </div>
+            )}
 
             <div className="space-y-3 max-h-[300px] overflow-y-auto">
-              {comments.length === 0 ? (
+              {commentsData === undefined ? (
+                commentsQuery.isLoading ? (
+                  <Loading />
+                ) : null
+              ) : comments.length === 0 ? (
                 <p className="text-sm text-muted-foreground">{t('comment.empty')}</p>
               ) : (
                 comments.map((c) => (
@@ -846,7 +1172,12 @@ export function TaskDetailPanel({
                 }}
                 className="flex-1"
               />
-              <Button size="sm" onClick={handleAddComment} isLoading={addCommentMutation.isPending}>
+              <Button
+                size="sm"
+                aria-label={tGlobal('common.submit')}
+                onClick={handleAddComment}
+                isLoading={addCommentMutation.isPending}
+              >
                 <Send className="h-4 w-4" />
               </Button>
             </div>
@@ -854,12 +1185,29 @@ export function TaskDetailPanel({
 
           {/* 活动 Tab */}
           <TabsContent value="activities" className="mt-0 space-y-3">
+            {activitiesQuery.isError && (
+              <QueryFeedback
+                compact={activitiesQuery.data !== undefined}
+                message={errorMessageOf(
+                  activitiesQuery.error,
+                  tRead(activitiesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+                )}
+                onRetry={() => void activitiesQuery.refetch()}
+                busy={activitiesQuery.isFetching}
+              />
+            )}
             {/* 计数仅在内容区显示 */}
-            <div className="text-xs text-muted-foreground">
-              {t('activity.count', { count: activities.length })}
-            </div>
+            {activitiesData !== undefined && (
+              <div className="text-xs text-muted-foreground">
+                {t('activity.count', { count: activities.length })}
+              </div>
+            )}
 
-            {activities.length === 0 ? (
+            {activitiesData === undefined ? (
+              activitiesQuery.isLoading ? (
+                <Loading />
+              ) : null
+            ) : activities.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t('activity.empty')}</p>
             ) : (
               <div className="space-y-3">
@@ -931,7 +1279,13 @@ export function TaskDetailPanel({
             {tGlobal('common.delete')}
           </Button>
           <div className="flex-1" />
-          <Button onClick={handleSave} isLoading={updateMutation.isPending}>
+          <Button
+            onClick={handleSave}
+            isLoading={writeBusy}
+            disabled={
+              readBusy || !accepted?.token || (!!recovery && recovery.kind !== REVIEW_READY)
+            }
+          >
             {tGlobal('common.save')}
           </Button>
         </div>

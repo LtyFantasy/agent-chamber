@@ -11,7 +11,7 @@
  *
  * [权威文档]
  *   - 主文档: docs/api-definition.md §16（DocSpace 模块；export 端点）
- *   - 补充: 线上 DocSpace `docs/platform-mcp.md` §2（export_doc_space 契约）
+ *   - 补充: 线上 DocSpace `docs/integrations/platform-mcp.md` §2（export_doc_space 契约）
  *
  * [关键不变量]
  *   - pathPrefix 是**字面、大小写敏感**前缀（目录语义请带尾 `/`）——LIKE 通配符由

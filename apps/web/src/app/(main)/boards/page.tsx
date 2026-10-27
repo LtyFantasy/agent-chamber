@@ -8,6 +8,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { errorMessageOf } from '@/lib/error-message';
+import { toast } from '@/lib/notify';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/button';
@@ -52,7 +54,7 @@ export default function BoardsPage() {
   } | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['boards', 'list'],
     queryFn: () => Api.boards.list({ pageSize: 100 }),
   });
@@ -82,6 +84,9 @@ export default function BoardsPage() {
       setNewDesc('');
       setNewVisibility(Visibility.PRIVATE);
     },
+    // 失败必须说话：此前无 onError，创建失败被静默吞掉（卡 240c74d6 的六枚之一）。
+    // 文案走 errorMessageOf：仅 4xx + 业务码透传服务端 message，断网时不再露出 axios 英文原文。
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('createError')) }),
   });
 
   const updateMutation = useMutation({
@@ -96,6 +101,7 @@ export default function BoardsPage() {
       void queryClient.invalidateQueries({ queryKey: ['boards'] });
       setEditBoard(null);
     },
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('updateError')) }),
   });
 
   const deleteMutation = useMutation({
@@ -104,6 +110,7 @@ export default function BoardsPage() {
       void queryClient.invalidateQueries({ queryKey: ['boards'] });
       setDeleteId(null);
     },
+    onError: (err: unknown) => toast.error({ title: errorMessageOf(err, t('deleteError')) }),
   });
 
   const boards = data?.items ?? [];
@@ -128,13 +135,19 @@ export default function BoardsPage() {
   const openEdit = async (board: Board) => {
     // 列表项只有 descriptionSnippet（截断值），编辑表单需完整描述，
     // 通过详情接口拉取避免数据截断风险（spec.md §7.4a）
-    const detail = await Api.boards.getById(board.id);
-    setEditBoard({
-      id: board.id,
-      name: board.name,
-      description: detail.description ?? undefined,
-      visibility: board.visibility,
-    });
+    try {
+      const detail = await Api.boards.getById(board.id);
+      setEditBoard({
+        id: board.id,
+        name: board.name,
+        description: detail.description ?? undefined,
+        visibility: board.visibility,
+      });
+    } catch (err: unknown) {
+      // 与 topics 列表页同规（卡 240c74d6 顺手修）：裸 await 会让详情失败变成未处理的
+      // Promise 拒绝——点铅笔毫无反应。失败必须说人话 + 指路（重试）。
+      toast.error({ title: errorMessageOf(err, t('loadErrorDesc')) });
+    }
   };
 
   return (
@@ -150,8 +163,25 @@ export default function BoardsPage() {
         </Button>
       </div>
 
+      {/* 四态分支：加载 / 错误 / 空 / 列表。
+          错误态判据 = `isError && data === undefined`，**不能**写成 `boards.length === 0`：
+          TanStack v5 刷新失败会保留旧 data，零看板用户刷新失败时错误分支会把空态（含创建
+          CTA 与 Dialog）整棵卸载，而零看板用户恰是空态入口的主目标（memory 页 R-2 实证；
+          卡 240c74d6 三列表页同规）。 */}
       {isLoading ? (
         <Loading />
+      ) : isError && data === undefined ? (
+        <div data-testid="boards-list-error">
+          <EmptyState
+            title={t('loadErrorTitle')}
+            description={errorMessageOf(error, t('loadErrorDesc'))}
+            action={
+              <Button variant="outline" onClick={() => void refetch()}>
+                {tGlobal('common.retry')}
+              </Button>
+            }
+          />
+        </div>
       ) : boards.length === 0 ? (
         <EmptyState
           title={t('noBoards')}
@@ -186,6 +216,7 @@ export default function BoardsPage() {
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0"
+                          aria-label={tGlobal('common.edit')}
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
@@ -200,6 +231,7 @@ export default function BoardsPage() {
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0"
+                          aria-label={tGlobal('common.delete')}
                           onClick={(e) => {
                             e.preventDefault();
                             e.stopPropagation();

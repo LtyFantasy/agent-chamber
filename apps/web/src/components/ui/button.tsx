@@ -13,7 +13,7 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     ref,
   ) => {
     const variants = {
-      // 【红线】渐变 + hover 光晕仅 default 主按钮变体；其余变体保持克制（docs/ui-design-system.md）
+      // 【红线】渐变 + hover 光晕仅 default 主按钮变体；其余变体保持克制（docs/frontend/ui-design-system.md）
       default:
         'bg-gradient-to-r from-primary to-violet-glow text-primary-foreground hover:shadow-glow-cyan',
       secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',

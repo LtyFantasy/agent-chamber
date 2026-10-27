@@ -13,13 +13,22 @@
  *   - `isTimeoutError` / `classifyHttpError` / `parseJsonObject`：分类原语（单测直击）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（失败标签表 / provider 列语义）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（失败标签表 / provider 列语义）
  *   - 补充: TypeSafe 官方文档 — REST `POST /v1/systemone` 契约 与 `TYPESAFE_*` env 约定
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（"transport 上移内核"）
  *
  * [关键不变量]
- *   - **零新依赖**：Node 22 全局 `fetch` + `AbortSignal.timeout`（不引入 SDK / 不引入重试退避；
- *     observe 期 fail-open 优先于完整性，过载窗口的代价由固定标签单列承担）。
+ *   - **零新 SDK / 零重试退避**：直连 = Node 22 全局 `fetch`；配代理 = undici 自带 `fetch`
+ *     + `ProxyAgent` 配对（observe 期 fail-open 优先于完整性，过载窗口的代价由固定标签单列
+ *     承担）。**为什么钉 `undici@^6` 且代理路径必须用 undici 自己的 fetch**：Node 22 内置
+ *     fetch 的 dispatcher 契约是 **bundled undici 6.x** 的旧式 handler；若引 npm 上的 undici
+ *     8.x，其 `ProxyAgent` 要求新式 handler（`onRequestStart`），内置 fetch 没有 ⇒ 配代理
+ *     100% 失败且代理零访问（评审实机验证）。钉 6.x 让 npm 包与 Node bundled 同大版本、
+ *     dispatcher 契约对齐；而**跨大版本混喂必炸**是长期坑，故代理路径固定走 undici 自带
+ *     fetch（与其 ProxyAgent 天然同版），直连路径保持全局 fetch（零依赖、行为不变）。
+ *   - **ProxyAgent 进程内缓存**：按代理 URL 复用同一 Agent——每次判定新建 = keep-alive
+ *     失效 + 连接/描述符累积；代理 URL 来自 env（进程生命周期内不变），**永不进日志**
+ *     （可能带 userinfo 凭证）。
  *   - **超时判别先于一切**：`TimeoutError`（`AbortSignal.timeout` 在 Node 22 的名称）与
  *     `AbortError`（部分环境/手动 abort）都判 `timeout`；**fetch 阶段与 body 读阶段同口径**
  *     ——body 读阶段超时若记成 error，会把超时混进"真故障"，失败率分母即失真。
@@ -58,10 +67,38 @@
  *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
  * =============================================================================
  */
+import { fetch as undiciFetch, ProxyAgent, type Dispatcher } from 'undici';
 import type { JudgmentFailedOutcome } from './judgment-capability.interface';
 
 /** 模型标识限长（`experience_judgments.model` 列宽 varchar(64)） */
 export const JUDGMENT_MODEL_MAX_LENGTH = 64;
+
+/**
+ * ProxyAgent 进程内缓存（按代理 URL 单源复用）。
+ *
+ * rationale：ProxyAgent 自带连接池——每次判定新建 = keep-alive 失效 + 连接/描述符累积。
+ * 代理 URL 来自 env（进程生命周期内不变），Map 复用即可；**键即代理 URL，永不进日志**。
+ */
+const proxyAgents = new Map<string, Dispatcher>();
+
+/**
+ * 取（或建）指定代理 URL 的 ProxyAgent（**可 throw**：非法值在 `new ProxyAgent` 同步抛）。
+ *
+ * rationale：ProxyAgent 自带连接池——每次判定新建 = keep-alive 失效 + 连接/描述符累积。
+ * 代理 URL 来自 env（进程生命周期内不变），Map 复用即可；**键即代理 URL，永不进日志**。
+ * 调用方必须在 try 内调用并 catch 回落直连（config 层已校验，但运行时输入不盲目信任）。
+ *
+ * @param proxyUrl 代理 URL（已在 config 层校验为合法 http(s) URL，本层仍防御性重建）
+ * @returns 可复用的 dispatcher（随 undici fetch 的 `dispatcher` 扩展字段传入）
+ */
+function resolveProxyDispatcher(proxyUrl: string): Dispatcher {
+  let agent = proxyAgents.get(proxyUrl);
+  if (!agent) {
+    agent = new ProxyAgent(proxyUrl);
+    proxyAgents.set(proxyUrl, agent);
+  }
+  return agent;
+}
 
 /**
  * 官方判别端点（`{API 根}/v1/systemone`）。
@@ -96,7 +133,16 @@ export interface SystemoneTransportOptions {
   apiKey: string;
   /** 硬顶超时（毫秒） */
   timeoutMs: number;
+  /** 专用出口代理（null/缺省 = 直连；值可能带 userinfo 凭证，**绝不进日志**） */
+  proxyUrl?: string | null;
 }
+
+/**
+ * 传输结局判别值（判别式联合 `SystemoneTransportResult` 的 `status` 值域单源）。
+ *
+ * 比较点必须走常量：`no-magic-string-compare` 已把 `'failed'` 拉黑（与 WebhookStatus 撞值）。
+ */
+export const JUDGMENT_TRANSPORT_STATUS = { OK: 'ok', FAILED: 'failed' } as const;
 
 /**
  * 传输结果：`ok` 带已解析响应体；`failed` 带**固定标签**与 timeout/error 归属。
@@ -105,8 +151,21 @@ export interface SystemoneTransportOptions {
  * 编译器会在新增分支时当场点名（"忘了处理某类失败"编译期即红）。
  */
 export type SystemoneTransportResult =
-  | { status: 'ok'; body: Record<string, unknown> }
-  | { status: 'failed'; outcome: Omit<JudgmentFailedOutcome, 'request'> };
+  | { status: typeof JUDGMENT_TRANSPORT_STATUS.OK; body: Record<string, unknown> }
+  | {
+      status: typeof JUDGMENT_TRANSPORT_STATUS.FAILED;
+      outcome: Omit<JudgmentFailedOutcome, 'request'>;
+    };
+
+/**
+ * 响应最小面：全局 `Response` 与 undici fetch 的 `Response` 名义类型不同（两条 fetch 路径
+ * 各返一种），但本层只用 `ok` / `status` / `text()`——收窄到实际消费面，两条路径都能喂进来。
+ */
+interface TransportResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+}
 
 /**
  * 发一次判别请求（**永不 throw**）。
@@ -134,9 +193,9 @@ export async function postSystemone(
     },
   });
 
-  let response: Response;
+  let response: TransportResponse;
   try {
-    response = await fetch(endpoint, {
+    const init: RequestInit & { dispatcher?: Dispatcher } = {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -146,12 +205,25 @@ export async function postSystemone(
       signal: AbortSignal.timeout(options.timeoutMs),
       // 防 307/308 把带 key 与正文的 POST 原样重发到第三方（命中同样落 transport 分类）
       redirect: 'error',
-    });
+    };
+    if (options.proxyUrl) {
+      // 专用出口代理：dispatcher 创建在 try 内——`new ProxyAgent` 对运行时非法值同步抛，
+      // 落 catch 与网络错误同口径（回落 transport 分类，**永不 throw** 不破坏）。
+      // 必须配 undici 自带 fetch：ProxyAgent 与全局 fetch 的 dispatcher 契约跨大版本不齐
+      // （见文件头不变量），混喂 = 代理零访问且必失败。
+      init.dispatcher = resolveProxyDispatcher(options.proxyUrl);
+      response = (await undiciFetch(
+        endpoint,
+        init as Parameters<typeof undiciFetch>[1],
+      )) as TransportResponse;
+    } else {
+      response = await fetch(endpoint, init);
+    }
   } catch (err: unknown) {
     return isTimeoutError(err)
       ? timeout()
       : transportError(
-          'judgment provider transport error (network unreachable / DNS / TLS / redirect refused)',
+          'judgment provider transport error (network unreachable / DNS / TLS / redirect refused / bad proxy config)',
         );
   }
 
@@ -167,9 +239,7 @@ export async function postSystemone(
     // body 读阶段（连接已建立、body 未读完）必须与 fetch 阶段同口径分码（见文件头不变量）
     return isTimeoutError(err)
       ? timeout()
-      : transportError(
-          'judgment provider transport error while reading the response body',
-        );
+      : transportError('judgment provider transport error while reading the response body');
   }
 
   const text = rawText.trim();
@@ -206,10 +276,11 @@ export function isTimeoutError(err: unknown): boolean {
  * 401/403、422、429、529 各自点名（消费方动作不同：查 key / 修问题集或正文 / 退避重试），
  * 其余只回状态码。429/529 的固定尾巴 `— upstream asks for backoff` 是复查口径的一部分。
  *
- * @param response 非 ok 的响应（**体被读出后丢弃**：只为让连接可复用）
+ * @param response 非 ok 的响应（**体被读出后丢弃**：只为让连接可复用；最小面类型见
+ *   `TransportResponse`——两条 fetch 路径的返回值都能传入）
  * @returns 固定分类文案
  */
-export async function classifyHttpError(response: Response): Promise<string> {
+export async function classifyHttpError(response: TransportResponse): Promise<string> {
   const status = response.status;
   // 读体仅为确保连接可复用；内容丢弃（不进日志、不落库、不进语料）
   await response.text().catch(() => '');

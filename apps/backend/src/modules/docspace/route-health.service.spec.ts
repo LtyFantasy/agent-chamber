@@ -49,6 +49,7 @@ describe('RouteHealthService', () => {
     routeRepo = {
       find: jest.fn(),
       save: jest.fn((x: unknown) => Promise.resolve(x)),
+      createQueryBuilder: jest.fn(),
     } as unknown as jest.Mocked<Repository<DocRoute>>;
 
     spaceRepo = {
@@ -430,6 +431,121 @@ describe('RouteHealthService', () => {
         { kind: 'codeEntry', target: 'codeEntry', value: 'apps/gone.ts' },
       ]);
       expect(result.broken).toBe(1);
+    });
+  });
+
+  // ─── 锚校验公共入口（2 期 A2 收口）──────────────────────────────────
+
+  describe('analyzeDocRouteAnchors / routesReferencingDoc', () => {
+    /** 装配 routesReferencingDoc 的 queryBuilder 链（space_id + docId 双条件） */
+    function mockReferencingRoutes(routes: DocRoute[]): {
+      where: jest.Mock;
+      andWhere: jest.Mock;
+    } {
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(routes),
+      };
+      (routeRepo.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+      return qb;
+    }
+
+    it('routesReferencingDoc：空间内先过滤 + primary/secondary 双命中条件', async () => {
+      const qb = mockReferencingRoutes([makeRoute()]);
+      const out = await service.routesReferencingDoc('space-1', 'doc-1');
+
+      expect(out.length).toBe(1);
+      expect(qb.where).toHaveBeenCalledWith('r.space_id = :spaceId', { spaceId: 'space-1' });
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        '(r.primary_doc_id = :docId OR r.secondary_doc_id = :docId)',
+        { docId: 'doc-1' },
+      );
+    });
+
+    it('headingPaths 集合命中 → 无断锚（routeCount 仍计数）', async () => {
+      mockReferencingRoutes([
+        makeRoute({ primaryHeadingPath: 'A' }),
+        makeRoute({ id: 'route-2', primaryDocId: 'doc-9' }),
+      ]);
+
+      const out = await service.analyzeDocRouteAnchors('space-1', 'doc-1', new Set(['A', 'B']));
+
+      expect(out.routeCount).toBe(2);
+      expect(out.brokenRouteIds).toEqual([]);
+      expect(out.anchors).toEqual([]);
+    });
+
+    it('headingPaths 未命中 → 该路由进 brokenRouteIds + anchors（含 secondary 角色）', async () => {
+      mockReferencingRoutes([
+        makeRoute({ primaryHeadingPath: 'A' }),
+        makeRoute({
+          id: 'route-2',
+          primaryDocId: 'doc-other',
+          secondaryDocId: 'doc-1',
+          secondaryHeadingPath: 'B',
+        }),
+      ]);
+
+      const out = await service.analyzeDocRouteAnchors('space-1', 'doc-1', new Set(['A']));
+
+      expect(out.brokenRouteIds).toEqual(['route-2']);
+      expect(out.anchors).toEqual([{ routeId: 'route-2', headingPath: 'B' }]);
+    });
+
+    it('纯文档级引用（无锚）在内容变更下不断锚；headingPaths=null（delete）下全部判断', async () => {
+      mockReferencingRoutes([makeRoute({ primaryHeadingPath: null })]);
+
+      const contentChange = await service.analyzeDocRouteAnchors('space-1', 'doc-1', new Set());
+      expect(contentChange.brokenRouteIds).toEqual([]);
+
+      const deleted = await service.analyzeDocRouteAnchors('space-1', 'doc-1', null);
+      expect(deleted.brokenRouteIds).toEqual(['route-1']);
+      // anchors 只列有锚的（docId 锚断本身无锚点可比）
+      expect(deleted.anchors).toEqual([]);
+    });
+
+    it('delete 分支：全部引用路由判断，anchors 只列非空锚', async () => {
+      mockReferencingRoutes([
+        makeRoute({ primaryHeadingPath: 'A' }),
+        makeRoute({ id: 'route-2', primaryHeadingPath: null }),
+      ]);
+
+      const out = await service.analyzeDocRouteAnchors('space-1', 'doc-1', null);
+
+      expect(out.brokenRouteIds).toEqual(['route-1', 'route-2']);
+      expect(out.anchors).toEqual([{ routeId: 'route-1', headingPath: 'A' }]);
+    });
+
+    it('无引用路由 → 全零（不抛）', async () => {
+      mockReferencingRoutes([]);
+      const out = await service.analyzeDocRouteAnchors('space-1', 'doc-1', new Set());
+      expect(out).toEqual({ routeCount: 0, brokenRouteIds: [], anchors: [] });
+    });
+
+    it('纯比对 analyzeRouteAnchors（MAJOR-2：零 IO，事务内可用）不触碰任何仓储', () => {
+      const routes = [
+        makeRoute({ primaryHeadingPath: 'A' }),
+        makeRoute({ id: 'route-2', primaryHeadingPath: 'GONE' }),
+      ];
+      const out = service.analyzeRouteAnchors(routes, 'doc-1', new Set(['A']));
+
+      expect(out.routeCount).toBe(2);
+      expect(out.brokenRouteIds).toEqual(['route-2']);
+      expect(out.anchors).toEqual([{ routeId: 'route-2', headingPath: 'GONE' }]);
+      // 零 IO：未触发任何查询（事务内调用的前提）
+      expect(routeRepo.createQueryBuilder).not.toHaveBeenCalled();
+      expect(spaceRepo.findOne).not.toHaveBeenCalled();
+    });
+
+    it('纯比对 delete 语义（headingPaths=null）：全部引用判断 + 只列非空锚', () => {
+      const routes = [
+        makeRoute({ primaryHeadingPath: 'A' }),
+        makeRoute({ id: 'route-2', primaryHeadingPath: null }),
+      ];
+      const out = service.analyzeRouteAnchors(routes, 'doc-1', null);
+      expect(out.brokenRouteIds).toEqual(['route-1', 'route-2']);
+      expect(out.anchors).toEqual([{ routeId: 'route-1', headingPath: 'A' }]);
     });
   });
 });

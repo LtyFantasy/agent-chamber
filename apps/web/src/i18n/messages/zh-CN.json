@@ -19,7 +19,9 @@
     "close": "关闭",
     "retry": "重试",
     "noData": "暂无数据",
-    "emptyList": "当前列表为空"
+    "emptyList": "当前列表为空",
+    "loadFailed": "数据加载失败，请重试。",
+    "refreshFailed": "刷新失败，当前显示上次成功加载的数据。"
   },
   "nav": {
     "dashboard": "仪表盘",
@@ -29,6 +31,8 @@
     "boards": "看板",
     "docs": "文档",
     "experiences": "经验库",
+    "memory": "记忆",
+    "usage": "用量",
     "search": "搜索",
     "settings": "设置",
     "monitoring": "监控",
@@ -42,6 +46,11 @@
     "pendingExperienceReviews": "{count} 条经验待终审"
   },
   "settings": {
+    "tabs": {
+      "profile": "资料",
+      "security": "安全",
+      "notifications": "通知"
+    },
     "language": {
       "title": "语言",
       "description": "选择界面显示语言"
@@ -53,7 +62,8 @@
       "description": "查看和更新您的个人资料",
       "username": "用户名",
       "usernamePlaceholder": "您的用户名",
-      "saveChanges": "保存修改"
+      "saveChanges": "保存修改",
+      "saveFailed": "保存资料失败，已保留修改，请重试。"
     },
     "role": {
       "admin": "管理员",
@@ -90,6 +100,217 @@
       "mismatch": "两次输入的密码不一致",
       "tooShort": "新密码至少需要6位",
       "changeFailed": "修改密码失败"
+    },
+    "notifications": {
+      "loadFailed": "通知设置加载失败",
+      "retry": "重试",
+      "upgradeBanner": {
+        "title": "通知现在按人发送了",
+        "description": "绑定你的飞书账号，才能收到与你相关的通知（你参与的话题、指派给你的任务、你创建或关注的文档）。",
+        "dismiss": "关闭横幅"
+      },
+      "envSeedNotice": {
+        "title": "这个渠道来自部署配置",
+        "description": "管理员在部署时为你导入了飞书收件地址。它已经可以收通知，但还没在你的账号下验证过——建议发送一条测试消息确认。",
+        "dismiss": "知道了"
+      },
+      "empty": {
+        "title": "还没有绑定通知渠道",
+        "description": "绑定飞书后，与你相关的任务、话题与文档变动会推送到你的飞书私聊。",
+        "action": "去绑定"
+      },
+      "channel": {
+        "sectionTitle": "通知渠道",
+        "sectionDescription": "通知只发给「绑定并验证过」的地址；地址变了要重新验证。",
+        "feishuName": "飞书",
+        "feishuDescription": "通过飞书私聊接收通知",
+        "statusBar": {
+          "pending": "还差一步：点「发送测试消息」完成验证，通过后才开始推送。",
+          "seeded": "已从部署配置导入，建议发送测试消息确认。"
+        },
+        "unconfigured": "平台未配置飞书应用，请联系管理员。",
+        "badgeLabel": {
+          "unbound": "未绑定",
+          "unverified": "未验证",
+          "seeded": "已导入·未验证",
+          "verified": "已验证",
+          "failed": "验证失败"
+        },
+        "openIdLabel": "飞书 open_id",
+        "openIdPlaceholder": "ou_xxxxxxxxxxxxxxxxxxxx",
+        "openIdHint": "你的飞书 open_id 形如 ou_ 开头（可在飞书开放平台后台或机器人日志里查到）。",
+        "openIdInvalid": "open_id 格式不正确：应以 ou_ 开头，后面是数字、字母、下划线或短横线。",
+        "save": "保存",
+        "test": "发送测试消息",
+        "testSending": "发送中",
+        "testHint": "会真的发一条消息到你的飞书；通过后自动开启通知。",
+        "testNeedsSave": "先保存新的 open_id，再发送测试消息（否则测的是旧地址）。",
+        "muteLabel": "启用通知",
+        "muteHint": "关闭即「临时静音」，会保留绑定与验证态；与下面的解绑不同，随时可以打开。",
+        "muteRequiresVerified": "先点「发送测试消息」完成验证，才能打开通知。",
+        "unbind": "解绑",
+        "unbindConfirmTitle": "解绑飞书通知？",
+        "unbindConfirmDescription": "通知会立即停止。重绑同一地址将保留验证态，无需重新验证。",
+        "unbindConfirm": "解绑",
+        "unbindCancel": "取消",
+        "savedToast": "渠道已保存",
+        "savedToastDescription": "地址有变动时需要重新发送测试消息完成验证。",
+        "testSuccessToast": "测试消息已发送",
+        "testSuccessToastDescription": "验证通过，通知已开启。",
+        "unboundToast": "已解绑飞书通知",
+        "mutedToast": "已临时静音",
+        "unmutedToast": "已重新开启通知",
+        "errors": {
+          "addressTaken": {
+            "title": "该飞书账号已绑定到其他账户",
+            "description": "若是你本人，请用原账号，或联系管理员解绑后再绑定。"
+          },
+          "channelExists": {
+            "title": "保存失败",
+            "description": "你的账号已有该渠道绑定，请刷新后重试。"
+          },
+          "invalidAddress": {
+            "title": "open_id 格式不正确",
+            "description": "检查 open_id 是否以 ou_ 开头、且完整复制。"
+          },
+          "notVerified": {
+            "title": "尚未完成验证",
+            "description": "先发送测试消息完成验证，再打开通知。"
+          },
+          "missingAddress": {
+            "title": "请填写 open_id",
+            "description": "首次绑定必须提供飞书 open_id。"
+          },
+          "noBinding": {
+            "title": "没有可用的绑定",
+            "description": "该渠道尚未绑定或已解绑，请先保存 open_id。"
+          },
+          "rateLimited": {
+            "title": "操作太频繁",
+            "description": "请在 {seconds} 秒后重试。"
+          },
+          "unknown": {
+            "title": "操作失败",
+            "description": "请稍后重试；若持续失败请联系管理员。"
+          }
+        },
+        "testFailures": {
+          "noProvider": {
+            "title": "平台未配置飞书应用",
+            "description": "请联系管理员完成飞书应用配置后重试。"
+          },
+          "notifyDisabled": {
+            "title": "平台通知已关闭",
+            "description": "请联系管理员开启通知后重试。"
+          },
+          "categoryDisabled": {
+            "title": "平台未启用测试通知",
+            "description": "请联系管理员在部署配置里启用后重试。"
+          },
+          "deliveryFailed": {
+            "title": "发送失败",
+            "description": "请检查 open_id 是否正确、飞书应用是否已授权该用户。"
+          },
+          "rateLimited": {
+            "title": "操作太频繁",
+            "description": "稍后重试即可。"
+          },
+          "other": {
+            "title": "测试消息未能送达",
+            "description": "请稍后重试；若持续失败请联系管理员。"
+          }
+        }
+      },
+      "moreChannels": {
+        "summary": "更多渠道（即将支持）",
+        "soon": "即将支持",
+        "dingtalk": "钉钉",
+        "wecom": "企业微信",
+        "slack": "Slack",
+        "description": "尚未实现，欢迎告诉我们你更需要哪一个。"
+      },
+      "prefs": {
+        "sectionTitle": "通知偏好",
+        "sectionDescription": "选择你想接收哪类通知。开关之外还有两层过滤：平台是否启用该类，以及你是否与这条消息相关（只通知你参与或有权访问的资源）。",
+        "unverifiedHint": "未绑定渠道时，以下开关不产生任何通知。",
+        "disabledBadge": "平台未启用",
+        "topicEmptyHint": "你当前参与 0 个话题——这类通知暂不会产生。",
+        "saved": "已保存",
+        "saveFailed": {
+          "title": "保存失败",
+          "description": "已恢复为原来的设置，请重试。"
+        },
+        "resetDefaults": "恢复默认",
+        "resetConfirmTitle": "恢复默认通知偏好？",
+        "resetConfirmDescription": "会清除你的类别偏好，回到平台默认（任务完成、Agent 直发）。",
+        "resetConfirm": "恢复默认",
+        "resetCancel": "取消",
+        "resetDone": "已恢复默认通知偏好",
+        "resetFailed": {
+          "title": "恢复默认失败",
+          "description": "请稍后重试。"
+        },
+        "groups": {
+          "tasks": {
+            "title": "任务",
+            "description": "与看板任务相关的事件"
+          },
+          "topics": {
+            "title": "话题",
+            "description": "你参与的话题里的新消息"
+          },
+          "docs": {
+            "title": "文档",
+            "description": "你有权访问的空间内的文档变动"
+          },
+          "direct": {
+            "title": "直发",
+            "description": "你的 Agent 主动发给你的消息"
+          }
+        },
+        "categories": {
+          "task_done": {
+            "name": "任务完成",
+            "description": "你创建或被指派的任务标记为完成"
+          },
+          "task_created": {
+            "name": "新建任务",
+            "description": "你参与或创建的任务下新增了任务"
+          },
+          "task_updated": {
+            "name": "任务更新",
+            "description": "任务内容、状态或优先级发生变化"
+          },
+          "task_assigned": {
+            "name": "任务指派",
+            "description": "任务被指派给你或你的 Agent"
+          },
+          "topic": {
+            "name": "话题消息",
+            "description": "你参与的话题里有新消息"
+          },
+          "doc_created": {
+            "name": "新建文档",
+            "description": "你有权访问的空间里新建了文档"
+          },
+          "doc_updated": {
+            "name": "文档更新",
+            "description": "你有权访问的文档被修改"
+          },
+          "doc_deleted": {
+            "name": "文档删除",
+            "description": "你有权访问的文档被删除"
+          },
+          "doc_moved": {
+            "name": "文档移动",
+            "description": "文档路径或所属空间发生变化"
+          },
+          "direct": {
+            "name": "Agent 直发",
+            "description": "你的 Agent 主动发给你的消息"
+          }
+        }
+      }
     }
   },
   "api": {
@@ -161,6 +382,11 @@
     "edit": "编辑话题",
     "noTopics": "暂无话题",
     "noTopicsDesc": "创建您的第一个话题",
+    "loadErrorTitle": "话题列表加载失败",
+    "loadErrorDesc": "请检查网络连接后重试。",
+    "createError": "创建话题失败，请重试。",
+    "updateError": "更新话题失败，请重试。",
+    "deleteError": "删除话题失败，请重试。",
     "noDescription": "暂无描述",
     "viewDetail": "查看详情",
     "notFound": "话题不存在",
@@ -455,7 +681,8 @@
     "comment": {
       "count": "共 {count} 条评论",
       "empty": "暂无评论",
-      "placeholder": "添加评论..."
+      "placeholder": "添加评论...",
+      "addFailed": "添加评论失败，已保留草稿，请重试。"
     },
     "activity": {
       "count": "共 {count} 条活动",
@@ -476,14 +703,16 @@
       "dependsOn": "我依赖",
       "remove": "移除依赖",
       "searchPlaceholder": "搜索任务...",
-      "noResults": "未找到匹配的任务"
+      "noResults": "未找到匹配的任务",
+      "removeFailed": "移除依赖失败，请重试。"
     },
     "docs": {
       "title": "关联文档",
       "empty": "暂无关联文档",
       "remove": "移除关联",
       "addFailed": "关联文档失败",
-      "openFailed": "打开关联文档失败"
+      "openFailed": "打开关联文档失败",
+      "removeFailed": "移除文档关联失败，请重试。"
     },
     "attributes": {
       "title": "属性",
@@ -506,7 +735,21 @@
     "delete": {
       "confirm": "确定要删除此任务吗？"
     },
-    "deleteTitle": "删除任务"
+    "deleteTitle": "删除任务",
+    "saveFailed": "保存任务失败，已保留修改，请重试。",
+    "deleteFailed": "删除任务失败，请重试。",
+    "milestoneFailed": "更改里程碑失败，请重试。",
+    "editor": {
+      "conflict": "编辑期间任务已被修改。已保留你的修改，请先读取最新版本再保存。",
+      "readFailed": "未能读取或确认任务的最新版本。已保留你的修改，请重新读取后再保存。",
+      "savedNeedsRead": "修改已保存，但尚未确认新的任务版本。请读取最新版本后再进行下一次保存。",
+      "invalidBaseline": "保存前需要有效的任务版本。请读取最新版本，你的修改会保留。",
+      "review": "已读取最新版本。请核对保留的修改，再点击保存；这些修改将覆盖对应的服务器字段。",
+      "readLatest": "读取最新版本",
+      "latestValues": "保留修改所对应的服务器最新值",
+      "emptyValue": "（空值）",
+      "milestoneHint": "里程碑与表单其他修改一起保存，请点击保存后生效。"
+    }
   },
   "boards": {
     "title": "看板",
@@ -514,13 +757,19 @@
     "create": "创建看板",
     "noBoards": "暂无看板",
     "noBoardsDesc": "创建您的第一个看板",
+    "loadErrorTitle": "看板列表加载失败",
+    "loadErrorDesc": "请检查网络连接后重试。",
+    "createError": "创建看板失败，请重试。",
+    "updateError": "更新看板失败，请重试。",
+    "deleteError": "删除看板失败，请重试。",
     "noDescription": "暂无描述",
     "taskProgress": "{completed} / {total} 任务",
     "viewBoard": "查看看板",
     "notFound": "看板不存在",
     "backToList": "返回看板列表",
     "loadingTasks": "加载任务中...",
-    "unsavedConfirm": "有未保存修改，确定关闭？",
+    "unsavedConfirm": "离开当前任务并丢弃未保存修改？",
+    "unsavedDescription": "未提交的修改将丢弃。已开始的保存会继续执行，离开不会撤销该请求。",
     "visibility": {
       "public": "公开",
       "private": "私密",
@@ -566,7 +815,14 @@
       "deleteConfirmSimple": "确定要删除列「{name}」吗？",
       "cannotDelete": "此列中有 {count} 个任务，无法删除。请先创建其他列并将任务转移后再删除。",
       "noLists": "暂无列",
-      "noListsDesc": "此看板还没有任何列"
+      "noListsDesc": "此看板还没有任何列",
+      "createTaskFailed": "创建任务失败，已保留草稿，请重试。",
+      "updateFailed": "更新列表失败，请重试。",
+      "deleteFailed": "删除列表失败，请重试。",
+      "createFailed": "创建列表失败，请重试。",
+      "reorderFailed": "列表排序失败，已恢复原顺序，请重试。",
+      "reorderTasksFailed": "任务排序失败，已恢复原顺序，请重试。",
+      "moveTaskFailed": "移动任务失败，已恢复原位置，请重试。"
     },
     "milestone": {
       "button": "里程碑",
@@ -620,14 +876,16 @@
       "editor": "编辑者",
       "member": "成员",
       "setEditor": "设为编辑者",
-      "inviteFailed": "邀请结果：成功 {succeeded} 个，失败 {failed} 个"
+      "inviteFailed": "邀请结果：成功 {succeeded} 个，失败 {failed} 个",
+      "actionFailed": "更新成员失败，请重试。"
     },
     "docs": {
       "bind": "文档",
       "docCount": "{count} 篇文档",
       "createTitle": "新建文档空间",
       "createDesc": "创建绑定本看板的文档空间",
-      "namePlaceholder": "空间名称"
+      "namePlaceholder": "空间名称",
+      "createFailed": "创建文档空间失败，请重试。"
     },
     "settings": {
       "title": "看板设置",
@@ -647,6 +905,8 @@
     "create": "新建空间",
     "noSpaces": "暂无文档空间",
     "noSpacesDesc": "创建第一个文档空间，组织项目知识",
+    "loadErrorTitle": "文档空间加载失败",
+    "loadErrorDesc": "请检查网络连接后重试。",
     "noDescription": "暂无描述",
     "docCount": "{count} 篇文档",
     "boundTopic": "话题",
@@ -1037,7 +1297,9 @@
       "entityId": "实体ID",
       "actor": "操作者",
       "ipAddress": "IP地址"
-    }
+    },
+    "previousPage": "上一页",
+    "nextPage": "下一页"
   },
   "logs": {
     "title": "活动日志",
@@ -1131,6 +1393,9 @@
     "passwordPlaceholder": "••••••••",
     "loginButton": "登录",
     "loginFailed": "登录失败",
+    "loginErrorInvalidCredentials": "邮箱或密码错误（若账号已被停用，请联系管理员）",
+    "loginErrorAccountDisabled": "账号已停用，请联系管理员",
+    "loginErrorRateLimited": "登录尝试过于频繁，请稍后重试",
     "viewAgentGuide": "查看 Agent 接入指南",
     "passwordMismatch": "两次输入的密码不一致",
     "passwordMinLength": "密码至少需要6位",
@@ -1198,12 +1463,14 @@
     "resetKey": {
       "title": "重置并查看 API Key",
       "description": "重置后将生成新 Key 并展示，旧 Key 立即失效。确定继续吗？",
-      "confirm": "确认重置"
+      "confirm": "确认重置",
+      "scopesHint": "新 Key 的权限继承被吊销 Key 的最严交集（若当前所有 Key 都是只读，新 Key 也是只读），永远不会获得更多权限。"
     },
     "newKey": {
       "title": "新的 API Key",
       "description": "请立即保存，此 Key 仅显示一次",
-      "saved": "我已保存"
+      "saved": "我已保存",
+      "scopes": "权限"
     },
     "detail": {
       "notFound": "Agent 不存在",
@@ -1259,8 +1526,13 @@
       "nameLabel": "名称",
       "namePlaceholder": "生产环境 Key",
       "revokeTitle": "Revoke API Key",
-      "revokeWarning": "此操作不可撤销，使用该 Key 的 Agent 将立即停止工作。"
-    }
+      "revokeWarning": "此操作不可撤销，使用该 Key 的 Agent 将立即停止工作。",
+      "scopes": "权限"
+    },
+    "toggleFailed": "更改 Agent 状态失败，请重试。",
+    "updateFailed": "更新 Agent 失败，请重试。",
+    "deleteFailed": "删除 Agent 失败，请重试。",
+    "resetKeyFailed": "重置 API Key 失败，请重试。"
   },
   "users": {
     "title": "用户管理",
@@ -1304,7 +1576,8 @@
     "delete": {
       "title": "确认删除",
       "description": "确定要删除用户 '{name}' 吗？此操作将软删除该用户（数据保留但账号不可用）。"
-    }
+    },
+    "deleteFailed": "删除用户失败，请重试。"
   },
   "skills": {
     "title": "Skill 库",
@@ -1593,5 +1866,806 @@
     },
     "clearFilters": "清除全部筛选",
     "backToFirstPage": "回到第 1 页"
+  },
+  "memory": {
+    "title": "记忆",
+    "description": "这个平台记住了什么：agent 提名、引擎形成的记忆主张。本页只读——记忆由 agent 经 API 写入。",
+    "filterAll": "全部",
+    "project": {
+      "label": "记忆项目",
+      "aria": "选择记忆项目",
+      "loading": "正在加载项目…",
+      "emptyTitle": "还没有记忆项目",
+      "emptyDesc": "绑定一个你能读的主题/看板/文档空间即可创建。",
+      "errorTitle": "记忆项目加载失败",
+      "retry": "重试",
+      "metadataOnlyBadge": "无内容读权限",
+      "metadataOnlyHint": "你可以读这个项目的账本元数据，但读不到记忆正文。",
+      "create": "新建项目",
+      "createTitle": "创建记忆项目",
+      "createDesc": "绑定同时是这个项目的权限来源——请绑定一个你能读的主题/看板/文档空间。",
+      "form": {
+        "name": "项目名称",
+        "namePlaceholder": "例如：Chamber 主项目",
+        "nameRequired": "请填写项目名称。",
+        "slug": "项目标识",
+        "slugHint": "以小写字母或数字开头，之后只能用 小写字母、数字 与 . _ -",
+        "slugRequired": "请填写项目标识。",
+        "slugInvalid": "标识须以小写字母或数字开头，且只含小写字母、数字与 . _ -",
+        "slugIrreversible": "项目标识会作为引擎侧 workspace 注册，创建后无法注销。",
+        "engine": "引擎",
+        "engineHument": "接引擎（可语义搜索，需 Hub 注册）",
+        "engineNone": "不接引擎（只做本地账本，搜索不可用）",
+        "provisioningAuto": "留空将自动在 Hub 注册，无需填写。",
+        "provisioningUnavailable": "需要运维提供引擎绑定信息。",
+        "provisioningTimeNote": "首次在此 Hub 注册引擎项目可能需要约 30 秒。",
+        "advancedSummary": "手动指定引擎绑定（高级）｜仅在复用已有 Hub workspace 时使用",
+        "engineWorkspaceId": "引擎工作区标识",
+        "engineActorId": "引擎侧 actor 标识",
+        "engineCredentialRef": "凭据引用名",
+        "engineCredentialRefHint": "填的是引用名、不是密钥本身（密钥由引擎侧解析）。",
+        "credentialLooksReal": "这看起来像真实密钥（sk_/apikey_ 前缀）——这里要填的是引用名，不是密钥。",
+        "engineTripleRequired": "自助开通当前不可用：三个字段不能留空，请全部填写，或改用「不接引擎」。",
+        "engineTriplePartial": "引擎绑定的三个字段要么全填、要么全留空——部分填写无法创建。",
+        "bindingType": "资源类型",
+        "bindingTypeTopic": "主题",
+        "bindingTypeBoard": "看板",
+        "bindingTypeDocSpace": "文档空间",
+        "bindingSelected": "已选 {count}/{max} 个绑定",
+        "bindingAdd": "添加",
+        "bindingRemove": "移除{type}绑定 {name}",
+        "bindingDuplicate": "这个资源已在列表中。",
+        "bindingEmpty": "至少绑定一个资源。",
+        "bindingMaxReached": "最多绑定 {max} 个资源。",
+        "bindingTarget": "绑定目标",
+        "targetPlaceholder": "请选择",
+        "targetLoading": "正在加载…",
+        "targetEmpty": "你没有可绑定的主题/看板/文档空间。",
+        "targetEmptyHint": "绑定同时是这个项目的权限来源——只有你能读的资源才可绑。",
+        "targetError": "候选列表加载失败。",
+        "targetRetry": "重试",
+        "targetCapNote": "最多列出前 100 个候选（已知限制）。",
+        "targetRequired": "请选择绑定目标。",
+        "cancel": "取消",
+        "submit": "创建",
+        "submitting": "正在创建…",
+        "submittingProvisioning": "正在向引擎注册…"
+      },
+      "createError": {
+        "slugTaken": "这个标识已被占用，换一个。",
+        "targetForbidden": "你对这个资源没有读权限。",
+        "engineField": "引擎绑定信息不完整：三个字段要么全填、要么全留空（留空即自动注册）。",
+        "provisionUnavailable": "自动注册暂时不可用（未到达 Hub），什么都没写库——保持 slug 与项目名不变再试一次即可。",
+        "provisionTimeout": "向 Hub 注册超时，可能已经落库。请保持 slug 与项目名不变再试一次（Hub 会按幂等键重放）。",
+        "provisionConflict": "Hub 拒绝了这次注册（冲突）：这个标识可能已被以不同形态占用。可以换一个标识，或在高级区显式填入已有的引擎绑定信息。",
+        "provisionFailed": "Hub 侧注册失败。可在高级区显式填入引擎绑定信息绕过自动注册，或修正原因后重试。",
+        "generic": "创建失败。"
+      },
+      "created": "记忆项目已创建",
+      "refreshFailedAfterCreate": "项目已创建，但项目列表刷新失败——请手动刷新页面后再选择它。"
+    },
+    "hub": {
+      "label": "引擎",
+      "ok": "引擎已连接",
+      "degraded": "引擎不可用"
+    },
+    "engine": {
+      "reason": {
+        "notConfigured": "这个部署没有配置记忆引擎。记忆是可选增强：下面的账本照常可读，只有搜索需要引擎。",
+        "projectUnbound": "本项目没有绑定引擎。账本照常可读；需要管理员为它绑定引擎后搜索才能用。",
+        "engineUnavailable": "记忆引擎暂时不可用。下面的账本照常可读，稍后再试搜索。"
+      },
+      "runtimeNote": "上一次搜索打到引擎时它不可用——在它恢复应答之前，搜索保持禁用。",
+      "cost": "语义搜索会消耗引擎配额。"
+    },
+    "tabs": {
+      "aria": "记忆账本视图",
+      "committed": "已记住",
+      "nominations": "提名记录",
+      "inactive": "已失效"
+    },
+    "formationState": {
+      "submitted": "处理中",
+      "committed": "已形成",
+      "no_memory": "无需记忆",
+      "rejected": "已拒绝",
+      "failed": "失败",
+      "unknown": "结果未知",
+      "conflict": "冲突"
+    },
+    "status": {
+      "active": "生效中",
+      "superseded": "已更正",
+      "withdrawn": "已撤销",
+      "hint": {
+        "active": "这是当前生效的主张。",
+        "superseded": "已有更正取代这条主张——它作为历史记录保留。",
+        "withdrawn": "这次更正被撤回，从未成为生效主张。"
+      }
+    },
+    "card": {
+      "excerptEmpty": "这条没有留存摘要。",
+      "sourceCount": "{count} 条来源",
+      "metadataOnly": "仅元数据",
+      "deferred": "稍后形成",
+      "recordedAt": "提名于 {time}",
+      "authorship": "无出处（自述）"
+    },
+    "nominator": {
+      "label": "提名者",
+      "system": "系统",
+      "deletedHint": "该提名者账号已删除——名字取自其档案，予以保留。",
+      "orphanHint": "该提名者的档案已无法解析——显示 id 前 8 位。",
+      "type": {
+        "human": "人类",
+        "agent": "Agent",
+        "system": "系统"
+      }
+    },
+    "search": {
+      "placeholder": "问问它记住了什么…",
+      "modeAria": "搜索模式",
+      "mode": {
+        "semantic": "语义",
+        "literal": "字面"
+      },
+      "semanticNote": "问引擎，最多返回 {max} 条；每次都会消耗引擎配额。",
+      "literalNote": "只在当前已加载的 {count} 条里按文字匹配，即时、不消耗配额。",
+      "submit": "搜索",
+      "searching": "搜索中…",
+      "clear": "返回账本",
+      "restoredHint": "输入框里恢复了上次的查询词。点「搜索」才会真的再查一次——打开分享的链接不会自己消耗配额。",
+      "errorTitle": "搜索失败",
+      "retry": "再试一次",
+      "forbidden": "你可以读这个项目的账本元数据，但读不到记忆正文——语义搜索需要内容读权限。",
+      "literalEmpty": "已加载的条目里没有匹配「{query}」的文字。",
+      "maxItemsNote": "最多 {max} 条",
+      "relevance": "相关度 {score}",
+      "orderNote": "排序与分数都由引擎给出：这个数字是引擎的词面命中排序权重，仅这一次搜索内可比（换搜索、换项目都不可比），既不是置信度、也不代表「更可能为真」。",
+      "trustNote": "这是它基于含义的联想，不是结论；正文是形成时的快照，来源可能已变化。",
+      "recallId": "本次召回 {id}",
+      "filteredByPermission": "另有条目因来源权限未显示。",
+      "engineDataSuspect": "引擎返回了本项目映射不到的条目——请谨慎对待。",
+      "resultCount": "{count} 条结果",
+      "debug": {
+        "summary": "原始信任框",
+        "trustLevel": "trustLevel",
+        "decisionAuthority": "decisionAuthority",
+        "usageNote": "usageNote"
+      },
+      "empty": {
+        "noMatches": "引擎对这个问题没有匹配。换个问法试试——也可能它还没记住相关的任何东西。",
+        "allFiltered": "引擎确实有匹配，但这些条目的来源权限不足、被全部过滤了——需要来源访问权才能看到。"
+      },
+      "staleResults": "这次刷新没有成功——下面是上一次的结果，可能已经过时。"
+    },
+    "empty": {
+      "committedTitle": "它还没记住任何东西",
+      "committedDesc": "记忆由 agent 提名后、由引擎形成。",
+      "committedRoadmap": "还有 {count} 条提名在处理中——打开「提名记录」跟进。",
+      "committedRoadmapLink": "打开提名记录",
+      "nominationsTitle": "没有可展示的提名记录",
+      "nominationsDesc": "引擎还在处理中的提名、以及失败后需要再看一眼的提名，会出现在这里。",
+      "inactiveTitle": "还没有失效的记录",
+      "inactiveDesc": "被更正取代、或更正未达成而撤回的条目会落到这里。"
+    },
+    "listError": "记忆账本加载失败",
+    "retry": "重试",
+    "tabError": "这个标签页加载失败：{message}",
+    "pagination": "第 {page} / {totalPages} 页 · 共 {total} 条",
+    "paginationPrev": "上一页",
+    "paginationNext": "下一页",
+    "truncated": "已显示最近 {shown} 条 · 共 {total} 条",
+    "degraded": {
+      "pageBanner": "你可以读这个项目的账本元数据，但读不到记忆正文。下面全部是元数据投影——需要内容读权限才能看到主张、摘要与来源。",
+      "rowLocked": "正文已隐去",
+      "rowLockedHint": "该条目的来源已不可见，正文已隐去。",
+      "compactCategory": "类别",
+      "compactState": "状态",
+      "compactTime": "时间"
+    },
+    "recovery": {
+      "label": "下一步",
+      "sameKeyResend": "仍在处理中——可以用同一个幂等键续跑。",
+      "inspectBackfill": "由引擎的只读回查回填。",
+      "hubManualRequired": "引擎拒绝了，或结果未知——需要运维介入。",
+      "configInvalid": "本项目的引擎绑定或凭据无效，重试无效。",
+      "paramInvalid": "请求参数被拒——换一个新的幂等键重提。",
+      "unknown": "这条没有记录下一步动作。",
+      "copyLedgerId": "复制账本 id",
+      "copied": "已复制账本 id"
+    },
+    "nomination": {
+      "ledgerId": "账本 id",
+      "reviewAt": "复核时间",
+      "reviewDue": "已到复核时间",
+      "createdAt": "创建于",
+      "updatedAt": "更新于"
+    },
+    "detail": {
+      "back": "返回记忆账本",
+      "notFound": "这条账本行不可见",
+      "notFoundDesc": "它可能已被删除，或属于一个你读不到的项目。",
+      "notFoundBack": "返回记忆账本",
+      "errorTitle": "这条账本行加载失败",
+      "retry": "重试",
+      "metadataOnlyTitle": "仅元数据可见",
+      "metadataOnlyDesc": "你可以读这条账本行的元数据，但读不到正文。需要本项目的内容读权限，才能看到主张、理由与来源。",
+      "metadataOnlyBack": "返回账本",
+      "metadataOnlyHint": "账本行 {id}",
+      "content": "正文",
+      "noContent": "这条没有留存正文。",
+      "subject": "主张",
+      "scope": "适用范围",
+      "effectiveNote": "生效 / 撤销说明",
+      "none": "—",
+      "sources": "来源",
+      "sourcesEmpty": "没有来源——这条主张是纯著述，不依赖来源。",
+      "sourceHeading": "来源 {index}",
+      "sourceMoved": "自这条记忆形成后已变化",
+      "sourceReadTool": "用 {tool} 回查当前版本",
+      "noEngineMemory": "更正 / 提名形成后才产生引擎记忆，这条还没有。",
+      "noEngineMemoryMetadata": "这条是「仅元数据可见」的投影——引擎投影同样要内容读权限，故一并隐去。",
+      "engineViewUnavailable": "该记忆的引擎投影当前不可读。"
+    },
+    "timeline": {
+      "title": "更正链",
+      "loading": "正在加载更正链…",
+      "unavailable": "更正链加载失败——上方正文照常展示（按已取到的行）。",
+      "retry": "重新加载更正链",
+      "chainIncomplete": "这条链可能不完整——本项目超过 {cap} 页账本行。",
+      "current": "现行版本",
+      "backToCurrent": "回到现行版本",
+      "selectVersion": "查看这个版本",
+      "metadataNode": "仅元数据",
+      "outsideChain": "这条不在下方展示的链视图内。",
+      "withdrawnTitle": "未达成尝试",
+      "withdrawnHint": "被撤回的更正行保留在审计轨迹里，但它们从未成为生效主张。",
+      "nodeAria": "第 {index} / {total} 个版本：{label}"
+    },
+    "usage": {
+      "open": "用量",
+      "openTitle": "查看这个项目已记录的模型用量"
+    },
+    "graph": {
+      "title": "记忆关系图",
+      "description": "引擎侧的节点与关系。图只显示引擎侧记忆——账本里尚未形成引擎记忆的行不会出现在这里。",
+      "back": "返回记忆账本",
+      "open": "关系图",
+      "openTitle": "在关系图里看这个项目的记忆（需要 ≥xl 屏宽）",
+      "openNarrow": "需要 ≥xl 屏宽",
+      "narrowTitle": "屏宽不足，无法显示关系图",
+      "narrowDesc": "关系图需要 ≥xl 的屏宽（本版不做窄屏图）。在更宽的窗口里打开，或先回账本。",
+      "loading": "正在加载关系图…",
+      "errorTitle": "关系图加载失败",
+      "retry": "重试",
+      "unavailableTitle": "这个项目的关系图读不到",
+      "unavailableDesc": "需要本项目的内容读权限，或引擎记忆当前都不可见。",
+      "skipCanvas": "跳过关系图",
+      "canvas": {
+        "noNodesTitle": "还没有引擎记忆",
+        "noNodesDesc": "本项目还没有形成任何引擎记忆。记忆由 agent 提名后、由引擎形成。",
+        "noEdgesNote": "边由更正（supersedes）或引擎关系产生；没有边是常态。",
+        "orphanGroup": "未连接（{count}）",
+        "hint": "滚轮缩放 · 拖拽平移 · 点击节点看详情",
+        "fit": "重新适配",
+        "zoomIn": "放大",
+        "zoomOut": "缩小",
+        "reset": "重置视图",
+        "loadMore": "加载更多",
+        "loadingMore": "加载中…",
+        "roleStatus": "当前显示 {nodes} 个节点 / {edges} 条边{truncated}",
+        "roleStatusTruncated": "，已截断"
+      },
+      "legend": {
+        "title": "关系类型",
+        "collapse": "收起图例",
+        "expand": "展开图例",
+        "arrowNote": "箭头指向被取代的旧版"
+      },
+      "filters": {
+        "label": "筛选",
+        "kind": "类型",
+        "kindAll": "全部类型",
+        "status": "状态",
+        "statusAll": "全部状态",
+        "relation": "关系",
+        "relationAll": "全部关系"
+      },
+      "governance": {
+        "summary": "已显示 {nodes} 个节点 · {edges} 条边",
+        "hiddenNodes": " · {count} 个节点因来源不可见被隐藏",
+        "omittedEdges": " · {count} 条边已省略",
+        "toggle": "明细",
+        "omittedDetail": "「已省略的边」包含两类：一端还在未加载的页里的（点「加载更多」可能补齐），以及两端分落在不同页的——browse 只取两端点同页的边，那部分**继续加载也不会补齐**。所以图上没有边，不等于引擎里没有关系。",
+        "scopeNote": "图只显示引擎侧记忆；账本里尚未形成引擎记忆的行不会出现。",
+        "permissionNote": "被隐藏的节点可能有两种成因：来源的读取权限不足（需要向来源所有者申请），或来源已被删除（回账本核对）。引擎侧的计数不区分这两者，故两种可能都要考虑。",
+        "suspectNote": "引擎返回了本项目映射不到的节点——请谨慎对待。",
+        "truncatedNote": "引擎返回的分页被截断，图可能不完整。",
+        "partialNote": "引擎只返回了部分数据，图可能不完整。"
+      },
+      "status": {
+        "resetStale": "引擎数据已变化，已重新加载第一页。",
+        "resetOther": "引擎返回错误（{code}），已重新加载第一页，可稍后重试。",
+        "cleared": "选中项已清除。",
+        "outOfView": "新增 {count} 个节点在图外——可点右下角「重新适配」看全。"
+      },
+      "node": {
+        "aria": "第 {index} / {total} 个记忆节点：{label}，{kind}，{status}",
+        "contradictions": "矛盾 {count}",
+        "supersessions": "取代 {count}"
+      },
+      "drawer": {
+        "title": "节点详情",
+        "close": "关闭",
+        "openDetail": "打开完整详情",
+        "noLedger": "这条引擎记忆没有对应的账本行，无法打开详情。",
+        "kind": "类型",
+        "status": "状态",
+        "scope": "作用域",
+        "resolution": "分辨率",
+        "anchor": "来源锚",
+        "boundary": "边界",
+        "confidence": "置信度",
+        "confidencePresent": "有（图面不展示数值）",
+        "confidenceAbsent": "无",
+        "preview": "预览",
+        "relations": "关系",
+        "relationsEmpty": "这条记忆目前没有已加载的关系边。",
+        "relationsPartial": "关系可能不完整（引擎只返回了部分数据）。",
+        "yes": "是",
+        "no": "否",
+        "resolutionValue": "当前 {active} · 可用 {available}"
+      },
+      "kind": {
+        "observation": "观察",
+        "episode": "事件",
+        "concept": "概念",
+        "belief": "信念",
+        "procedure": "流程"
+      },
+      "statusLabel": {
+        "active": "生效中",
+        "superseded": "已被取代",
+        "archived": "已归档"
+      },
+      "relation": {
+        "derived_from": "派生自",
+        "supports": "支持",
+        "contradicts": "矛盾",
+        "supersedes": "取代",
+        "part_of": "从属"
+      },
+      "anchor": {
+        "fresh": "可校验",
+        "stale": "来源已变",
+        "unknown": "未校验",
+        "failed": "校验失败",
+        "none": "无锚"
+      },
+      "scope": {
+        "actorPrivate": "仅本项目",
+        "workspaceShared": "工作区共享",
+        "ownerShared": "所有者共享"
+      }
+    },
+    "resolution": {
+      "title": "分辨率阶梯",
+      "subtitle": "这条记忆当前各层级的状态",
+      "legend": "R0 是形成默认，更高层级需引擎晋升——空槽 ≠ 数据丢失。",
+      "active": "默认呈现",
+      "historicalCount": "另有 {count} 个旧版本",
+      "openCurrent": "查看 {resolution} 正文",
+      "openHistorical": "查看 {resolution} 的旧版本",
+      "openDisabled": "这一层还没有内容，不能展开。",
+      "historyJump": "在版本历史里看 {resolution} 的 {count} 个旧版本",
+      "mappedCount": "这条账本行映射了 {count} 条引擎记忆，此处显示第 1 条。",
+      "label": {
+        "R0": "标签 / 定位",
+        "R1": "要点",
+        "R2": "概览",
+        "R3": "工作模型",
+        "R4": "深层记忆"
+      },
+      "state": {
+        "current": "已有内容",
+        "historical": "只有旧版本",
+        "missing": "引擎侧数据不完整，转运维看",
+        "beyond": "尚未晋升"
+      }
+    },
+    "representations": {
+      "title": "版本历史",
+      "subtitle": "这条记忆在同一分辨率下的旧版本",
+      "loading": "正在加载旧版本…",
+      "retry": "重试",
+      "expand": "展开旧版本",
+      "collapse": "收起旧版本",
+      "resolutionLabel": "分辨率",
+      "emptyTitle": "没有旧版本",
+      "emptyDesc": "同一记忆在同一分辨率下被重新形成时才产生旧版本；更正不产生旧版本（它是跨记忆的取代链，见下面的更正链块）。",
+      "entryAria": "第 {index} / {total} 个旧版本：{createdAt}",
+      "previewTruncated": "预览已截断",
+      "bytes": "原文 {bytes} 字节",
+      "dialog": {
+        "titleCurrent": "当前正文（{resolution}）",
+        "titleHistorical": "历史版本 · {createdAt}",
+        "close": "关闭",
+        "loading": "正在加载正文…",
+        "unavailable": "该记忆的引擎投影当前不可读。",
+        "errorOther": "正文加载失败。",
+        "retry": "重试",
+        "bodyTruncated": "正文已被引擎截断（原文 {bytes} 字节）。"
+      }
+    }
+  },
+  "usage": {
+    "title": "用量",
+    "description": "平台 API/MCP 调用统计，以及项目当前 Hument 引擎身份已记录的模型工作。这是两本独立账，永远不会相加。",
+    "platformDescription": "平台 API 与 MCP 调用统计。",
+    "tabs": {
+      "aria": "用量视图",
+      "platform": "平台 API / MCP",
+      "hument": "Hument 模型用量"
+    },
+    "state": {
+      "loading": "加载中…",
+      "retry": "重试",
+      "unknown": "未知",
+      "unknownHint": "未知值——不是 0",
+      "debug": "机器可读详情",
+      "debugStatus": "HTTP 状态",
+      "debugCode": "错误码",
+      "debugReason": "原因",
+      "debugEngineCode": "引擎码",
+      "debugHintCode": "提示码",
+      "debugRequestId": "请求 id",
+      "retryAfter": "已限流：等待 {seconds} 秒后重试。",
+      "retryWait": "{seconds} 秒后可重试"
+    },
+    "platform": {
+      "adminOnlyTitle": "平台用量仅管理员可见",
+      "adminOnlyDesc": "这里聚合全平台 API/MCP 调用统计。如需访问，请联系管理员。",
+      "filters": {
+        "groupBy": "聚合维度",
+        "metric": "工具口径",
+        "range": "时间窗",
+        "actorType": "身份种类",
+        "limit": "Top N",
+        "refresh": "刷新",
+        "jumpNow": "跳到最新"
+      },
+      "groupBy": {
+        "tool": "MCP 工具",
+        "route": "REST 路由",
+        "actor": "调用者"
+      },
+      "metric": {
+        "invocations": "调用次数",
+        "rest_calls": "扇出 REST 调用"
+      },
+      "actorType": {
+        "all": "全部身份",
+        "agent": "Agent",
+        "human": "人类",
+        "system": "System（MCP fallback 鉴权）",
+        "anonymous": "匿名"
+      },
+      "range": {
+        "7": "最近 7 天",
+        "28": "最近 28 天",
+        "90": "最近 90 天",
+        "custom": "自定义窗口"
+      },
+      "table": {
+        "caption": "所选时间窗内的 Top-N {groupBy} 用量",
+        "key": {
+          "tool": "工具",
+          "route": "路由",
+          "actor": "调用者"
+        },
+        "calls": "调用次数",
+        "actors": "去重调用者",
+        "avg": "平均 ms",
+        "errorRate": "错误率",
+        "type": "身份种类",
+        "details": "详情",
+        "expand": "展开 {key}",
+        "max": "峰值 ms",
+        "actorName": "调用者名",
+        "actorType": "身份种类",
+        "anonymous": "匿名",
+        "deletedActor": "已删除调用者",
+        "groupKey": "原始键",
+        "actorTypeValue": {
+          "agent": "Agent",
+          "human": "人类",
+          "system": "System（MCP fallback 鉴权）",
+          "anonymous": "匿名"
+        }
+      },
+      "note": {
+        "window": "时间窗 {from} → {to}（UTC，右端不含）。",
+        "coverage": "数据起点 {start} · 已覆盖 {days} 天。",
+        "noTableData": "这个部署还没有任何用量数据。",
+        "coverageWarn": "数据不足 28 天——不要把短窗口的差异读成趋势。",
+        "topN": "仅显示 Top {limit}——这不是全量，禁止求和。",
+        "noSum": "Top-N 是排序后的键，不是完整分区；这里故意不展示总和。",
+        "mixedUnits": "调用者维度混合了 invocation 行与扇出 REST 行（单位不同），只能用于活跃度排序。",
+        "coverageUnknown": "数据起点 {start} · 覆盖天数未知。",
+        "coverageUnknownWarn": "覆盖天数未知——无法排除“不足 28 天”的警示。",
+        "ledgerScope": "这里统计平台 API/MCP 调用次数，与模型用量和费用分别记账，不能相加。",
+        "raw": "原始 ISO 值"
+      },
+      "empty": {
+        "noTableDataTitle": "完全没有用量数据",
+        "noTableDataDesc": "用量表是空的——这个部署还没有记录任何 API/MCP 调用。",
+        "windowTitle": "这个时间窗内没有调用",
+        "windowDesc": "表里有数据，但所选时间窗内没有。请放宽时间窗。",
+        "filteredTitle": "没有匹配该过滤的调用",
+        "filteredDesc": "时间窗内有数据，但身份种类过滤把全部行排除了。清除过滤即可看到该窗口。"
+      },
+      "error": {
+        "title": "平台用量加载失败"
+      },
+      "stale": "刷新失败——正在显示上一次结果。"
+    },
+    "hument": {
+      "project": {
+        "label": "记忆项目",
+        "aria": "选择记忆项目",
+        "search": "搜索本页",
+        "searchPlaceholder": "名称或 slug",
+        "searchHint": "搜索只过滤本页加载的 100 个项目；其余项目请翻页。",
+        "prev": "上一页项目",
+        "next": "下一页项目",
+        "page": "第 {page} / {total} 页",
+        "outsidePage": "当前选中项目（不在本页）",
+        "disabledUsage": "用量已关闭——需要全部绑定可读或管理员",
+        "noEngine": "未绑定引擎",
+        "unavailable": "引擎不可用",
+        "emptyTitle": "没有记忆项目",
+        "emptyDesc": "用量按记忆项目统计。请先创建或加入一个项目。",
+        "listErrorTitle": "记忆项目列表加载失败",
+        "notFoundTitle": "项目不存在",
+        "notFoundDesc": "该项目不存在、已软删，或对你不可见。",
+        "loading": "正在加载项目…",
+        "browseAll": "浏览全部项目",
+        "selectTitle": "选择一个记忆项目",
+        "selectDesc": "在上方选择项目，读取它已记录的 Hument 用量。",
+        "emptyAction": "去记忆页创建/加入",
+        "filteredOut": "当前选中项目（被搜索过滤）"
+      },
+      "filters": {
+        "operation": "操作",
+        "provider": "Provider 操作",
+        "model": "模型",
+        "modelHint": "模型过滤是精确匹配 requested 或 resolved；只有点击「应用过滤」才会发请求。",
+        "limit": "Trace 页大小",
+        "time": "时间窗（UTC）",
+        "preset7": "最近 7 天",
+        "preset28": "最近 28 天",
+        "preset90": "最近 90 天",
+        "from": "开始",
+        "to": "结束",
+        "apply": "应用过滤",
+        "reset": "重置",
+        "windowHint": "绝对 UTC [since, until)；最长 {max} 天，两端必填。",
+        "windowError": {
+          "sinceRequired": "必须填写开始时间。",
+          "untilRequired": "必须填写结束时间。",
+          "invalid": "两端都必须是合法时间。",
+          "order": "结束时间必须晚于开始时间。",
+          "span": "时间窗不能超过 90 天。"
+        },
+        "advanced": "高级过滤",
+        "advancedActive": "高级过滤（{count}）"
+      },
+      "permission": {
+        "title": "该项目的用量已关闭",
+        "desc": "用量是项目级引擎聚合，不能按来源逐条过滤；需要管理员，或对该项目的**全部**绑定都有读权限。请让绑定 owner 补齐剩余权限，或联系管理员。"
+      },
+      "shared": {
+        "title": "该项目的用量已禁用",
+        "desc": "该引擎身份与其他记忆项目共享，或它的永久归属 claim 缺失/归他人所有。没有发起任何引擎调用。需要运维核对身份 claim；平台不提供自助释放。"
+      },
+      "engine": {
+        "projectUnboundTitle": "该项目没有绑定引擎",
+        "projectUnboundDesc": "已记录的模型用量来自项目当前的 Hument 引擎身份。请先绑定引擎，才能读取用量。",
+        "notConfiguredTitle": "这个部署没有记忆引擎",
+        "notConfiguredDesc": "当前部署未配置记忆引擎，因此没有引擎用量可读。",
+        "engineUnavailableTitle": "记忆引擎不可用",
+        "engineUnavailableDesc": "引擎当前不可达。等它恢复后用量即可读取；这里不展示任何猜测数字。"
+      },
+      "summary": {
+        "stale": "刷新失败——正在显示上一次成功快照（{asOf}）。可重试获取新快照。",
+        "asOf": "数据时刻 {asOf}",
+        "window": "时间窗 {since} → {until}（UTC，右端不含）。",
+        "totalsNote": "totals 覆盖完整匹配集；trace 页大小不会改变它。",
+        "target": "引擎身份：workspace {workspace} · actor {actor} · scope {scope}",
+        "caveat": "当前 binding/actor 已记录的模型工作——不是项目全部消耗，也不是完整账单。未知不是 0。",
+        "details": "身份与窗口原始值",
+        "ledgerScope": "Hument 引擎用量账本——不是平台 API/MCP 调用。"
+      },
+      "cards": {
+        "logicalCalls": "逻辑调用",
+        "evidenceRows": "{count} 条证据行",
+        "totalTokens": "总 token",
+        "tokensUnknown": "{unknown} 行未知 · 已知 {known} token",
+        "tokensKnown": "已知 {known} token",
+        "physicalCalls": "物理调用",
+        "physicalUnknown": "{unknown} 个单位未知 · 已知 {known} 次调用",
+        "physicalKnown": "已知 {known} 次调用",
+        "cost": "成本（micros）",
+        "actualCost": "实际",
+        "estimatedCost": "估算",
+        "currencyNote": "micros 是引擎记录的原始单位（其成本单位的百万分之一）。引擎未声明币种；不做换算，也不默认 USD。",
+        "duration": "物理耗时：{physical} ms · 已知 {known} ms · {unknown} 行未知",
+        "unknown": "未知",
+        "estimatedCoverage": "{unknown} 行未知 · 已知 {known} micros",
+        "nonAddable": "实际与估算分列，不可相加。"
+      },
+      "coverage": {
+        "label": "覆盖度",
+        "status": "状态 {status}",
+        "scope": "作用域 {scope}",
+        "excluded": "排除 {count} 条无时刻行",
+        "excludedHint": "没有物理开始时间的行不会进入带时间窗的 totals。这不等于零使用。",
+        "sources": "来源",
+        "noSources": "引擎没有报告 coverage 来源。",
+        "statusValue": {
+          "complete": "完整",
+          "partial": "部分",
+          "unknown": "未知"
+        },
+        "scopeValue": {
+          "actor_private": "仅当前身份"
+        }
+      },
+      "groups": {
+        "title": "分组",
+        "description": "按操作 / Provider 操作 / 模型分组的 Top {shown} / 共 {total} 组",
+        "caption": "按操作、Provider 操作与模型分组的用量",
+        "operation": "操作",
+        "providerModel": "Provider 操作 / 模型",
+        "basis": "模型依据",
+        "logicalCalls": "逻辑调用",
+        "tokens": "Token",
+        "estimated": "估算 micros",
+        "details": "详情",
+        "expand": "展开分组 {operation}",
+        "empty": "该时间窗与过滤下没有分组。",
+        "collapse": "只看 Top 10",
+        "unknownModel": "（引擎未报告模型）",
+        "basisValue": {
+          "requested": "请求模型",
+          "resolved": "解析模型",
+          "unknown": "未知"
+        },
+        "showMore": "再显示 {count} 组"
+      },
+      "detail": {
+        "evidenceRows": "证据行",
+        "generations": "生成次数",
+        "batches": "批次",
+        "physicalCalls": "物理调用",
+        "knownPhysical": "已知物理调用",
+        "unknownPhysical": "未知单位",
+        "retries": "重试",
+        "http429": "HTTP 429",
+        "cacheReuses": "缓存复用",
+        "replayCount": "重放次数",
+        "knownInputTokens": "已知输入 token",
+        "knownOutputTokens": "已知输出 token",
+        "knownTotalTokens": "已知总 token",
+        "actualCost": "实际 micros",
+        "estimatedCost": "估算 micros",
+        "costStatus": "成本状态",
+        "duration": "物理 ms",
+        "unknownInputRows": "未知输入 token 行",
+        "unknownOutputRows": "未知输出 token 行",
+        "unknownTotalRows": "未知总 token 行",
+        "unknownEstimatedRows": "未知估算行",
+        "costStatusValue": {
+          "known": "已知",
+          "partial": "部分",
+          "unknown": "未知"
+        },
+        "nonAddable": "实际与估算分列，不可相加。"
+      },
+      "trace": {
+        "title": "Trace",
+        "description": "折叠懒加载；与汇总使用同一个绝对时间窗。",
+        "loaded": "已加载 {loaded} / 共 {total} 行",
+        "resetting": "数据快照已变化——正在重拉首页，下方行保持显示。",
+        "firstError": "Trace 加载失败",
+        "emptyTitle": "没有 trace 行",
+        "emptyDesc": "该时间窗与过滤下没有用量行。",
+        "loadMore": "加载更多",
+        "loadingMore": "加载中…",
+        "end": "全部匹配行已加载。",
+        "loadMoreError": "这一页加载失败——下方已加载行保留。",
+        "retryLoadMore": "重试这一页",
+        "resetExhausted": "复位后游标再次失效",
+        "resetExhaustedHint": "为避免死循环已停止。请重新应用过滤（或放宽时间窗）从首页重启。",
+        "collapse": "收起 Trace",
+        "open": "加载 Trace",
+        "caption": "当前时间窗内已记录的用量行",
+        "stale": "刷新失败——正在显示之前已加载的行。",
+        "columns": {
+          "time": "时间",
+          "operation": "操作",
+          "provider": "Provider 操作",
+          "model": "模型",
+          "tokens": "Token",
+          "elapsed": "耗时 ms",
+          "cost": "估算 micros"
+        },
+        "expand": "展开 trace 行 {id}",
+        "detail": {
+          "id": "行 id",
+          "evidenceKind": "证据类型",
+          "source": "来源",
+          "usageSource": "用量来源",
+          "tokenBasis": "token 依据",
+          "modelBasis": "模型依据",
+          "requestedModel": "请求模型",
+          "resolvedModel": "解析模型",
+          "inputTokens": "输入 token",
+          "outputTokens": "输出 token",
+          "actualCost": "实际 micros",
+          "costStatus": "成本状态",
+          "physicalUnknown": "物理调用未知",
+          "cacheReuses": "缓存复用",
+          "requestBytes": "请求字节",
+          "responseBytes": "响应字节",
+          "responseComplete": "响应完整",
+          "httpStatus": "HTTP 状态",
+          "state": "状态",
+          "invocationId": "调用 id",
+          "logicalCallId": "逻辑调用 id",
+          "generationId": "生成 id",
+          "requestDigest": "请求摘要",
+          "yes": "是",
+          "no": "否",
+          "startedAt": "开始时间（原始）",
+          "finishedAt": "结束时间（原始）"
+        },
+        "restartFirstPage": "从首页重新加载",
+        "disabledBlocked": "摘要被权限/共享/版本/身份错误阻断时，Trace 关闭。",
+        "disabledEmpty": "摘要已明确该时间窗/过滤没有行，Trace 禁用。",
+        "limit": "Trace 页大小"
+      },
+      "empty": {
+        "filterTitle": "没有匹配该过滤的行",
+        "filterDesc": "时间窗内有数据，但操作 / Provider 操作 / 模型过滤把所有行都排除了。",
+        "allExcludedTitle": "所有行都因缺少时刻被排除",
+        "allExcludedDesc": "匹配的证据行都没有物理开始时间，因此带时间窗的 totals 无法包含它们。这是覆盖债，不是零使用。",
+        "windowTitle": "这个时间窗没有用量",
+        "windowDesc": "引擎没有记录该项目当前身份在所选时间窗内的任何用量。"
+      },
+      "error": {
+        "versionTitle": "引擎尚不支持用量接口",
+        "versionDesc": "请把 Hub 升级到包含 usage 路由的版本（alpha.19 或合同修复版）。重试无效。",
+        "dataTitle": "引擎数据无法读取",
+        "dataDesc": "Hub 的存量账本或回执无法解析（schema 不兼容 / 证据冲突）。这是数据问题，不是版本信号。需要运维核对 Hub 数据，不要盲重试。",
+        "identityTitle": "引擎身份未授权",
+        "identityDesc": "项目当前绑定缺失、歧义，或缺少 inspect_read。请修项目身份 / binding 授权；重试与升级都无效。",
+        "unreachableTitle": "记忆引擎不可达",
+        "unreachableDesc": "请求没有到达引擎。请检查项目引擎端点后稍后重试。",
+        "rateLimitedTitle": "用量接口已限流",
+        "rateLimitedDesc": "请按 Retry-After 等待后，用同一个请求重试。",
+        "timeoutTitle": "记忆引擎超时",
+        "timeoutDesc": "请求可能仍在引擎侧执行。请稍后重试，不要假定它已经失败。",
+        "networkTitle": "网络错误",
+        "networkDesc": "浏览器无法到达平台。请检查网络后重试。",
+        "notFoundTitle": "项目不存在",
+        "notFoundDesc": "该项目不存在、已软删，或对你不可见。",
+        "unauthorizedTitle": "需要重新登录",
+        "unauthorizedDesc": "登录态已失效，请重新登录。",
+        "genericTitle": "用量加载失败",
+        "genericDesc": "请求失败。请重试；若持续失败，查看机器可读详情。"
+      }
+    }
   }
 }

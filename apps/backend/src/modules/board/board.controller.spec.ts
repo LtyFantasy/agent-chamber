@@ -282,7 +282,7 @@ describe('BoardController', () => {
       expect(service.findList).toHaveBeenCalledWith('list-1');
       expect(service.findById).toHaveBeenCalledWith('board-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
-      expect(service.removeList).toHaveBeenCalledWith('list-1', 'list-2');
+      expect(service.removeList).toHaveBeenCalledWith('list-1', 'list-2', mockActor);
     });
   });
 
@@ -300,7 +300,7 @@ describe('BoardController', () => {
       expect(service.findList).toHaveBeenCalledWith('list-1');
       expect(service.findById).toHaveBeenCalledWith('board-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'write');
-      expect(service.reorderTasks).toHaveBeenCalledWith('list-1', dto);
+      expect(service.reorderTasks).toHaveBeenCalledWith('list-1', dto, mockActor);
     });
   });
 
@@ -677,7 +677,7 @@ describe('BoardController', () => {
       expect(await controller.getDigest('board-1', query, mockActor)).toBe(digest);
       expect(service.findById).toHaveBeenCalledWith('board-1');
       expect(permService.ensureCan).toHaveBeenCalledWith(board, mockActor, 'read');
-      expect(service.getDigest).toHaveBeenCalledWith('board-1', query);
+      expect(service.getDigest).toHaveBeenCalledWith('board-1', query, mockActor.id);
     });
 
     it('should propagate 403 when read permission denied (ForbiddenException)', async () => {

@@ -34,6 +34,7 @@ import { DataSource } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
+import { NotFoundException } from '@nestjs/common';
 import { ActorType, ErrorCode, Visibility } from '@agent-chamber/shared';
 import * as entities from '../src/database/entities';
 import { IdempotencyRecord } from '../src/database/entities/idempotency-record.entity';
@@ -69,6 +70,7 @@ import type { AccessQueryService } from '../src/common/services/access-query.ser
 import { ActorProfileService } from '../src/common/services/actor-profile.service';
 import type { ResourceValidator } from '../src/common/resource-validator';
 import type { AuditService } from '../src/modules/audit/audit.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -120,6 +122,11 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
   let dbAvailable = false;
 
   let spaceId: string;
+  /**
+   * 第二个 OPEN 空间（validate docId 通道跨空间作用域用例专用）：
+   * path spaceId 由调用方决定，docId 必须受它约束。
+   */
+  let otherSpaceId: string;
   const createdDocIds: string[] = [];
   const spaceIds: string[] = [];
 
@@ -167,6 +174,7 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
       routeHealthStub,
       ds.getRepository(IdempotencyRecord),
       renderer,
+      new HintDedupService(),
     );
     diagramService = new DiagramService(
       docService,
@@ -181,6 +189,7 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
       ds.getRepository(TaskDocLink),
       // 判别重排内核（v1.85.0 批次 3）：本套件只测文档检索的既有行为 ⇒ 能力恒未启用
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
 
     // bundle round-trip 装配（照 docspace-bundle e2e 先例全构造 DocSpaceService）
@@ -212,12 +221,14 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
       eventStub,
       actorProfileService,
       auditServiceStub,
+      new HintDedupService(),
     );
     const docRouteService = new DocRouteService(
       ds.getRepository(DocRoute),
       ds.getRepository(Doc),
       docService,
       auditServiceStub,
+      new HintDedupService(),
     );
     bundleService = new DocBundleService(
       docspaceService,
@@ -270,6 +281,19 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
     );
     spaceId = space.id;
     spaceIds.push(spaceId);
+
+    // ── 种子：第二个 OPEN 空间（validate docId 跨空间作用域用例）──
+    const otherSpace = await ds.getRepository(DocSpace).save(
+      ds.getRepository(DocSpace).create({
+        name: `Diagram E2E Other ${RUN}`,
+        slug: `diagram-e2e-other-${RUN}`.slice(0, 128),
+        description: null,
+        creatorId: spaceCreator,
+        settings: {},
+      }),
+    );
+    otherSpaceId = otherSpace.id;
+    spaceIds.push(otherSpaceId);
   }, 120000);
 
   afterAll(async () => {
@@ -642,6 +666,99 @@ describe('Diagram IR v1 — 真实 PG + 真实渲染器（plan §6.2 全链）',
     expect(rowAfter?.updatedAt?.getTime()).toBe(rowBefore?.updatedAt?.getTime());
     expect(versionCountAfter).toBe(versionCountBefore);
   }, 120000);
+
+  // ─── ⑥b validate docId 通道空间作用域（卡 956e75f2，security）────────────
+
+  describe('validate docId 通道空间作用域', () => {
+    /** 取异常并断言为 NotFoundException（跨空间与不存在必须走同一条路径） */
+    async function capture404(p: Promise<unknown>): Promise<NotFoundException> {
+      return p.then(
+        () => {
+          throw new Error('expected rejection with 404 DOC_NOT_FOUND');
+        },
+        (e: unknown) => e as NotFoundException,
+      );
+    }
+
+    /** 本用例锁 service 层异常体等式；HTTP 信封由 all-exceptions filter 单源保证（timestamp/requestId 在那里注入，此处防御性剔除） */
+    function stableResponse(err: NotFoundException): Record<string, unknown> {
+      const body = { ...(err.getResponse() as Record<string, unknown>) };
+      delete body.timestamp;
+      delete body.requestId;
+      return body;
+    }
+
+    it('① 跨空间 docId（diagram 文档）→ 404 DOC_NOT_FOUND', async () => {
+      if (!dbAvailable) return;
+      const created = await upsertDiagram('architecture', `tmp/${RUN}-scope-a.json`);
+
+      const err = await capture404(
+        diagramService.validateDiagram(otherSpaceId, { docId: created.id }),
+      );
+      expect(err).toBeInstanceOf(NotFoundException);
+      expect(err.getStatus()).toBe(404);
+      expect(stableResponse(err)).toEqual({
+        message: 'Document not found',
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+    }, 120000);
+
+    it('② 跨空间非 diagram doc → 404（不得 400 DIAGRAM_DOC_TYPE_LOCKED 泄露 actual docType）', async () => {
+      if (!dbAvailable) return;
+      const mdDoc = await docService.upsert(
+        spaceId,
+        {
+          path: `tmp/${RUN}-scope-md.md`,
+          content: '# 跨空间非 diagram\n\n本行内容不得通过 validate 泄露。',
+        },
+        testActor,
+      );
+      createdDocIds.push(mdDoc.id);
+
+      const err = await capture404(
+        diagramService.validateDiagram(otherSpaceId, { docId: mdDoc.id }),
+      );
+      expect(err.getStatus()).toBe(404);
+      expect(stableResponse(err)).toEqual({
+        message: 'Document not found',
+        code: ErrorCode.DOC_NOT_FOUND,
+      });
+      // 非 diagram 守卫（400 + actual docType）在作用域解析之后，跨空间时不得触达
+      expect(JSON.stringify(err.getResponse())).not.toContain('diagram');
+    }, 120000);
+
+    it('③ 同空间 docId 对照仍 200（修复不误伤合法通道）', async () => {
+      if (!dbAvailable) return;
+      const created = await upsertDiagram('architecture', `tmp/${RUN}-scope-control.json`);
+
+      const result = await diagramService.validateDiagram(spaceId, {
+        docId: created.id,
+        patches: [{ op: 'replace', path: '/meta/title', value: 'Same Space OK' }],
+      });
+      expect(result.ok).toBe(true);
+      expect(result.profile).toBeTruthy();
+    }, 120000);
+
+    it('④ 响应体深等：跨空间 404 ≡ 不存在 UUID 的 404（剔除 timestamp/requestId）', async () => {
+      if (!dbAvailable) return;
+      const created = await upsertDiagram('architecture', `tmp/${RUN}-scope-equal.json`);
+
+      const crossSpace = await capture404(
+        diagramService.validateDiagram(otherSpaceId, { docId: created.id }),
+      );
+      const missing = await capture404(
+        diagramService.validateDiagram(spaceId, {
+          // 本套件未使用的哨兵 UUID → 纯"不存在"
+          docId: '00000000-0000-4000-8000-0000000000f9',
+        }),
+      );
+
+      expect(crossSpace.getStatus()).toBe(missing.getStatus());
+      expect(stableResponse(crossSpace)).toEqual(stableResponse(missing));
+      // 显式锚定：两条通道的响应体只允许 {message, code} 两个键
+      expect(Object.keys(stableResponse(crossSpace)).sort()).toEqual(['code', 'message']);
+    }, 120000);
+  });
 
   // ─── ⑦ bundle round-trip ──────────────────────────────────
 

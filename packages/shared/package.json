@@ -8,7 +8,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint \"src/**/*.ts\" --fix --max-warnings 100"
+    "lint": "eslint \"src/**/*.ts\" --max-warnings 100",
+    "lint:fix": "eslint \"src/**/*.ts\" --fix --max-warnings 100"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^8.60.1",

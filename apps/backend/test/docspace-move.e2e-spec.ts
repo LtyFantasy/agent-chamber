@@ -63,6 +63,7 @@ import { TaskDocLink } from '../src/database/entities/task-doc-link.entity';
 import type { EventService } from '../src/modules/event/event.service';
 import type { RouteHealthService } from '../src/modules/docspace/route-health.service';
 import type { UnifiedActor } from '../src/common/types/actor.types';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -174,6 +175,7 @@ describe('DocMoveService — 真实 PG 集成（原子 move + move impact）', (
       ds.getRepository(IdempotencyRecord),
       // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
       { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
+      new HintDedupService(),
     );
 
     moveService = new DocMoveService(
@@ -187,6 +189,7 @@ describe('DocMoveService — 真实 PG 集成（原子 move + move impact）', (
       // 入链内核（v1.90.0-dev backlinks 批次）：move 的 impact 走同一内核
       new DocLinksService(ds.getRepository(Doc), ds.getRepository(DocSection), service),
       eventStub,
+      new HintDedupService(),
     );
 
     // ── 种子数据：一个空间 + 文档 + 任务关联 + 意图路由（全部带 RUN 隔离）──

@@ -12,6 +12,13 @@
  *   - 补充: plan docspace-lazy-tree-v1.md（v1.70.0-dev：GET /doc-spaces/:id/docs/tree
  *     懒加载目录树 + /docs/facets 聚合计数——只读端点，权限与 findAll 同款
  *     ensureCan(space, actor ?? null, 'read')；字面路由与既有 :docId 参数路由无冲突）
+ *   - 补充: plan blue-beetle-x-23-banshee.md（v1.92.0-dev：findFacets 增词表状态/回显——
+ *     controller 已持有 space，`space.settings` 直接透传给 service，**无新增查询**；
+ *     PATCH /doc-spaces/:id 三词表字段归内容字段权限，hasStructural 判断不动）
+ *   - 补充: plan black-widow-rocket-nightwing.md（v1.92.0-dev 3 期：POST
+ *     /doc-spaces/:id/tags/rename（动作型 @HttpCode(200)，write 权限，dryRun 先行）+
+ *     GET /doc-spaces/:id/docs/orphans（只读诊断，read 权限）；findAll 起把
+ *     `space.settings` 透传给 service——tag 过滤的词表 alias 集合展开数据源，零额外查询）
  *
  * [踩坑索引]
  *   - Hument 事故（topic msg 6dbc4da3）：stale position fail-open → fail-closed
@@ -21,6 +28,13 @@
  *   - tree/facets SQL 形态硬约束（plan A1/A2）：WHERE 只用 LIKE（禁止 substring 进
  *     WHERE）、substring/split_part 只进 SELECT/GROUP BY、plen 由 service JS 算好整数
  *     传入——改 SQL 前先读 doc.service.ts findTree 注释与 plan「SQL 形态硬约束」节
+ *   - **凭证扫描挂点（v1.94.0-dev，卡 349d337e）**：本 controller 有**四个** doc 写入挂点
+ *     （upsert / patchSection / patchContent / appendDoc，批量在 doc.service.batchUpsert）。
+ *     四条纪律：① 只在**真实写入成功后**调（幂等 replay / unchanged 一律跳过）；
+ *     ② `patchContent` 只扫 **`dto.newString`**（删除凭证是修复动作，不是泄漏）；
+ *     ③ 命中只落**告警行 + 领域事实**，正文不进日志/事实（见 `hints/credential-scan.ts`）；
+ *     ④ **upsert 还必须跳过 `concurrentWinner`**（23505 并发败者：本请求 content 未落库、
+ *     `result.id` 是胜者 docId——评审 P2-1；`doc.upserted` 事实共用同一门控）。
  *
  * [铁律关联] #17(测试契约) #18(不变量检查) #4(文档优先) #21(双层校验) #22(findOne必须判空)
  *
@@ -52,6 +66,7 @@ import type { DocBacklinks } from '@agent-chamber/shared';
 import { ApiTags, ApiOperation, ApiQuery, ApiParam, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { DocService } from './doc.service';
 import { DocMoveService } from './doc-move.service';
+import { DocRenameService } from './doc-rename.service';
 import { DocLinksService } from './doc-links.service';
 import { DocSearchService } from './doc-search.service';
 import { DocSpaceService } from './docspace.service';
@@ -71,8 +86,18 @@ import {
   AppendDocDto,
   MoveDocDto,
   PatchDocMetadataDto,
+  // DocSpace 元数据治理 3 期：tags rename + orphan 诊断
+  RenameDocTagsDto,
+  QueryOrphanDocsDto,
 } from './dto';
 import { JwtOrApiKeyGuard } from '../../common/guards/jwt-or-api-key.guard';
+// 领域事实（hint 阶段三）：doc upsert 是「该提名了」提示的第四个写口；无请求袋时
+// emitFact 是 no-op（fail-open，定时任务 / 脚本路径不受影响）
+import { emitFact } from '../hints/hint-facts';
+// 凭证粘贴扫描（v1.94.0-dev，卡 349d337e）：本 controller 的四个 doc 写入挂点
+// （upsert / patchSection / patchContent / appendDoc）共用同一 helper——它内部完成
+// 「扫描 →（命中）告警行 + 领域事实」，域侧不得直接 import 扫描器（见该文件头不变量）
+import { emitCredentialScanFactIfHit } from '../hints/credential-scan';
 
 /**
  * 批量读节单次请求 position 数上限
@@ -89,6 +114,7 @@ export class DocController {
   constructor(
     private readonly docService: DocService,
     private readonly docMoveService: DocMoveService,
+    private readonly docRenameService: DocRenameService,
     private readonly docLinksService: DocLinksService,
     private readonly docSearchService: DocSearchService,
     private readonly docSpaceService: DocSpaceService,
@@ -151,7 +177,33 @@ export class DocController {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor, 'write');
     // v1.63.0：clientRequestId 幂等键透传（重放返回首次响应快照 + idempotentReplay）
-    return this.docService.upsert(spaceId, dto, actor, dto.clientRequestId);
+    const result = await this.docService.upsert(spaceId, dto, actor, dto.clientRequestId);
+    // 领域事实（hint 阶段三，决策 4）：**只在单文档 upsert 真实落库**时陈述——
+    // ① `unchanged:true`（内容未变）；② **仅 rechunked**（section 元数据修复，内容没变）；
+    // ③ 幂等 replay（镜像重放，同一份内容被重放）；④ **`concurrentWinner`**（23505 并发败者：
+    // 本请求的 content 未落库，返回的是胜者那行）四者都不 emit——否则同一份内容会被
+    // 重复计入「该提名了」的分母（灌水），且与 docspace 既有的「unchanged 出口不发 hints」
+    // 先例自相矛盾。分母边界（只覆盖本入口，不含批量/patch/append/move 写口）见
+    // docs/modules/hint-system.md §4.1。
+    if (
+      !result.unchanged &&
+      !result.rechunked &&
+      !result.idempotentReplay &&
+      // **评审 P2-1**：败者出口的 content 根本没落库，且 result.id 是**胜者**的 docId——
+      // 少这一档会把本请求未写入的正文扫出告警、并把 resourceId 指到别人的文档上。
+      !result.concurrentWinner
+    ) {
+      emitFact('doc.upserted', { docId: result.id, spaceId });
+      // 凭证扫描（v1.94.0-dev）：与上面的事实**同门控**——只在真实写入后扫，只扫本次写入的
+      // 正文；其余三档（unchanged / 仅 rechunked / 幂等 replay / 并发败者）一律不扫
+      // （见 credential-scan.ts 的 [关键不变量]）
+      emitCredentialScanFactIfHit(dto.content, {
+        resourceKind: 'doc',
+        resourceId: result.id,
+        actorId: actor?.id ?? null,
+      });
+    }
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -234,7 +286,7 @@ export class DocController {
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
-    return this.docService.findAll(spaceId, query);
+    return this.docService.findAll(spaceId, query, space.settings);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -308,7 +360,13 @@ export class DocController {
       'Space-wide facet counts (v1.70.0-dev): types = GROUP BY doc_type (non-empty), ' +
       'tags = unnest(tags) GROUP BY, categories = JOIN doc_categories (soft-deleted ' +
       'filtered). Only non-deleted docs are counted. Replaces client-side full-list ' +
-      'aggregation. Requires the same read permission as the space.',
+      'aggregation. ' +
+      'v1.92.0-dev (DocSpace metadata governance phase 1): when the space declares a ' +
+      'vocabulary (settings.docTypes / canonicalTags / pathTypes), each facet item gains ' +
+      'vocabStatus (types: declared|undeclared; tags: canonical|alias|undeclared) and ' +
+      'tags may carry canonicalValue (status=alias), and the response echoes the declared ' +
+      'vocabulary under `vocabulary`. Unconfigured families omit these fields entirely. ' +
+      'Requires the same read permission as the space.',
   })
   @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
   @ApiResponse({ status: 200, description: 'Facet counts returned successfully' })
@@ -318,7 +376,84 @@ export class DocController {
   ) {
     const space = await this.docSpaceService.findById(spaceId);
     await this.permService.ensureCan(space, actor ?? null, 'read');
-    return this.docService.findFacets(spaceId);
+    // 词表状态/回显所需 settings 由已持有的 space 透传，无新增查询（plan §3-D3）
+    return this.docService.findFacets(spaceId, space.settings);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Get('doc-spaces/:id/docs/orphans')
+  @ApiOperation({
+    summary: 'List orphan documents of a space (diagnostic)',
+    description:
+      'Diagnostic read (v1.92.0-dev DocSpace metadata governance phase 3): docs with ' +
+      'deleted_at IS NULL that are NOT referenced by any doc_routes row (primary ∪ secondary). ' +
+      'A leaf document without a route is NOT an error — this is a maintenance list, not a defect ' +
+      'verdict. A route pointing at a deleted doc is a different dimension (link health) and is ' +
+      'NOT counted here. ' +
+      'By default the space overviewFilter (excludeTypes / excludeCategories) is applied — ' +
+      'diaries and archived docs are not navigation-surface material and would flood the list; ' +
+      'pass includeExcluded=true for the raw set. Response echoes appliedFilters. ' +
+      'stats.byTopDir groups by the first path segment so a structural leaf cluster (e.g. 190 world ' +
+      'leaves) is distinguishable at a glance from actionable orphans. pathPrefix slices a cluster. ' +
+      'Pure read, computed on the fly — no stored report, no scheduler. Requires read access.',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiResponse({ status: 200, description: 'Orphan list returned successfully' })
+  @ApiResponse({ status: 400, description: 'VALIDATION_ERROR: malformed pagination / pathPrefix' })
+  async findOrphans(
+    @Param('id', ParseUUIDPipe) spaceId: string,
+    @Query() query: QueryOrphanDocsDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'read');
+    return this.docService.findOrphans(spaceId, space.settings, query);
+  }
+
+  @UseGuards(JwtOrApiKeyGuard)
+  @Post('doc-spaces/:id/tags/rename')
+  // 动作型端点（批量改写存量 tag，不创建资源）：POST 默认 201 → 显式 200（doc-route recheck 同款先例）
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Rename / merge tags across a whole space (governance, dryRun first)',
+    description:
+      'Batch rewrite of existing docs.tags (v1.92.0-dev DocSpace metadata governance phase 3). ' +
+      'rename = one value in `from`; merge = several values (or `to` already in use) — the storage ' +
+      'semantics are the same: every `from` value is replaced by `to`. ' +
+      'Always run with dryRun=true first: it returns the affected list (total + sample ≤50), ' +
+      'per-value hit counts, trgm near-synonym candidates (similarNotAffected), the vocabulary ' +
+      'change plan and a batchToken — with ZERO side effects (no write, no audit, no idempotency ' +
+      'record). Then execute with expectedBatchToken: if a concurrent write changed the affected ' +
+      'set, the request fails with 409 DOC_BATCH_CONFLICT (abort-all, zero side effects) and ' +
+      'data.diff.currentAffectedDocIds (batchToken is a one-way hash, so the dryRun snapshot cannot ' +
+      'be reconstructed server-side — compare the current set with your dryRun result and re-run ' +
+      'dryRun for a fresh token). ' +
+      'Alias declaration is generated unconditionally: the space vocabulary (settings.canonicalTags) ' +
+      'is created if absent, so reads by the OLD value keep matching after the rename ' +
+      '(per-space search/list expand the query value to [canonical, ...aliases]). ' +
+      'Documents are rewritten by SQL (docId, content and updated_at are untouched — governance ' +
+      'metadata writes must not flood the updatedAt_desc ordering). ingest documents are rewritten ' +
+      'too and reported separately (ingestAffected) so the repository side can be synced. ' +
+      'After commit: one summary audit row (oldData carries the per-doc pre-image for rollback). ' +
+      'Requires write access (creator or editor).',
+  })
+  @ApiParam({ name: 'id', description: 'DocSpace ID (UUID)', type: String })
+  @ApiBody({ type: RenameDocTagsDto })
+  @ApiResponse({ status: 200, description: 'Rename previewed (dryRun) or executed' })
+  @ApiResponse({ status: 404, description: 'DOC_SPACE_NOT_FOUND' })
+  @ApiResponse({
+    status: 409,
+    description: 'DOC_BATCH_CONFLICT: expectedBatchToken mismatch; IDEMPOTENCY_KEY_CONFLICT',
+  })
+  @ApiResponse({ status: 422, description: 'VALIDATION_ERROR: every from value equals to' })
+  async renameTags(
+    @Param('id', ParseUUIDPipe) spaceId: string,
+    @Body() dto: RenameDocTagsDto,
+    @CurrentActor() actor: UnifiedActor,
+  ) {
+    const space = await this.docSpaceService.findById(spaceId);
+    await this.permService.ensureCan(space, actor ?? null, 'write');
+    return this.docRenameService.renameTags(spaceId, dto, actor);
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -417,9 +552,13 @@ export class DocController {
     await this.permService.ensureCan(space, actor ?? null, 'read');
     const accessibleSpaceIds = [spaceId];
     // actor / traceId 只为判别重排服务（未启用时二者都不被读取——原路径不碰内核）
+    // hintContext（2 期 A1）：本端点已持有 space（权限检查必需）→ 传 spaceId + settings
+    // 给读侧 hint（**零新增查询**）。⚠️ 全局检索端点（GET /search）**不传**——该面跨
+    // 空间共享 DocSearchService，传了会引入跨空间泄漏面与额外查询（见 service 注释）。
     return this.docSearchService.search(accessibleSpaceIds, query, {
       actor: actor ?? null,
       traceId: requestId,
+      hintContext: { spaceId: space.id, settings: space.settings },
     });
   }
 
@@ -430,7 +569,11 @@ export class DocController {
   @ApiOperation({
     summary: 'Get document detail',
     description:
-      'Return document metadata + section outline (position, headingPath, headingLevel, tokenEstimate). ' +
+      'Return document metadata + section outline (position, headingPath, headingLevel, ' +
+      'sectionHash, tokenEstimate). sectionHash is a pure derived anchor ' +
+      '(sha256 of headingPath/headingLevel/content — never stored), identical in value to the ' +
+      'one returned by the section read channels; it lets a single outline call reconcile a ' +
+      'whole document. ' +
       'Small documents (tokenEstimate > 0 and ≤ 2000 by default, overridable via maxFullTokens) are ' +
       'inlined with full content (mode:"full" + content) — Agent-friendly, no per-section round trips. ' +
       'Large documents return mode:"outline" (metadata + section list without body) for targeted reading. ' +
@@ -776,7 +919,7 @@ export class DocController {
     await this.permService.ensureCan(space, actor ?? null, 'write');
     // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
     // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 patchSection 入口，快照 = 本入口响应）
-    return this.docService.patchSection(
+    const result = await this.docService.patchSection(
       id,
       position,
       dto.content,
@@ -785,6 +928,16 @@ export class DocController {
       dto.expectedSectionHash,
       dto.clientRequestId,
     );
+    // 凭证扫描（v1.94.0-dev）：扫描对象 = 本次替换的**整节新片段**；幂等 replay / unchanged
+    // 不扫（未发生真实写入，见 credential-scan.ts 的 [关键不变量]）
+    if (!result.unchanged && !result.idempotentReplay) {
+      emitCredentialScanFactIfHit(dto.content, {
+        resourceKind: 'doc',
+        resourceId: result.id,
+        actorId: actor?.id ?? null,
+      });
+    }
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -798,6 +951,8 @@ export class DocController {
       'skipDuplicateTitle=false, sections joined with "\\n\\n"), byte-identical to the read-side ' +
       'full=true channel; the default rendering (full=false) drops the first title heading and ' +
       'will produce 0-match 404s if used to construct oldString. ' +
+      'Matching is byte-exact including leading whitespace/indentation (never trimmed) — ' +
+      'copy oldString verbatim from the read side, do not hand-type indentation. ' +
       'Match semantics: 0 matches → 404 DOC_NOT_FOUND (re-read the content first); ' +
       'multiple matches → 409 RESOURCE_CONFLICT with data.matchCount (expand oldString with ' +
       'more surrounding context and retry); exactly 1 match → replaced and the document is ' +
@@ -844,7 +999,7 @@ export class DocController {
     await this.permService.ensureCan(space, actor ?? null, 'write');
     // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
     // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 patchByMatch 入口，快照 = 本入口响应）
-    return this.docService.patchByMatch(
+    const result = await this.docService.patchByMatch(
       id,
       dto.oldString,
       dto.newString,
@@ -852,6 +1007,16 @@ export class DocController {
       actor,
       dto.clientRequestId,
     );
+    // 凭证扫描（v1.94.0-dev）：只扫 **newString**——被删掉的片段（oldString）不该触发告警
+    // （「删除凭证」是修复动作，不是泄漏）；幂等 replay / unchanged 不扫
+    if (!result.unchanged && !result.idempotentReplay) {
+      emitCredentialScanFactIfHit(dto.newString, {
+        resourceKind: 'doc',
+        resourceId: result.id,
+        actorId: actor?.id ?? null,
+      });
+    }
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)
@@ -917,13 +1082,22 @@ export class DocController {
     await this.permService.ensureCan(space, actor ?? null, 'write');
     // source 缺省 native（与 upsert 契约一致）；非 native 文档须携带匹配 source（隔离检查在 upsert 内）
     // v1.63.0：clientRequestId 幂等键透传（幂等包裹在 appendDoc 入口，快照 = 本入口响应）
-    return this.docService.appendDoc(
+    const result = await this.docService.appendDoc(
       id,
       { content: dto.content, position: dto.position, headingPath: dto.headingPath },
       source ?? DOC_SOURCE_NATIVE,
       actor,
       dto.clientRequestId,
     );
+    // 凭证扫描（v1.94.0-dev）：扫描对象 = 本次追加的片段；幂等 replay / unchanged 不扫
+    if (!result.unchanged && !result.idempotentReplay) {
+      emitCredentialScanFactIfHit(dto.content, {
+        resourceKind: 'doc',
+        resourceId: result.id,
+        actorId: actor?.id ?? null,
+      });
+    }
+    return result;
   }
 
   @UseGuards(JwtOrApiKeyGuard)

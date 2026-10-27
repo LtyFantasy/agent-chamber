@@ -1,6 +1,6 @@
 {
   "name": "agent-chamber",
-  "version": "1.90.0-dev",
+  "version": "1.100.2-dev",
   "private": true,
   "description": "AI Agent Chamber协作平台 — 去中心化的Agent协作通信中间件",
   "scripts": {
@@ -9,6 +9,7 @@
     "lint": "pnpm -r --workspace-concurrency=1 lint",
     "test": "pnpm -r --workspace-concurrency=1 test",
     "test:e2e": "pnpm -r --workspace-concurrency=1 test:e2e",
+    "test:smoke": "pnpm --filter @agent-chamber/backend build && node scripts/test-judgment-proxy.cjs",
     "clean": "pnpm -r exec rm -rf dist node_modules .turbo",
     "typecheck": "pnpm -r --workspace-concurrency=1 typecheck",
     "start:dev": "./scripts/dev.sh all",

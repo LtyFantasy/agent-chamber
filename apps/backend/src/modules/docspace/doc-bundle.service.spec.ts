@@ -17,8 +17,9 @@
  * 真实 PG 的 roundtrip 无损/幂等再导入/导入冲突覆盖在 docspace-bundle.e2e-spec.ts
  * （铁律 #23：ORM SQL 生成与 chunk 往返 mock 测不出）。
  */
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, Logger } from '@nestjs/common';
 import { createHash } from 'crypto';
+import { QueryFailedError } from 'typeorm';
 import { ActorType, ErrorCode, Visibility } from '@agent-chamber/shared';
 import { DocSpaceService } from './docspace.service';
 import { AuditService } from '../audit/audit.service';
@@ -1362,6 +1363,116 @@ describe('DocBundleService', () => {
       const r = await service.importBundle('space-1', makeBundle(), mockActor);
       expect(r.routes.summary.failed).toBe(1);
       expect(r.routes.results[0].error?.code).toBe(ErrorCode.DOC_ROUTE_DOC_NOT_FOUND);
+    });
+  });
+
+  // ─── per-item 失败日志（F4 项5 第 6 条 + 复审 MAJOR-2）────────────────────
+  //
+  // 为什么必须钉：三处 catch 的 Logger.warn 此前**没有任何测试覆盖**（删掉也全绿），
+  // 而 categories / routes 的 DTO 没有数组上限（media 有、docs 无）——日志条数上界
+  // 一旦被改掉，单请求就能刷出几十 MB 日志（复审 MAJOR-2）。
+  describe('per-item 失败日志接线与条数上界', () => {
+    /** 11 条全失败：恰好越过 PER_ITEM_LOG_DETAIL_MAX(10) 一条，验证「明细截断 + 聚合收口」 */
+    const OVER_LIMIT = 11;
+
+    it('categories 全失败 → 前 10 条明细 + 一条聚合行；明细含构造名/sqlstate/消毒文案，不含 PG 原文', async () => {
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        docspaceService.findById.mockResolvedValue(makeSpace());
+        categoryRepo.find = findFrom<DocCategory>([]);
+        (docspaceService.createCategory as jest.Mock).mockRejectedValue(
+          new QueryFailedError(
+            'INSERT',
+            [],
+            Object.assign(
+              new Error('duplicate key value violates unique constraint "doc_categories_slug_key"'),
+              { code: '23505' },
+            ),
+          ),
+        );
+
+        const categories = Array.from({ length: OVER_LIMIT }, (_, i) => ({
+          name: `Cat${i}`,
+          slug: `cat-${i}`,
+          description: null,
+          sortOrder: i,
+        }));
+        const r = await service.importBundle(
+          'space-1',
+          makeBundle({ categories, routes: [] }),
+          mockActor,
+        );
+
+        expect(r.categories.summary.failed).toBe(OVER_LIMIT);
+        const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+        const detail = lines.filter((l) => l.startsWith('importCategories per-item failed:'));
+        const aggregate = lines.filter((l) =>
+          l.startsWith('importCategories per-item failures truncated:'),
+        );
+
+        expect(detail).toHaveLength(10);
+        expect(aggregate).toHaveLength(1);
+        expect(aggregate[0]).toContain('total=11');
+        expect(aggregate[0]).toContain('first 10');
+        expect(detail[0]).toContain(
+          'name=Cat0 err=QueryFailedError sqlstate=23505 msg=Resource conflict',
+        );
+        // 日志行也不得回显 PG 原文（与响应面同一份消毒文案）
+        expect(detail.join('\n')).not.toMatch(/doc_categories_slug_key|constraint|violates/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('routes 全失败 → 同样的明细上界与聚合行（业务键为 intent + primaryDocPath）', async () => {
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        docspaceService.findById.mockResolvedValue(makeSpace());
+        categoryRepo.find = findFrom<DocCategory>([]);
+        // path 必须解析成功，让失败发生在 docRouteService.create 内部
+        docRepo.find = findFrom<Doc>([makeDoc()]);
+        routeRepo.find = findFrom<DocRoute>([]);
+        (docRouteService.create as jest.Mock).mockRejectedValue(
+          new QueryFailedError(
+            'INSERT',
+            [],
+            Object.assign(
+              new Error('duplicate key value violates unique constraint "doc_routes_pkey"'),
+              { code: '23505' },
+            ),
+          ),
+        );
+
+        const routes = Array.from({ length: OVER_LIMIT }, (_, i) => ({
+          intent: `我要了解架构 ${i}`,
+          category: null,
+          primaryDocPath: 'docs/a.md',
+          primaryHeadingPath: null,
+          secondaryDocPath: null,
+          secondaryHeadingPath: null,
+          codeEntry: null,
+          codeEntryType: 'exact',
+          sortOrder: i,
+        }));
+        const r = await service.importBundle('space-1', makeBundle({ routes }), mockActor);
+
+        expect(r.routes.summary.failed).toBe(OVER_LIMIT);
+        const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+        const detail = lines.filter((l) => l.startsWith('importRoutes per-item failed:'));
+        const aggregate = lines.filter((l) =>
+          l.startsWith('importRoutes per-item failures truncated:'),
+        );
+
+        expect(detail).toHaveLength(10);
+        expect(aggregate).toHaveLength(1);
+        expect(aggregate[0]).toContain('total=11');
+        expect(detail[0]).toContain(
+          'intent=我要了解架构 0 primaryDocPath=docs/a.md err=QueryFailedError sqlstate=23505 msg=Resource conflict',
+        );
+        expect(detail.join('\n')).not.toMatch(/doc_routes_pkey|constraint|violates/);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
   });
 });

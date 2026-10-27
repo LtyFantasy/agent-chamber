@@ -8,7 +8,7 @@
  *     keyPrefix，审计插桩缓解）
  *   - 第二期（经验库禁自审四态，**已退役**）: .kimi/plans/plan-experience-base-p2.md §0 — agent 分支
  *     的 ownerId 曾是"agent 审自己 owner / 同 owner 兄弟互审"两态的判定输入；
- *     v1.81.0（2026-09-24）终审侧已无消费点，多租户恢复时参见线上 docs/experience-base.md §11 决策记录
+ *     v1.81.0（2026-09-24）终审侧已无消费点，多租户恢复时参见线上 docs/modules/experience-base.md §11 决策记录
  *
  * [踩坑索引] D5(双身份统一) O1(ownerId 只对 agent 填) P1(permissions 形状)
  *

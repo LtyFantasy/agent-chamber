@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from './dialog';
 import { Button } from './button';
+import { useDismissableLayer } from '@/lib/use-dismissable-layer';
 
 /**
  * AlertDialog — 声明式确认框（组合复用 Dialog，不复制遮罩/玻璃代码）。
@@ -48,8 +49,6 @@ export function AlertDialog({
   const titleId = useId();
   const descId = useId();
   const confirmRef = useRef<HTMLButtonElement>(null);
-  /** 打开前的焦点元素（关闭后还原，避免 Tab 顺序跳回页面顶部） */
-  const restoreFocusRef = useRef<HTMLElement | null>(null);
   /** 最新 onCancel 引用（Esc keydown 监听在 open 期间挂载，用 ref 免重挂） */
   const onCancelRef = useRef(onCancel);
   onCancelRef.current = onCancel;
@@ -58,31 +57,19 @@ export function AlertDialog({
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
-  // 打开：记录触发元素焦点 + autoFocus 确认钮；关闭：还原焦点（幂等）。
-  // 依赖含 mounted：mounted 守卫下首帧 return null（portal 未挂），
-  // mounted 翻转后重跑才能拿到确认钮 ref 执行 focus
-  useEffect(() => {
-    if (!open) {
-      restoreFocusRef.current?.focus?.();
-      restoreFocusRef.current = null;
-      return;
-    }
-    restoreFocusRef.current = document.activeElement as HTMLElement | null;
-    confirmRef.current?.focus();
-  }, [open, mounted]);
-
-  // Esc = 取消（keydown 挂 window；open 期间生效，卸载自动移除）
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCancelRef.current();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open]);
+  /*
+    Esc 关闭 + 焦点还原（打开时记录触发元素、autoFocus 确认钮；关闭/卸载时幂等还原）。
+    迁到 `useDismissableLayer`：本组件原是这份语义的参考实现，记忆正文 Dialog 与关系图
+    节点抽屉都要同一套，三处各写一份必然漂移（plan §4.1 的抽取要求）。
+    `ready: mounted` 替代原来的 `[open, mounted]` deps——首帧 portal 未挂时 confirmRef
+    还是 null，不等它翻转 autoFocus 会永远落空。
+  */
+  useDismissableLayer({
+    open,
+    onDismiss: () => onCancelRef.current(),
+    initialFocus: confirmRef,
+    ready: mounted,
+  });
 
   // scroll lock：弹窗打开时锁页面滚动，关闭还原（对齐原生 confirm 的阻塞语义）
   useEffect(() => {

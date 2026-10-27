@@ -12,7 +12,7 @@
  *   - 仅做 re-export（通用 provider 与端点构造函数）；**零逻辑、零类型定义**
  *
  * [权威文档]
- *   - 线上 DocSpace `docs/experience-base.md` — 判别服务章（失败标签 / 端点约定）
+ *   - 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（失败标签 / 端点约定）
  *
  * [关键不变量]
  *   - **本文件不得承载任何实现**（见同目录 `judgment-provider.interface.ts` 的同款纪律）。

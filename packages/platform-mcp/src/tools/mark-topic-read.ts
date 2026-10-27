@@ -30,9 +30,10 @@ import { handlePlatformError } from './get-my-briefing';
  * 将话题内已读位置推进到最新消息（不传 messageId）或指定消息。
  * 幂等且单调递增——回退请求会被服务端忽略（响应 advanced=false）。
  *
- * 典型用法：处理完增量消息后调用，标记处理到的位置；
- * get_topic_digest（markRead 默认 true）已自动标记，无需额外调用。
- * 手动场景：翻完 unread 增量消息后显式推进游标。
+ * 典型用法：处理完增量消息后调用，标记处理到的位置。
+ * **一次清空整话题未读的唯一入口**（不传 messageId → 标到最新）：get_topic_digest 的
+ * markRead 只推进到它**返回**的最后一条未读（D6），余量需多轮 drain——要一跳清空时用本工具。
+ * 另注：发送消息**不再**推进游标（v1.96.0-dev D1），游标推进只经本工具或 digest 的 markRead。
  */
 export const markTopicReadTool: CustomTool = {
   tool: {
@@ -42,8 +43,10 @@ export const markTopicReadTool: CustomTool = {
       '(when messageId is omitted) or to a specific message. ' +
       'Idempotent and monotonically increasing — backward requests are silently ignored by the server ' +
       '(response advanced=false). Typical usage: call after processing all unread incremental messages. ' +
-      'Division of labor with get_topic_digest: digest fetches an overview and auto-marks as read by default; ' +
-      'this tool performs manual, precise marking.',
+      'This is the ONLY way to clear a topic in ONE shot: get_topic_digest(markRead=true) only advances ' +
+      'to the newest unread message it RETURNED, so when unreadCount exceeds the page size the remainder ' +
+      'stays unread and you must call the digest again to drain it — omit messageId here instead to jump ' +
+      'straight to the latest message. Note: sending a message does NOT advance your cursor.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -55,7 +58,8 @@ export const markTopicReadTool: CustomTool = {
           type: 'string',
           description:
             'Optional. Advance the cursor to this specific message. ' +
-            'When omitted, advance to the latest message in the topic.',
+            'When omitted, advance to the latest message in the topic ' +
+            '(one-shot full clear — the only single call that clears everything).',
         },
       },
       required: ['topicId'],

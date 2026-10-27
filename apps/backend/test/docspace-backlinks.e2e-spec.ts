@@ -110,9 +110,12 @@ import { ResourceValidator } from '../src/common/resource-validator';
 import { AuditService } from '../src/modules/audit/audit.service';
 import { EventService } from '../src/modules/event/event.service';
 import { DocController } from '../src/modules/docspace/doc.controller';
+import { DocCategoryController } from '../src/modules/docspace/doc-category.controller';
 import { DocService } from '../src/modules/docspace/doc.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 import { DocLinksService } from '../src/modules/docspace/doc-links.service';
 import { DocMoveService } from '../src/modules/docspace/doc-move.service';
+import { DocRenameService } from '../src/modules/docspace/doc-rename.service';
 import { DocSearchService } from '../src/modules/docspace/doc-search.service';
 import { DocSpaceService } from '../src/modules/docspace/docspace.service';
 import { RouteHealthService } from '../src/modules/docspace/route-health.service';
@@ -243,13 +246,18 @@ class BacklinksE2eAuthModule {}
     ]),
     BacklinksE2eAuthModule,
   ],
-  controllers: [DocController],
+  controllers: [DocController, DocCategoryController],
   providers: [
     // 生产依赖链（真实现）
     DocService,
     DocLinksService,
     DocMoveService,
+    // 存量治理写服务（3 期，v1.92.0-dev）：DocController 构造器新增依赖——
+    // 不注册会让整个测试模块编译失败（端点本身在本套件不触达）
+    DocRenameService,
     DocSpaceService,
+    // hint 去重窗口（2 期，v1.92.0-dev）：DocService/DocSpaceService/DocMoveService 的新依赖
+    HintDedupService,
     OwnerProxyService,
     DocSpacePolicy,
     PermissionService,
@@ -667,5 +675,141 @@ describe('DocSpace backlinks — 真实 PG + 真实 HTTP 集成（v1.90.0-dev）
     expect(hrefs.sort()).toEqual(
       [`/docs/${spaceId}?doc=${targetDoc.id}`, './target.md', './target.md'].sort(),
     );
+  });
+
+  // ─── ④ 存量治理三端点（3 期，v1.92.0-dev）——真 HTTP 面 ─────────────────
+  //
+  // 服务级全矩阵在 test/docspace-governance.e2e-spec.ts（真 DataSource）；本组只补
+  // HTTP 面的三件事：**信封形状**（ResponseInterceptor 产出 {code,data}）、**权限拒绝**
+  // 语义（私有空间非成员 → 404 不泄露存在性）、**404 分码**（空间/分类不存在）。
+
+  it('POST /doc-spaces/:id/tags/rename：dryRun 走信封 + 非成员 404 + 空间不存在 404', async () => {
+    if (!dbAvailable) return;
+
+    const res = await authed(
+      request(app.getHttpServer()).post(`${API_PREFIX}/doc-spaces/${spaceId}/tags/rename`),
+      ownerToken,
+    )
+      .send({ from: ['zz-gov-no-such-tag'], to: 'zz-gov-target', dryRun: true })
+      .expect(200);
+    const envelope = res.body as Envelope<Record<string, unknown>>;
+    expect(envelope.code).toBe(200);
+    expect(envelope.data.dryRun).toBe(true);
+    expect(envelope.data.batchToken).toMatch(/^[0-9a-f]{64}$/);
+
+    // 非成员（私有空间）写权限 → 403 PERMISSION_DENIED（write 语义：资源存在但无权操作，
+    // 与 read 的 404 刻意不同——PermissionService.ensureCan 既有契约，非本端点自定）
+    const denied = await authed(
+      request(app.getHttpServer()).post(`${API_PREFIX}/doc-spaces/${spaceId}/tags/rename`),
+      strangerToken,
+    )
+      .send({ from: ['a'], to: 'b', dryRun: true })
+      .expect(403);
+    expect((denied.body as { code: string }).code).toBe(ErrorCode.PERMISSION_DENIED);
+
+    // 空间不存在 → 404 DOC_SPACE_NOT_FOUND
+    const ghost = await authed(
+      request(app.getHttpServer()).post(
+        `${API_PREFIX}/doc-spaces/00000000-0000-4000-8000-00000000dead/tags/rename`,
+      ),
+      ownerToken,
+    )
+      .send({ from: ['a'], to: 'b', dryRun: true })
+      .expect(404);
+    expect((ghost.body as { code: string }).code).toBe(ErrorCode.DOC_SPACE_NOT_FOUND);
+
+    // `to` 空 / 纯空白 → 400（评审 B1：DTO 层格式闸门，绝不落空 tag）。
+    // ValidationPipe 的 400 经 AllExceptionsFilter 落 `ErrorCode.BAD_REQUEST`(=400)——
+    // 该路径不带业务分码，与 service 层的 422 VALIDATION_ERROR 刻意分层
+    for (const bad of ['', '   ']) {
+      const invalid = await authed(
+        request(app.getHttpServer()).post(`${API_PREFIX}/doc-spaces/${spaceId}/tags/rename`),
+        ownerToken,
+      )
+        .send({ from: ['a'], to: bad })
+        .expect(400);
+      expect((invalid.body as { code: number }).code).toBe(ErrorCode.BAD_REQUEST);
+    }
+
+    // 未认证 → 401（守卫在场）
+    await request(app.getHttpServer())
+      .post(`${API_PREFIX}/doc-spaces/${spaceId}/tags/rename`)
+      .send({ from: ['a'], to: 'b' })
+      .expect(401);
+  });
+
+  it('GET /doc-spaces/:id/docs/orphans：信封含 stats/appliedFilters + 非成员 404', async () => {
+    if (!dbAvailable) return;
+
+    const res = await authed(
+      request(app.getHttpServer()).get(`${API_PREFIX}/doc-spaces/${spaceId}/docs/orphans`),
+      ownerToken,
+    ).expect(200);
+    const envelope = res.body as Envelope<Record<string, unknown>>;
+    expect(envelope.code).toBe(200);
+    expect(Array.isArray(envelope.data.items)).toBe(true);
+    expect(envelope.data.stats).toMatchObject({
+      totalDocs: expect.any(Number),
+      routedDocs: expect.any(Number),
+      orphanDocs: expect.any(Number),
+      byTopDir: expect.any(Array),
+    });
+    expect(envelope.data.appliedFilters).toBeDefined();
+
+    const denied = await authed(
+      request(app.getHttpServer()).get(`${API_PREFIX}/doc-spaces/${spaceId}/docs/orphans`),
+      strangerToken,
+    ).expect(404);
+    expect((denied.body as { code: string }).code).toBe(ErrorCode.DOC_SPACE_NOT_FOUND);
+  });
+
+  it('POST /doc-categories/:id/merge：dryRun 信封 + 分类不存在 404 + 非成员 404', async () => {
+    if (!dbAvailable) return;
+
+    const source = await ds.getRepository(DocCategory).save(
+      ds.getRepository(DocCategory).create({
+        spaceId,
+        name: `Gov HTTP Source ${RUN}`,
+        slug: `gov-http-src-${RUN}`.slice(0, 128),
+      }),
+    );
+    const target = await ds.getRepository(DocCategory).save(
+      ds.getRepository(DocCategory).create({
+        spaceId,
+        name: `Gov HTTP Target ${RUN}`,
+        slug: `gov-http-dst-${RUN}`.slice(0, 128),
+      }),
+    );
+
+    const res = await authed(
+      request(app.getHttpServer()).post(`${API_PREFIX}/doc-categories/${source.id}/merge`),
+      ownerToken,
+    )
+      .send({ targetId: target.id, dryRun: true })
+      .expect(200);
+    const envelope = res.body as Envelope<Record<string, unknown>>;
+    expect(envelope.code).toBe(200);
+    expect(envelope.data.dryRun).toBe(true);
+    expect(envelope.data.softRefs).toMatchObject({ routesCategoryCount: expect.any(Number) });
+
+    // 分类不存在 → 404 DOC_CATEGORY_NOT_FOUND
+    const ghost = await authed(
+      request(app.getHttpServer()).post(
+        `${API_PREFIX}/doc-categories/00000000-0000-4000-8000-00000000dead/merge`,
+      ),
+      ownerToken,
+    )
+      .send({ targetId: target.id, dryRun: true })
+      .expect(404);
+    expect((ghost.body as { code: string }).code).toBe(ErrorCode.DOC_CATEGORY_NOT_FOUND);
+
+    // 非成员（私有空间）写权限 → 403 PERMISSION_DENIED（同 tags/rename 的 write 语义）
+    const denied = await authed(
+      request(app.getHttpServer()).post(`${API_PREFIX}/doc-categories/${source.id}/merge`),
+      strangerToken,
+    )
+      .send({ targetId: target.id, dryRun: true })
+      .expect(403);
+    expect((denied.body as { code: string }).code).toBe(ErrorCode.PERMISSION_DENIED);
   });
 });

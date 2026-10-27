@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
- *   - 补充: docs/roundtable-design.md §8e (claude-code ACP 行为档案, 桥 0.23.1 + Claude Code
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
+ *   - 补充: docs/modules/roundtable-design.md §8e (claude-code ACP 行为档案, 桥 0.23.1 + Claude Code
  *           2.1.232 实测 2026-08-15——C1 模型双保险 / C2 档位五值 / C3 认证纯 env key /
  *           审批 toolCall 自带全套元数据 / 反向 RPC id 从 0 起 / cancel 5ms / resume 无损)
  *

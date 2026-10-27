@@ -43,7 +43,8 @@ import { ApiUsageQueryService, type ApiUsageResponse } from './api-usage-query.s
 import { ApiUsageQueryDto } from './dto/api-usage-query.dto';
 
 /**
- * 调用频率查询端点（D8：admin-only，无 web UI——分析面 = 本端点 + 4 条 SQL 配方）。
+ * 调用频率查询端点（D8：admin-only；Web 落点 = `/usage` 的平台 Tab，分析面另保留
+ * 4 条 SQL 配方）。
  *
  * 为什么 admin-only 而不是"按 actor 收窄"：本端点的用途是**工具集优胜劣汰的全局
  * 决策数据**（平台级画像），按调用者收窄后失去意义；且它是只读聚合，不泄露正文。
@@ -56,6 +57,7 @@ export class ApiUsageController {
   constructor(private readonly apiUsageQueryService: ApiUsageQueryService) {}
 
   @Get('api-usage')
+  // no-store 由 UsageStatsModule.configure() 的路径级 middleware 负责全部出口。
   @ApiOperation({
     summary: 'Aggregate API / MCP tool usage',
     description:

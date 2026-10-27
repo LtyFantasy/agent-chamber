@@ -1,8 +1,8 @@
 /**
  * update_doc_route 单元测试（v1.55 任务 T3）
  *
- * 覆盖：happy path（PATCH 透传 Partial 字段）、nullable 字段 null=清空语义、
- * 非空字段 null 丢弃、routeId 缺失守卫、上游 404/400 透传。
+ * 覆盖：广告 schema 的 nullable 合同、Partial 三态透传、非空字段 null 丢弃、
+ * routeId 缺失守卫、上游 404/400 透传。
  */
 
 import type { CustomToolContext } from '@agent-chamber/automcp';
@@ -38,6 +38,65 @@ beforeEach(() => {
 });
 
 describe('update_doc_route', () => {
+  it.each([
+    'category',
+    'primaryHeadingPath',
+    'secondaryDocId',
+    'secondaryHeadingPath',
+    'codeEntry',
+  ])('广告 schema：%s 同时允许 string 与 null', (field) => {
+    expect(updateDocRouteTool.tool.inputSchema.properties?.[field]?.type).toEqual([
+      'string',
+      'null',
+    ]);
+  });
+
+  it('广告 schema：非空字段类型、required 与 codeEntryType 枚举保持', () => {
+    const schema = updateDocRouteTool.tool.inputSchema;
+    const properties = schema.properties ?? {};
+
+    expect(schema.required).toEqual(['routeId']);
+    for (const field of ['routeId', 'intent', 'primaryDocId', 'codeEntryType']) {
+      expect(properties[field]?.type).toBe('string');
+    }
+    expect(properties.sortOrder?.type).toBe('integer');
+    expect(properties.codeEntryType?.enum).toEqual(['exact', 'pattern']);
+  });
+
+  it('省略全部更新字段时 body 无键，不用 null 补齐', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce(updatedRoute);
+
+    await updateDocRouteTool.handler({ routeId: 'route-1' }, ctx());
+
+    expect(request.mock.calls[0][2].body).toEqual({});
+  });
+
+  it('nullable 字段有效值原样透传，省略的字段不携带', async () => {
+    const request = mockRequest();
+    request.mockResolvedValueOnce(updatedRoute);
+
+    await updateDocRouteTool.handler(
+      {
+        routeId: 'route-1',
+        category: 'ops',
+        primaryHeadingPath: '概览 § API',
+        secondaryDocId: 'doc-2',
+        secondaryHeadingPath: '补充 § 入口',
+        codeEntry: 'apps/backend/src/main.ts',
+      },
+      ctx(),
+    );
+
+    expect(request.mock.calls[0][2].body).toEqual({
+      category: 'ops',
+      primaryHeadingPath: '概览 § API',
+      secondaryDocId: 'doc-2',
+      secondaryHeadingPath: '补充 § 入口',
+      codeEntry: 'apps/backend/src/main.ts',
+    });
+  });
+
   it('happy path：PATCH /doc-routes/:id 透传 Partial 字段', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce(updatedRoute);
@@ -82,12 +141,19 @@ describe('update_doc_route', () => {
     });
   });
 
-  it('非空约束字段（intent/primaryDocId/sortOrder）null 丢弃，避免透传 DB 非空违约', async () => {
+  it('非空约束字段（intent/primaryDocId/sortOrder/codeEntryType）null 丢弃', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce(updatedRoute);
 
     await updateDocRouteTool.handler(
-      { routeId: 'route-1', intent: null, primaryDocId: null, sortOrder: null, category: 'ops' },
+      {
+        routeId: 'route-1',
+        intent: null,
+        primaryDocId: null,
+        sortOrder: null,
+        codeEntryType: null,
+        category: 'ops',
+      },
       ctx(),
     );
 
@@ -95,7 +161,7 @@ describe('update_doc_route', () => {
     expect(call[2].body).toEqual({ category: 'ops' });
   });
 
-  it('codeEntryType 透传（T5），null 丢弃（非空枚举列）', async () => {
+  it('codeEntryType 有效枚举值原样透传', async () => {
     const request = mockRequest();
     request.mockResolvedValueOnce(updatedRoute);
 
@@ -150,6 +216,7 @@ describe('update_doc_route', () => {
 
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
+    expect(body.failedStep).toBe('update_doc_route');
     expect(body.status).toBe(400);
     expect(body.code).toBe(10005);
   });

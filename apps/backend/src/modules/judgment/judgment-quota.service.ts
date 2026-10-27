@@ -13,7 +13,7 @@
  *   - `judgmentSkipRowBound`：行有界上界（**派生式** `(级别数 + 1) × 能力数`）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（三级闸与取值）
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（三级闸与取值）
  *   - 补充: plan `kate-bishop-moon-girl-sam-alexander.md` §批次 2（配额三窗口上移内核 +
  *     skip 五态 taxonomy + 派生上界，arch M4）
  *   - 补充: `.env.example` 判别块（三个额度键的语义与"软闸非账单承诺"）

@@ -1,0 +1,20 @@
+{
+  // backend 影子构建 tsconfig（Stage 0 / 卡 876c1f22）—— 只有 deploy.sh 步骤 6 用
+  // （pnpm --filter @agent-chamber/backend build:shadow → nest build --path 本文件）。
+  //
+  // 为什么必须影子：
+  //   nest-cli.json 的 compilerOptions.deleteOutDir=true 会先删除 outDir 再编译；
+  //   原地构建等于把「正在服役的 dist」整个删掉（运行中的 backend 虽然已 eager-load
+  //   全部模块，但 stack trace / 任何按需 require 都会踩到半成品目录）。
+  //   nest build 的 deleteOutDir 取的就是【本文件解析出的 outDir】⇒ 这里指向 ./dist-new，
+  //   被删的是影子目录，运行中的 dist 全程不受影响。
+  //
+  // 为什么 tsBuildInfoFile 也放进 dist-new：
+  //   dist-new 每次部署前都会被 artifact_prepare 删除 ⇒ 增量信息随之失效、必然全量重编，
+  //   避免「tsbuildinfo 还在但产物目录已被删」导致跳过 emit 的经典坑。
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "outDir": "./dist-new",
+    "tsBuildInfoFile": "./dist-new/tsconfig.tsbuildinfo"
+  }
+}

@@ -14,7 +14,7 @@
  *   - `ExperienceCheckInput`：本能力的输入契约（条目内容 + 当次词表快照）
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` §12（rubric 表：七维 + rubricVersion 说明，
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` §12（rubric 表：七维 + rubricVersion 说明，
  *     含"未来形态 = 硬门槛"注记）/§9（翻案率配对 = 校准数据源）
  *   - 补充: 线上 DocSpace `docs/spec.md` — `JudgmentCapability` 终稿形状
  *   - 历史: .kimi/plans/plan-experience-base-p2.md §3.3（原始六维问题集表——plan 标题记"五维"，
@@ -33,7 +33,7 @@
  *   - **observe-only（用户 2026-09-24 拍板）**：`admissionSuggestion` 与既有各维一样只是
  *     **建议文本**——本文件与调用链上**没有任何**"据此拒绝录入 / 自动改写条目 / 自动升降
  *     quality"的代码路径。未来形态（准入判定为 reject 则拒收）是独立批次，前置条件 =
- *     `docs/experience-base.md` §9 的翻案率配对数据量达标。
+ *     `docs/modules/experience-base.md` §9 的翻案率配对数据量达标。
  *   - **rubric 代际可辨**：`EXPERIENCE_JUDGMENT_RUBRIC_VERSION` 写入快照 `rubricVersion`
  *     ——训练/校准数据据此区分"这条评语出自哪一代问题集"；旧快照无该字段 = v1。
  *   - **既有六维的 instructions 与词表不可改**（v1.82.0 明令）：改动即切断校准数据的纵向

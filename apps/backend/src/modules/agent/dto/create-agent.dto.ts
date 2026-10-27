@@ -2,13 +2,21 @@ import {
   IsString,
   IsOptional,
   IsArray,
+  ArrayNotEmpty,
+  ArrayUnique,
+  IsIn,
   ValidateNested,
   IsUrl,
   MinLength,
   MaxLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { AgentConfigInput, CreateAgentInput } from '@agent-chamber/shared';
+import {
+  API_KEY_SCOPE_VALUES,
+  AgentConfigInput,
+  CreateAgentInput,
+  type ApiKeyScope,
+} from '@agent-chamber/shared';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 class AgentConfigDto implements AgentConfigInput {
@@ -55,6 +63,20 @@ export class CreateAgentDto implements CreateAgentInput {
   @IsString({ each: true })
   @ApiPropertyOptional({ description: 'Capabilities', example: ['code_review', 'testing'] })
   capabilities?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayUnique()
+  @IsIn(API_KEY_SCOPE_VALUES, { each: true })
+  @ApiPropertyOptional({
+    description:
+      "Scopes for the default API key issued with this agent. Omit for full access ['read','write'].",
+    example: ['read'],
+    enum: API_KEY_SCOPE_VALUES,
+    isArray: true,
+  })
+  scopes?: ApiKeyScope[];
 
   @IsOptional()
   @ValidateNested()

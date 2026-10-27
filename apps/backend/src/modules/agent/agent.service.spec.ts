@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository, ObjectLiteral } from 'typeorm';
+import { Repository, ObjectLiteral, IsNull } from 'typeorm';
 import { NotFoundException } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { Hash } from 'crypto';
@@ -868,12 +868,20 @@ describe('AgentService', () => {
       const savedApiKey = createMockApiKey({ name: 'Reset Key' });
       mockApiKeyRepo.create.mockReturnValue(createdApiKey);
       mockApiKeyRepo.save.mockResolvedValue(savedApiKey);
+      // 被吊销集合（用于 scopes 交集继承）：默认一把双权 key
+      mockApiKeyRepo.find.mockResolvedValue([
+        createMockApiKey({ permissions: { scopes: ['read', 'write'] } }),
+      ]);
 
       const result = await service.resetKey('agent-1');
 
       expect(mockAgentRepo.findOne).toHaveBeenCalledWith({
         where: { id: 'agent-1' },
         relations: { actor: true },
+      });
+      // 交集继承要求先读活跃 key（必须在 UPDATE 之前，否则 revoked_at 已置位读不到 scopes）
+      expect(mockApiKeyRepo.find).toHaveBeenCalledWith({
+        where: { agentId: 'agent-1', revokedAt: IsNull() },
       });
       expect(mockApiKeyRepo.createQueryBuilder).toHaveBeenCalled();
       expect(executeMock).toHaveBeenCalled();
@@ -887,7 +895,107 @@ describe('AgentService', () => {
         permissions: { scopes: ['read', 'write'] },
       });
       expect(mockApiKeyRepo.save).toHaveBeenCalledWith(createdApiKey);
-      expect(result).toEqual({ apiKey: 'ask_mocked_random_string' });
+      // 响应 = 白名单投影 + apiKey 明文（keyHash 不外泄）
+      expect(result).toEqual({
+        id: 'key-1',
+        name: 'Reset Key',
+        keyPrefix: 'ask_mock',
+        scopes: ['read', 'write'],
+        createdAt: new Date('2024-01-01'),
+        lastUsedAt: null,
+        expiresAt: null,
+        revokedAt: null,
+        apiKey: 'ask_mocked_random_string',
+      });
+      expect(result).not.toHaveProperty('keyHash');
+    });
+
+    it('混合 scope：read + read-write 两把 → 重置后取交集（仅 read，永不升格）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      } as unknown as SelectQueryBuilder<ApiKey>);
+      mockApiKeyRepo.find.mockResolvedValue([
+        createMockApiKey({ id: 'key-read', permissions: { scopes: ['read'] } }),
+        createMockApiKey({ id: 'key-full', permissions: { scopes: ['read', 'write'] } }),
+      ]);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey({ name: 'Reset Key' }));
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey({ name: 'Reset Key' }));
+
+      await service.resetKey('agent-1');
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read'] } }),
+      );
+    });
+
+    it('显式 scopes 入参优先于交集继承', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      } as unknown as SelectQueryBuilder<ApiKey>);
+      mockApiKeyRepo.find.mockResolvedValue([
+        createMockApiKey({ permissions: { scopes: ['read'] } }),
+      ]);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey({ name: 'Reset Key' }));
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey({ name: 'Reset Key' }));
+
+      await service.resetKey('agent-1', ['read', 'write']);
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read', 'write'] } }),
+      );
+    });
+
+    it('无活跃 key 可继承（空集合）→ 回落只读，绝不升格', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      } as unknown as SelectQueryBuilder<ApiKey>);
+      mockApiKeyRepo.find.mockResolvedValue([]);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey({ name: 'Reset Key' }));
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey({ name: 'Reset Key' }));
+
+      await service.resetKey('agent-1');
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read'] } }),
+      );
+    });
+
+    it('被吊销集合的 permissions 全部非法 → 交集为空 → 回落只读（fail-closed，不升格）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue(undefined),
+      } as unknown as SelectQueryBuilder<ApiKey>);
+      mockApiKeyRepo.find.mockResolvedValue([
+        createMockApiKey({ permissions: {} }),
+        createMockApiKey({ id: 'key-x', permissions: { scopes: ['admin'] } }),
+      ]);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey({ name: 'Reset Key' }));
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey({ name: 'Reset Key' }));
+
+      await service.resetKey('agent-1');
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read'] } }),
+      );
     });
 
     it('should throw NotFoundException when agent not found', async () => {
@@ -1219,7 +1327,7 @@ describe('AgentService', () => {
   });
 
   describe('findKeys', () => {
-    it('should return keys list ordered by createdAt DESC', async () => {
+    it('should return whitelisted projection ordered by createdAt DESC (keyHash 不外泄)', async () => {
       const keys = [createMockApiKey({ id: 'key-1' }), createMockApiKey({ id: 'key-2' })];
       mockApiKeyRepo.find.mockResolvedValue(keys);
 
@@ -1229,7 +1337,52 @@ describe('AgentService', () => {
         where: { agentId: 'agent-1' },
         order: { createdAt: 'DESC' },
       });
-      expect(result).toEqual(keys);
+      // 投影白名单（2026-10-16 卡 72566c2e）：keyHash / ipWhitelist / createdBy / agent 等
+      // 内部字段一律不出现在响应里
+      expect(result).toEqual([
+        {
+          id: 'key-1',
+          name: 'Default Key',
+          keyPrefix: 'ask_mock',
+          scopes: ['read', 'write'],
+          createdAt: new Date('2024-01-01'),
+          lastUsedAt: null,
+          expiresAt: null,
+          revokedAt: null,
+        },
+        {
+          id: 'key-2',
+          name: 'Default Key',
+          keyPrefix: 'ask_mock',
+          scopes: ['read', 'write'],
+          createdAt: new Date('2024-01-01'),
+          lastUsedAt: null,
+          expiresAt: null,
+          revokedAt: null,
+        },
+      ]);
+      expect(result[0]).not.toHaveProperty('keyHash');
+      expect(result[0]).not.toHaveProperty('ipWhitelist');
+      expect(Object.keys(result[0]).sort()).toEqual(
+        [
+          'createdAt',
+          'expiresAt',
+          'id',
+          'keyPrefix',
+          'lastUsedAt',
+          'name',
+          'revokedAt',
+          'scopes',
+        ].sort(),
+      );
+    });
+
+    it('permissions 非法时 scopes 投影为空数组（与执行面 fail-closed 一致，不回退全权）', async () => {
+      mockApiKeyRepo.find.mockResolvedValue([createMockApiKey({ permissions: {} })]);
+
+      const result = await service.findKeys('agent-1');
+
+      expect(result[0].scopes).toEqual([]);
     });
   });
 
@@ -1260,7 +1413,63 @@ describe('AgentService', () => {
         permissions: { scopes: ['read', 'write'] },
       });
       expect(mockApiKeyRepo.save).toHaveBeenCalledWith(createdApiKey);
-      expect(result).toEqual({ ...savedApiKey, apiKey: 'ask_mocked_random_string' });
+      // 响应 = 白名单投影 + apiKey 明文（keyHash 不外泄）
+      expect(result).toEqual({
+        id: 'key-1',
+        name: 'Custom Key',
+        keyPrefix: 'ask_mock',
+        scopes: ['read', 'write'],
+        createdAt: new Date('2024-01-01'),
+        lastUsedAt: null,
+        expiresAt: null,
+        revokedAt: null,
+        apiKey: 'ask_mocked_random_string',
+      });
+      expect(result).not.toHaveProperty('keyHash');
+    });
+
+    it('dto.scopes 显式指定时按指定落库（只读 key）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey());
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey());
+
+      await service.createKey('agent-1', { name: 'RO', scopes: ['read'] });
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read'] } }),
+      );
+    });
+
+    it('dto.scopes 缺省 → 双权（向后兼容）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey());
+      mockApiKeyRepo.save.mockResolvedValue(createMockApiKey());
+
+      await service.createKey('agent-1', { name: 'Full' });
+
+      expect(mockApiKeyRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ permissions: { scopes: ['read', 'write'] } }),
+      );
+    });
+
+    it('dto.scopes 显式空数组 → 400（不是"缺省双权"；缺省只认 undefined）', async () => {
+      const agent = createMockAgent();
+      mockAgentRepo.findOne.mockResolvedValue(agent);
+      mockApiKeyRepo.create.mockReturnValue(createMockApiKey());
+
+      // `[]` 的字面意思 = 这把 key 没有任何权限；归一成双权 = 写侧静默加宽（fail-open），
+      // 与读侧 resolveKeyScopes 对 `[]` 的拒绝（fail-closed）自相矛盾。
+      const err = await service.createKey('agent-1', { name: 'Empty', scopes: [] }).then(
+        () => null,
+        (e: unknown) => e as { getStatus?: () => number; getResponse?: () => { code?: number } },
+      );
+      expect(err?.getStatus?.()).toBe(400);
+      expect(err?.getResponse?.().code).toBe(ErrorCode.VALIDATION_ERROR);
+      // 失败发生在写库之前
+      expect(mockApiKeyRepo.create).not.toHaveBeenCalled();
+      expect(mockApiKeyRepo.save).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when agent not found', async () => {
@@ -1282,9 +1491,13 @@ describe('AgentService', () => {
       mockApiKeyRepo.findOne.mockResolvedValue(key);
       mockApiKeyRepo.save.mockResolvedValue(key);
 
-      const result = await service.revokeKey('key-1');
+      const result = await service.revokeKey('key-1', 'agent-1');
 
-      expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({ where: { id: 'key-1' } });
+      // BOLA 收窄（2026-10-16 卡 72566c2e）：where 必须带 agentId——只按 keyId 查 =
+      // 任何 agent 都能用自己凭证吊销别人 agent 的 key（越权对象级访问）
+      expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'key-1', agentId: 'agent-1' },
+      });
       expect(key.revokedAt).toBeInstanceOf(Date);
       expect(mockApiKeyRepo.save).toHaveBeenCalledWith(key);
       // 审计（Phase 2）：DELETE + api_key；service 层（key 实体含 agentId/keyPrefix）；
@@ -1307,7 +1520,7 @@ describe('AgentService', () => {
       mockApiKeyRepo.findOne.mockResolvedValue(key);
       mockApiKeyRepo.save.mockResolvedValue(key);
 
-      await service.revokeKey('key-1', 'admin-1');
+      await service.revokeKey('key-1', 'agent-1', 'admin-1');
 
       expect(mockAuditService.log).toHaveBeenCalledWith(
         expect.objectContaining({ entityId: 'key-1', actorId: 'admin-1' }),
@@ -1317,9 +1530,26 @@ describe('AgentService', () => {
     it('should throw NotFoundException when key not found', async () => {
       mockApiKeyRepo.findOne.mockResolvedValue(null);
 
-      await expect(service.revokeKey('not-found')).rejects.toThrow(NotFoundException);
-      expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({ where: { id: 'not-found' } });
+      await expect(service.revokeKey('not-found', 'agent-1')).rejects.toThrow(NotFoundException);
+      expect(mockApiKeyRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'not-found', agentId: 'agent-1' },
+      });
       // 失败路径不记审计
+      expect(mockAuditService.log).not.toHaveBeenCalled();
+    });
+
+    it('BOLA：key 属于别的 agent → 收窄查询落空 → 404（与"不存在"同形，不泄露存在性）', async () => {
+      // mock 忠实模拟 where 收窄：只有 agentId 匹配才返回行
+      mockApiKeyRepo.findOne.mockImplementation(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        async (opts: any) =>
+          opts?.where?.agentId === 'agent-1' && opts?.where?.id === 'key-1'
+            ? createMockApiKey()
+            : null,
+      );
+
+      await expect(service.revokeKey('key-1', 'agent-OTHER')).rejects.toThrow(NotFoundException);
+      expect(mockApiKeyRepo.save).not.toHaveBeenCalled();
       expect(mockAuditService.log).not.toHaveBeenCalled();
     });
   });

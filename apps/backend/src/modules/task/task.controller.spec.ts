@@ -216,7 +216,15 @@ describe('TaskController', () => {
 
       expect(await controller.update('task-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
-      expect(service.update).toHaveBeenCalledWith('task-1', dto, mockActor.id, mockActor.type);
+      // 第 5 参 actor 是乐观锁路径锁内重跑权限判定的输入（卡 09ffa9a8 TOCTOU）——
+      // 不能只传 id/type，Policy 判定需要完整统一身份
+      expect(service.update).toHaveBeenCalledWith(
+        'task-1',
+        dto,
+        mockActor.id,
+        mockActor.type,
+        mockActor,
+      );
     });
   });
 
@@ -251,7 +259,15 @@ describe('TaskController', () => {
 
       expect(await controller.move('task-1', dto, mockActor)).toBe(result);
       expect(permService.ensureCan).toHaveBeenCalledWith(task, mockActor, 'write');
-      expect(service.move).toHaveBeenCalledWith('task-1', dto, mockActor.id, mockActor.type);
+      // F4-2：actor 作为第 5 参透传给 service（跨板 move 的目标板 write 门需要它，
+      // 且必须传**完整对象** —— 迷你 {id,type} 会丢 role 使 BoardPolicy admin bypass 失效）
+      expect(service.move).toHaveBeenCalledWith(
+        'task-1',
+        dto,
+        mockActor.id,
+        mockActor.type,
+        mockActor,
+      );
       // 审计（Phase 2）：UPDATE + task（move）；含 listId 前后值与 status 前后值
       expect(auditService.log).toHaveBeenCalledWith({
         action: 'update',

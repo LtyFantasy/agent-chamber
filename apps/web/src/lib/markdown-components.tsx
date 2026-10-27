@@ -16,7 +16,7 @@
  *
  * [权威文档]
  *   - 主文档: docs/api-definition.md §Attachments（读取链路全鉴权）
- *   - 补充: docs/frontend-architecture.md §8.5（/docs 板块约定）
+ *   - 补充: docs/frontend/frontend-architecture.md §8.5（/docs 板块约定）
  *
  * [关键不变量]
  *   - system 公告条与 thinking 过程记录两处 ReactMarkdown 不接本工厂：

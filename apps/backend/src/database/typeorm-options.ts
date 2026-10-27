@@ -44,7 +44,7 @@
  */
 import type { TypeOrmModuleOptions } from '@nestjs/typeorm';
 import { SnakeNamingStrategy } from './snake-naming.strategy';
-import { PG_CONNECTION_EXTRA } from './pg-session-defaults';
+import { PG_CONNECTION_EXTRA, PG_POOL_SIZE } from './pg-session-defaults';
 import * as entities from './entities';
 
 /**
@@ -73,6 +73,10 @@ export function buildTypeOrmOptions(): TypeOrmModuleOptions {
     // TypeORM CLI 与真库测试用）——故两处必须同时引用同一常量，只改一处 = 测试绿而生产
     // 静默丢召回。详见 database/pg-session-defaults.ts 文件头。
     extra: PG_CONNECTION_EXTRA,
+    // 连接池容量上限（TypeORM 顶层池选项 → pg.Pool 的 max）：未配置时 pg 隐式 10，
+    // 而任务乐观锁路径"持锁事务 + 全局 repo 第 2 条连接"的叠加形态会在池满时**永久挂死**
+    // （pg.connect 默认不超时）。取值依据与残余风险见 pg-session-defaults.ts 的 PG_POOL_SIZE。
+    poolSize: PG_POOL_SIZE,
     entities: Object.values(entities),
     namingStrategy: new SnakeNamingStrategy(),
     synchronize: false,

@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §5 (数据模型) + §6 (会话层规则/座位管理)
- *   - 补充: docs/roundtable-design.md §7 (seatLabel 身份模型, runner_id 绑定)
+ *   - 主文档: docs/modules/roundtable-design.md §5 (数据模型) + §6 (会话层规则/座位管理)
+ *   - 补充: docs/modules/roundtable-design.md §7 (seatLabel 身份模型, runner_id 绑定)
  *
  * [踩坑索引]
  *

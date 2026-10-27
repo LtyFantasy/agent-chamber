@@ -1,5 +1,28 @@
 'use client';
 
+/**
+ * =============================================================================
+ * AGENT-CODE-HOOK | 修改本文件前必读
+ * =============================================================================
+ * [功能概念]
+ *   - 文档空间正文相对链接解析与会话内缓存
+ * [代码职责]
+ *   - 在当前空间解析 path，并将命中或未命中结果用于后续点击。
+ * [权威文档]
+ *   - DocSpace Agent Chamber / docs/frontend/frontend-architecture.md §8.5 文档空间详情页
+ * [关键不变量]
+ *   - 正负缓存仅属于当前空间访问；切空间或卸载后，旧请求不得缓存、导航或提示。
+ *   - 请求以 Map 实例识别会话，A→B→A 也不得重新接纳第一次 A 的迟到结果。
+ * [关联代码]
+ *   - 同目录 page.test.tsx — 同实例跨空间、往返与卸载后的解析回归
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
+ * =============================================================================
+ */
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams, useRouter, usePathname } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient, useInfiniteQuery } from '@tanstack/react-query';
@@ -35,6 +58,7 @@ import {
   ListTree,
 } from 'lucide-react';
 import { Api } from '@/lib/api';
+import { errorMessageOf } from '@/lib/error-message';
 import { dedupeOutlineSections } from '@/lib/outline-sections';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { formatDate } from '@/lib/utils';
@@ -85,12 +109,13 @@ const SIDEBAR_MODE_KEY = 'docs:sidebar-mode';
 type SidebarViewMode = 'tree' | 'category';
 
 /**
- * mutation 错误统一提示（范式照抄 task-detail-panel.tsx addDependencyMutation）：
- * 优先透传服务端 error.response.data.message（4xx 业务原因），兜底 axios message / 领域文案。
+ * mutation 错误统一提示（**通道分级单源 = `lib/error-message.ts`**，卡 240c74d6）：
+ * 仅 4xx + 业务码透传服务端 message，其余（5xx / 断网）用调用方给的领域文案——
+ * 旧写法 `|| axiosErr?.message` 在断网时会把 axios 的 'Network Error' 英文原文弹给用户。
+ * 失败只通知一次，Dialog 与用户输入交由成功路径收尾。
  */
-const alertMutationError = (fallback: string) => (err: unknown) => {
-  const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-  alert(axiosErr?.response?.data?.message || axiosErr?.message || fallback);
+const notifyMutationError = (fallback: string) => (err: unknown) => {
+  toast.error({ title: errorMessageOf(err, fallback) });
 };
 
 /**
@@ -203,8 +228,18 @@ export default function DocSpaceDetailPage() {
   });
   /** 待滚动定位的标题路径（搜索命中 / 反向引用点击直达 section 用；**末段**文本，见写入点） */
   const pendingHeadingRef = useRef<string | null>(null);
-  /** 断链点击解析的会话内缓存（path → docId | null；null = 已确认不存在，避免重复请求） */
+  /** 断链点击解析的当前空间缓存（path → docId | null；null = 已确认不存在） */
   const pathCacheRef = useRef<Map<string, string | null>>(new Map());
+  /** 当前空间作用域，与缓存实例共同阻止旧空间请求产生副作用。 */
+  const currentSpaceIdRef = useRef(spaceId);
+  useEffect(() => {
+    currentSpaceIdRef.current = spaceId;
+    pathCacheRef.current = new Map();
+    return () => {
+      // 替换实例而非 clear：回到同一 spaceId 或页面卸载后，旧请求也必须失效。
+      pathCacheRef.current = new Map();
+    };
+  }, [spaceId]);
   const contentRef = useRef<HTMLDivElement>(null);
   /** 中栏滚动容器（切文档滚顶目标）：**不借 `data-scroll-container`**——那个属性是
    *  附件图片 IntersectionObserver 的语义锚点（attachment-image.tsx 消费），复用会把
@@ -452,10 +487,15 @@ export default function DocSpaceDetailPage() {
    *  提取标量进 deps 替代 doc 对象本体（消解 exhaustive-deps warning，语义等价） */
   const currentDocPath = doc?.path;
 
-  /** 相对 .md 链接点击解析：会话内缓存（path → docId | null）优先，未命中走 ?path= 异步解析 */
+  /** 相对 .md 链接点击解析：当前空间缓存优先，未命中走 ?path=；迟到结果无副作用。 */
   const handleRelativeDocLink = useCallback(
     async (resolvedPath: string) => {
-      const cached = pathCacheRef.current.get(resolvedPath);
+      const requestCache = pathCacheRef.current;
+      /** 空间 ID 和缓存实例均一致才属于本次访问，覆盖 A→B→A 与卸载场景。 */
+      const isCurrentRequest = () =>
+        currentSpaceIdRef.current === spaceId && pathCacheRef.current === requestCache;
+      if (!isCurrentRequest()) return;
+      const cached = requestCache.get(resolvedPath);
       if (cached !== undefined) {
         if (cached) router.push(`/docs/${spaceId}?doc=${cached}`, { scroll: false });
         else toast.error({ title: t('detail.docLinkNotFound') });
@@ -463,14 +503,16 @@ export default function DocSpaceDetailPage() {
       }
       try {
         const doc = await Api.docs.getDocByPath(spaceId, resolvedPath);
+        if (!isCurrentRequest()) return;
         if (doc) {
-          pathCacheRef.current.set(resolvedPath, doc.id);
+          requestCache.set(resolvedPath, doc.id);
           router.push(`/docs/${spaceId}?doc=${doc.id}`, { scroll: false });
         } else {
-          pathCacheRef.current.set(resolvedPath, null);
+          requestCache.set(resolvedPath, null);
           toast.error({ title: t('detail.docLinkNotFound') });
         }
       } catch {
+        if (!isCurrentRequest()) return;
         // 解析请求失败：不缓存（下次点击可重试），toast 提示
         toast.error({ title: t('detail.docLinkNotFound') });
       }
@@ -644,10 +686,9 @@ export default function DocSpaceDetailPage() {
         toast.warning({ title: t('bundle.export.tooLarge') });
       }
     } catch (err) {
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      toast.error({
-        title: axiosErr?.response?.data?.message || axiosErr?.message || t('bundle.export.failed'),
-      });
+      // 通道分级单源（卡 240c74d6）：仅 4xx + 业务码透传服务端 message，断网时用本地文案——
+      // 旧写法 `|| axiosErr?.message` 会把 axios 的 'Network Error' 英文原文送上 toast。
+      toast.error({ title: errorMessageOf(err, t('bundle.export.failed')) });
     } finally {
       setExporting(false);
     }
@@ -679,11 +720,8 @@ export default function DocSpaceDetailPage() {
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      toast.error({
-        title:
-          axiosErr?.response?.data?.message || axiosErr?.message || t('bundle.export.zipFailed'),
-      });
+      // 通道分级单源（卡 240c74d6）：仅 4xx + 业务码透传服务端 message，断网时用本地文案。
+      toast.error({ title: errorMessageOf(err, t('bundle.export.zipFailed')) });
     } finally {
       setExporting(false);
     }
@@ -698,17 +736,17 @@ export default function DocSpaceDetailPage() {
   const uninviteMutation = useMutation({
     mutationFn: (actorId: string) => Api.docs.uninviteAgent(spaceId, actorId),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('members.actionFailed')),
+    onError: notifyMutationError(t('members.actionFailed')),
   });
   const addEditorMutation = useMutation({
     mutationFn: (agentId: string) => Api.docs.addEditor(spaceId, agentId),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('members.actionFailed')),
+    onError: notifyMutationError(t('members.actionFailed')),
   });
   const removeEditorMutation = useMutation({
     mutationFn: (actorId: string) => Api.docs.removeEditor(spaceId, actorId),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('members.actionFailed')),
+    onError: notifyMutationError(t('members.actionFailed')),
   });
   // v1.45 DOCSPACE-PERM：creator 转让（creator-only，后端 409/404/403 语义由后端保证）
   const transferCreatorMutation = useMutation({
@@ -717,7 +755,7 @@ export default function DocSpaceDetailPage() {
       invalidateSpace();
       toast.success({ title: t('members.transferSuccess') });
     },
-    onError: alertMutationError(t('members.transferFailed')),
+    onError: notifyMutationError(t('members.transferFailed')),
   });
 
   // ── MembersSheet 数据装配（批次 C3：内联成员 Sheet → 共享组件；页面层负责
@@ -822,18 +860,18 @@ export default function DocSpaceDetailPage() {
       invalidateSpace();
       setNewCategoryName('');
     },
-    onError: alertMutationError(t('categories.actionFailed')),
+    onError: notifyMutationError(t('categories.actionFailed')),
   });
   const renameCategoryMutation = useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) =>
       Api.docs.updateCategory(id, { name }),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('categories.actionFailed')),
+    onError: notifyMutationError(t('categories.actionFailed')),
   });
   const deleteCategoryMutation = useMutation({
     mutationFn: (id: string) => Api.docs.deleteCategory(id),
     onSuccess: invalidateSpace,
-    onError: alertMutationError(t('categories.actionFailed')),
+    onError: notifyMutationError(t('categories.actionFailed')),
   });
   const updateSpaceMutation = useMutation({
     mutationFn: (data: {
@@ -850,7 +888,7 @@ export default function DocSpaceDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['docs', 'spaces'] });
       setSpaceSettingsOpen(false);
     },
-    onError: alertMutationError(t('spaceSettings.saveError')),
+    onError: notifyMutationError(t('spaceSettings.saveError')),
   });
 
   /** 文档 upsert mutation：仅发 { path, content }，后端 upsert 未传字段全部 ?? existing 兜底 */
@@ -858,10 +896,10 @@ export default function DocSpaceDetailPage() {
     mutationFn: (input: { path: string; content: string }) => Api.docs.upsertDoc(spaceId, input),
     onSuccess: (result) => {
       if (result.unchanged === true) {
-        alert(t('editor.unchanged'));
+        toast.info({ title: t('editor.unchanged') });
         return; // 内容无变化不退出编辑态
       }
-      alert(t('editor.saveSuccess'));
+      toast.success({ title: t('editor.saveSuccess') });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content', selectedDocId] });
       void queryClient.invalidateQueries({ queryKey: ['docs', 'doc-content-full', selectedDocId] });
@@ -877,9 +915,10 @@ export default function DocSpaceDetailPage() {
       setEditing(null);
     },
     onError: (err: unknown) => {
-      // 透传服务端 message（如 409 DOC_SOURCE_MISMATCH 原因），兜底通用文案
-      const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-      alert(axiosErr?.response?.data?.message || axiosErr?.message || t('editor.saveError'));
+      // 通道分级单源（卡 240c74d6）：仅 4xx + 业务码透传服务端 message（如 409
+      // DOC_SOURCE_MISMATCH 的原因），其余用通用文案——旧写法 `|| axiosErr?.message`
+      // 断网时会把 axios 的 'Network Error' 英文原文弹出来。
+      toast.error({ title: errorMessageOf(err, t('editor.saveError')) });
     },
   });
 
@@ -1864,6 +1903,7 @@ export default function DocSpaceDetailPage() {
                 variant="ghost"
                 size="sm"
                 className="h-9 w-9 p-0"
+                aria-label={tGlobal('common.delete')}
                 onClick={async () => {
                   // 分类删除确认（全局 confirm；与文件内其他确认框同批替换 window.confirm）
                   const ok = await confirm({
@@ -1896,6 +1936,7 @@ export default function DocSpaceDetailPage() {
             <Button
               size="sm"
               className="h-9"
+              aria-label={tGlobal('common.create')}
               disabled={!newCategoryName.trim()}
               isLoading={createCategoryMutation.isPending}
               onClick={() => createCategoryMutation.mutate(newCategoryName.trim())}

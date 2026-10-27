@@ -127,10 +127,7 @@ export class UsageStatsRetentionService {
           `(retentionMonths=${USAGE_STATS_RETENTION_MONTHS})`,
       );
     } catch (err) {
-      this.logger.error(
-        `retention sweep failed: ${(err as Error).message}`,
-        (err as Error).stack,
-      );
+      this.logger.error(`retention sweep failed: ${(err as Error).message}`, (err as Error).stack);
     }
   }
 

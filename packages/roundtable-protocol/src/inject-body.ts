@@ -4,7 +4,7 @@
  * inject 的 prompt 文本 = 规则头（markdown，chamber §6 统一装配）+ 本 JSON 消息体。
  * 消息体投影对齐 MCP 消息结构，agent 可明确解析每条消息的发送角色与 id。
  *
- * 出处：docs/roundtable-design.md §4「seat.inject 消息体格式（r3 冻结，只增不改）」。
+ * 出处：docs/modules/roundtable-design.md §4「seat.inject 消息体格式（r3 冻结，只增不改）」。
  */
 
 /**
@@ -35,7 +35,7 @@ export const INJECT_FROM_TYPES = ['human', 'agent', 'system'] as const;
 /** 消息发送者类型（r3 冻结）：human / agent / system */
 export type InjectFromType = (typeof INJECT_FROM_TYPES)[number];
 
-/** 注入消息体（r3 冻结 schema，只增不改，docs/roundtable-design.md §4） */
+/** 注入消息体（r3 冻结 schema，只增不改，docs/modules/roundtable-design.md §4） */
 export interface InjectBody {
   /** 协议版本（固定 1；r3 冻结） */
   v: typeof INJECT_BODY_VERSION;

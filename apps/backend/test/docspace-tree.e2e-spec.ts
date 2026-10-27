@@ -19,6 +19,8 @@
  *   - 根层语义：prefix='' 时直挂文档 = path 不含 '/' 的文档；带目录段的 path
  *     （如 <RUN>/root1.md）首段是目录，不属于根层直挂——种子数据因此不带 RUN
  *     前缀（space_id 隔离，无跨空间冲突）
+ *   - recent 同时间目录：分页前须按段名 ASC 打破 latestDocAt 平局；真实 SQL
+ *     与跨页结果共同断言，避免未指定总序的查询偶然按预期返回而漏报。
  *
  * [铁律关联] #17(测试契约) #23(jsonb/ORM 集成覆盖) #8(测试绑定)
  *
@@ -56,6 +58,7 @@ import { Board } from '../src/database/entities/board.entity';
 import { AuditLog } from '../src/database/entities/audit-log.entity';
 import type { EventService } from '../src/modules/event/event.service';
 import type { RouteHealthService } from '../src/modules/docspace/route-health.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -118,6 +121,7 @@ describe('DocService.findTree/findFacets — 真实 PG 集成（懒加载目录�
       ds.getRepository(IdempotencyRecord),
       // Diagram IR v1：本套件不触发 diagram 分支，桩件仅防构造参数缺失
       { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
+      new HintDedupService(),
     );
 
     // ── 种子：主空间（3 层目录 12 篇 + 转义目录 3 篇）+ 空空间 ──
@@ -417,6 +421,89 @@ describe('DocService.findTree/findFacets — 真实 PG 集成（懒加载目录�
 
     const facets = await service.findFacets(emptySpaceId);
     expect(facets).toEqual({ types: [], tags: [], categories: [] });
+  });
+
+  it('recent 同时间目录：默认/显式 recent 均以 name ASC 稳定分页，且更新时间仍优先', async () => {
+    if (!dbAvailable) return;
+
+    // 独立前缀隔离已有 fixture；afterAll 的 spaceId 清理同时覆盖这里的文档。
+    const prefix = `recent-order-${RUN}/`;
+    const expectedNames = ['zulu', 'alpha', 'bravo', 'charlie', 'delta', 'echo', 'aardvark'];
+    const tiedAt = '2026-05-02T00:00:00.000Z';
+    const newerAt = '2026-05-03T00:00:00.000Z';
+    const olderAt = '2026-05-01T00:00:00.000Z';
+    // ASCII 倒序写入，防止种子插入顺序本身掩盖同时间目录的次级排序缺失。
+    const seedNames = ['zulu', 'echo', 'delta', 'charlie', 'bravo', 'alpha', 'aardvark'];
+    for (const name of seedNames) {
+      await service.upsert(
+        spaceId,
+        { path: `${prefix}${name}/note.md`, content: `# ${name}` },
+        testActor,
+      );
+    }
+    for (const name of seedNames) {
+      const updatedAt = name === 'zulu' ? newerAt : name === 'aardvark' ? olderAt : tiedAt;
+      await ds.query(`UPDATE docs SET updated_at = $1 WHERE space_id = $2 AND path = $3`, [
+        updatedAt,
+        spaceId,
+        `${prefix}${name}/note.md`,
+      ]);
+    }
+
+    // QueryRunner 在发给 PG 前无条件调用 logQuery；spy 保留真实执行路径，
+    // SQL 总序断言确保旧实现即使碰巧返回预期行序，也不能假性通过。
+    const logQuerySpy = jest.spyOn(ds.logger, 'logQuery');
+    try {
+      for (const sort of [undefined, 'recent'] as const) {
+        /** 每次读真实 PG，同时核验 folders 查询在 LIMIT/OFFSET 前已具备总序。 */
+        const readTree = async (foldersLimit: number, foldersOffset = 0) => {
+          logQuerySpy.mockClear();
+          const tree = await service.findTree(spaceId, {
+            prefix,
+            ...(sort === undefined ? {} : { sort }),
+            foldersLimit,
+            foldersOffset,
+          });
+          const folderQueries = logQuerySpy.mock.calls
+            .map(([sql]) => sql)
+            .filter((sql) => sql.includes('AS "latestDocAt"'));
+          expect(folderQueries).toHaveLength(1);
+          const normalizedSql = folderQueries[0].replace(/"/g, '').replace(/\s+/g, ' ').trim();
+          const orderBy = normalizedSql.match(/\bORDER BY (.+?)(?= LIMIT\b| OFFSET\b|$)/)?.[1];
+          expect(orderBy).toBe('MAX(d.updated_at) DESC, name ASC');
+          return tree;
+        };
+
+        const full = await readTree(expectedNames.length);
+        expect(full.folders.items.map((folder) => folder.name)).toEqual(expectedNames);
+        expect(full.folders.total).toBe(expectedNames.length);
+        expect(full.folders.hasMore).toBe(false);
+        expect(full.folders.items.map((folder) => folder.latestDocAt)).toEqual([
+          newerAt,
+          tiedAt,
+          tiedAt,
+          tiedAt,
+          tiedAt,
+          tiedAt,
+          olderAt,
+        ]);
+
+        // 7 个目录 / 每页 3 个，平局组跨页且末页不足一页；总数不随 offset 改变。
+        const pageSize = 3;
+        const pagedNames: string[] = [];
+        for (let offset = 0; offset < expectedNames.length; offset += pageSize) {
+          const page = await readTree(pageSize, offset);
+          const names = page.folders.items.map((folder) => folder.name);
+          expect(names).toEqual(expectedNames.slice(offset, offset + pageSize));
+          expect(page.folders.total).toBe(expectedNames.length);
+          expect(page.folders.hasMore).toBe(offset + names.length < expectedNames.length);
+          pagedNames.push(...names);
+        }
+        expect(pagedNames).toEqual(expectedNames);
+      }
+    } finally {
+      logQuerySpy.mockRestore();
+    }
   });
 
   // ⚠️ 本用例必须位于套件末尾：remove 后 setImmediate 触发 recalcSpaceLinkHealth，

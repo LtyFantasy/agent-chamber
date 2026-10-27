@@ -13,7 +13,7 @@
  *   - 提供 `judgment.*` 配置：provider / baseUrl / apiKey / typesafeModel / timeoutMs /
  *     rateLimitPerHour（actor 额度）/ globalRateLimitPerHour（全局总闸）/
  *     capabilityRateLimitPerHour（能力子额度）/ capabilities（受管能力白名单）/
- *     warnings（配置组合异常描述）
+ *     proxyUrl（专用出口代理）/ warnings（配置组合异常描述）
  *   - 键读取：provider=typesafe → `TYPESAFE_*`；**其余一律** baseUrl = TypeSafe 官方缺省根、
  *     apiKey = null（none 下 apiKey 无消费者——工厂只在 typesafe 分支读它）
  *   - 解析防御：provider 非法值 → none；timeout / 三级额度非法值 → 回缺省；model 空串 → 回缺省；
@@ -23,7 +23,7 @@
  *   - **production-only fail-fast**：provider=typesafe 缺 key、端点非 https 时仅生产启动即崩
  *
  * [权威文档]
- *   - 主文档: 线上 DocSpace `docs/experience-base.md` — 判别服务章（provider 值域
+ *   - 主文档: 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（provider 值域
  *     `none|typesafe` / 失败标签 / "启用 = 文本出境"声明）
  *   - 补充: 线上 DocSpace `docs/spec.md` — `JudgmentCapability` 与能力值域
  *   - 补充: 线上 DocSpace `DEPLOY.md` — 判别服务 env 块与生产切换 runbook
@@ -46,6 +46,10 @@
  *   - **typesafe 端点的 scheme 硬闸（仅 production）**：非 `https:` 即抛，只有 `localhost` /
  *     `127.0.0.1` 放行 http（照 plugins/kimi-code/hooks/session-start.mjs 的 S6 白名单）；
  *     解析失败的畸形串同样视为不安全——否则文本与 key 会以明文过网。
+ *   - **专用出口代理只服务判别流量**：`TYPESAFE_HTTP_PROXY` / `TYPESAFE_HTTPS_PROXY` 按
+ *     baseUrl 的 scheme 选键（只在 typesafe 分支读取），**不读全局 `HTTP_PROXY`/`HTTPS_PROXY`**
+ *     ——一个键改道全部出境（webhook / 飞书 / 通知）是最糟的静默副作用。非法值 fail-open
+ *     回落直连 + 一条 warning（**只含键名**——代理值可能带 userinfo 凭证，永不进日志）。
  *   - **`TYPESAFE_DEFAULT_MODEL` 空串也回落缺省**（`?.trim() || `）：docker compose 的
  *     `${VAR:-}` 会注入空串，空串当请求 model 发出 = 官方 422（arch R4）。
  *   - **解析防御是硬要求**（arch 复核 N5）：`JUDGMENT_TIMEOUT_MS` / `JUDGMENT_RATE_LIMIT` /
@@ -200,6 +204,15 @@ export interface JudgmentConfig {
    * ⚠️ 它**只是请求参数**：落库快照的 `model` 恒取上游响应自报值（两者可以不同）。
    */
   typesafeModel: string | null;
+  /**
+   * 专用出口代理（**仅 typesafe 分支解析**；null = 直连）。
+   *
+   * 来源 = `TYPESAFE_HTTP_PROXY` / `TYPESAFE_HTTPS_PROXY`（按 baseUrl 的 scheme 选键）；
+   * 用途 = 官方 API 地区封锁（HTTP 451）时把判别流量改走自建代理出口，**不读全局代理变量**
+   * （只改判别自己的道，webhook / 飞书等其他出境不受影响）。**值可能带 userinfo 凭证，
+   * 绝不进日志**（warnings 只含键名；启动 INFO 只回显 host:port）。
+   */
+  proxyUrl: string | null;
   /** 单次判定硬顶（毫秒） */
   timeoutMs: number;
   /** 单 actor 每小时额度（create 与 update 判定共用） */
@@ -413,6 +426,56 @@ function isSecureEndpoint(endpoint: string): boolean {
 }
 
 /**
+ * 专用出口代理 env 键名（单源：本文件解析、`.env.example` 与 warnings 文案引用同一字面量）。
+ *
+ * 命名照 hument 的 `HUMENT_JEV_HTTP_PROXY/HTTPS_PROXY` 先例（去产品前缀、归入本仓
+ * `TYPESAFE_*` 键族）：**专用键优先、不读全局代理变量**——判别出口只改自己的道。
+ */
+export const TYPESAFE_PROXY_ENV_KEYS = {
+  http: 'TYPESAFE_HTTP_PROXY',
+  https: 'TYPESAFE_HTTPS_PROXY',
+} as const;
+
+/**
+ * 解析专用出口代理（**仅 typesafe 分支调用**；none 下无消费者，不读键、不产 warning）。
+ *
+ * 规则：按 baseUrl 的 scheme 选键（https 端点 → `TYPESAFE_HTTPS_PROXY`）；空串 / 未设 =
+ * 直连（compose `${VAR:-}` 注空串的误报守卫，与数值键同源纪律）；非法值（非 URL /
+ * 非 http(s) scheme / 无 host）⇒ **fail-open 回落直连** + 一条 warning（只含键名——
+ * 代理值可能带 userinfo 凭证，**原值永不进日志**，与 JUDGMENT-WARNING-VALUE-LEAK 同源）。
+ *
+ * @param baseUrl 已解析的判别端点 API 根（畸形时按 https 键处理——scheme 硬闸负责拦它，
+ *   这里只保证选键不崩）
+ * @returns `{ proxyUrl, warnings }`
+ */
+function resolveProxyUrl(baseUrl: string): { proxyUrl: string | null; warnings: string[] } {
+  let scheme = 'https:';
+  try {
+    scheme = new URL(baseUrl).protocol;
+  } catch {
+    // 畸形 baseUrl 由 scheme 硬闸（production）/ 上游 404（dev）负责，本函数只保证选键不崩
+  }
+  const key = scheme === 'http:' ? TYPESAFE_PROXY_ENV_KEYS.http : TYPESAFE_PROXY_ENV_KEYS.https;
+  const raw = process.env[key]?.trim();
+  if (!raw) return { proxyUrl: null, warnings: [] };
+  try {
+    const parsed = new URL(raw);
+    if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.host) {
+      throw new Error('not an http(s) proxy URL');
+    }
+  } catch {
+    return {
+      proxyUrl: null,
+      warnings: [
+        `${key} is not a valid http(s) proxy URL — ignoring it (judgment traffic goes DIRECT). ` +
+          'The value was not logged.',
+      ],
+    };
+  }
+  return { proxyUrl: raw, warnings: [] };
+}
+
+/**
  * `JUDGMENT_CAPABILITIES` 的键名（单源：警告文案与 `.env.example` 引用同一字面量）。
  *
  * 值是**逗号分隔的能力名列表**（如 `rerank`）；缺省空集（除恒启用的 `record_check` 外全关）。
@@ -544,6 +607,10 @@ export default registerAs('judgment', (): JudgmentConfig => {
   const typesafeModel = isTypesafe
     ? process.env.TYPESAFE_DEFAULT_MODEL?.trim() || DEFAULT_TYPESAFE_MODEL
     : null;
+  // 专用出口代理只在 typesafe 分支解析（none 下无消费者：不读键、不产 warning）
+  const proxyKnobs = isTypesafe
+    ? resolveProxyUrl(baseUrl)
+    : { proxyUrl: null, warnings: [] as string[] };
 
   if (provider !== 'none' && process.env.NODE_ENV === 'production') {
     // production-only fail-fast（照 attachment-url.config.ts:72-78 先例）：
@@ -587,6 +654,8 @@ export default registerAs('judgment', (): JudgmentConfig => {
     apiKey,
     /** typesafe 的请求模型（缺省 jev-latest；空串回落；其余 provider 恒 null） */
     typesafeModel,
+    /** 专用出口代理（仅 typesafe 分支解析；null = 直连；值永不进日志） */
+    proxyUrl: proxyKnobs.proxyUrl,
     /** 单次判定硬顶（8s 缺省；非法值回落） */
     timeoutMs: knobs.timeoutMs,
     /** 单 actor 每小时额度（60 缺省；非法值回落；create/update 共用） */
@@ -598,6 +667,6 @@ export default registerAs('judgment', (): JudgmentConfig => {
     /** 受 `JUDGMENT_CAPABILITIES` 管辖的已启用能力（小写归一；缺省空集） */
     capabilities: capabilityKnobs.capabilities,
     /** 配置组合异常（**已净化**；由 provider 工厂在启动时逐条 warn；空数组 = 无异常） */
-    warnings: [...knobs.warnings, ...capabilityKnobs.warnings],
+    warnings: [...knobs.warnings, ...proxyKnobs.warnings, ...capabilityKnobs.warnings],
   };
 });

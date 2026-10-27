@@ -15,8 +15,8 @@
  *   - 打开时锁 body 滚动（overflow hidden，关闭恢复）
  *
  * [权威文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（消息渲染）— 图片预览宿主挂载
- *   - 补充: docs/ui-design-system.md §6.1（markdown 图片渲染层级）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（消息渲染）— 图片预览宿主挂载
+ *   - 补充: docs/frontend/ui-design-system.md §6.1（markdown 图片渲染层级）
  *
  * [关键不变量]
  *   - 全站唯一挂载点 = app/providers.tsx（NotificationHost 旁），禁止重复挂载

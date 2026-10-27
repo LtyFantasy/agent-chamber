@@ -14,6 +14,10 @@
  *   - 补充: plan fire-jericho-she-hulk.md（v1.63.0 Board 任务 7d918c7b）：move 加
  *     clientRequestId 幂等（此前零防重）——重放返回首次 DocMoveResult 快照 +
  *     idempotentReplay:true，文档不会二次移动；helper 见 common/services/idempotency.helper.ts
+ *   - 补充: plan hawkman-deadman-doctor-mid-nite.md（v1.92.0-dev 2 期）：move 的
+ *     `route_anchor_recheck` hint——数据源 = 已算好的 `impact.docRoutes`（**零额外查询**，
+ *     A3），dryRun 与正式 move 同发；**move 不动 sections/headings，锚必然不断**，
+ *     文案诚实表述「供知悉核对」而非问题上报
  *
  * [踩坑索引]
  *   - Hument 事故（topic msg 6dbc4da3）：乐观锁 TOCTOU → 事务外快速失败 + 事务内
@@ -25,6 +29,9 @@
  *     （剥前缀 + docs/ 补全）与 sourcePath 无关；重写为严格 POSIX 源目录解析后，
  *     inbound/outbound 必须传 sourceDoc.path / doc.path，禁止再调用无 sourcePath
  *     的旧签名（TS 类型层已强制；加新调用点时先看 link-health.ts 语义表）
+ *   - move-anchor-not-broken-v1.92.0（2 期）：**不要**在 move 路径做 headingPath 锚校验
+ *     ——move 只改 path，锚（primary/secondaryHeadingPath）与 docId 引用全部连续；
+ *     给 move 发 route_anchor_broken 是误报。move 只发 route_anchor_recheck（知悉型）。
  *
  * [铁律关联] #9(代理层透传) #11(注释强制) #17(测试契约) #21(双层校验) #22(findOne必须判空) #23(jsonb/ORM 集成覆盖)
  *
@@ -57,7 +64,16 @@ import { IdempotencyRecord } from '../../database/entities/idempotency-record.en
 import { DocService } from './doc.service';
 import { DocLinksService } from './doc-links.service';
 import type { SpaceDocCandidate } from './doc-links.service';
-import { DOC_IDEMPOTENCY_ENTITY_TYPE, DOC_SOURCE_NATIVE } from './doc-constants';
+import {
+  DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
+  DOC_IDEMPOTENCY_ENTITY_TYPE,
+  DOC_SOURCE_NATIVE,
+} from './doc-constants';
+// hint（2 期，v1.92.0-dev）：route_anchor_recheck 复用已算好的 impact.docRoutes（A3）
+import { buildRouteAnchorRecheckHint, DOC_HINT_PROFILE } from './doc-hints.helper';
+// hint 基建（阶段一抽核到 modules/hints/）：去重窗口 + 信封接线
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
 import { EventService } from '../event/event.service';
 import { extractDocLinks, resolveHrefToDocPath, matchDocReferenceLink } from './link-health';
 import type { MoveDocDto } from './dto';
@@ -113,6 +129,8 @@ export class DocMoveService {
     // 本类保留「文档移动唯一写通道」与 outbound/collision/routes/taskLinks 迁移视图
     private readonly docLinksService: DocLinksService,
     private readonly eventService: EventService,
+    // hint 去重窗口（2 期，v1.92.0-dev）：内存 TTL Map 的 Nest provider（A5）
+    private readonly hintDedup: HintDedupService,
   ) {}
 
   /**
@@ -391,7 +409,8 @@ export class DocMoveService {
       throw new ConflictException({
         message:
           `expectedContentHash mismatch: document was modified since the caller's read ` +
-          `(expected ${dto.expectedContentHash}, current ${doc.contentHash}); re-read the document and retry`,
+          `(expected ${dto.expectedContentHash}, current ${doc.contentHash}); re-read the document and retry` +
+          DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
         code: ErrorCode.DOC_CONTENT_CONFLICT,
         data: { currentContentHash: doc.contentHash },
       });
@@ -406,7 +425,41 @@ export class DocMoveService {
       });
     }
 
-    // dryRun：完整校验链已全过——返回预演视图（impact 完整清单），不写库
+    // ── hint（2 期，v1.92.0-dev；A3）────────────────────────────────────────
+    // route_anchor_recheck：有意图路由指向本文档的**知悉型**提示。数据源 = 已算好的
+    // impact.docRoutes（**零额外查询**）；move 只 UPDATE path、不动 sections/headings，
+    // 锚必然不因 move 断（docId 引用连续）——文案诚实表述「供知悉核对」，不是问题上报。
+    // dryRun 与正式 move 同发（预演视图与实际一致）。族关 → 零 hints。
+    const moveSpaceCtx = await this.docService.getSpaceWriteContext(doc.spaceId);
+    const recheckCandidate =
+      moveSpaceCtx.hintToggles?.routes === true
+        ? buildRouteAnchorRecheckHint(
+            // 同一路由可能同时以 primary/secondary 引用本文档（docRoutes 是逐角色条目）
+            // → routeIds 去重（展示清单不该出现重复 id）
+            [...new Set(impact.docRoutes.map((ref) => ref.routeId))],
+            doc.id,
+          )
+        : null;
+    const moveHints = recheckCandidate
+      ? emitHints(
+          this.logger,
+          this.hintDedup,
+          [recheckCandidate],
+          {
+            surface: 'move',
+            spaceId: doc.spaceId,
+            actorId: actor?.id ?? 'system',
+          },
+          // dryRun 预演**不占去重窗口**（BLOCKER-1）：否则「先 dryRun 再正式 move」时
+          // 正式响应会被自己的预演吞掉，与「预演视图与实际一致」承诺矛盾。
+          // 抑制判定照常（近期真送达过则预演也被压制）。
+          // profile = docspace 的领域侧内核配置（优先级 / 文案 / 族归属单源）
+          { markWindow: dto.dryRun !== true, profile: DOC_HINT_PROFILE },
+        )
+      : undefined;
+
+    // dryRun：完整校验链已全过——返回预演视图（impact 完整清单），不写库。
+    // 2 期：dryRun **同发** route_anchor_recheck（预演视图与实际 move 一致，A3）。
     if (dto.dryRun) {
       return {
         docId: doc.id,
@@ -416,6 +469,7 @@ export class DocMoveService {
         moved: false,
         wouldMove: true,
         impact,
+        ...(moveHints ? { hints: moveHints } : {}),
       };
     }
 
@@ -452,7 +506,8 @@ export class DocMoveService {
             message:
               `expectedContentHash mismatch (in-transaction recheck): document was modified ` +
               `concurrently (expected ${dto.expectedContentHash}, current ${locked.contentHash}); ` +
-              `re-read the document and retry`,
+              `re-read the document and retry` +
+              DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX,
             code: ErrorCode.DOC_CONTENT_CONFLICT,
             data: { currentContentHash: locked.contentHash },
           });
@@ -508,6 +563,7 @@ export class DocMoveService {
             contentHash: fresh.contentHash,
             moved: true,
             impact,
+            ...(moveHints ? { hints: moveHints } : {}),
           } satisfies DocMoveResult);
         }
         return fresh;
@@ -589,6 +645,7 @@ export class DocMoveService {
       contentHash: movedDoc.contentHash,
       moved: true,
       impact,
+      ...(moveHints ? { hints: moveHints } : {}),
     };
   }
 }

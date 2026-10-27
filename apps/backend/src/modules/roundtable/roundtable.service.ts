@@ -1,10 +1,21 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/roundtable-design.md §6 (会话层规则: ③ 核心逻辑)
- *   - 补充: docs/roundtable-design.md §3 (契约① SeatEvent/单飞行) / §4 (双向对账/seat.inject
+ * [功能概念]
+ *   - 圆桌会话路由、座位治理与 ACP 审批结果投影。
+ *
+ * [代码职责]
+ *   - 处理消息/事件、攒批与安全阀；校验人类裁决并持久化、下发、公告、审计。
+ *
+ * [关键不变量]
+ *   - 裁决执行只透传选中的不透明 optionId；结果仅由四种 ACP 标准 kind 投影。
+ *   - 所选 kind 缺失或不支持时，在任何请求赋值和副作用之前返回 422，保留 pending。
+ *   - 治理仍须 human + topic write + creator/admin/ownerProxy；上行 options 原样保存。
+ *
+ * [权威文档]
+ *   - 主文档: DocSpace Agent Chamber / docs/modules/roundtable-design.md §6 (会话层规则: ③ 核心逻辑)
+ *   - 补充: docs/modules/roundtable-design.md §3 (契约① SeatEvent/单飞行) / §4 (双向对账/seat.inject
  *     r3 冻结消息体) / §5 (roundtable_seats: config/state 分列, last_event_seq/last_inject_seq)
  *     / §7 (seatLabel 身份模型与回声抑制) / §8 (ACP 无 system prompt → 规则头随 inject 装配)
  *     / §6 r5 (攒批管线语义: 座位维度 batchWindowMs 窗口, 0=直通, 到期封批入单飞行 FIFO)
@@ -17,11 +28,17 @@
  *     / §12 r17 (一 agent 一 topic 一 active 座位唯一约束: createSeat 业务检查 409 +
  *     部分唯一索引 uq_roundtable_seats_topic_bind_actor 兜底, removed 软删豁免可重建)
  *
+ * [关联代码]
+ *   - roundtable.controller.ts / dto/verdict-permission-request.dto.ts — HTTP 与不透明选项格式。
+ *   - roundtable.service.spec.ts / test/roundtable-permission-verdict.e2e-spec.ts — 状态与零副作用验证。
+ *   - packages/roundtable-runner/src/runner-core.ts — 选中 optionId 原样下发至 driver。
+ *   - DocSpace Agent Chamber / docs/api-definition.md §7a.3 — 裁决 HTTP 合同。
+ *
  * [踩坑索引] RT-BATCH-1(封批即冻结) RT-BATCH-2(定时器随 offline 清理) RT-BATCH-3(replayGap 覆盖不到未派发消息) RT-ROUTE-1(system 不唤醒防礼貌循环) RT-ROUTE-2(唤醒不可达只 park 不开窗) RT-VALVE-1(触发公告在跨过阈值那 turn+节流) RT-VALVE-2(人类判定走 actor 表, senderType/actorType 是内存字段) RT-VALVE-3(暂停只闸新唤醒, FIFO 存量照发) RT-DEBT-1(游标蛙跳: 失败 seq 精确留档, dedup 放行) RT-DEBT-2(无界增长: chunk 缓冲上限 + 两侧对账裁剪) RT-DEBT-3(auto-join 公告幂等) RT-ANNOUNCE-1(公告正文 tool 摘要 title 优先) RT-SEAT-1(jsonb 嵌套 findOne 生成整列等值, 路径提取须 queryBuilder) RT-PERM-2(审批幂等键须带 status=pending, requestId 跨会话归零撞键) TOPIC-PERM(write放宽后座位/裁决须creator收口) R1(公共解析收口) A2.5(座位bindActorId须usable)
  *
  * [铁律关联] #9(代理层透传) #11(注释) #17(测试契约) #20(契约即设计) #21(双层校验)
  *
- * [详细踩坑]（最多 5 条最近/最严重的，LRU 淘汰）
+ * [持久踩坑]（有效旧约束保留；细节与导航见上述权威文档）
  *   A2.5: createSeat 的 bindActorId 必须存在且未软删（现状曾完全无存在性校验——软删
  *       agent 会被绑进座位形成活配置错误）。统一走 ActorProfileService.assertActorUsable
  *       （404 AGENT_NOT_FOUND，契约 docs/spec.md §1 规则 6）。2026-08-26 统一批 A2.5。
@@ -31,7 +48,7 @@
  *       合规）；禁止散落 actorRepo 自查询（旧实现 findOne 过滤软删 → sender-xxxx 裸 ID 兜底）。
  *       收口见 common/services/actor-profile.service.ts，契约 docs/spec.md §1。2026-08-26 统一批 A2。
  *   TOPIC-PERM: v1.46 TopicPolicy.write 放宽给 editor 参与方——roundtable 内两处
- *               ensureCan(topic,'write') 调用点（createSeat / resolvePermissionRequest）
+ *               ensureCan(topic,'write') 调用点（createSeat / verdictPermissionRequest）
  *               若不同步收口，editor 将获得建座位/裁决权限请求的能力（属成员管理/治理
  *               范畴）。修复：两处叠加 ensureTopicCreatorOrAdmin（admin|creator|ownerProxy）。
  *   RT-PERM-2: permission_request 幂等去重键 (seatId, requestId) 不含状态——requestId
@@ -56,9 +73,10 @@
  *               不公告；公告是 system → 「system 不唤醒」天然免疫递归。
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 import {
@@ -143,7 +161,7 @@ const RECENT_ACTIVITY_CAP = 10;
 const RECENT_ACTIVITY_TITLE_CAP = 80;
 
 /**
- * 攒批窗口缺省值（毫秒；设计 docs/roundtable-design.md §6：座位维度时间窗默认 5s，
+ * 攒批窗口缺省值（毫秒；设计 docs/modules/roundtable-design.md §6：座位维度时间窗默认 5s，
  * 一处常量可调）。0 = 直通（M1 行为，dogfood 桌可关攒批对照）——阶段 2 消费。
  * 取值 rationale（2026-08-15 用户拍板）：窗口只为攒住「连续碎消息」突发，5s 足够；
  * 30s 对「空闲座位 + 单条消息」是纯等待延迟，busy 排队场景则相对 turn 时长无感。
@@ -299,7 +317,7 @@ interface BatchWindow {
 }
 
 /**
- * 圆桌会话层 M1 版（chamber ③，厂商无关；docs/roundtable-design.md §2/§6）
+ * 圆桌会话层（chamber ③，厂商无关；docs/modules/roundtable-design.md §2/§6）
  *
  * 职责：
  * 1. 座位 CRUD（createSeat/listSeats）：topic 存在性 findOrThrow + permService.ensureCan
@@ -474,7 +492,7 @@ export class RoundtableService {
     // 校验，软删 agent 会被绑进座位形成活配置错误（契约 docs/spec.md §1 规则 6）。
     // agent 创建者缺省绑自己（认证层已挡软删，恒通过）；人类显式指定时同样校验。
     await this.actorProfileService.assertActorUsable(bindActorId);
-    // r17 唯一座位约束（docs/roundtable-design.md §12 r17：一 agent 一 topic 只能有一个
+    // r17 唯一座位约束（docs/modules/roundtable-design.md §12 r17：一 agent 一 topic 只能有一个
     // active 座位；removed 软删豁免——移除后可重建）：同 topic + 同 bindActorId 且
     // status != 'removed' 的座位已存在 → 409（铁律 #21/#22 业务存在性检查在 Service 层）。
     // ⚠️ RT-SEAT-1：findOne 的 jsonb 嵌套对象条件（config: { bindActorId }）在 typeorm
@@ -1002,11 +1020,12 @@ export class RoundtableService {
    * 人类裁决（POST /roundtable/permission-requests/:id/verdict，M3 阶段 1）
    *
    * 权限模型（§7 + M3 拍板）：仅人类（JWT）可裁决，agent API Key 一律 403（裁决 =
-   * 治理动作，人类特权）；裁决者必须为 topic 参与者（ensureCan 'write'，非参与者 403）。
+   * 治理动作，人类特权）；还须 topic write 权限及 creator/admin/ownerProxy 治理身份。
    * 状态机（铁律 #18）：仅 pending 可裁决——非 pending 409（重复裁决/已作废/已孤儿）；
    * optionId 必须 ∈ 请求 options（按 id/optionId 双键匹配，与 runner 侧 handleVerdict
-   * 同规）——非法 422。状态映射：选中 option 的 kind === 'reject' → rejected，否则
-   * approved（approve_once/approve_always 都是放行，二者差异仅对 runner 会话内生效）。
+   * 同规）——非法 422。四种 ACP 标准 kind 精确投影：allow_once/allow_always → approved，
+   * reject_once/reject_always → rejected；缺失或不支持的 kind 在任何赋值/副作用前 422。
+   * 执行始终透传原 optionId，不从 optionId 猜测 kind 或生成执行选项。
    * 落库 → seat.permission_verdict 下行（requestId + optionId，seq=0——对账游标仅适用
    * inject，与 seat.assign 同规）→ topic 公告（「<人> 已批准/拒绝了座位 X 的审批请求」，
    * 不节流——同一请求只能裁决一次，天然无刷屏）。
@@ -1017,8 +1036,8 @@ export class RoundtableService {
    * @param dto Controller 已做格式校验的 DTO（optionId）
    * @param actor 当前统一身份（人类）
    * @returns 落库后的审批请求行（status/verdictOptionId/resolvedBy/resolvedAt 已更新）
-   * @throws ForbiddenException agent 或非参与者；NotFoundException 请求不存在；
-   *   ConflictException 非 pending；UnprocessableEntityException optionId 非法
+   * @throws ForbiddenException agent 或缺少 topic write/治理身份；NotFoundException 请求不存在；
+   *   ConflictException 非 pending；UnprocessableEntityException optionId 非法或所选 kind 不支持
    */
   async verdictPermissionRequest(
     id: string,
@@ -1062,10 +1081,26 @@ export class RoundtableService {
         code: ErrorCode.VALIDATION_ERROR,
       });
     }
-    const status =
-      String(option.kind ?? '') === 'reject'
-        ? PERMISSION_REQUEST_STATUS.REJECTED
-        : PERMISSION_REQUEST_STATUS.APPROVED;
+    /** kind 仅投影平台记录；先完整校验，避免无效协议选项改状态或触发任何下行副作用。 */
+    let status: 'approved' | 'rejected';
+    switch (option.kind) {
+      case 'allow_once':
+      case 'allow_always':
+        status = PERMISSION_REQUEST_STATUS.APPROVED;
+        break;
+      case 'reject_once':
+      case 'reject_always':
+        status = PERMISSION_REQUEST_STATUS.REJECTED;
+        break;
+      default:
+        throw new UnprocessableEntityException({
+          message:
+            'Selected permission option kind is missing or unsupported. Supported kinds: ' +
+            'allow_once, allow_always, reject_once, reject_always. Approval status unchanged; ' +
+            'no verdict sent. Check runner/adapter options before submitting a verdict.',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+    }
     request.status = status;
     request.verdictOptionId = dto.optionId;
     request.resolvedBy = actor.id;
@@ -1297,7 +1332,12 @@ export class RoundtableService {
         }
       }
     } catch (err) {
-      // 铁规②：异常自吞只记日志（EventEmitter2 v6 同步冒泡实测，见 event.service.ts 挂点注释）
+      // 异常自吞只记日志。**订正（notifications 一期 S7）**：Nest 的 @OnEvent loader 本就有
+      // 双层隔离（回调被 try/catch + `suppressErrors` 默认吞；`{async:true}` 走 setImmediate），
+      // 旧"listener 抛错同步冒泡污染 emit 路径"的立论已不成立；真正会崩进程的是 listener 内
+      // fire-and-forget 的 `void` promise rejection（Nest 包装覆盖不到、Node 22 无全局处理器）。
+      // 故此处 await 链自吞是良好卫生，硬规则仍是"每个 void promise 自带 .catch"（见
+      // event.service.ts 挂点注释）。
       this.logger.error(`onMessageCreated 注入触发失败（已自吞）: ${String(err)}`);
     }
   }

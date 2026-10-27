@@ -90,6 +90,7 @@ import type { AccessQueryService } from '../src/common/services/access-query.ser
 import { ActorProfileService } from '../src/common/services/actor-profile.service';
 import type { ResourceValidator } from '../src/common/resource-validator';
 import type { AuditService } from '../src/modules/audit/audit.service';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 /** 本地开发库连接（docker-compose 默认值；env 覆盖便于换环境跑） */
 const DB_CONFIG = {
@@ -387,6 +388,7 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       eventStub,
       actorProfileService,
       auditServiceStub,
+      new HintDedupService(),
     );
     docService = new DocService(
       ds.getRepository(Doc),
@@ -401,12 +403,14 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       ds.getRepository(IdempotencyRecord),
       // Diagram IR v1：bundle 回导 diagram 的重校验重渲染由 docspace-diagram e2e 覆盖；本套件桩件仅防构造参数缺失
       { validateAndRender: jest.fn() } as unknown as DiagramRendererService,
+      new HintDedupService(),
     );
     docRouteService = new DocRouteService(
       ds.getRepository(DocRoute),
       ds.getRepository(Doc),
       docService,
       auditServiceStub,
+      new HintDedupService(),
     );
 
     // ── 媒体用例装配（P2 批 5）：真 MinIO + 真 AttachmentService 门面 ──
@@ -1157,6 +1161,79 @@ describe('DocBundleService 导出→回导 roundtrip — 真实 PG 集成', () =
       expect(after?.slug).toContain('BundleMeta');
       expect(after?.creatorId).toBe(spaceCreator);
     } finally {
+      await ds.getRepository(DocSpace).delete({ id: metaSpace });
+    }
+  }, 60000);
+
+  it('overwriteSpaceMeta：bundle 携带词表随包走；脏形状词表键剔除且不阻断导入（code-review F1）', async () => {
+    if (!dbAvailable) return;
+
+    const bundle = await bundleService.exportBundle(srcSpaceId);
+    const metaSpace = await makeSpace(`BundleVocab ${RUN}`);
+    const metaRepo = ds.getRepository(DocSpace);
+    try {
+      // ── ① 词表随包走：bundle.space.settings 带 canonicalTags → 导入后目标空间生效 ──
+      const withVocab = {
+        ...bundle,
+        space: {
+          ...bundle.space,
+          settings: {
+            ...((bundle.space as { settings?: Record<string, unknown> }).settings ?? {}),
+            canonicalTags: [{ value: 'npc', aliases: ['NPC'] }],
+          },
+        },
+      };
+      const r1 = await bundleService.importBundle(metaSpace, withVocab as never, testActor, true);
+      expect(r1.spaceMeta).toEqual({ applied: true, status: 'updated' });
+
+      const after1 = await metaRepo.findOne({ where: { id: metaSpace } });
+      expect(after1?.settings.canonicalTags).toEqual([{ value: 'npc', aliases: ['NPC'] }]);
+
+      // 词表真的被**读侧**消费：导入后该空间写 tags 命中 alias 即归一
+      const w1 = await docService.upsert(
+        metaSpace,
+        { path: `tmp/${RUN}/bundle-vocab.md`, content: `# Bundle Vocab\n\n正文。`, tags: ['NPC'] },
+        testActor,
+      );
+      expect(w1.tagNormalizations).toEqual([{ from: 'NPC', to: 'npc' }]);
+
+      // ── ② 脏形状词表键（bundle 是外部文件，可被手改）：剔除 + 不阻断导入 ──
+      const dirty = {
+        ...bundle,
+        space: {
+          ...bundle.space,
+          settings: {
+            ...((bundle.space as { settings?: Record<string, unknown> }).settings ?? {}),
+            canonicalTags: ['openviking'], // 字符串数组 = 异形（旧读侧会 TypeError 500）
+            docTypes: [123], // 非字符串元素
+          },
+        },
+      };
+      const r2 = await bundleService.importBundle(metaSpace, dirty as never, testActor, true);
+      // 导入成功（fail-open）——灾备通道不因一个脏词表键整体失败
+      expect(r2.spaceMeta).toEqual({ applied: true, status: 'updated' });
+
+      const after2 = await metaRepo.findOne({ where: { id: metaSpace } });
+      expect(after2?.settings.canonicalTags).toBeUndefined();
+      expect(after2?.settings.docTypes).toBeUndefined();
+
+      // 脏键剔除后该空间 = 无词表：写 tags 零归一且不 500
+      const w2 = await docService.upsert(
+        metaSpace,
+        { path: `tmp/${RUN}/bundle-dirty.md`, content: `# Bundle Dirty\n\n正文。`, tags: ['NPC'] },
+        testActor,
+      );
+      expect(w2.tagNormalizations).toBeUndefined();
+    } finally {
+      // 导入会在目标空间建文档/分类/路由（bundle 全量内容）——按空间硬删兜底
+      const docs = await ds.getRepository(Doc).find({ where: { spaceId: metaSpace } });
+      for (const d of docs) {
+        await ds.getRepository(DocSection).delete({ docId: d.id });
+        await ds.getRepository(DocVersion).delete({ docId: d.id });
+      }
+      await ds.getRepository(Doc).delete({ spaceId: metaSpace });
+      await ds.getRepository(DocRoute).delete({ spaceId: metaSpace });
+      await ds.getRepository(DocCategory).delete({ spaceId: metaSpace });
       await ds.getRepository(DocSpace).delete({ id: metaSpace });
     }
   }, 60000);

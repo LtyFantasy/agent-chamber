@@ -54,6 +54,7 @@ import { ToolMapper } from './mapper/tool-mapper';
 import { McpServer } from './server/mcp-server';
 import { HttpProxy } from './proxy/http-proxy';
 import { loadProfile, resolveProfilePath } from './profile/profile-loader';
+import { filterCustomTools } from './profile/custom-tool-filter';
 import type {
   ServeOptions,
   AuthConfig,
@@ -68,8 +69,15 @@ import type {
 export interface ServeResult {
   /** 服务器访问 URL */
   url: string;
-  /** 注册的 tool 数量 */
+  /** 注册的 tool 数量（自动映射 + 过滤后实际注册的 custom tools） */
   toolCount: number;
+  /**
+   * 被 profile `excludeCustomTools` 排除的 custom tool 数量
+   *
+   * 单独返回而不是只体现在 toolCount 差额里：降级是**显式策略**，运维日志/测试
+   * 需要能区分"模块本来就少"与"被 profile 排除了 N 个"。
+   */
+  customToolsExcluded: number;
   /** Express 应用实例（供测试使用） */
   app: Application;
   /** 停止服务器的回调 */
@@ -207,7 +215,8 @@ export async function runServe(options: ServeOptions): Promise<ServeResult> {
   const auth = buildAuthConfig(options);
   const proxy = new HttpProxy(options.baseUrl, auth);
   // surface 解析一次后全程不变（D4c）：进 ALS 上下文 → 两头与上报载荷都取自它。
-  // 认证显式注入 server：`/mcp` 实例没有 custom tools（不走 registerCustomTools），
+  // 认证显式注入 server：启动不带 --custom-tools 时没有任何人会调 registerCustomTools
+  // （带该参数时它写的是同一字段，见步骤 6——所以本调用不能省），
   // 不注入则 fallbackAuth 恒 undefined → invocation 上报因无凭据被整片跳过。
   const surface = resolveSurface(options);
   const server = new McpServer(
@@ -225,10 +234,27 @@ export async function runServe(options: ServeOptions): Promise<ServeResult> {
 
   // ─── 6. 加载 custom tools（可选）───
   let customToolCount = 0;
+  let customToolsExcluded = 0;
+  // profile 声明的排除表（供"未挂 custom tools"的 WARN 分支使用；避免窄化失败）
+  const declaredExcludes = profile?.excludeCustomTools ?? [];
   if (options.customTools !== undefined && options.customTools !== '') {
     const module = await loadCustomToolsModule(options.customTools);
-    server.registerCustomTools(module.customTools, auth);
-    customToolCount = module.customTools.length;
+    // 语义工具降级：profile 的 excludeCustomTools 在注册前生效（未知名直接抛错）。
+    // 必须在 registerCustomTools 之前——注册后再删会让 mcp-server 的重名校验与
+    // tools/list 顺序都依赖调用时序，且失败时已产生半注册状态。
+    const customTools = filterCustomTools(module.customTools, declaredExcludes);
+    customToolsExcluded = module.customTools.length - customTools.length;
+    server.registerCustomTools(customTools, auth);
+    customToolCount = customTools.length;
+  } else if (declaredExcludes.length > 0) {
+    // 静默失效是配置事故的温床：profile 声明了降级意图，但本实例没挂 custom tools 模块，
+    // 排除表完全不起作用（也没有任何工具可被排除）。打 WARN 让运维看到"配置未生效"，
+    // 与 custom-tool-filter 的关键不变量（排除必须可验证）对齐；不 throw——
+    // 不带 custom tools 的实例本身可能是合法用法（例如只暴露原子工具的定制实例）。
+    console.warn(
+      `[automcp] WARNING: profile declares ${declaredExcludes.length} excludeCustomTools entr(ies) ` +
+        'but --custom-tools is not set; the exclusion is inert',
+    );
   }
 
   const url = await server.start();
@@ -239,6 +265,7 @@ export async function runServe(options: ServeOptions): Promise<ServeResult> {
   return {
     url,
     toolCount,
+    customToolsExcluded,
     app,
     stop: () => server.stop(),
   };

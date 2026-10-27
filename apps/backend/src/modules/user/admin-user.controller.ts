@@ -30,7 +30,7 @@ export class AdminUserController {
   @ApiOperation({
     summary: 'List all users (admin only)',
     description:
-      'Returns a paginated list of all users (including soft-deleted). Supports keyword search via `q`. Only accessible by ADMIN.',
+      'Returns a paginated list of all users except soft-deleted ones (soft deletion lives on the actor row). Supports keyword search via `q`. Only accessible by ADMIN.',
   })
   @ApiQuery({
     name: 'page',

@@ -27,9 +27,13 @@ import { DocLinksService } from './doc-links.service';
 import { EventService } from '../event/event.service';
 import { ErrorCode, AuditAction, ActorType, EventType } from '@agent-chamber/shared';
 import { NotFoundException, ConflictException } from '@nestjs/common';
+import { DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX } from './doc-constants';
+import { HintDedupService } from '../hints/hint-dedup.service';
 
 describe('DocMoveService', () => {
   let service: DocMoveService;
+  /** hint 去重窗口（2 期，v1.92.0-dev）：真实例（内存 TTL Map） */
+  let hintDedup: HintDedupService;
   let docRepo: jest.Mocked<Partial<Repository<Doc>>>;
   let sectionRepo: jest.Mocked<Partial<Repository<DocSection>>>;
   let routeRepo: jest.Mocked<Partial<Repository<DocRoute>>>;
@@ -42,6 +46,8 @@ describe('DocMoveService', () => {
     reconstructContent: jest.Mock;
     getSpaceEventContext: jest.Mock;
     recalcSpaceLinkHealth: jest.Mock;
+    /** 空间写上下文（2 期）：hint 族闸门来源 */
+    getSpaceWriteContext: jest.Mock;
   };
   // 入链内核（v1.90.0-dev 从 DocMoveService 抽出）——本套件注入**真实例**（repo 已被
   // mock），使入链断言（去重/双匹配/section 定位/调用图）仍在同一套件内被覆盖
@@ -146,6 +152,13 @@ describe('DocMoveService', () => {
       reconstructContent: jest.fn(),
       getSpaceEventContext: jest.fn().mockResolvedValue({ topicId: 'topic-1', boardId: 'board-1' }),
       recalcSpaceLinkHealth: jest.fn().mockResolvedValue(undefined),
+      // 空间写上下文（2 期）：缺省全关（hintToggles null）——既有用例零 hints 零行为变化
+      getSpaceWriteContext: jest.fn().mockResolvedValue({
+        vocabulary: null,
+        hintToggles: null,
+        pathTypes: null,
+        settings: {},
+      }),
     };
     eventService = { create: jest.fn().mockResolvedValue({}) };
     // 入链内核真实例：repo 走本套件的 mock（其调用图被断言覆盖），docService 用 mock
@@ -155,6 +168,8 @@ describe('DocMoveService', () => {
       sectionRepo as never,
       docService as unknown as DocService,
     );
+
+    hintDedup = new HintDedupService();
 
     service = new DocMoveService(
       docRepo as never,
@@ -166,6 +181,7 @@ describe('DocMoveService', () => {
       docService as unknown as DocService,
       docLinksService,
       eventService as unknown as EventService,
+      hintDedup,
     );
   });
 
@@ -726,18 +742,22 @@ describe('DocMoveService', () => {
       expect(mockTransaction).not.toHaveBeenCalled();
     });
 
-    it('409 DOC_CONTENT_CONFLICT：expectedContentHash 事务外快速失败', async () => {
+    it('409 DOC_CONTENT_CONFLICT：expectedContentHash 事务外快速失败 + **message 含恢复动作**（决策 10）', async () => {
       arrangeHappyMocks();
-      await expect(
-        service.move(target.id, { toPath: 'docs/new.md', expectedContentHash: 'stale-hash' }),
-      ).rejects.toThrow(
-        expect.objectContaining({
-          response: expect.objectContaining({
-            code: ErrorCode.DOC_CONTENT_CONFLICT,
-            data: { currentContentHash: 'hash-target' },
-          }),
-        }),
-      );
+      let caught: ConflictException | null = null;
+      try {
+        await service.move(target.id, { toPath: 'docs/new.md', expectedContentHash: 'stale-hash' });
+      } catch (e: unknown) {
+        caught = e as ConflictException;
+      }
+      const response = caught?.getResponse() as { code: number; data: unknown; message: string };
+      expect(response).toMatchObject({
+        code: ErrorCode.DOC_CONTENT_CONFLICT,
+        data: { currentContentHash: 'hash-target' },
+      });
+      // 八处抛点共用同一句恢复动作单源（doc-constants.DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX）：
+      // 先 read_doc 重取 contentHash + 勿用同一 payload 盲重试
+      expect(response.message).toContain(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX);
       expect(mockTransaction).not.toHaveBeenCalled();
     });
 
@@ -884,7 +904,11 @@ describe('DocMoveService', () => {
         service.move(target.id, { toPath: 'docs/new.md', expectedContentHash: 'hash-target' }),
       ).rejects.toThrow(
         expect.objectContaining({
-          response: expect.objectContaining({ code: ErrorCode.DOC_CONTENT_CONFLICT }),
+          response: expect.objectContaining({
+            code: ErrorCode.DOC_CONTENT_CONFLICT,
+            // 事务内抛点与事务外抛点共用同一句恢复动作单源（doc-constants）
+            message: expect.stringContaining(DOC_CONTENT_CONFLICT_RECOVERY_SUFFIX),
+          }),
         }),
       );
       expect(auditRepo.save).not.toHaveBeenCalled();

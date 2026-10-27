@@ -1,22 +1,30 @@
 /**
  * =============================================================================
- * AGENT-HOOK | 修改本文件前必读
+ * AGENT-CODE-HOOK | 修改本文件前必读
  * =============================================================================
- * [设计文档]
- *   - 主文档: docs/roundtable-design.md §6 (座位管理) / §7 (seatLabel 与权限边界)
- *   - 补充: docs/roundtable-design.md §5 (roundtable_seats 表)
+ * [功能概念]
+ *   - 圆桌座位治理、审批读取与人类裁决的 HTTP 合同。
  *
- * [踩坑索引]
+ * [代码职责]
+ *   - 绑定路由与 DTO、透传当前 actor，声明真实状态码；业务校验交给 Service。
  *
- * [铁律关联] #9(代理层透传) #11(注释) #21(双层校验)
+ * [权威文档]
+ *   - 主文档: DocSpace Agent Chamber / docs/api-definition.md §7a.3 — 审批裁决。
+ *   - 补充: DocSpace Agent Chamber / docs/modules/roundtable-design.md §6/§7 — 座位管理与权限。
  *
- * [详细踩坑]（最多 5 条）
- *   （暂无）
+ * [关键不变量]
+ *   - verdict 成功沿 Nest POST 默认 201；不把 Service 4xx 包成 500。
+ *   - 裁决须 human + topic write + creator/admin/ownerProxy；未知所选 kind 返回 422。
+ *
+ * [关联代码]
+ *   - roundtable.service.ts / dto/verdict-permission-request.dto.ts — 业务与格式校验。
+ *   - test/roundtable-permission-verdict.e2e-spec.ts — 受控 HTTP/DTO/业务链验证。
  *
  * [修改检查]
- *   □ 已读 [设计文档] 确认修改符合设计意图
- *   □ 如果设计文档已过时，同步更新文档（铁律 #12）
- *   □ 如需修复 bug，先执行完整的根因分析流程（影响面评估 → 测试覆盖 → 验证）
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
  * =============================================================================
  */
 import { Controller, Post, Get, Delete, Body, Query, Param, UseGuards } from '@nestjs/common';
@@ -170,20 +178,25 @@ export class RoundtableController {
 
   @Post('permission-requests/:id/verdict')
   @ApiOperation({
-    summary: 'Resolve a permission request (human only)',
+    summary: 'Resolve a permission request (human creator/admin/owner proxy only)',
     description:
       'Resolve a pending permission request: persist the verdict, deliver seat.permission_verdict ' +
-      'down to the runner and announce in the topic. Humans (JWT) who are topic participants only; ' +
-      'agent API keys are rejected with 403. Non-pending requests return 409; optionId not in the ' +
-      'request options returns 422.',
+      'down to the runner and announce in the topic. Requires a human (JWT), topic write access ' +
+      'and topic creator, its owner proxy or platform admin governance. Agent API keys return 403. ' +
+      'Non-pending requests return 409; an optionId outside request options or a selected option ' +
+      'with missing/unsupported ACP kind returns 422 before any state change or verdict delivery.',
   })
   @ApiParam({ name: 'id', description: 'Permission request id (UUID)' })
-  @ApiResponse({ status: 200, description: 'Resolved permission request' })
+  @ApiResponse({ status: 201, description: 'Resolved permission request' })
+  @ApiResponse({ status: 400, description: 'Invalid optionId format' })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
-  @ApiResponse({ status: 403, description: 'Forbidden (agent key or not a topic participant)' })
+  @ApiResponse({ status: 403, description: 'Forbidden (agent key, no topic write access or not creator/admin/owner proxy)' })
   @ApiResponse({ status: 404, description: 'Permission request not found' })
   @ApiResponse({ status: 409, description: 'Already resolved (not pending)' })
-  @ApiResponse({ status: 422, description: 'optionId not in request options' })
+  @ApiResponse({
+    status: 422,
+    description: 'optionId not in request options or selected kind missing/unsupported (VALIDATION_ERROR; no state change or verdict delivery)',
+  })
   async verdictPermissionRequest(
     @Param('id') id: string,
     @Body() dto: VerdictPermissionRequestDto,

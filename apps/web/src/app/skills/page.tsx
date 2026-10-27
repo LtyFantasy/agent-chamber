@@ -4,6 +4,8 @@ import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import { useLocale, useTranslations } from 'next-intl';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { errorMessageOf } from '@/lib/error-message';
 import { Card, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Loading } from '@/components/ui/loading';
@@ -21,16 +23,11 @@ import { AlertCircle, BookOpen, ChevronRight } from 'lucide-react';
  */
 export default function SkillListPage() {
   const t = useTranslations('skills');
+  const tRead = useTranslations('common');
   const locale = useLocale();
 
-  const {
-    data: skills,
-    isLoading,
-    error,
-  } = useQuery({
-    queryKey: ['skills', 'list'],
-    queryFn: () => Api.skills.list(),
-  });
+  const skillsQuery = useQuery({ queryKey: ['skills', 'list'], queryFn: () => Api.skills.list() });
+  const { data: skills, isLoading } = skillsQuery;
 
   if (isLoading) {
     return (
@@ -40,10 +37,34 @@ export default function SkillListPage() {
     );
   }
 
-  // 请求失败或列表为空时展示空态提示
-  if (error || !skills || skills.length === 0) {
+  if (skillsQuery.isError && skills === undefined)
+    return (
+      <QueryFeedback
+        compact={skillsQuery.data !== undefined}
+        message={errorMessageOf(
+          skillsQuery.error,
+          tRead(skillsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void skillsQuery.refetch()}
+        busy={skillsQuery.isFetching}
+      />
+    );
+
+  // A successful empty result remains mounted through a failed refresh.
+  if (!skills || skills.length === 0) {
     return (
       <div className="flex min-h-screen flex-col items-center justify-center px-4">
+        {skillsQuery.isError && (
+          <QueryFeedback
+            compact={skillsQuery.data !== undefined}
+            message={errorMessageOf(
+              skillsQuery.error,
+              tRead(skillsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+            )}
+            onRetry={() => void skillsQuery.refetch()}
+            busy={skillsQuery.isFetching}
+          />
+        )}
         <AlertCircle className="mb-4 h-12 w-12 text-muted-foreground" />
         <h1 className="text-2xl font-bold">{t('title')}</h1>
         <p className="mt-2 text-sm text-muted-foreground">{t('empty')}</p>
@@ -55,6 +76,17 @@ export default function SkillListPage() {
     // 不刷不透明 bg-background（ui-design-system §3：底色由 body 负责，避免盖住全局网格纹理）
     <main className="min-h-screen px-4 py-8 md:px-8">
       <div className="mx-auto max-w-4xl">
+        {skillsQuery.isError && (
+          <QueryFeedback
+            compact={skillsQuery.data !== undefined}
+            message={errorMessageOf(
+              skillsQuery.error,
+              tRead(skillsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+            )}
+            onRetry={() => void skillsQuery.refetch()}
+            busy={skillsQuery.isFetching}
+          />
+        )}
         <div className="mb-6 flex items-center gap-3">
           <BookOpen className="h-6 w-6 text-primary" />
           <div>

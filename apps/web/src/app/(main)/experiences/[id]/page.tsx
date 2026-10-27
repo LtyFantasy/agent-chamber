@@ -38,6 +38,7 @@ import {
   type ExperienceQuality,
 } from '@/types';
 import { Api } from '@/lib/api';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
 import { createMarkdownComponents } from '@/lib/markdown-components';
@@ -301,12 +302,11 @@ export default function ExperienceDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ['experiences', 'facets'] });
       toast.success({ title: t('feedback.thanks') });
     } catch (err) {
-      const axiosErr = err as { response?: { status?: number; data?: { message?: string } } };
       toast.error({
         title:
-          axiosErr?.response?.status === 409
+          httpStatusOf(err) === 409
             ? t('feedback.expiredNotice')
-            : axiosErr?.response?.data?.message || t('feedback.failed'),
+            : errorMessageOf(err, t('feedback.failed')),
       });
     } finally {
       setFeedbackPending(false);
@@ -339,8 +339,7 @@ export default function ExperienceDetailPage() {
           quality === EXPERIENCE_QUALITY.VERIFIED ? t('review.verified') : t('review.suspected'),
       });
     } catch (err) {
-      const axiosErr = err as { response?: { data?: { message?: string } } };
-      setReviewError(axiosErr?.response?.data?.message || t('review.failed'));
+      setReviewError(errorMessageOf(err, t('review.failed')));
     } finally {
       setReviewPending(null);
     }
@@ -363,9 +362,8 @@ export default function ExperienceDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ['experiences'] });
       router.push('/experiences');
     } catch (err) {
-      const axiosErr = err as { response?: { data?: { message?: string } } };
       toast.error({
-        title: axiosErr?.response?.data?.message || t('detail.deleteFailed'),
+        title: errorMessageOf(err, t('detail.deleteFailed')),
       });
     }
   };

@@ -1,6 +1,26 @@
+/**
+ * =============================================================================
+ * AGENT-CODE-HOOK | 修改本文件前必读
+ * =============================================================================
+ * [功能概念] 看板按列读取、局部错误恢复与拖拽操作反馈
+ * [代码职责] 展示主资源与辅助查询，并把列分页交给本地 useBoardTaskColumns。
+ * [权威文档] DocSpace Agent Chamber: docs/frontend/frontend-architecture.md §8.2–8.3、§12。
+ * [关键不变量] 关闭抽屉与任务栈前进/返回共用 dirty 离开确认；丢弃不新发保存。
+ *   初错不冒充空；缓存空/非空、Dialog 保留；列范围/代际隔离且页长固定100。
+ *   拖拽失败在本地恢复快照；持久化前禁止重入；迟到结果不得恢复到其他范围。
+ *   成功写始终失效事件所属看板；只有当前看板仍有相关列时才用当前读取范围刷新。
+ *   拖拽事件同步计算并发布逻辑排序；UI 与 payload 同源，跨列 order = active 的实际下标。
+ * [关联代码] components/boards/use-board-task-columns.ts；page.error-state.test.tsx。
+ * [修改检查]
+ *   □ 已读 [权威文档]，确认修改符合设计意图
+ *   □ 已核对 [关键不变量] 与 [关联代码] 的影响面
+ *   □ 行为、合同、不变量或归属变化时，同步更新文档侧 AGENT-DOC-HOOK
+ *   □ 如需修复缺陷，先完成根因分析、影响面评估、风险匹配测试与验证
+ * =============================================================================
+ */
 'use client';
 
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import { Priority, TaskStatus, Visibility } from '@agent-chamber/shared';
 import { UserRole, BoardMemberRole, AgentStatus, ActorType } from '@/types';
 import { useParams } from 'next/navigation';
@@ -10,6 +30,9 @@ import { useTranslations } from 'next-intl';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Api } from '@/lib/api';
+import { QueryFeedback } from '@/components/ui/query-feedback';
+import { useBoardTaskColumns } from '@/components/boards/use-board-task-columns';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { isCreatorOrOwner } from '@/lib/is-resource-owner';
 import { MARKDOWN_CLASSES } from '@/lib/markdown-classes';
 import { confirm, toast } from '@/lib/notify';
@@ -73,12 +96,13 @@ import { TaskCardBadges, statusLabelKeys, statusStyles } from '@/components/task
 import { MilestoneManageDialog } from '@/components/boards/milestone-manage-dialog';
 
 /**
- * mutation 错误统一提示（范式照抄 docs/[id]/page.tsx alertMutationError）：
- * 优先透传服务端 error.response.data.message（4xx 业务原因），兜底 axios message / 领域文案。
+ * mutation 错误统一提示（**通道分级单源 = `lib/error-message.ts`**，卡 240c74d6）：
+ * 仅 4xx + 业务码透传服务端 message，其余（5xx / 断网）用调用方给的领域文案——
+ * 旧写法 `|| axiosErr?.message` 在断网时会把 axios 的 'Network Error' 英文原文弹给用户。
+ * 失败只通知一次，Dialog 与用户输入交由成功路径收尾。
  */
-const alertMutationError = (fallback: string) => (err: unknown) => {
-  const axiosErr = err as { response?: { data?: { message?: string } }; message?: string };
-  alert(axiosErr?.response?.data?.message || axiosErr?.message || fallback);
+const notifyMutationError = (fallback: string) => (err: unknown) => {
+  toast.error({ title: errorMessageOf(err, fallback) });
 };
 
 // ──────────────────────────────────────────────
@@ -160,6 +184,10 @@ function SortableBoardColumn({
   onLoadMore,
   hasNext,
   onTaskCreated,
+  feedback,
+  readPending,
+  agentsAvailable,
+  agentsFeedback,
 }: {
   list: BoardListSummary;
   boardId: string;
@@ -171,6 +199,14 @@ function SortableBoardColumn({
   onLoadMore?: () => void;
   hasNext?: boolean;
   onTaskCreated?: () => void;
+  /** Only this column owns its read error and retry. */
+  feedback?: React.ReactNode;
+  /** Disable load-more while a read of this column is pending. */
+  readPending?: boolean;
+  /** A missing agent response is unavailable, never a successful empty option list. */
+  agentsAvailable: boolean;
+  /** The open creation dialog owns an accessible retry for unavailable agents. */
+  agentsFeedback?: React.ReactNode;
 }) {
   const queryClient = useQueryClient();
   const t = useTranslations('boards');
@@ -232,6 +268,7 @@ function SortableBoardColumn({
       setNewTaskPriority(Priority.P2);
       setNewTaskAssigneeId('');
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('list.createTaskFailed')) }),
   });
 
   const updateListMutation = useMutation({
@@ -241,6 +278,7 @@ function SortableBoardColumn({
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', boardId] });
       setEditDialogOpen(false);
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('list.updateFailed')) }),
   });
 
   const deleteListMutation = useMutation({
@@ -250,6 +288,7 @@ function SortableBoardColumn({
       setDeleteDialogOpen(false);
       setTargetListId(null);
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('list.deleteFailed')) }),
   });
 
   const handleCreateTask = () => {
@@ -301,7 +340,7 @@ function SortableBoardColumn({
 
     // 列中有任务
     if (allLists.length === 0) {
-      alert(t('list.cannotDelete', { count: totalTasks }));
+      toast.warning({ title: t('list.cannotDelete', { count: totalTasks }) });
       return;
     }
 
@@ -377,6 +416,7 @@ function SortableBoardColumn({
         </div>
       </div>
 
+      {feedback}
       <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
         <div
           ref={setDroppableRef}
@@ -400,6 +440,8 @@ function SortableBoardColumn({
           size="sm"
           className="mt-2 w-full justify-start text-muted-foreground"
           onClick={onLoadMore}
+          disabled={readPending}
+          aria-busy={readPending}
         >
           {t('list.loadMore')}
         </Button>
@@ -456,12 +498,22 @@ function SortableBoardColumn({
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">{tGlobal('tasks.form.assignee')}</label>
+            {agentsFeedback}
             <select
               className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              aria-label={tGlobal('tasks.form.assignee')}
+              disabled={!agentsAvailable}
               value={newTaskAssigneeId}
               onChange={(e) => setNewTaskAssigneeId(e.target.value)}
             >
-              <option value="">{tGlobal('tasks.form.unassigned')}</option>
+              {agentsAvailable ? (
+                <option value="">{tGlobal('tasks.form.unassigned')}</option>
+              ) : (
+                <option value={newTaskAssigneeId}>
+                  {newTaskAssigneeId ||
+                    tGlobal(agentsFeedback ? 'common.loadFailed' : 'common.loading')}
+                </option>
+              )}
               {agents.map((agent) => (
                 <option key={agent.id} value={agent.id}>
                   {agent.name}
@@ -585,24 +637,53 @@ export default function BoardDetailPage() {
   const queryClient = useQueryClient();
   const { user: currentUser } = useAuthStore();
   const t = useTranslations('boards');
+  const tRead = useTranslations('common');
   const tGlobal = useTranslations();
 
   const [createListOpen, setCreateListOpen] = useState(false);
   const [newListName, setNewListName] = useState('');
   const [milestoneManageOpen, setMilestoneManageOpen] = useState(false);
   const [lists, setLists] = useState<BoardListSummary[]>([]);
-  const [listTasks, setListTasks] = useState<Record<string, TaskSummary[]>>({});
-  const [listPagination, setListPagination] = useState<
-    Record<string, { page: number; hasNext: boolean }>
-  >({});
-  const [tasksLoading, setTasksLoading] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const originalTaskListIdRef = useRef<string | null>(null);
   /** 抽屉内任务导航栈：点任务卡 setTaskStack([id])，点依赖链接压栈 */
   const [taskStack, setTaskStack] = useState<string[]>([]);
   /** 抽屉内面板是否有未保存修改（用于关闭 confirm 拦截） */
   const [isPanelDirty, setIsPanelDirty] = useState(false);
-  const [blockersMap, setBlockersMap] = useState<Record<string, boolean>>({});
+  /** Navigation confirmation is serialized and belongs to the committed board/stack. */
+  const taskNavigationRef = useRef({ boardId: id, stack: taskStack, dirty: isPanelDirty });
+  const taskNavigationPendingRef = useRef(false);
+  useLayoutEffect(() => {
+    taskNavigationRef.current = { boardId: id, stack: taskStack, dirty: isPanelDirty };
+  }, [id, taskStack, isPanelDirty]);
+  /** Closing, dependency navigation and returning all discard through the same boundary. */
+  const navigateTaskStack = async (next: string[]) => {
+    if (taskNavigationPendingRef.current) return;
+    const current = taskNavigationRef.current;
+    taskNavigationPendingRef.current = true;
+    try {
+      if (
+        current.dirty &&
+        !(await confirm({
+          title: t('unsavedConfirm'),
+          description: t('unsavedDescription'),
+          confirmText: tGlobal('common.confirm'),
+          cancelText: tGlobal('common.cancel'),
+        }))
+      )
+        return;
+      if (
+        taskNavigationRef.current.boardId !== current.boardId ||
+        taskNavigationRef.current.stack !== current.stack
+      )
+        return;
+      setTaskStack(next);
+      setIsPanelDirty(false);
+    } finally {
+      taskNavigationPendingRef.current = false;
+    }
+  };
+
   const [milestoneFilter, setMilestoneFilter] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [labelFilter, setLabelFilter] = useState<string>('');
@@ -611,11 +692,12 @@ export default function BoardDetailPage() {
   const [docsDialogOpen, setDocsDialogOpen] = useState(false);
   const [docsSpaceName, setDocsSpaceName] = useState('');
 
-  const { data: board, isLoading } = useQuery({
+  const boardQuery = useQuery({
     queryKey: ['boards', 'detail', id],
     queryFn: () => Api.boards.getById(id),
     enabled: !!id,
   });
+  const { data: board, isLoading } = boardQuery;
 
   /** 看板图例（description）只读查看模态框（v1.47.0-dev UX 统一）：编辑入口 = 设置 Dialog */
   const [descModalOpen, setDescModalOpen] = useState(false);
@@ -640,11 +722,12 @@ export default function BoardDetailPage() {
   }, [board]);
 
   /** 绑定本看板的文档空间（头部 Docs 徽章用） */
-  const { data: boardSpacesData } = useQuery({
+  const spacesQuery = useQuery({
     queryKey: ['docs', 'spaces', 'board', id],
     queryFn: () => Api.docs.listSpaces({ boardId: id, pageSize: 10 }),
     enabled: !!id,
   });
+  const { data: boardSpacesData } = spacesQuery;
   const linkedSpace = boardSpacesData?.items?.[0];
 
   const createSpaceMutation = useMutation({
@@ -655,13 +738,15 @@ export default function BoardDetailPage() {
       setDocsDialogOpen(false);
       setDocsSpaceName('');
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('docs.createFailed')) }),
   });
 
-  const { data: agentsData } = useQuery({
+  const agentsQuery = useQuery({
     queryKey: ['agents', 'list'],
     // listAll 循环翻页拉全：单页 pageSize:100 在 >100 个 agent 时静默丢数据（评审 M-e）
     queryFn: () => Api.agents.listAll(),
   });
+  const { data: agentsData } = agentsQuery;
 
   /** v1.37 owner 代理：我的 agent id 集合（agent 创建的 board 视同我创建） */
   const myAgentIds = useMemo(() => (agentsData ?? []).map((a) => a.id), [agentsData]);
@@ -699,76 +784,36 @@ export default function BoardDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'list'] });
       setSettingsOpen(false);
     },
-    onError: alertMutationError(t('legend.saveError')),
+    onError: notifyMutationError(t('legend.saveError')),
   });
 
   const activeAgents = (agentsData ?? []).filter((a) => a.status === AgentStatus.ACTIVE);
 
-  const { data: milestonesData } = useQuery({
+  const milestonesQuery = useQuery({
     queryKey: ['milestones', 'list', board?.id],
     queryFn: () => Api.tasks.getMilestones({ boardId: board!.id!, pageSize: 100 }),
     enabled: !!board?.id,
   });
+  const { data: milestonesData } = milestonesQuery;
 
   // 从 board detail 初始化 lists（board detail 不再携带 tasks）
   useEffect(() => {
-    if (board?.lists && !activeId) {
+    if (board?.lists && !activeId && !dragPendingRef.current) {
       setLists(board.lists);
     }
   }, [board?.lists, activeId]);
 
-  /**
-   * 根据当前筛选器构造请求后端的 status 参数。
-   * 空值表示使用后端默认值（backlog + in_progress），对应 UI 的「活跃任务」。
-   * 显式 'all' 才返回全部状态。
-   */
-  const resolveStatusParam = useCallback((): string | 'all' | undefined => {
-    if (statusFilter === 'all') return 'all';
-    if (statusFilter) return statusFilter;
-    // 不传 status，后端默认只返回 backlog / in_progress
-    return undefined;
-  }, [statusFilter]);
-
-  // 并发加载每个 list 的 tasks；status 过滤必须传到后端，milestone 仍保留本地过滤
-  useEffect(() => {
-    if (!lists.length || !id) return;
-
-    const status = resolveStatusParam();
-    setTasksLoading(true);
-
-    const loadTasks = async () => {
-      const results = await Promise.all(
-        lists.map((list) =>
-          Api.boards
-            .getListTasks(id, list.id, {
-              status,
-              pageSize: 100,
-            })
-            .catch(() => null),
-        ),
-      );
-
-      const tasksMap: Record<string, TaskSummary[]> = {};
-      const paginationMap: Record<string, { page: number; hasNext: boolean }> = {};
-
-      lists.forEach((list, index) => {
-        const result = results[index];
-        if (result) {
-          tasksMap[list.id] = result.items;
-          paginationMap[list.id] = { page: result.page, hasNext: result.hasNext };
-        } else {
-          tasksMap[list.id] = [];
-          paginationMap[list.id] = { page: 1, hasNext: false };
-        }
-      });
-
-      setListTasks(tasksMap);
-      setListPagination(paginationMap);
-      setTasksLoading(false);
-    };
-
-    void loadTasks();
-  }, [lists, id, statusFilter, resolveStatusParam]);
+  /** Only lists belonging to the resolved board may initiate a read after navigation. */
+  const currentListIds =
+    board?.id === id
+      ? lists
+          .filter((list) => board.lists.some((current) => current.id === list.id))
+          .map((list) => list.id)
+      : [];
+  const columnReads = useBoardTaskColumns(id, currentListIds, statusFilter || undefined);
+  const listTasks = columnReads.tasks;
+  const listPagination = columnReads.pagination;
+  const tasksLoading = Object.values(columnReads.pending).some(Boolean);
 
   /** 当前已加载任务中出现过的全部标签（去重排序，供标签筛选下拉） */
   const allLabels = useMemo(() => {
@@ -802,69 +847,121 @@ export default function BoardDetailPage() {
   const [workingLists, setWorkingLists] = useState<
     { list: BoardListSummary; tasks: TaskSummary[] }[]
   >([]);
+  /** Event-time logical order; old sensor callbacks must not serialize an earlier render. */
+  const workingListsRef = useRef(workingLists);
+  // Canonical reads publish only after commit; speculative renders cannot replace a live order.
+  useLayoutEffect(() => {
+    workingListsRef.current = workingLists;
+  }, [workingLists]);
+
+  /** Publish one computed order to both subsequent sensor events and the rendered preview. */
+  const publishWorkingLists = (next: typeof workingLists) => {
+    workingListsRef.current = next;
+    setWorkingLists(next);
+  };
+
+  /** One drag transaction owns its snapshot until persistence completes. */
+  const [dragPending, setDragPending] = useState(false);
+  /** The ref also blocks a second sensor event before React has rendered pending state. */
+  const dragPendingRef = useRef(false);
+  const dragScope = JSON.stringify([id, statusFilter, milestoneFilter, labelFilter]);
+  const dragScopeRef = useRef({
+    scope: dragScope,
+    boardId: id,
+    listIds: currentListIds,
+    refresh: columnReads.refresh,
+  });
+  const dragSnapshotRef = useRef<{
+    /** Board plus server/local filters that own these displayed positions. */
+    scope: string;
+    /** List order before the gesture. */
+    lists: typeof lists;
+    /** Filtered task positions before the gesture. */
+    workingLists: typeof workingLists;
+  } | null>(null);
+
+  // Publish only committed ranges/readers: an abandoned Suspense render cannot cancel a gesture.
+  // Reader ownership also matters after a successful write outlives its original filter.
+  useLayoutEffect(() => {
+    const previousScope = dragScopeRef.current.scope;
+    dragScopeRef.current = {
+      scope: dragScope,
+      boardId: id,
+      listIds: currentListIds,
+      refresh: columnReads.refresh,
+    };
+    if (previousScope === dragScope) return;
+    dragSnapshotRef.current = null;
+    dragPendingRef.current = false;
+    setDragPending(false);
+    setActiveId(null);
+  });
+
+  /** A stale completion cannot consume the snapshot belonging to a newer drag or range. */
+  const ownsDrag = (snapshot: typeof dragSnapshotRef.current | undefined) =>
+    !!snapshot &&
+    snapshot === dragSnapshotRef.current &&
+    snapshot.scope === dragScopeRef.current.scope;
+
+  /** Restore actual local order even if invalidation shares the old object or its read fails. */
+  const finishDrag = (snapshot: typeof dragSnapshotRef.current | undefined, restore: boolean) => {
+    if (!ownsDrag(snapshot)) return false;
+    if (restore && snapshot) {
+      setLists(snapshot.lists);
+      publishWorkingLists(snapshot.workingLists);
+    }
+    dragSnapshotRef.current = null;
+    dragPendingRef.current = false;
+    setDragPending(false);
+    return true;
+  };
 
   useEffect(() => {
+    if (activeId || dragPending) return;
     setWorkingLists(
       lists.map((list) => ({
         list,
         tasks: filteredTasks[list.id] || [],
       })),
     );
-  }, [lists, filteredTasks]);
+  }, [lists, filteredTasks, activeId, dragPending]);
 
-  // 批量查询所有任务的 blockers 状态
+  /** Blocker reads have their own cache and feedback instead of silently inventing no blockers. */
+  const blockerTaskIds = Object.values(listTasks)
+    .flatMap((tasks) => tasks.map((task) => task.id))
+    .sort();
+  const blockersQuery = useQuery({
+    queryKey: ['tasks', 'batch-blockers', id, statusFilter, blockerTaskIds],
+    queryFn: () => Api.tasks.getBatchBlockers(blockerTaskIds),
+    enabled: blockerTaskIds.length > 0,
+  });
+  /** A larger requested batch must not erase already-known badges while pending or failed. */
+  const blockerScope = JSON.stringify([id, statusFilter]);
+  const [knownBlockers, setKnownBlockers] = useState<{
+    scope: string;
+    values: Record<string, boolean>;
+  }>({ scope: blockerScope, values: {} });
   useEffect(() => {
-    const allTaskIds = Object.values(listTasks).flatMap((tasks) => tasks.map((t) => t.id));
-    if (allTaskIds.length === 0) return;
-    Api.tasks
-      .getBatchBlockers(allTaskIds)
-      .then(setBlockersMap)
-      .catch(() => {});
-  }, [listTasks]);
-
-  /** 重新加载某一列的 tasks（mutation 成功后调用） */
-  const refetchListTasks = useCallback(
-    async (listId: string) => {
-      const result = await Api.boards.getListTasks(id, listId, {
-        status: resolveStatusParam(),
-        pageSize: 100,
-      });
-      setListTasks((prev) => ({ ...prev, [listId]: result.items }));
-      setListPagination((prev) => ({
-        ...prev,
-        [listId]: { page: result.page, hasNext: result.hasNext },
-      }));
-    },
-    [id, resolveStatusParam],
-  );
-
-  /** 刷新全部可见列的 tasks（状态变更经 mappedStatus 联动可能换列，全列刷最稳） */
-  const refetchAllLists = useCallback(() => {
-    lists.forEach((list) => {
-      void refetchListTasks(list.id);
+    if (blockersQuery.data === undefined) return;
+    const accepted = Object.fromEntries(
+      blockerTaskIds.map((taskId) => [taskId, blockersQuery.data![taskId] ?? false]),
+    );
+    setKnownBlockers((previous) => ({
+      scope: blockerScope,
+      values: { ...(previous.scope === blockerScope ? previous.values : {}), ...accepted },
+    }));
+    // The hashed id list, rather than its render-time array identity, owns each accepted batch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockerScope, JSON.stringify(blockerTaskIds), blockersQuery.data]);
+  const blockersMap = knownBlockers.scope === blockerScope ? knownBlockers.values : {};
+  /** Refresh invalidates an older append for the same column, even within the same filter range. */
+  const refetchListTasks = columnReads.refresh;
+  const loadMoreTasks = columnReads.loadMore;
+  const refetchAllLists = () => {
+    currentListIds.forEach((listId) => {
+      void refetchListTasks(listId);
     });
-  }, [lists, refetchListTasks]);
-
-  /** 加载更多任务 */
-  const loadMoreTasks = useCallback(
-    async (listId: string) => {
-      const nextPage = (listPagination[listId]?.page || 1) + 1;
-      const result = await Api.boards.getListTasks(id, listId, {
-        status: resolveStatusParam(),
-        page: nextPage,
-        pageSize: 20,
-      });
-      setListTasks((prev) => ({
-        ...prev,
-        [listId]: [...(prev[listId] || []), ...result.items],
-      }));
-      setListPagination((prev) => ({
-        ...prev,
-        [listId]: { page: result.page, hasNext: result.hasNext },
-      }));
-    },
-    [id, listPagination, resolveStatusParam],
-  );
+  };
 
   const createListMutation = useMutation({
     mutationFn: (name: string) => Api.boards.createList(id, { name }),
@@ -873,6 +970,7 @@ export default function BoardDetailPage() {
       setCreateListOpen(false);
       setNewListName('');
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('list.createFailed')) }),
   });
 
   /** 邀请 Agent 加入看板（R2 Promise 契约：页面层 allSettled 循环调用；
@@ -889,6 +987,7 @@ export default function BoardDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('members.actionFailed')) }),
   });
 
   const addEditorMutation = useMutation({
@@ -896,6 +995,7 @@ export default function BoardDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('members.actionFailed')) }),
   });
 
   const removeEditorMutation = useMutation({
@@ -903,6 +1003,7 @@ export default function BoardDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
     },
+    onError: (err) => toast.error({ title: errorMessageOf(err, t('members.actionFailed')) }),
   });
 
   // ── MembersSheet 数据装配（批次 C2：内联成员 Sheet → 共享组件；页面层负责
@@ -1011,10 +1112,23 @@ export default function BoardDetailPage() {
   };
 
   const reorderListsMutation = useMutation({
-    mutationFn: (lists: { id: string; position: number }[]) =>
-      Api.boards.reorderLists(id, { lists }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
+    mutationFn: ({
+      boardId,
+      lists,
+    }: {
+      /** Event-time board owner; never forwarded as an extra API field. */
+      boardId: string;
+      lists: { id: string; position: number }[];
+    }) => Api.boards.reorderLists(boardId, { lists }),
+    onMutate: () => dragSnapshotRef.current,
+    onSuccess: (_, { boardId }, snapshot) => {
+      finishDrag(snapshot, false);
+      // A successful server write must invalidate its owner even after the local snapshot expires.
+      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', boardId] });
+    },
+    onError: (err, _, snapshot) => {
+      if (finishDrag(snapshot, true))
+        toast.error({ title: errorMessageOf(err, t('list.reorderFailed')) });
     },
   });
 
@@ -1023,12 +1137,22 @@ export default function BoardDetailPage() {
       listId,
       tasks,
     }: {
+      /** Event-time board owner for cache invalidation after navigation. */
+      boardId: string;
       listId: string;
       tasks: { id: string; position: number }[];
     }) => Api.boards.reorderTasks(listId, { tasks }),
-    onSuccess: (_, { listId }) => {
-      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
-      void refetchListTasks(listId);
+    onMutate: () => dragSnapshotRef.current,
+    onSuccess: (_, { boardId, listId }, snapshot) => {
+      finishDrag(snapshot, false);
+      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', boardId] });
+      const current = dragScopeRef.current;
+      if (current.boardId === boardId && current.listIds.includes(listId))
+        void current.refresh(listId);
+    },
+    onError: (err, _, snapshot) => {
+      if (finishDrag(snapshot, true))
+        toast.error({ title: errorMessageOf(err, t('list.reorderTasksFailed')) });
     },
   });
 
@@ -1038,17 +1162,27 @@ export default function BoardDetailPage() {
       listId,
       order,
     }: {
+      /** Event-time board owner for cache invalidation after navigation. */
+      boardId: string;
       taskId: string;
       listId: string;
       order: number;
       sourceListId?: string;
     }) => Api.tasks.move(taskId, { listId, order }),
-    onSuccess: (_, { listId, sourceListId }) => {
-      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', id] });
-      void refetchListTasks(listId);
-      if (sourceListId && sourceListId !== listId) {
-        void refetchListTasks(sourceListId);
+    onMutate: () => dragSnapshotRef.current,
+    onSuccess: (_, { boardId, listId, sourceListId }, snapshot) => {
+      finishDrag(snapshot, false);
+      void queryClient.invalidateQueries({ queryKey: ['boards', 'detail', boardId] });
+      const current = dragScopeRef.current;
+      if (current.boardId !== boardId) return;
+      // Refresh only columns still displayed by the committed view, using its current status range.
+      for (const target of new Set([listId, sourceListId])) {
+        if (target && current.listIds.includes(target)) void current.refresh(target);
       }
+    },
+    onError: (err, _, snapshot) => {
+      if (finishDrag(snapshot, true))
+        toast.error({ title: errorMessageOf(err, t('list.moveTaskFailed')) });
     },
   });
 
@@ -1060,13 +1194,20 @@ export default function BoardDetailPage() {
   );
 
   const handleDragStart = (event: DragStartEvent) => {
+    if (dragPendingRef.current || dragScopeRef.current.scope !== dragScope) return;
+    const current = workingListsRef.current;
+    dragSnapshotRef.current = {
+      scope: dragScope,
+      lists: current.map((item) => item.list),
+      workingLists: current,
+    };
     const activeIdValue = event.active.id as string;
     const activeType = event.active.data.current?.type as string;
     setActiveId(activeIdValue);
 
     // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
     if (activeType === 'task') {
-      const item = workingLists.find((item) => item.tasks.some((t) => t.id === activeIdValue));
+      const item = current.find((item) => item.tasks.some((t) => t.id === activeIdValue));
       originalTaskListIdRef.current = item?.list.id || null;
     } else {
       originalTaskListIdRef.current = null;
@@ -1074,70 +1215,61 @@ export default function BoardDetailPage() {
   };
 
   const handleDragOver = (event: DragOverEvent) => {
+    if (
+      dragPendingRef.current ||
+      dragScopeRef.current.scope !== dragScope ||
+      !ownsDrag(dragSnapshotRef.current)
+    )
+      return;
     const { active, over } = event;
     if (!over) return;
-
     const activeIdValue = active.id as string;
     const overId = over.id as string;
 
-    // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
-    if (active.data.current?.type !== 'task') return;
-    if (activeIdValue === overId) return;
+    // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit sensor marker, not MessageType.TASK.
+    if (active.data.current?.type !== 'task' || activeIdValue === overId) return;
 
-    const activeListId = active.data.current?.listId as string;
-    const overListId = over.data.current?.listId as string;
+    const current = workingListsRef.current;
+    // Sensor listId can lag a cross-column preview. Locate both cards in the logical order.
+    const sourceIndex = current.findIndex((item) =>
+      item.tasks.some((task) => task.id === activeIdValue),
+    );
+    const targetIndex = current.findIndex((item) => item.tasks.some((task) => task.id === overId));
+    const targetListIndex =
+      targetIndex !== -1
+        ? targetIndex
+        : current.findIndex((item) => item.list.id === over.data.current?.listId);
+    if (sourceIndex === -1 || targetListIndex === -1) return;
+    const taskIndex = current[sourceIndex].tasks.findIndex((task) => task.id === activeIdValue);
+    const overTaskIndex = current[targetListIndex].tasks.findIndex((task) => task.id === overId);
+    if (sourceIndex === targetListIndex && overTaskIndex === -1) return;
 
-    if (!activeListId || !overListId) return;
-
-    setWorkingLists((prev) => {
-      const newLists = prev.map((item) => ({
-        ...item,
-        tasks: [...item.tasks],
-      }));
-
-      const source = newLists.find((item) => item.list.id === activeListId);
-      if (!source) return prev;
-
-      const taskIndex = source.tasks.findIndex((t) => t.id === activeIdValue);
-      if (taskIndex === -1) return prev;
-
-      const [movedTask] = source.tasks.splice(taskIndex, 1);
-
-      if (activeListId === overListId) {
-        const overTaskIndex = source.tasks.findIndex((t) => t.id === overId);
-        // overId 不是任务 id（可能是列本身）→ 放回原位
-        if (overTaskIndex === -1) {
-          source.tasks.splice(taskIndex, 0, movedTask);
-          return newLists;
-        }
-        // 先把 removed task 放回去，再用 arrayMove 正确排序
-        // 因为已经 splice 掉了 active，overTaskIndex 比原索引小了1（如果 over 在 active 之后）
-        source.tasks.splice(taskIndex, 0, movedTask);
-        const toIndex = overTaskIndex >= taskIndex ? overTaskIndex + 1 : overTaskIndex;
-        const newTasks = arrayMove(source.tasks, taskIndex, toIndex);
-        source.tasks.length = 0;
-        source.tasks.push(...newTasks);
-      } else {
-        const target = newLists.find((item) => item.list.id === overListId);
-        if (!target) {
-          source.tasks.splice(taskIndex, 0, movedTask);
-          return prev;
-        }
-        const overTaskIndex = target.tasks.findIndex((t) => t.id === overId);
-        // 放到 over 的后面（overTaskIndex + 1），如果 over 不是任务则放到末尾
-        const insertIndex = overTaskIndex !== -1 ? overTaskIndex + 1 : target.tasks.length;
-        target.tasks.splice(insertIndex, 0, movedTask);
-      }
-
-      return newLists;
-    });
+    // Compute outside React's updater: an updater may run later or more than once.
+    const next = current.map((item) => ({ ...item, tasks: [...item.tasks] }));
+    if (sourceIndex === targetListIndex) {
+      next[sourceIndex].tasks = arrayMove(next[sourceIndex].tasks, taskIndex, overTaskIndex);
+    } else {
+      const [moved] = next[sourceIndex].tasks.splice(taskIndex, 1);
+      const insertIndex =
+        overTaskIndex !== -1 ? overTaskIndex + 1 : next[targetListIndex].tasks.length;
+      next[targetListIndex].tasks.splice(insertIndex, 0, moved);
+    }
+    publishWorkingLists(next);
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
+    if (
+      dragPendingRef.current ||
+      dragScopeRef.current.scope !== dragScope ||
+      !ownsDrag(dragSnapshotRef.current)
+    )
+      return;
     const { active, over } = event;
+    const current = workingListsRef.current;
     setActiveId(null);
 
     if (!over) {
+      finishDrag(dragSnapshotRef.current, true);
       return;
     }
 
@@ -1146,41 +1278,52 @@ export default function BoardDetailPage() {
     const activeType = active.data.current?.type as string;
 
     if (activeType === 'column') {
-      const oldIndex = workingLists.findIndex((item) => item.list.id === activeIdValue);
-      const newIndex = workingLists.findIndex((item) => item.list.id === overId);
+      const oldIndex = current.findIndex((item) => item.list.id === activeIdValue);
+      const newIndex = current.findIndex((item) => item.list.id === overId);
 
       if (oldIndex !== -1 && newIndex !== -1 && oldIndex !== newIndex) {
-        const newLists = arrayMove(workingLists, oldIndex, newIndex);
-        setWorkingLists(newLists);
+        const newLists = arrayMove(current, oldIndex, newIndex);
+        publishWorkingLists(newLists);
         setLists(newLists.map((item) => item.list));
-        reorderListsMutation.mutate(newLists.map((item, i) => ({ id: item.list.id, position: i })));
+        dragPendingRef.current = true;
+        setDragPending(true);
+        reorderListsMutation.mutate({
+          boardId: id,
+          lists: newLists.map((item, i) => ({ id: item.list.id, position: i })),
+        });
       }
       // eslint-disable-next-line rulesdir/no-magic-string-compare -- dnd-kit 拖拽 data.type 标记（'task'|'column'），非 MessageType.TASK
     } else if (activeType === 'task') {
       const sourceListId = originalTaskListIdRef.current;
-      const targetListId = over.data.current?.listId as string;
+      const targetItem = current.find((item) =>
+        item.tasks.some((task) => task.id === activeIdValue),
+      );
+      const targetListId = targetItem?.list.id;
 
       if (!sourceListId || !targetListId) {
+        finishDrag(dragSnapshotRef.current, true);
         return;
       }
-
-      const targetItem = workingLists.find((item) => item.list.id === targetListId);
       if (!targetItem) {
+        finishDrag(dragSnapshotRef.current, true);
         return;
       }
 
       const tasks = targetItem.tasks || [];
-      const overTaskIndex = tasks.findIndex((t) => t.id === overId);
-      const finalIndex =
-        overTaskIndex !== -1 ? overTaskIndex : tasks.length > 0 ? tasks.length - 1 : 0;
+      // The drop target can be adjacent to active or active itself; persist its actual preview index.
+      const finalIndex = tasks.findIndex((task) => task.id === activeIdValue);
 
+      dragPendingRef.current = true;
+      setDragPending(true);
       if (sourceListId === targetListId) {
         reorderTasksMutation.mutate({
+          boardId: id,
           listId: targetListId,
           tasks: tasks.map((t, i) => ({ id: t.id, position: i })),
         });
       } else {
         moveTaskMutation.mutate({
+          boardId: id,
           taskId: activeIdValue,
           listId: targetListId,
           order: finalIndex,
@@ -1210,7 +1353,7 @@ export default function BoardDetailPage() {
     );
   }
 
-  if (!board) {
+  if (!board && httpStatusOf(boardQuery.error) === 404) {
     return (
       <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col items-center justify-center">
         <h2 className="text-xl font-semibold">{t('notFound')}</h2>
@@ -1221,8 +1364,76 @@ export default function BoardDetailPage() {
     );
   }
 
+  if (!board)
+    return (
+      <QueryFeedback
+        compact={boardQuery.data !== undefined}
+        message={errorMessageOf(
+          boardQuery.error,
+          tRead(boardQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+        )}
+        onRetry={() => void boardQuery.refetch()}
+        busy={boardQuery.isFetching}
+      />
+    );
+
   return (
     <div className="flex h-[calc(100vh-5rem)] md:h-[calc(100vh-3rem)] flex-col">
+      {boardQuery.isError && (
+        <QueryFeedback
+          compact={boardQuery.data !== undefined}
+          message={errorMessageOf(
+            boardQuery.error,
+            tRead(boardQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void boardQuery.refetch()}
+          busy={boardQuery.isFetching}
+        />
+      )}
+      {spacesQuery.isError && (
+        <QueryFeedback
+          compact={spacesQuery.data !== undefined}
+          message={errorMessageOf(
+            spacesQuery.error,
+            tRead(spacesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void spacesQuery.refetch()}
+          busy={spacesQuery.isFetching}
+        />
+      )}
+      {!inviteSheetOpen && agentsQuery.isError && (
+        <QueryFeedback
+          compact={agentsQuery.data !== undefined}
+          message={errorMessageOf(
+            agentsQuery.error,
+            tRead(agentsQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void agentsQuery.refetch()}
+          busy={agentsQuery.isFetching}
+        />
+      )}
+      {milestonesQuery.isError && (
+        <QueryFeedback
+          compact={milestonesQuery.data !== undefined}
+          message={errorMessageOf(
+            milestonesQuery.error,
+            tRead(milestonesQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void milestonesQuery.refetch()}
+          busy={milestonesQuery.isFetching}
+        />
+      )}
+      {blockerTaskIds.length > 0 && blockersQuery.isError && (
+        <QueryFeedback
+          compact={blockersQuery.data !== undefined}
+          message={errorMessageOf(
+            blockersQuery.error,
+            tRead(blockersQuery.data !== undefined ? 'refreshFailed' : 'loadFailed'),
+          )}
+          onRetry={() => void blockersQuery.refetch()}
+          busy={blockersQuery.isFetching}
+        />
+      )}
       {/* 看板头部：移动端垂直堆叠，桌面端水平排列，防止操作按钮溢出视口 */}
       <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex items-center gap-3 min-w-0">
@@ -1290,6 +1501,7 @@ export default function BoardDetailPage() {
               </span>
             </Link>
           ) : (
+            boardSpacesData !== undefined &&
             (currentUser?.role === UserRole.ADMIN ||
               isCreatorOrOwner(board.creatorId, currentUser?.id, myAgentIds)) && (
               <Button variant="outline" size="sm" onClick={() => setDocsDialogOpen(true)}>
@@ -1316,11 +1528,14 @@ export default function BoardDetailPage() {
             <>
               <select
                 className="h-9 rounded-md border border-input bg-background px-3 text-sm max-w-[140px] sm:max-w-none"
+                disabled={milestonesData === undefined}
                 value={milestoneFilter}
                 onChange={(e) => setMilestoneFilter(e.target.value)}
               >
                 <option value="">{t('filter.allMilestones')}</option>
-                <option value="none">{t('filter.unassigned')}</option>
+                {milestonesData !== undefined && (
+                  <option value="none">{t('filter.unassigned')}</option>
+                )}
                 {(milestonesData?.items ?? []).map((m: Milestone) => (
                   <option key={m.id} value={m.id}>
                     {m.name}
@@ -1371,6 +1586,11 @@ export default function BoardDetailPage() {
           onDragStart={handleDragStart}
           onDragOver={handleDragOver}
           onDragEnd={handleDragEnd}
+          onDragCancel={() => {
+            if (dragPendingRef.current || dragScopeRef.current.scope !== dragScope) return;
+            setActiveId(null);
+            finishDrag(dragSnapshotRef.current, true);
+          }}
         >
           <SortableContext
             items={workingLists.map((item) => item.list.id)}
@@ -1384,13 +1604,45 @@ export default function BoardDetailPage() {
                     list={item.list}
                     boardId={id}
                     tasks={item.tasks}
-                    onSelectTask={(taskId) => setTaskStack([taskId])}
+                    onSelectTask={(taskId) => void navigateTaskStack([taskId])}
                     agents={activeAgents}
+                    agentsAvailable={agentsData !== undefined}
+                    agentsFeedback={
+                      agentsQuery.isError ? (
+                        <QueryFeedback
+                          compact={agentsData !== undefined}
+                          message={errorMessageOf(
+                            agentsQuery.error,
+                            tRead(agentsData !== undefined ? 'refreshFailed' : 'loadFailed'),
+                          )}
+                          onRetry={() => void agentsQuery.refetch()}
+                          busy={agentsQuery.isFetching}
+                        />
+                      ) : undefined
+                    }
                     allLists={lists.filter((l) => l.id !== item.list.id)}
                     blockersMap={blockersMap}
                     onLoadMore={() => loadMoreTasks(item.list.id)}
                     hasNext={listPagination[item.list.id]?.hasNext}
                     onTaskCreated={() => refetchListTasks(item.list.id)}
+                    readPending={columnReads.pending[item.list.id]}
+                    feedback={
+                      columnReads.errors[item.list.id] ? (
+                        <QueryFeedback
+                          compact={listTasks[item.list.id] !== undefined}
+                          message={errorMessageOf(
+                            columnReads.errors[item.list.id]!.error,
+                            tRead(
+                              listTasks[item.list.id] !== undefined
+                                ? 'refreshFailed'
+                                : 'loadFailed',
+                            ),
+                          )}
+                          onRetry={() => void columnReads.retry(item.list.id)}
+                          busy={columnReads.pending[item.list.id]}
+                        />
+                      ) : undefined
+                    }
                   />
                 ))
               ) : (
@@ -1425,22 +1677,8 @@ export default function BoardDetailPage() {
       {/* 任务详情右侧 Sheet 抽屉 */}
       <Sheet
         open={taskStack.length > 0}
-        onOpenChange={async (open) => {
-          if (!open) {
-            if (isPanelDirty) {
-              // 未保存守卫（v1.48.1 收尾）：全局确认弹框替代 window.confirm
-              if (
-                !(await confirm({
-                  title: t('unsavedConfirm'),
-                  confirmText: tGlobal('common.confirm'),
-                  cancelText: tGlobal('common.cancel'),
-                }))
-              )
-                return;
-            }
-            setTaskStack([]);
-            setIsPanelDirty(false);
-          }
+        onOpenChange={(open) => {
+          if (!open) void navigateTaskStack([]);
         }}
         className="sm:max-w-2xl"
       >
@@ -1452,8 +1690,12 @@ export default function BoardDetailPage() {
               void refetchAllLists();
             }}
             onDirtyChange={setIsPanelDirty}
-            onNavigateTask={(tid) => setTaskStack((s) => [...s, tid])}
-            onNavigateBack={() => setTaskStack((s) => s.slice(0, -1))}
+            onNavigateTask={(tid) =>
+              void navigateTaskStack([...taskNavigationRef.current.stack, tid])
+            }
+            onNavigateBack={() =>
+              void navigateTaskStack(taskNavigationRef.current.stack.slice(0, -1))
+            }
             showBack={taskStack.length > 1}
             previousTaskTitle={
               taskStack.length > 1
@@ -1644,7 +1886,7 @@ export default function BoardDetailPage() {
         members={memberItems}
         candidates={candidateItems}
         capabilities={{
-          invite: canManageMembers,
+          invite: canManageMembers && agentsData !== undefined,
           remove: canManageMembers,
           changeRole: canManageMembers
             ? [{ fromRole: 'member', toRole: 'editor', label: t('members.setEditor') }]
@@ -1653,6 +1895,19 @@ export default function BoardDetailPage() {
         onInvite={handleInvite}
         onRemove={handleRemoveMember}
         onChangeRole={handleChangeRole}
+        feedbackSlot={
+          agentsQuery.isError ? (
+            <QueryFeedback
+              compact={agentsData !== undefined}
+              message={errorMessageOf(
+                agentsQuery.error,
+                tRead(agentsData !== undefined ? 'refreshFailed' : 'loadFailed'),
+              )}
+              onRetry={() => void agentsQuery.refetch()}
+              busy={agentsQuery.isFetching}
+            />
+          ) : undefined
+        }
         inviting={inviteAgentMutation.isPending}
       />
 

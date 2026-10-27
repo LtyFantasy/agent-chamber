@@ -5,9 +5,9 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/ui-design-system.md §6.1（消息内 Markdown 渲染层级 + 长消息折叠模式）
- *   - 补充: docs/frontend-architecture.md §3.2.3（话题详情页消息流）
- *   - 圆桌: docs/roundtable-design.md §6/§7（座位 badge 展示语义 / 过程折叠视图）
+ *   - 主文档: docs/frontend/ui-design-system.md §6.1（消息内 Markdown 渲染层级 + 长消息折叠模式）
+ *   - 补充: docs/frontend/frontend-architecture.md §3.2.3（话题详情页消息流）
+ *   - 圆桌: docs/modules/roundtable-design.md §6/§7（座位 badge 展示语义 / 过程折叠视图）
  *
  * [踩坑索引]
  *   - thinking 折叠不能用 CollapsibleMarkdown 的实测高度阈值模式：其折叠判定是
@@ -68,9 +68,9 @@ import { Badge } from '@/components/ui/badge';
 import { confirm } from '@/lib/notify';
 
 /**
- * 消息气泡：8 种消息类型配色体系（docs/ui-design-system.md §6）+ 圆桌扩展。
+ * 消息气泡：8 种消息类型配色体系（docs/frontend/ui-design-system.md §6）+ 圆桌扩展。
  *
- * 圆桌三件套（docs/roundtable-design.md §6/§7，M2 阶段 6）：
+ * 圆桌三件套（docs/modules/roundtable-design.md §6/§7，M2 阶段 6）：
  * 1. seatLabel badge：消息头 senderName 旁渲染圆桌座位标签（仅 backend 透传
  *    metadata.seatLabel 单键时出现），subtle variant 中性低调不抢正文；
  * 2. thinking 过程折叠：type='thinking' 无条件默认折叠为「过程记录」摘要行，
@@ -116,7 +116,7 @@ export function MessageBubble({
   // 删除确认弹窗打开期间置 true（双击防护：异步 confirm 无原生同步阻塞，
   // 不防则连点排队两个确认框——确认两次 = 重复删除消息）
   const deleteConfirmPendingRef = useRef(false);
-  // 8 种消息类型配色体系（docs/ui-design-system.md §6）：
+  // 8 种消息类型配色体系（docs/frontend/ui-design-system.md §6）：
   // status_update 青 / system 红 / artifact 紫 / thinking 灰+呼吸微光 /
   // proposal 绿 / vote 琥珀 / task 靛——全部暗色适配（半透明底 + 亮阶文字）。
   // strong 字段 = markdown 强调同族提亮（2026-08-02 用户拍板）：彩色气泡内
@@ -403,7 +403,7 @@ export function MessageBubble({
           )}
       </div>
       {/* Markdown 暗色适配（共享紧凑版，单一事实源 lib/markdown-classes.ts，
-          设计约定见 docs/ui-design-system.md §6.1）：
+          设计约定见 docs/frontend/ui-design-system.md §6.1）：
           - whitespace-pre-wrap 有意保留：聊天换行语义（Enter 发送 / Shift+Enter 换行），
             段落间距由 pre-wrap 保留的换行提供，故聊天版不含 [&_p] margin（叠加会双倍空行）
           - 条件覆盖用 `&&` 双写父选择器提权——与共享类同属性冲突时，胜负由生成

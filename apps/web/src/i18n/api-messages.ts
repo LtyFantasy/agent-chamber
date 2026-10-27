@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §i18n
- *   - 补充: docs/i18n.md（Phase 2 补齐）
+ *   - 主文档: docs/frontend/frontend-architecture.md §i18n
+ *   - 补充: docs/frontend/i18n.md（Phase 2 补齐）
  *
  * [踩坑索引] 无
  *
@@ -36,7 +36,7 @@ export const messagesMap: Record<Locale, typeof en> = {
 /**
  * 非 React 模块（如 lib/api.ts 的错误 fallback）的文案入口。
  * 已知折中（见 i18n plan §架构师复查）：api 层理想状态不持有用户可见文案，
- * 本期保留此工具函数，docs/i18n.md 中标注为已知债务。
+ * 本期保留此工具函数，docs/frontend/i18n.md 中标注为已知债务。
  *
  * @param key api 命名空间下的文案 key（类型安全，写错编译报错）
  * @returns 当前 cookie locale 对应文案；缺 key 时回退英文，再缺回退 DEFAULT_LOCALE 兜底

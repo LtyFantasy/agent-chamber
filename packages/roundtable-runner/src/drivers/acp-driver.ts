@@ -3,12 +3,12 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
- *   - 补充: docs/roundtable-design.md §8 (kimi ACP 行为档案 8 条 / codex ACP 行为档案,
+ *   - 主文档: docs/modules/roundtable-design.md §3 (契约①: SeatDriver 的厂商实现——单飞行/BusyError)
+ *   - 补充: docs/modules/roundtable-design.md §8 (kimi ACP 行为档案 8 条 / codex ACP 行为档案,
  *           0.34.0 / 0.147.0 实测——本文件设计输入；M4a 由 kimi-acp.ts 提取为传输基座)
  *
  * [踩坑索引] ③(message_complete 无 text) ④(resume 失败无降级→楔死) ⑤(fs caps 声明→turn 静默死亡)
- *              ⑥(RT-PERM-1: kind 命名不可信→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
+ *              ⑥(RT-PERM-1: 执行选项不按 kind 猜测→optionId 直透) ⑦(RT-PERM-2: tool 元数据在 update 本体非 content)
  *              ⑧(cancel 语义：优雅优先，kill 仅为超时兜底) ⑨(codex 桥 request_permission 不带 title——
  *              toolCallId 缓存补全，只补缺省不覆盖)
  *              RT-ID-1(分发判定序：带 method 的反向 RPC 判定必须在 pending.has(id) 之前——
@@ -27,10 +27,10 @@
  *      修复：driver 累积 message_chunk 全文，complete 携带全文 text。见 memory/2026-08-07.md §6
  *   ⑤: client 声明 fs caps 后 turn 静默死亡（Write 成功但完成路径无响应）→ 一律不声明
  *      fs caps（clientCapabilities 仅 terminal:false）。见 memory/2026-08-07.md §4
- *   ⑥: RT-PERM-1 —— ACP 审批选项的 kind 是厂商自由命名（真机为 allow_once/
- *      allow_always/reject_once），旧代码按猜测的 approve_* 双重映射把 approve 吞成
- *      reject。根治：answerPermission 收 optionId（与 request_permission params 同源），
- *      在挂起选项里精确匹配 String(o.optionId) === optionId，不做 kind 猜测。
+ *   ⑥: RT-PERM-1 —— ACP kind 标准值为 allow_once/allow_always/reject_once/
+ *      reject_always；optionId 是不透明选择键。旧代码按猜测的 approve_* 双重映射把
+ *      批准吞成拒绝。answerPermission 精确匹配挂起选项并原样透传 optionId，
+ *      禁止按 kind 猜执行 ID；平台仅按标准 kind 记录批准/拒绝结果（设计 §6）。
  *   ⑦: RT-PERM-2 —— ACP tool_call/tool_response 更新的工具元数据（toolCallId/title/
  *      kind/status/locations/rawInput）挂在 update 本体上，content 是内容块数组（或
  *      缺失）；旧代码取 update.content ?? {} 当 tool 载荷 → chamber 校验丢弃。
@@ -60,7 +60,7 @@
  * spawn acp 子进程 / NDJSON readline 分帧 / pending Map 请求-响应 /
  * 三分发（响应 / 反向 RPC / 通知）/ 反向 RPC 应答 / 流式通知。
  *
- * 行为档案落地（docs/roundtable-design.md §8，kimi 0.34.0 / codex 0.147.0 实测）：
+ * 行为档案落地（docs/modules/roundtable-design.md §8，kimi 0.34.0 / codex 0.147.0 实测）：
  *   1. 会话全量落盘，跨进程复活无损 → sessionId 由 getSessionId 回调注入，
  *      start/inject 懒启动时 session/resume 复活（而非 session/new）；
  *   2. 审批全异步 → session/request_permission 反向 RPC → permission_request 事件
@@ -502,7 +502,7 @@ export class AcpDriver implements SeatDriver {
    * 应答挂起的审批请求（人类裁决下行 → session/request_permission 的反向 RPC 应答）。
    * optionId 在挂起选项里**精确匹配**（RT-PERM-1：optionId 命名空间与 ACP
    * request_permission params 同源——runner-core 缓存与 driver 挂起表来自同一事件，
-   * 精确匹配即可；kind 是厂商自由命名不可信，禁止按 kind 猜测映射）。命中答
+   * 精确匹配即可；kind 为 ACP 四种标准结果语义，禁止据此猜执行 ID）。命中答
    * { outcome: 'selected', optionId }；未命中答 cancelled 并 warn（不选任何选项）。
    * 审批已随 turn 结束关闭（挂起表已清）→ 幂等忽略（chamber 重放 verdict 的场景）。
    */

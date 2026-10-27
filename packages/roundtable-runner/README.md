@@ -25,7 +25,7 @@ Chamber Server  ←── WS（X-API-Key 认证，双向信封）──  roundta
   curl -fsSL <platform-url>/api/v1/downloads/install-runner.sh | bash -s -- --platform-url <platform-url> --api-key <KEY> --start
   ```
 
-  脚本流程：下载 `roundtable-runner.tar.gz` 解压到 `--install-dir`（缺省 `~/.local/share/agent-chamber/runner/`）→ **自检 `node cli.js --help`，失败自动 `npm install --omit=dev` 重建依赖**（vendored node_modules 跨平台可能不兼容；npm 随 node 分发，无需装 pnpm）→ 生成 `start-runner.sh` → `--start` 时 setsid 立即后台启动并打印日志路径。bundle 由平台 backend `/api/v1/downloads/` 直接分发（版本与平台零 skew），构建见 `scripts/build-runner-bundle.sh`（deploy.sh 步骤 5.3 调用）。
+  脚本流程：下载 `roundtable-runner.tar.gz` 解压到 `--install-dir`（缺省 `~/.local/share/agent-chamber/runner/`）→ **自检 `node cli.js --help`，失败自动 `npm install --omit=dev` 重建依赖**（vendored node_modules 跨平台可能不兼容；npm 随 node 分发，无需装 pnpm）→ 生成 `start-runner.sh` → `--start` 时 setsid 立即后台启动并打印日志路径。bundle 由平台 backend `/api/v1/downloads/` 直接分发（版本与平台零 skew），构建见 `scripts/build-runner-bundle.sh`（deploy.sh 健康门之后的可选步骤调用，产物先落到影子目录再原子切换；失败只告警不阻断部署）。
 - **repo（开发者 / 已 clone 仓库）**：build-from-source——直接跑 `./scripts/install-runner.sh`（构建 + 生成 start-runner.sh 一步到位），或按下方「三分钟上手」步骤 0 手动构建。
 
 **state-dir 默认派生 `~/.roundtable-runner-<runner-name>`（R3）**：每个 runner 独占状态目录，消灭「共享状态目录导致座位假死」的历史事故；显式 `--state-dir` 仍优先。
@@ -174,7 +174,7 @@ curl -s http://localhost:8743/api/v1/roundtable/seats \
 
 同一 runner 可同时托管五家厂商座位（hello `vendors` 五家上报，chamber 按 vendor 绑定各自座位）。
 
-**driver 自动钉死清单**（无需手动配置；实测档案见 docs/roundtable-design.md §8e，桥 0.23.1 + Claude Code 2.1.232）：
+**driver 自动钉死清单**（无需手动配置；实测档案见 docs/modules/roundtable-design.md §8e，桥 0.23.1 + Claude Code 2.1.232）：
 
 | 项 | 值 | 说明 |
 |---|---|---|

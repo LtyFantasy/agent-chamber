@@ -12,8 +12,8 @@ import { create } from 'zustand';
  *     （image-preview-host.tsx）之间的契约层：open(displaySrc, alt, pinKey) / close()
  *
  * [权威文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（消息渲染）— 图片预览宿主挂载
- *   - 补充: docs/ui-design-system.md §6.1（markdown 图片渲染层级）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（消息渲染）— 图片预览宿主挂载
+ *   - 补充: docs/frontend/ui-design-system.md §6.1（markdown 图片渲染层级）
  *
  * [关键不变量]
  *   - 不 persist（瞬态 UI 状态，会话刷新即消失——与 notification.store 同范式）

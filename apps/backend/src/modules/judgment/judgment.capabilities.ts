@@ -10,7 +10,7 @@
  *
  * [权威文档]
  *   - 线上 DocSpace `docs/spec.md` — `JudgmentCapability` 终稿形状
- *   - 线上 DocSpace `docs/experience-base.md` — 判别服务章（能力清单与出境字段）
+ *   - 线上 DocSpace `docs/modules/experience-base.md` — 判别服务章（能力清单与出境字段）
  *
  * [关键不变量]
  *   - **新增能力必须在此登记**：注册表是"平台上有哪些判别能力"的唯一清单——漏登记的症状是
@@ -43,10 +43,7 @@ import { docSearchRerankCapability } from '../docspace/rerank/doc-search-rerank'
  * 类型用 `JudgmentCapability<never, unknown>` 的宽化视图：注册表要能同时容纳不同输入/输出
  * 类型的能力，而"调用它"只发生在调用点（那里有精确类型）——注册表只用于**遍历与断言**。
  */
-export const JUDGMENT_CAPABILITY_REGISTRY: readonly JudgmentCapability<
-  never,
-  unknown
->[] = [
+export const JUDGMENT_CAPABILITY_REGISTRY: readonly JudgmentCapability<never, unknown>[] = [
   experienceRecordCheckCapability as JudgmentCapability<never, unknown>,
   // 文档搜索重排（v1.85.0 批次 3）：登记后才能被"三必填遍历断言"覆盖
   docSearchRerankCapability as JudgmentCapability<never, unknown>,

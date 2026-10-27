@@ -3,7 +3,7 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §5 (数据模型) + §7 (安全边界: API Key 复用,
+ *   - 主文档: docs/modules/roundtable-design.md §5 (数据模型) + §7 (安全边界: API Key 复用,
  *     一 key 一 runner 后到踢先到)
  *
  * [踩坑索引]

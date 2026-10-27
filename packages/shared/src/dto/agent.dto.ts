@@ -1,4 +1,5 @@
 import { AgentStatus } from '../enums';
+import type { ApiKeyScope } from '../constants';
 
 /**
  * Agent 配置输入
@@ -20,6 +21,11 @@ export interface AgentConfigInput {
 export interface CreateAgentInput {
   /** Agent 名称 */
   name: string;
+  /**
+   * 随 agent 一并签发的默认 API Key 权限范围（可选，2026-10-16 卡 72566c2e）。
+   * 缺省 = 全量 `['read','write']`（行为向后兼容）。值域单源见 `constants/index.ts`。
+   */
+  scopes?: ApiKeyScope[];
   /** Agent 描述 */
   description?: string;
   /** 系统提示词 */
@@ -94,4 +100,9 @@ export interface AgentHeartbeatInput {
 export interface CreateAgentKeyInput {
   /** Key 名称 */
   name: string;
+  /**
+   * 权限范围（可选，2026-10-16 卡 72566c2e）。缺省 = 全量 `['read','write']`（行为向后兼容）。
+   * 值域与运行时收窄单源见 `constants/index.ts` 的 `API_KEY_SCOPE_VALUES`。
+   */
+  scopes?: ApiKeyScope[];
 }

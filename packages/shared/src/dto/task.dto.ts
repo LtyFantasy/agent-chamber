@@ -40,9 +40,20 @@ export interface CreateTaskInput {
 }
 
 /**
- * 更新任务请求输入
+ * 更新任务请求输入。正式合同：DocSpace Agent Chamber docs/spec.md Task DTO / docs/api-definition.md §7.13。
  */
 export interface UpdateTaskInput {
+  /**
+   * 乐观锁前提（可选）：任务详情响应里的 `updatedAt` 原样回传。
+   *
+   * 与任务当前 `updatedAt` 不符 → 409 `RESOURCE_CONFLICT` + `data.currentUpdatedAt`
+   * （任何写者——包括 move / assign / report——都会推进 `updated_at`，使旧 token 失效）。
+   *
+   * ⚠️ **可选锁 = 无锁**（`docs/api-definition.md` §18.7 的一般结论在此是有意放宽的例外，
+   * 因为 `POST /tasks/:id/report` 的内部状态写路径与存量旧客户端无法提供 token）。
+   * **新代码应当总是传**——不传等于放弃并发保护。
+   */
+  expectedUpdatedAt?: string;
   /** 任务标题 */
   title?: string;
   /** 任务描述 */
@@ -51,7 +62,7 @@ export interface UpdateTaskInput {
   priority?: Priority;
   /** 任务状态 */
   status?: TaskStatus;
-  /** 单个分配对象 ID，传 null/undefined 表示取消分配 */
+  /** 单个分配对象 ID；省略/undefined 保持原值，null 取消分配 */
   assigneeId?: string | null;
   /** 截止日期 */
   dueDate?: string;
@@ -59,8 +70,8 @@ export interface UpdateTaskInput {
   labels?: string[];
   /** 所属列 ID */
   listId?: string;
-  /** 里程碑 ID */
-  milestoneId?: string;
+  /** 里程碑 ID；省略/undefined 保持原值，null 解除关联（空串不是合法 UUID） */
+  milestoneId?: string | null;
   /** 自定义字段 */
   customFields?: Record<string, unknown>;
 }

@@ -15,6 +15,10 @@
  *     打分 + 外层地板/排序/分页）、snippet 生成（ts_headline 作用于**单字化文本**优先、
  *     trgm 窗口兜底）、路由 / 任务链接两路 boost 融合、零命中日志 + hint 信封组装；
  *     时间序分支与相关度分支共享同一内层子查询
+ *   - tag 过滤的**空间词表 alias 集合展开**（3 期，v1.92.0-dev；plan D3/A1）：`tag` 经
+ *     `expandTagQueryValues` 展开为 `[canonical, ...aliases]` 后按 `d.tags && …` 重叠匹配
+ *     ——使 rename 前写入的存量旧值在 canonical 查询下仍被召回；展开源 = `hintContext.settings`
+ *     （per-space 端点已传，全局检索不传 ⇒ 不展开）
  *
  * [权威文档]
  *   - 主文档: docs/architecture.md §3.2 (DocSpace 模块)
@@ -68,7 +72,13 @@
  *   - src/common/utils/search/zero-hit-log.ts — 零命中结构化日志（四路共用）
  *   - src/common/utils/search/snippet-cleanup.ts — headline 单字化空格/标记清理
  *   - src/database/pg-session-defaults.ts — pg_trgm 阈值单源（两个 DataSource 装配点共用）
- *   - src/modules/search/search.service.ts — 全局检索复用本 service（自动继承四模式）
+ *   - src/modules/search/search.service.ts — 全局检索复用本 service（自动继承四模式）；
+ *     **不传 options.hintContext** ⇒ 读侧 hints 整段跳过（A1：零泄漏零额外查询）
+ *   - src/modules/docspace/doc-hints.helper.ts（领域构造器 + DOC_HINT_PROFILE）与
+ *     src/modules/hints/{hint-emit,hint-dedup.service}.ts（阶段一抽核到模块基建）—
+ *     hints 信封（2 期）：候选构造 / 排序+去重+截尾接线 / 内存去重窗口。旧三态双写
+ *     走 `makeLegacySearchHintCandidate`（`noDedup` 豁免窗口，与旧 hint 字段逐响应等价）；
+ *     埋点 resourceKey 一律 `hintResourceKey` **哈希化**（q/筛选值是用户输入，禁落日志原文）
  *   - test/doc-search-prefilter.e2e-spec.ts — 真库召回超集判决（批次 1-d 三臂重定义）
  *   - test/single-cjk-char-path.e2e-spec.ts / snippet-cleanup.e2e-spec.ts — 降级与
  *     snippet 契约的真库钉子
@@ -99,6 +109,7 @@
  * =============================================================================
  */
 import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DocSection } from '../../database/entities/doc-section.entity';
@@ -112,6 +123,7 @@ import type {
   DocSearchHintCode,
 } from '@agent-chamber/shared';
 import {
+  Visibility,
   DOC_SEARCH_POSITIONAL_ORDER_HINT,
   DOC_SEARCH_WEAK_HIT_HINT,
   DOC_SEARCH_ZERO_HIT_HINT,
@@ -145,6 +157,47 @@ import {
   RERANK_MAX_POOL_SIZE,
   RERANK_POOL_DEPTH,
 } from './rerank/doc-search-rerank';
+// hint（2 期，v1.92.0-dev）：读侧两条 + 旧三态双写；族开关经 hintContext 传入的
+// settings 解析（A1：全局搜索不传 → 整段跳过，零泄漏零额外查询）
+import {
+  buildQueryLooksLikePathHint,
+  buildSuggestRelaxingHint,
+  DOC_HINT_PROFILE,
+  DOC_SEARCH_FILTER_PARAMS,
+  isPathLikeQuery,
+  makeLegacySearchHintCandidate,
+  type HintCandidate,
+} from './doc-hints.helper';
+// 内核候选构造（引流码用）：doc-hints.helper 只 re-export 类型，构造函数直接用内核单源
+import { makeHintCandidate } from '../hints/hint-core';
+// hint 基建（阶段一抽核到 modules/hints/）：去重窗口 + 信封接线
+import { HintDedupService } from '../hints/hint-dedup.service';
+import { emitHints } from '../hints/hint-emit';
+import {
+  expandTagQueryValues,
+  parseCanonicalTags,
+  parseHintToggles,
+} from './doc-vocabulary.helper';
+
+/**
+ * 搜索过滤条件（内部形状，`search()` 构造后贯穿 SQL 构建 / 读侧 hint 回显）。
+ *
+ * `tagValues`（v1.92.0-dev 3 期，plan D3/A1）：`tag` 经空间词表 `expandTagQueryValues`
+ * 展开后的**多值集合**（`[canonical, ...aliases]`；未命中词表 = `[tag]` 单元素）。
+ * SQL 用数组重叠 `d.tags && :tagValues`（语义 = 交集非空）；`tag` 原值仍保留供
+ * `suggest_relaxing` hint 回显调用方真实用过的参数。全局检索不传 settings ⇒ 恒单元素
+ * ⇒ 行为逐字节不变。
+ */
+interface DocSearchFilters {
+  q: string;
+  type?: string;
+  tag?: string;
+  /** tag 查询值的展开集合（见接口注释；缺省 = 未展开，SQL 回退单值语义） */
+  tagValues?: string[];
+  category?: string;
+  createdAfter?: string;
+  createdBefore?: string;
+}
 
 /**
  * 双路打分权重常量（**活成员只剩 TRGM_CONTENT**）
@@ -233,7 +286,15 @@ export const SINGLE_CHAR_CONST_SCORE = 0.1;
  *   SEARCH_DF_DEGRADE_THRESHOLD——同 single-char 杠杆（高频 bigram 同病灶，§2.5）；
  * - `normal`：`ts_rank_cd × SEARCH_TS_W1` + 编译预过滤 + K-gate 结构门。
  */
-type DocSearchMode = 'trgm-only' | 'single-char' | 'df-degraded' | 'normal';
+/** 搜索模式值域（比较点走常量——`no-magic-string-compare` 已拉黑 'normal'，与 TopicKind 撞值） */
+const DOC_SEARCH_MODE = {
+  TRGM_ONLY: 'trgm-only',
+  SINGLE_CHAR: 'single-char',
+  DF_DEGRADED: 'df-degraded',
+  NORMAL: 'normal',
+} as const;
+
+type DocSearchMode = (typeof DOC_SEARCH_MODE)[keyof typeof DOC_SEARCH_MODE];
 
 /** Snippet 最大字符数 */
 const SNIPPET_MAX_CHARS = 300;
@@ -299,6 +360,11 @@ export class DocSearchService {
      * 本 service 走原路径，完全不碰内核（不调用、不写日志、不占额度）。闸门/落行纪律都在内核。
      */
     private readonly judgment: JudgmentRunnerService,
+    /**
+     * hint 去重窗口（2 期，v1.92.0-dev）：内存 TTL Map 的 Nest provider（A5）。
+     * 读侧 hints 的压制与标记都经本依赖。
+     */
+    private readonly hintDedup: HintDedupService,
   ) {}
 
   /**
@@ -372,6 +438,17 @@ export class DocSearchService {
       actor?: UnifiedActor | null;
       /** 本次请求 id（`@RequestId()` 经 middleware 归一化后传入；仅作日志线索） */
       traceId?: string | null;
+      /**
+       * 读侧 hint 上下文（2 期，v1.92.0-dev；**A1 关键契约**）——只有 caller 显式传入
+       * 时才计算 `query_looks_like_path` / `suggest_relaxing`：
+       * - per-space 端点（`GET /doc-spaces/:id/search`）传 `{ spaceId, settings }`
+       *   ——controller 已持有 space（权限检查必需），**零新增查询**；
+       * - **全局检索（`/search?q=`）不传**——该面跨空间共享本 service，且信封只解构
+       *   `{ hits }`，不传即整段跳过（零 hints、零额外查询、零跨空间泄漏）。
+       *
+       * `settings` 是 `space.settings` 原文，本 service 内过 parseHintToggles。
+       */
+      hintContext?: { spaceId: string; settings: unknown };
     } = {},
   ): Promise<DocSearchResponse> {
     const {
@@ -388,7 +465,30 @@ export class DocSearchService {
     const effectiveLimit = Math.min(Math.max(limit, 1), MAX_LIMIT);
     // offset 防御性下钳 0（controller/DTO 层已拦格式，此处兜底 Service 直调）
     const effectiveOffset = Math.max(offset, 0);
-    const filters = { q, type, tag, category, createdAfter, createdBefore };
+    const filters: DocSearchFilters = {
+      q,
+      type,
+      tag,
+      category,
+      createdAfter,
+      createdBefore,
+      // v1.92.0-dev 3 期（plan D3/A1）：tag 查询值经空间词表**集合展开**（含 alias）。
+      // 通道复用 hintContext.settings（per-space 端点 2 期起已传；全局检索不传 ⇒ 不展开
+      // ——跨空间词表异构，文档化说明见 docs/api-definition）。
+      // ⚠️ hintContext 在此**兼作空间词表上下文**（2 期读侧 hint 与 3 期 alias 展开共用）；
+      // 无 tag 或未命中词表 ⇒ 单元素，SQL 语义不变。
+      ...(tag
+        ? {
+            tagValues: expandTagQueryValues(
+              parseCanonicalTags(
+                (options.hintContext?.settings as Record<string, unknown> | null | undefined)
+                  ?.canonicalTags,
+              ),
+              tag,
+            ),
+          }
+        : {}),
+    };
     const sortByTime = sort === 'createdAt_desc' || sort === 'createdAt_asc';
 
     // 空查询短路：`?q=`（空串/纯空白）是**合法请求形态**，语义与改动前一致（空 q 下
@@ -406,7 +506,7 @@ export class DocSearchService {
     // ── 四模式裁决（每次搜索先 compileQuery，主脑裁决 #7）────────────────────
     const compiled = compileQuery(q);
     const mode = await this.resolveMode(compiled);
-    const degraded = mode === 'single-char' || mode === 'df-degraded';
+    const degraded = mode === DOC_SEARCH_MODE.SINGLE_CHAR || mode === DOC_SEARCH_MODE.DF_DEGRADED;
 
     // ── 重排触发（v1.85.0 批次 3）─────────────────────────────────────────────
     // 五个条件缺一不可（plan 终裁）：能力已启用（provider 可用 + 白名单）→ 身份是 agent →
@@ -435,20 +535,28 @@ export class DocSearchService {
         mode,
         compiled,
       );
-      return this.finalizeResponse(hits, q, compiled, mode, sortByTime);
+      return this.finalizeResponse(hits, q, compiled, mode, sortByTime, {
+        filters,
+        hintContext: options.hintContext,
+        actorId: options.actor?.id ?? 'system',
+      });
     }
 
     const pool = await this.fetchRerankPool(accessibleSpaceIds, filters, poolSize, mode, compiled);
     // 空候选**不发起付费调用**（与既有 `rows.length === 0` 早退同语义、同结果）
     if (pool.length === 0) {
-      return this.finalizeResponse([], q, compiled, mode, sortByTime);
+      return this.finalizeResponse([], q, compiled, mode, sortByTime, {
+        filters,
+        hintContext: options.hintContext,
+        actorId: options.actor?.id ?? 'system',
+      });
     }
 
     // 可见性闸：池内任一候选属非 open 空间 ⇒ 放弃本次重排（落标量行，**不带 candidateDocIds**
     // ——把"哪些文档被挡下"写进日志等于反向泄露"某私有空间存在这些文档"）。
     // 回落到原路径（**不是**池切片）：非 active 结局一律与原路径逐字节一致，避免"私有空间在池里"
     // 时出现与未启用判别时不同的排序（池 SQL 的 ORDER BY 比原路径多一个 doc_id 平局键）。
-    if (pool.some((row) => (row.space_visibility ?? 'open') !== 'open')) {
+    if (pool.some((row) => (row.space_visibility ?? Visibility.OPEN) !== Visibility.OPEN)) {
       await this.judgment.recordSkip(
         docSearchRerankCapability.name,
         options.actor ?? null,
@@ -463,7 +571,11 @@ export class DocSearchService {
         mode,
         compiled,
       );
-      return this.finalizeResponse(hits, q, compiled, mode, sortByTime);
+      return this.finalizeResponse(hits, q, compiled, mode, sortByTime, {
+        filters,
+        hintContext: options.hintContext,
+        actorId: options.actor?.id ?? 'system',
+      });
     }
 
     hits = await this.searchWithRerank(
@@ -477,7 +589,11 @@ export class DocSearchService {
       mode,
       compiled,
     );
-    return this.finalizeResponse(hits, q, compiled, mode, sortByTime);
+    return this.finalizeResponse(hits, q, compiled, mode, sortByTime, {
+      filters,
+      hintContext: options.hintContext,
+      actorId: options.actor?.id ?? 'system',
+    });
   }
 
   /**
@@ -486,10 +602,10 @@ export class DocSearchService {
    * 主脑裁决 #3）超 SEARCH_DF_DEGRADE_THRESHOLD → df-degraded；其余 normal。
    */
   private async resolveMode(compiled: CompiledQuery): Promise<DocSearchMode> {
-    if (compiled.isEmpty) return 'trgm-only';
-    if (compiled.singleCjkChar !== null) return 'single-char';
-    if (await this.isDfOverThreshold(compiled)) return 'df-degraded';
-    return 'normal';
+    if (compiled.isEmpty) return DOC_SEARCH_MODE.TRGM_ONLY;
+    if (compiled.singleCjkChar !== null) return DOC_SEARCH_MODE.SINGLE_CHAR;
+    if (await this.isDfOverThreshold(compiled)) return DOC_SEARCH_MODE.DF_DEGRADED;
+    return DOC_SEARCH_MODE.NORMAL;
   }
 
   /**
@@ -522,6 +638,9 @@ export class DocSearchService {
    * hint 三态触发规则（`hintCode` 与 hint 一一对应；v1.89.0-dev 批次 A 起弱命中独立文案）：
    * - **零命中** ⇒ `logSearchZeroHit` + `DOC_SEARCH_ZERO_HIT_HINT` / `'zero_hit'`
    *   （无论模式——降级查询零命中时「换词」比「位置序声明」更可操作）；
+   *   **零命中时另追加引流码**（阶段三决策 9）`search_experiences_suggested`——只在
+   *   caller 传了 `hintContext` 时构造（全局检索不传 ⇒ 不构造，理由见该处注释），
+   *   且它**不受 read 族闸门约束**（与 zero_hit 双写同侧，默认可见）；
    * - **降级路径**（单字/df）且相关度排序 ⇒ `DOC_SEARCH_POSITIONAL_ORDER_HINT` /
    *   `'positional_order'`（注明未按相关度排序；时间序是用户显式选择的遍历语义，不附加）；
    * - **弱命中**（normal/trgm-only，**有结果**但最高分 < **`DOC_SEARCH_WEAK_HIT_SCORE`**
@@ -541,16 +660,37 @@ export class DocSearchService {
    * trgm-only 的 hint 频率失真，**本条就是拆线的落点**（拆法同 task：给 trgm-only 一份基准值）。
    *
    * ⚠️ `hintCode` 只在 hint 存在时出现（**禁 null**——消费方 jest `toEqual` 严格相等断言在册）。
+   *
+   * **2 期（v1.92.0-dev）**：本方法升级为 `async` 并承担统一 hints 信封的组装——
+   * ① 旧三态**双写**进 `hints[]`（code 同值、status=suggestion、message 与 `hint` 逐字
+   * 一致，data 带结构化触发信息）；② 读侧 `query_looks_like_path` / `suggest_relaxing`
+   * ——**仅在 caller 传 `hintContext` 且 read 族开时计算**（A1：全局检索不传 ⇒ 整段跳过）。
+   * 两条早退（空 q / 空白名单）在 `search()` 内直接返回 `{hits: []}`，**不发任何 hint**
+   * （空 q 不是检索未命中；空白名单下 suggest_relaxing 是误导）。
+   *
+   * @param context.filters 本次生效的查询参数（suggest_relaxing 只回显 caller 真实用过的）
+   * @param context.hintContext caller 显式传入的读侧 hint 上下文（缺省 = 跳过读侧）
+   * @param context.actorId 去重窗口的 actor 维度（未认证归 'system'）
    */
-  private finalizeResponse(
+  private async finalizeResponse(
     hits: DocSearchHit[],
     q: string,
     compiled: CompiledQuery,
     mode: DocSearchMode,
     sortByTime: boolean,
-  ): DocSearchResponse {
+    context: {
+      filters: DocSearchFilters;
+      hintContext?: { spaceId: string; settings: unknown };
+      actorId: string;
+    },
+  ): Promise<DocSearchResponse> {
     let hint: string | undefined;
     let hintCode: DocSearchHintCode | undefined;
+    // 旧三态双写的埋点资源键：**哈希化**（见 hintResourceKey——q 是用户输入，禁落日志原文）；
+    // 旧三态本身豁免去重窗口（noDedup），该键只作日志维度
+    const legacyResourceKey = this.hintResourceKey(context.hintContext?.spaceId ?? 'global', q);
+    const candidates: HintCandidate[] = [];
+
     if (hits.length === 0) {
       logSearchZeroHit(this.logger, {
         surface: 'doc',
@@ -560,10 +700,32 @@ export class DocSearchService {
       });
       hint = DOC_SEARCH_ZERO_HIT_HINT;
       hintCode = 'zero_hit';
-    } else if (mode === 'single-char' || mode === 'df-degraded') {
+      candidates.push(makeLegacySearchHintCandidate('zero_hit', legacyResourceKey, { q }));
+      // 引流码（阶段三决策 9）：**只讲经验库单一目的地**（放宽筛选 / 浏览路由由
+      // suggest_relaxing / zero_hit 的文案承担）。**刻意放 read 族闸门外**——与上面这条
+      // 零命中双写同侧，默认可见（决策 9：它是迁移期/引流豁免，api-definition §16.4 有边界说明）。
+      // **硬闸门 = caller 显式传了 hintContext**：全局检索（`/search?q=`）不传它、且信封
+      // 只解构 `{ hits }`（hints 被丢弃）——不设防就会出现「标了去重窗口但永不送达」，
+      // 把观测数据污染成「送达率为零的码」（architect N4；全局路径列入 §5 盲区）。
+      // 已知缺席场景：拥挤（形似路径 + 筛选 + 零命中）时 ≤3 截尾会吃掉本码（rank 13 排在
+      // zero_hit 之后），处置 = 承认缺席 + 靠 slot_truncated 埋点使其可见（§4.3 盲区标注）。
+      if (context.hintContext) {
+        candidates.push(
+          makeHintCandidate(
+            'search_experiences_suggested',
+            'suggestion',
+            context.hintContext.spaceId,
+            { suggestedTool: 'search_experiences' },
+          ),
+        );
+      }
+    } else if (mode === DOC_SEARCH_MODE.SINGLE_CHAR || mode === DOC_SEARCH_MODE.DF_DEGRADED) {
       if (!sortByTime) {
         hint = DOC_SEARCH_POSITIONAL_ORDER_HINT;
         hintCode = 'positional_order';
+        candidates.push(
+          makeLegacySearchHintCandidate('positional_order', legacyResourceKey, { mode }),
+        );
       }
     } else {
       const topScore = Math.max(...hits.map((hit) => hit.score));
@@ -572,9 +734,114 @@ export class DocSearchService {
         logSearchWeakHit(this.logger, { query: q, topScore });
         hint = DOC_SEARCH_WEAK_HIT_HINT;
         hintCode = 'weak_hit';
+        candidates.push(
+          makeLegacySearchHintCandidate('weak_hit', legacyResourceKey, {
+            topScore,
+            threshold: DOC_SEARCH_WEAK_HIT_SCORE,
+          }),
+        );
       }
     }
-    return hint === undefined ? { hits } : { hits, hint, hintCode };
+
+    // ── 读侧两条（A1：仅 caller 显式传 hintContext 时计算）────────────────────
+    // 族关 = 零行为变化零额外查询（连 path 存在性轻查也不做）。
+    if (context.hintContext) {
+      const toggles = parseHintToggles(
+        (context.hintContext.settings as Record<string, unknown> | null | undefined)?.hintToggles,
+      );
+      if (toggles?.read === true) {
+        candidates.push(...(await this.buildReadHints(q, hits, context)));
+      }
+    }
+
+    const hints = emitHints(
+      this.logger,
+      this.hintDedup,
+      candidates,
+      {
+        surface: 'search',
+        spaceId: context.hintContext?.spaceId ?? null,
+        actorId: context.actorId,
+      },
+      { profile: DOC_HINT_PROFILE },
+    );
+
+    return {
+      hits,
+      ...(hint === undefined ? {} : { hint, hintCode }),
+      ...(hints ? { hints } : {}),
+    };
+  }
+
+  /**
+   * @internal 读侧 hint 候选（2 期，v1.92.0-dev；**只在 read 族开 + 有 hintContext 时调用**）。
+   *
+   * - `query_looks_like_path`：q 形似路径 ∧ 本空间存在该精确 path 的未软删 doc ∧
+   *   （零命中 ∨ top hit 不是该 doc）——存在性走 `docRepo` 轻查（select id,path），
+   *   不经 DocService（避免多一次实体水合）。
+   * - `suggest_relaxing`：**零命中** ∧ 显式筛选非空（type/tag/category/createdAfter/
+   *   createdBefore 任一——`sort`/`limit`/`offset`/`q` **不算筛选**）。只回显 caller
+   *   真实用过的参数；**不提 pathPrefix/applySpaceDefaults**（本端点没有这两个参数）。
+   */
+  private async buildReadHints(
+    q: string,
+    hits: DocSearchHit[],
+    context: {
+      filters: DocSearchFilters;
+      hintContext?: { spaceId: string; settings: unknown };
+    },
+  ): Promise<HintCandidate[]> {
+    const spaceId = context.hintContext!.spaceId;
+    const out: HintCandidate[] = [];
+
+    // ① query_looks_like_path
+    if (isPathLikeQuery(q)) {
+      const doc = await this.docRepo
+        .createQueryBuilder('d')
+        .select(['d.id', 'd.path'])
+        .where('d.space_id = :spaceId', { spaceId })
+        .andWhere('d.path = :path', { path: q })
+        .andWhere('d.deleted_at IS NULL')
+        .getOne();
+      // top hit 已是该 doc 时不发（检索已经把它排在第一，提示无价值）
+      if (doc && hits[0]?.docId !== doc.id) {
+        out.push(buildQueryLooksLikePathHint(doc.path, doc.id, doc.path));
+      }
+    }
+
+    // ② suggest_relaxing（零命中 + 显式筛选）
+    if (hits.length === 0) {
+      const applied: Record<string, unknown> = {};
+      for (const param of DOC_SEARCH_FILTER_PARAMS) {
+        const value = context.filters[param];
+        if (value !== undefined) applied[param] = value;
+      }
+      // 资源键 = spaceId + 筛选签名**哈希**（tag/category 值同样是用户输入，禁落日志原文）
+      const candidate = buildSuggestRelaxingHint(
+        applied,
+        this.hintResourceKey(spaceId, JSON.stringify(applied)),
+      );
+      if (candidate) out.push(candidate);
+    }
+
+    return out;
+  }
+
+  /**
+   * @internal 读侧去重/埋点资源键（MAJOR-3 修复）：`${scope}:sha256(signature)[:16]`。
+   *
+   * 为什么必须哈希：`resourceKey` 会原样进结构化日志 JSONL（hint-emit → hint-log），
+   * 而签名里含 **q / tag / category 等用户输入原文**——落原文既违反 hint-log 的
+   * 「禁用户输入原文」不变量，又让该维度成为无界基数（每个新查询一个新键）。
+   * 不可逆短哈希保留「同签名同键」的去重语义，同时让日志维度有界且不含原文。
+   * 窗口键与日志键同源（都走本方法）。
+   *
+   * ⚠️ `query_looks_like_path` 的 resourceKey = 命中的 **path**（空间内文档路径，
+   * 白名单允许项）——不走本方法。
+   */
+  private hintResourceKey(scope: string, signature: string): string {
+    const digest = createHash('sha256').update(signature).digest('hex').slice(0, 16);
+    return `${scope}:${digest}`;
   }
 
   /**
@@ -598,14 +865,7 @@ export class DocSearchService {
    */
   private async searchBySqlOrder(
     accessibleSpaceIds: string[] | null,
-    filters: {
-      q: string;
-      type?: string;
-      tag?: string;
-      category?: string;
-      createdAfter?: string;
-      createdBefore?: string;
-    },
+    filters: DocSearchFilters,
     effectiveLimit: number,
     effectiveOffset: number,
     sort: DocSearchSort,
@@ -615,7 +875,7 @@ export class DocSearchService {
     const { q } = filters;
     // 时间序接管 ORDER BY：boost 融合仅适用相关度排序（见方法注释）
     const sortByTime = sort === 'createdAt_desc' || sort === 'createdAt_asc';
-    const degraded = mode === 'single-char' || mode === 'df-degraded';
+    const degraded = mode === DOC_SEARCH_MODE.SINGLE_CHAR || mode === DOC_SEARCH_MODE.DF_DEGRADED;
 
     const mainQb = this.buildScoredQuery(accessibleSpaceIds, filters, false, mode, compiled);
     if (degraded && !sortByTime) {
@@ -732,24 +992,17 @@ export class DocSearchService {
    */
   private buildScoredQuery(
     accessibleSpaceIds: string[] | null,
-    filters: {
-      q: string;
-      type?: string;
-      tag?: string;
-      category?: string;
-      createdAfter?: string;
-      createdBefore?: string;
-    },
+    filters: DocSearchFilters,
     withVisibilityProjection: boolean,
     mode: DocSearchMode,
     compiled: CompiledQuery,
   ) {
-    const { q, type, tag, category, createdAfter, createdBefore } = filters;
-    const degraded = mode === 'single-char' || mode === 'df-degraded';
+    const { q, type, tag, tagValues, category, createdAfter, createdBefore } = filters;
+    const degraded = mode === DOC_SEARCH_MODE.SINGLE_CHAR || mode === DOC_SEARCH_MODE.DF_DEGRADED;
     // 共享 SQL 导出组（**导出即组整体取用**：score/prefilter/headline/kGate 四段同源）；
     // trgm-only（isEmpty）时 builder 返回 null——该模式本就不用任何 ts 段
     const group: SearchSqlGroup | null =
-      degraded || mode === 'normal'
+      degraded || mode === DOC_SEARCH_MODE.NORMAL
         ? buildSearchSql(
             { vector: 's.search_vector', text: 's.content' },
             compiled,
@@ -761,7 +1014,7 @@ export class DocSearchService {
     // 合成分表达式（模式分支；外层 SELECT 与 WHERE floor 共用同一串——两处各写一份迟早漂移）
     const compositeExpr = degraded
       ? `(${SINGLE_CHAR_CONST_SCORE})`
-      : mode === 'trgm-only'
+      : mode === DOC_SEARCH_MODE.TRGM_ONLY
         ? `(sub.trgm_content_score * ${RANK_WEIGHTS.TRGM_CONTENT} + sub.trgm_heading_score * ${SEARCH_TRGM_HEADING_W})`
         : `(sub.ts_rank_score * ${SEARCH_TS_W1} + sub.trgm_content_score * ${RANK_WEIGHTS.TRGM_CONTENT} + sub.trgm_heading_score * ${SEARCH_TRGM_HEADING_W})`;
 
@@ -792,7 +1045,7 @@ export class DocSearchService {
             .addSelect('1', 'ts_rank_score')
             .addSelect('0', 'trgm_content_score')
             .addSelect('0', 'trgm_heading_score');
-        } else if (mode === 'trgm-only') {
+        } else if (mode === DOC_SEARCH_MODE.TRGM_ONLY) {
           // trgm-only：ts 项恒 0（编译产物无词项，ts 腿结构上不可能命中）
           sqb
             .addSelect('0', 'ts_rank_score')
@@ -822,7 +1075,7 @@ export class DocSearchService {
         if (degraded) {
           // 降级：ts-only 候选（两 `%` 腿明文不查）
           sqb.andWhere((group as SearchSqlGroup).prefilterExpr);
-        } else if (mode === 'trgm-only') {
+        } else if (mode === DOC_SEARCH_MODE.TRGM_ONLY) {
           // trgm-only：`%` 是召回本体（编译产物无词项可查），两腿原样保留
           sqb.andWhere('(s.content % :q OR s.heading_path % :q)');
         } else if (compiled.arms.length > 0) {
@@ -838,7 +1091,7 @@ export class DocSearchService {
         //    compiledQ 同一 64 cap 集合
         //    （门集合 ⊊ 预过滤集合 = 静默丢召回，architect R1 复核）。无 arm（纯 ASCII /
         //    单字查询）时 kGateExpr 为 null 不挂门。
-        if (mode === 'normal' && (group as SearchSqlGroup).kGateExpr !== null) {
+        if (mode === DOC_SEARCH_MODE.NORMAL && (group as SearchSqlGroup).kGateExpr !== null) {
           sqb.andWhere((group as SearchSqlGroup).kGateExpr as string);
         }
         if (group !== null) {
@@ -856,7 +1109,11 @@ export class DocSearchService {
           sqb.andWhere('d.doc_type = :docType', { docType: type });
         }
         if (tag) {
-          sqb.andWhere(':tagVal = ANY(d.tags)', { tagVal: tag });
+          // v1.92.0-dev 3 期（plan D3/A1）：空间词表 alias 兼容——集合展开后按**数组重叠**
+          // （交集非空）匹配，使 rename 前写入的存量旧值（如 `NPC`）在 canonical 查询
+          // （`npc`）下仍被召回。未命中词表 / 全局检索（无 hintContext）时 tagValues 缺省
+          // ⇒ 回退 `[tag]` 单元素 ⇒ 与旧 `:tag = ANY(d.tags)` 语义逐字节等价。
+          sqb.andWhere('d.tags && CAST(:tagValues AS text[])', { tagValues: tagValues ?? [tag] });
         }
         if (category) {
           sqb.andWhere('dc.slug = :catSlug', { catSlug: category });
@@ -900,14 +1157,7 @@ export class DocSearchService {
    */
   private async fetchRerankPool(
     accessibleSpaceIds: string[] | null,
-    filters: {
-      q: string;
-      type?: string;
-      tag?: string;
-      category?: string;
-      createdAfter?: string;
-      createdBefore?: string;
-    },
+    filters: DocSearchFilters,
     poolSize: number,
     mode: DocSearchMode,
     compiled: CompiledQuery,
@@ -946,14 +1196,7 @@ export class DocSearchService {
     accessibleSpaceIds: string[] | null,
     // 类型与 `searchBySqlOrder` / `fetchRerankPool` 的形参**逐字同形**（含时间窗）：它会被原样
     // 转发给两者，窄类型会让"带时间窗的重排请求"在编译期看起来不可达（复审 NEW-4）
-    filters: {
-      q: string;
-      type?: string;
-      tag?: string;
-      category?: string;
-      createdAfter?: string;
-      createdBefore?: string;
-    },
+    filters: DocSearchFilters,
     pool: Array<SearchRow & { score: number }>,
     limit: number,
     offset: number,

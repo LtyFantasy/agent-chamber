@@ -20,11 +20,39 @@ jest.mock('bcrypt', () => ({
 }));
 
 function createMockRepo<T extends ObjectLiteral>() {
+  /**
+   * 事务内 EntityManager 桩（deleteByAdmin 的凭证连带吊销走
+   * `userRepo.manager.transaction(...)`，卡 e6926d73）：事务回调拿到同一个 manager，
+   * 顺序/调用面由调用方断言。SQL 语义（`IsNull()` 只打未撤销行、子查询命中名下 agent
+   * 的 key）mock 证不了——真 PG 覆盖见 test/soft-deleted-login.e2e-spec.ts（铁律 #23）。
+   */
+  const mockManager = {
+    save: jest.fn().mockImplementation(async (entity: { id?: string }) => {
+      if (!entity.id) {
+        entity.id = 'actor-new';
+      }
+      return entity;
+    }),
+    update: jest.fn().mockResolvedValue({ affected: 1, raw: [], generatedMaps: [] }),
+    createQueryBuilder: jest.fn(() => ({
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1, raw: [] }),
+    })),
+    transaction: jest.fn(),
+  };
+  mockManager.transaction.mockImplementation(async (cb: (m: unknown) => Promise<unknown>) =>
+    cb(mockManager),
+  );
+
   return {
     find: jest.fn(),
     findOne: jest.fn(),
     findOneBy: jest.fn(),
     findAndCount: jest.fn(),
+    // Notifications 二期：preferences 走原子合并 SQL（裸 query）
+    query: jest.fn().mockResolvedValue([]),
     save: jest.fn(),
     create: jest.fn(),
     delete: jest.fn(),
@@ -33,14 +61,7 @@ function createMockRepo<T extends ObjectLiteral>() {
     count: jest.fn(),
     countBy: jest.fn(),
     update: jest.fn(),
-    manager: {
-      save: jest.fn().mockImplementation(async (entity) => {
-        if (!entity.id) {
-          entity.id = 'actor-new';
-        }
-        return entity;
-      }),
-    },
+    manager: mockManager,
     createQueryBuilder: jest.fn(() => ({
       select: jest.fn().mockReturnThis(),
       leftJoin: jest.fn().mockReturnThis(),
@@ -154,7 +175,9 @@ describe('UserService', () => {
   describe('updateMe', () => {
     it('should update name, avatar and preferences', async () => {
       const user = createMockUser();
-      mockRepo.findOne.mockResolvedValue(user);
+      // preferences 走原子合并后服务会**重读**一份（内存不再持有合并结果）
+      const merged = createMockUser({ preferences: { theme: 'dark', lang: 'en' } });
+      mockRepo.findOne.mockResolvedValueOnce(user).mockResolvedValueOnce(merged);
       mockRepo.save.mockResolvedValue(user);
 
       const dto: UpdateProfileDto = {
@@ -167,7 +190,11 @@ describe('UserService', () => {
 
       expect(user.displayName).toBe('New Name');
       expect(user.avatarUrl).toBe('https://example.com/avatar.png');
-      expect(user.preferences).toEqual({ theme: 'dark', lang: 'en' });
+      // Notifications 二期：preferences 是**一条原子 SQL**（不是读内存再整体 save）
+      expect(mockRepo.query).toHaveBeenCalledWith(
+        expect.stringContaining("coalesce(preferences, '{}'::jsonb) || $2::jsonb"),
+        ['user-1', JSON.stringify({ lang: 'en' })],
+      );
       expect(mockRepo.save).toHaveBeenCalledWith(user);
       expect(result.name).toBe('New Name');
       expect(result.avatar).toBe('https://example.com/avatar.png');
@@ -261,13 +288,18 @@ describe('UserService', () => {
   describe('updateSettings', () => {
     it('should merge and return updated preferences', async () => {
       const user = createMockUser();
-      mockRepo.findOne.mockResolvedValue(user);
+      const merged = createMockUser({ preferences: { theme: 'dark', notifications: true } });
+      mockRepo.findOne.mockResolvedValueOnce(user).mockResolvedValueOnce(merged);
       mockRepo.save.mockResolvedValue(user);
 
       const result = await service.updateSettings('user-1', { notifications: true });
 
-      expect(user.preferences).toEqual({ theme: 'dark', notifications: true });
-      expect(mockRepo.save).toHaveBeenCalledWith(user);
+      // Notifications 二期：原子合并（一条 SQL）+ 不再走 save（避免陈旧快照覆盖）
+      expect(mockRepo.query).toHaveBeenCalledWith(
+        expect.stringContaining("coalesce(preferences, '{}'::jsonb) || $2::jsonb"),
+        ['user-1', JSON.stringify({ notifications: true })],
+      );
+      expect(mockRepo.save).not.toHaveBeenCalled();
       expect(result).toEqual({ theme: 'dark', notifications: true });
       // 审计（Phase 2）：UPDATE + user（settings）；只记字段名
       expect(mockAuditService.log).toHaveBeenCalledWith({
@@ -284,6 +316,23 @@ describe('UserService', () => {
       mockRepo.findOne.mockResolvedValue(null);
 
       await expect(service.updateSettings('not-found', {})).rejects.toThrow(NotFoundException);
+    });
+
+    it('should strip notificationCategories from the preferences patch (Notifications 二期堵旁门)', async () => {
+      const user = createMockUser();
+      const merged = createMockUser({ preferences: { theme: 'dark' } });
+      mockRepo.findOne.mockResolvedValueOnce(user).mockResolvedValueOnce(merged);
+
+      await service.updateSettings('user-1', {
+        notifications: true,
+        // 旁路写入：通知类别偏好只能走 /notification-settings/me/prefs（带自定义 validator + 原子键级合并）
+        notificationCategories: { task_done: false },
+      } as never);
+
+      const [, params] = mockRepo.query.mock.calls[0] as [string, unknown[]];
+      const patch = JSON.parse(params[1] as string) as Record<string, unknown>;
+      expect(patch).not.toHaveProperty('notificationCategories');
+      expect(patch).toHaveProperty('notifications', true);
     });
   });
 
@@ -388,8 +437,12 @@ describe('UserService', () => {
   describe('findAll', () => {
     function createMockQueryBuilder(items: User[], total: number) {
       return {
+        // findAll 走 innerJoinAndSelect：软删条件在 JOIN 的 ON 子句里，左连接下 NULL 会
+        // 空虚满足 `actor.deleted_at IS NULL`（真 PG 语义证明见 admin-user-delete.e2e-spec.ts）
+        innerJoinAndSelect: jest.fn().mockReturnThis(),
         leftJoinAndSelect: jest.fn().mockReturnThis(),
         leftJoin: jest.fn().mockReturnThis(),
+        innerJoin: jest.fn().mockReturnThis(),
         select: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
@@ -412,6 +465,8 @@ describe('UserService', () => {
       const result = await service.findAll({ page: '1', pageSize: '20' });
 
       expect(mockRepo.createQueryBuilder).toHaveBeenCalledWith('user');
+      // 回归闸：软删过滤依赖 inner join（改回 leftJoin 即失效，见上方注释）
+      expect(qbMock.innerJoinAndSelect).toHaveBeenCalledWith('user.actor', 'actor');
       expect(result.items).toHaveLength(2);
       expect(result.total).toBe(2);
       expect(result.page).toBe(1);
@@ -474,6 +529,8 @@ describe('UserService', () => {
       const user = createMockUser({ id: 'user-1', displayName: 'Alice' });
       const qbMock = {
         select: jest.fn().mockReturnThis(),
+        // findAllLightweight 走 innerJoin（软删过滤依赖它，见 user.service.ts 处注释）
+        innerJoin: jest.fn().mockReturnThis(),
         leftJoin: jest.fn().mockReturnThis(),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
@@ -486,7 +543,7 @@ describe('UserService', () => {
 
       const result = await service.findAllLightweight({});
 
-      // 防止 TypeORM 0.3.30 在 skip/take + leftJoin + orderBy(关联字段) 时
+      // 防止 TypeORM 0.3.30 在 skip/take + 关联 join + orderBy(关联字段) 时
       // 生成 `distinctAlias.actor_display_name does not exist` 的回归
       expect(qbMock.select).toHaveBeenCalledWith([
         'user.id',
@@ -495,6 +552,7 @@ describe('UserService', () => {
         'actor.displayName',
         'actor.avatarUrl',
       ]);
+      expect(qbMock.innerJoin).toHaveBeenCalledWith('user.actor', 'actor');
       expect(qbMock.orderBy).toHaveBeenCalledWith('actor.displayName', 'ASC');
       expect(result.items).toEqual([
         { id: 'user-1', name: 'Alice', avatarUrl: null, role: UserRole.EDITOR },
@@ -780,7 +838,41 @@ describe('UserService', () => {
         relations: { actor: true },
       });
       expect(user.actor.deletedAt).toBeInstanceOf(Date);
-      expect(mockRepo.save).toHaveBeenCalledWith(user);
+      // 卡 e6926d73：软删改由**事务内 manager** 执行（同事务先吊销 refresh token 与
+      // 名下 agent 的 API Key，再软删）——顺序不变量即"先 revoke 后软删"
+      const mgr = mockRepo.manager as unknown as {
+        transaction: jest.Mock;
+        update: jest.Mock;
+        save: jest.Mock;
+        createQueryBuilder: jest.Mock;
+      };
+      expect(mgr.transaction).toHaveBeenCalled();
+      expect(mgr.update).toHaveBeenCalledWith(
+        expect.anything(),
+        { userId: 'user-1', revokedAt: expect.anything() },
+        { revokedAt: expect.any(Date) },
+      );
+      expect(mgr.save).toHaveBeenCalledWith(user);
+      // 三步顺序不变量：① refresh 吊销 → ② API Key 连带吊销（事务内 queryBuilder）→
+      // ③ actor 软删。② 若被挪到 ③ 之后（或漏掉），本断言即红。
+      expect(mgr.createQueryBuilder).toHaveBeenCalled();
+      const revokeOrder = mgr.update.mock.invocationCallOrder[0];
+      const keyRevokeOrder = mgr.createQueryBuilder.mock.invocationCallOrder[0];
+      const softDeleteOrder = mgr.save.mock.invocationCallOrder[0];
+      expect(revokeOrder).toBeLessThan(keyRevokeOrder);
+      expect(keyRevokeOrder).toBeLessThan(softDeleteOrder);
+      // ② 步的 update 目标与 set 载荷（SQL 语义 mock 证不了，真 PG 覆盖见
+      // test/soft-deleted-login.e2e-spec.ts ⑥）
+      const keyQb = mgr.createQueryBuilder.mock.results[0].value as {
+        update: jest.Mock;
+        set: jest.Mock;
+        where: jest.Mock;
+      };
+      expect(keyQb.update).toHaveBeenCalled();
+      expect(keyQb.set).toHaveBeenCalledWith({
+        revokedAt: expect.any(Date),
+        revokedReason: 'owner deleted',
+      });
       expect(result).toBe(true);
       // 审计（Phase 2）：DELETE + user（admin 软删）；actor=操作 admin
       expect(mockAuditService.log).toHaveBeenCalledWith({
@@ -791,6 +883,33 @@ describe('UserService', () => {
         newData: { userId: 'user-1', username: 'testuser' },
         source: 'api',
       });
+    });
+
+    it('should abort the soft delete when the API Key revoke step fails (事务回滚语义)', async () => {
+      const user = createMockUser({ id: 'user-1' });
+      mockRepo.findOne.mockResolvedValue(user);
+      mockRepo.save.mockResolvedValue(user);
+
+      // ② 步（API Key 连带吊销）SQL 失败
+      const mgr = mockRepo.manager as unknown as {
+        createQueryBuilder: jest.Mock;
+        save: jest.Mock;
+      };
+      mgr.createQueryBuilder.mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockRejectedValue(new Error('api key revoke failed')),
+      });
+
+      await expect(service.deleteByAdmin('user-1', 'admin-1')).rejects.toThrow(
+        'api key revoke failed',
+      );
+      // 回滚语义的单元级证据：③ 软删未执行（真实回滚由 manager.transaction 承担，
+      // 本桩不模拟回滚，故"未往下走"就是可断言的部分）
+      expect(mgr.save).not.toHaveBeenCalled();
+      expect(user.actor.deletedAt).toBeNull();
+      expect(mockAuditService.log).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when user not found', async () => {

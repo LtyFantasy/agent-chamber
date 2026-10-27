@@ -40,6 +40,7 @@ import {
   type RecordExperienceResponse,
 } from '@/types';
 import { Api } from '@/lib/api';
+import { errorMessageOf, httpStatusOf } from '@/lib/error-message';
 import { toast } from '@/lib/notify';
 import {
   EXPERIENCE_ENV_KEY_ORDER,
@@ -81,9 +82,8 @@ const EMPTY_ENV: Record<ExperienceEnvKey, string> = { os: '', tool: '', version:
 
 /** 表单错误信息（优先透传服务端 message；409 走专用文案） */
 function formErrorMessage(err: unknown, fallback: string, conflictText: string): string {
-  const axiosErr = err as { response?: { status?: number; data?: { message?: string } } };
-  if (axiosErr?.response?.status === 409) return conflictText;
-  return axiosErr?.response?.data?.message || fallback;
+  if (httpStatusOf(err) === 409) return conflictText;
+  return errorMessageOf(err, fallback);
 }
 
 /**
@@ -253,7 +253,7 @@ function ExperienceFormBody({
       }
       onClose();
     } catch (err) {
-      const status = (err as { response?: { status?: number } }).response?.status;
+      const status = httpStatusOf(err);
       // 乐观锁冲突的恢复路径（评审 M3）：重读最新版本（invalidate → 父级 entry 更新），
       // 用户本次编辑内容保留在表单里，确认后重新提交即用新的 expectedUpdatedAt。
       // 不做这一步的话详情缓存 staleTime 5 分钟，关窗再开仍是旧 token → 永远 409。

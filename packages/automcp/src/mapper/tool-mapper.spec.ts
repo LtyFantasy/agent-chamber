@@ -1,5 +1,5 @@
 import { ToolMapper } from './tool-mapper';
-import type { ParsedOperation } from '../types';
+import type { JSONSchema, ParsedOperation } from '../types';
 
 describe('ToolMapper', () => {
   let mapper: ToolMapper;
@@ -579,5 +579,104 @@ describe('ToolMapper', () => {
       expect(props.config.properties!.note.type).toEqual(['string', 'null']);
       expect(props.tags.items!.type).toEqual(['string', 'null']);
     });
+  });
+});
+
+/**
+ * Usage 两读面的 **inputSchema 精确形状**（alpha.19）。
+ *
+ * 目的：证明 MCP 客户端看到的参数面只有「项目 id + 四个开放过滤器 + 时间窗（+ trace 的
+ * limit/cursor）」——**没有** `scope` / `workspaceId` / `actorId` / `body`，也没有 summary
+ * 的分页键。这些键一旦被 mapper 漏进 schema，模型就会以为它们可传（运行时后端 400）。
+ */
+describe('ToolMapper — usage 两读面 inputSchema（alpha.19）', () => {
+  let mapper: ToolMapper;
+
+  beforeEach(() => {
+    mapper = new ToolMapper();
+  });
+
+  /** 与 OpenAPI 解析产物同形的参数（path id + query DTO 属性） */
+  function usageOperation(
+    operationId: string,
+    query: Array<{
+      name: string;
+      schema: JSONSchema & { minimum?: number; maximum?: number; maxLength?: number };
+    }>
+  ): ParsedOperation {
+    return {
+      operationId,
+      method: 'get',
+      path: '/memory/projects/{id}/usage/summary',
+      summary: 'Recorded usage summary',
+      description: 'usage summary',
+      tags: ['Memory'],
+      parameters: [
+        { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+        ...query.map((param) => ({
+          name: param.name,
+          in: 'query' as const,
+          required: false,
+          schema: param.schema,
+        })),
+      ],
+      responses: {},
+      security: [{ apiKey: [] }, { bearer: [] }],
+    };
+  }
+
+  it('summary：只有 id + 四个过滤器 + since/until；无 scope/身份/body/limit/cursor', () => {
+    const mapping = mapper.mapOperation(
+      usageOperation('MemoryController_getUsageSummary', [
+        { name: 'operation', schema: { type: 'string' } },
+        { name: 'providerOperation', schema: { type: 'string' } },
+        { name: 'model', schema: { type: 'string' } },
+        { name: 'since', schema: { type: 'string' } },
+        { name: 'until', schema: { type: 'string' } },
+      ])
+    );
+
+    expect(mapping.tool.name).toBe('memory_controller_get_usage_summary');
+    const schema = mapping.tool.inputSchema;
+    expect(schema.type).toBe('object');
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(
+      ['id', 'model', 'operation', 'providerOperation', 'since', 'until'].sort()
+    );
+    for (const forbidden of ['scope', 'workspaceId', 'actorId', 'body', 'limit', 'cursor']) {
+      expect(Object.keys(schema.properties ?? {})).not.toContain(forbidden);
+    }
+    expect(schema.required).toEqual(['id']);
+    expect((schema.properties as unknown as Record<string, Record<string, unknown>>).operation.type).toBe(
+      'string'
+    );
+    expect((schema.properties as unknown as Record<string, Record<string, unknown>>).since.type).toBe('string');
+  });
+
+  it('trace：额外 limit（integer 1–200）与 cursor（string），仍无 scope/身份/body', () => {
+    const mapping = mapper.mapOperation(
+      usageOperation('MemoryController_getUsageTrace', [
+        { name: 'operation', schema: { type: 'string' } },
+        { name: 'providerOperation', schema: { type: 'string' } },
+        { name: 'model', schema: { type: 'string' } },
+        { name: 'since', schema: { type: 'string' } },
+        { name: 'until', schema: { type: 'string' } },
+        { name: 'limit', schema: { type: 'integer', minimum: 1, maximum: 200 } },
+        { name: 'cursor', schema: { type: 'string', maxLength: 4096 } },
+      ])
+    );
+
+    expect(mapping.tool.name).toBe('memory_controller_get_usage_trace');
+    const schema = mapping.tool.inputSchema;
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(
+      ['cursor', 'id', 'limit', 'model', 'operation', 'providerOperation', 'since', 'until'].sort()
+    );
+    const properties = schema.properties as unknown as Record<string, Record<string, unknown>>;
+    expect(properties.limit).toMatchObject({ type: 'integer', minimum: 1, maximum: 200 });
+    expect(properties.cursor).toMatchObject({ type: 'string', maxLength: 4096 });
+    for (const forbidden of ['scope', 'workspaceId', 'actorId', 'body']) {
+      expect(Object.keys(schema.properties ?? {})).not.toContain(forbidden);
+    }
   });
 });

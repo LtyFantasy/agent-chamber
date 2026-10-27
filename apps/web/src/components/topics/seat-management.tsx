@@ -5,8 +5,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/roundtable-design.md §6（座位管理）/ §7（runner 认领规则）
- *   - 补充: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
+ *   - 主文档: docs/modules/roundtable-design.md §6（座位管理）/ §7（runner 认领规则）
+ *   - 补充: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌座位管理 UI）
  *
  * [踩坑索引]
  *   - runner 列表排序契约在后端（online 优先 + lastSeenAt 倒序），web 按序直渲

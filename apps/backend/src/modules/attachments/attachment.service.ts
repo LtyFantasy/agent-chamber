@@ -84,6 +84,10 @@ import { AUDIT_ENTITY_TYPE } from '../audit/audit-constants';
 import { PermissionService } from '../../common/services/permission.service';
 import { OwnerProxyService } from '../../common/services/owner-proxy.service';
 import { UnifiedActor } from '../../common/types/actor.types';
+// F4 项5（复审 MAJOR-1）：per-item 错误文案的单源在 common/utils——bundle 导入的 media 段
+// 与 docspace 的 docs 段写在**同一响应**的同一形状里（media.failed[].reason），文案策略
+// 各写一份必然漂移，而漂移的那份就是 PG 原文泄露面
+import { PublicBatchError, sanitizeBatchErrorMessage } from '../../common/utils/batch-error.util';
 import { AttachmentStorageService } from './storage.service';
 import { AttachmentAccessService } from './attachment-access.service';
 import {
@@ -880,8 +884,11 @@ export class AttachmentService {
           throw err;
         }
       } catch (err) {
-        // per-item 失败不中止批次（与 categories/routes 段同口径）
-        fail(err instanceof Error ? err.message : String(err));
+        // per-item 失败不中止批次（与 categories/routes 段同口径）。
+        // F4 项5（复审 MAJOR-1）：reason 经文案单源消毒——这里捕获到的可能是
+        // QueryFailedError（插行撞唯一约束 / uuid 语法错），原文含表名、约束名与用户
+        // 输入回显（P2-#4），而 media.failed[] 与 docs 段同在一个匿名可达响应里
+        fail(sanitizeBatchErrorMessage(err));
       }
     }
 
@@ -904,24 +911,30 @@ export class AttachmentService {
       try {
         const row = await this.attachmentRepo.findOne({ where: { id: entry.attachmentId } });
         if (!row) {
-          throw new Error(`attachment row ${entry.attachmentId} not found`);
+          // 应用级诊断（文案只回显 bundle 自带的 attachmentId）：用 PublicBatchError 才能在
+          // 下方 reason 经文案单源消毒后**原样透出**——否则会降级成 'Internal error'，
+          // 排障信息丢失（构造纪律见 common/utils/batch-error.util.ts）
+          throw new PublicBatchError(`attachment row ${entry.attachmentId} not found`);
         }
         if (row.docId === entry.docId) {
           bound++;
           continue;
         }
         if (row.docId !== null) {
-          throw new Error(
+          throw new PublicBatchError(
             `attachment ${entry.attachmentId} is already bound to another doc; refusing to rebind`,
           );
         }
         await this.attachmentRepo.update({ id: entry.attachmentId }, { docId: entry.docId });
         bound++;
       } catch (err) {
+        // F4 项5（复审 MAJOR-1）：reason 是**对外文案**（media.failed[] 与 docs 段同端点同形状），
+        // 必经文案单源消毒——上面两处应用级诊断已改 PublicBatchError 以免被降级；
+        // 未预期的 driver/未知错误在这里降级为固定文案（PG 原文含表名/约束名/输入回显）
         failures.push({
           docPath: entry.docPath,
           originalName: entry.originalName,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: sanitizeBatchErrorMessage(err),
         });
       }
     }

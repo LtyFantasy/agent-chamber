@@ -78,6 +78,7 @@ import {
 } from '../src/common/utils/search/search-tuning';
 import { DOC_SEARCH_STRONG_HIT_SCORE, TASK_SEARCH_WEAK_HIT_SCORE } from '@agent-chamber/shared';
 import * as zeroHitLog from '../src/common/utils/search/zero-hit-log';
+import { HintDedupService } from '../src/modules/hints/hint-dedup.service';
 
 const SPACE_ID = 'e2e2e2e2-0000-4000-8000-0000000000c1';
 const ACTOR_ID = 'e2e2e2e2-0000-4000-8000-0000000000c2';
@@ -133,6 +134,7 @@ describe('检索中文根治不变量矩阵（14 条）', () => {
       db().getRepository(DocRoute),
       db().getRepository(TaskDocLink),
       { isEnabled: () => false, run: jest.fn(), recordSkip: jest.fn() } as never,
+      new HintDedupService(),
     );
   });
 

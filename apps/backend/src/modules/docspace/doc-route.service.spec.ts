@@ -6,6 +6,7 @@ import { Doc } from '../../database/entities/doc.entity';
 import { DocService } from './doc.service';
 import { AuditService } from '../audit/audit.service';
 import { ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
+import { HintDedupService } from '../hints/hint-dedup.service';
 
 /**
  * DocRouteService 测试（v1.42 批次 B5）
@@ -15,9 +16,17 @@ import { ActorType, ErrorCode, UserRole } from '@agent-chamber/shared';
  */
 describe('DocRouteService', () => {
   let service: DocRouteService;
+  /** hint 去重窗口（2 期，v1.92.0-dev）：真实例（内存 TTL Map） */
+  let hintDedup: HintDedupService;
   let routeRepo: jest.Mocked<Repository<DocRoute>>;
   let docRepo: jest.Mocked<Repository<Doc>>;
-  let docService: { sectionExistsByHeadingPath: jest.Mock };
+  let docService: {
+    sectionExistsByHeadingPath: jest.Mock;
+    /** 空间写上下文（2 期）：hint 族闸门来源 */
+    getSpaceWriteContext: jest.Mock;
+    /** 分类 slug 解析（2 期）：route_target_excluded 的 category 维度 */
+    findCategorySlug: jest.Mock;
+  };
 
   const mockActor = { id: 'user-1', type: ActorType.HUMAN, role: UserRole.ADMIN };
   const mockAuditService = { log: jest.fn().mockResolvedValue(undefined) };
@@ -92,13 +101,26 @@ describe('DocRouteService', () => {
       findOne: jest.fn(),
     } as unknown as jest.Mocked<Repository<Doc>>;
 
-    docService = { sectionExistsByHeadingPath: jest.fn() };
+    docService = {
+      sectionExistsByHeadingPath: jest.fn(),
+      // 空间写上下文（2 期）：缺省全关——既有用例零 hints 零行为变化
+      getSpaceWriteContext: jest.fn().mockResolvedValue({
+        vocabulary: null,
+        hintToggles: null,
+        pathTypes: null,
+        settings: {},
+      }),
+      findCategorySlug: jest.fn().mockResolvedValue(null),
+    };
+
+    hintDedup = new HintDedupService();
 
     service = new DocRouteService(
       routeRepo,
       docRepo,
       docService as unknown as DocService,
       mockAuditService as unknown as AuditService,
+      hintDedup,
     );
   });
 

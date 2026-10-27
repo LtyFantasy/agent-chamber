@@ -1,14 +1,14 @@
 ---
 name: experiences
 description: 经验库（Experience Base）子 skill——平台第四资源，全部署共享的跨项目经验库。覆盖什么时候搜（动手排障/用陌生工具前）、什么值得录与什么是垃圾经验（跨项目价值判据，受众不限软件开发）、怎么写好一条（title 写症状/signals 提炼/四节模板）、6 个 MCP 工具契约、质量治理（quality 三态/终审/反馈纪律）、可选 JEV 判别层（fail-open observe-only）。Agent 检索经验、录入经验、终审经验时使用。
-version: 1.1.0
-updatedAt: 2026-09-26
+version: 1.1.3
+updatedAt: 2026-10-25
 ---
 
 # 经验库（Experience Base）— 跨项目经验共享
 
 > 平台第四件核心资源：topic 管"人"、board 管"事"、DocSpace 管"知识"、**经验库管"教训"**。
-> 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)；设计与匹配契约的唯一事实源 = 平台文档 `docs/experience-base.md`。
+> 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)；设计与匹配契约的唯一事实源 = 平台文档 `docs/modules/experience-base.md`。
 
 ---
 
@@ -117,7 +117,7 @@ updatedAt: 2026-09-26
 
 ## 6. 接口用法（MCP 6 个语义工具）
 
-> 认证透传与全部工具一致（`X-API-Key`）；结构化响应直接在 `structuredContent`（无 code/data 信封）。REST 等价与完整契约见平台文档 `docs/experience-base.md` §5 与 `docs/api-definition.md`。
+> 认证透传与全部工具一致（`X-API-Key`）；结构化响应直接在 `structuredContent`（无 code/data 信封）。REST 等价与完整契约见平台文档 `docs/modules/experience-base.md` §5 与 `docs/api-definition.md`。
 
 | 工具 | 契约要点（容易踩的全在这） |
 |---|---|
@@ -137,7 +137,7 @@ updatedAt: 2026-09-26
 ## 7. 检索技巧
 
 1. **signals 是第一入口**：精确相等通道、设计上的主入口。录入时把症状提炼成 token，检索时按 token 搜。
-2. **`q` 给 2–4 字领域词最稳**：v1.86 起 `q` 经 CJK 单字化编译（逐字 bigram ts 腿 + trgm 兜底腿），短 CJK 词不再零命中；但叠加 **K-gate 精度门**（命中不同 bigram 数 ≥K 才召回，≤4 字 K=1、更长 K=2），单字偶合的异词汇召回会被门拒。搜 `端口` 或 `端口映射` 均可；`signals` 仍是第一入口。
+2. **`q` 给 2–4 字领域词最稳**：`q` 经 CJK 单字化编译（逐字 bigram ts 腿 + trgm 兜底腿），短 CJK 词（2 字起）可命中；但叠加 **K-gate 精度门**（命中不同 bigram 数 ≥K 才召回，≤4 字 K=1、更长 K=2），单字偶合的异词汇召回会被门拒。搜 `端口` 或 `端口映射` 均可；`signals` 仍是第一入口。
 3. **跨词表召回仍走 `q`，但受 K-gate 约束**：pg_trgm 兜底腿桥接措辞差（录入 `端口映射失效`、检索写 `端口不可达`），但**无共享 bigram** 的召回会被精度门拒——这是设计意图（经验库精度优先：误命中代价 > 漏命中），不是 bug；确信相关却被门拒时改走 `signals` 精确通道。
 4. **零命中先降滤镜再换词**：`env*`/`domains`/`intent` 都是收窄，先摘掉再重试；别忘了 suspect（`quality=suspect`）与 expired（`includeExpired=true`）默认被排除。
 5. 排序：有 `q` = verified 层 → 融合分 → 去重 helped 数 → 新鲜度；无 `q` = `recent`（默认）或 `most_used`（同口径权重；计数自报可刷，读作参考）。
@@ -169,7 +169,11 @@ updatedAt: 2026-09-26
 - **Fail-open**：判别服务挂了/慢了/超限，条目照常录入——它只能加注释，永远拦不住写。
 - **Observe-only**：初判是**建议**。没有任何代码路径会因判别结果拒绝录入、改内容或改 quality；`reject` 建议改变条目的唯一方式是作者或终审人看完觉得有道理。人审永远是终审。
 
-**作为作者收到 `admissionSuggestion.verdict='reject'` 时**：别无视——按 §3 判据自省：改到值得录（`update_experience`），或承认不值得录并删除（MCP 未暴露删除工具，走 web UI 或 REST `DELETE /experiences/:id`）。`intentSuggestion`/`domainSuggestion` 同理可采纳。
+**作为作者收到 `admissionSuggestion.verdict='reject'` 时**：别无视——按 §3 判据自省：改到值得录（`update_experience`），或承认不值得录并删除（MCP 未暴露删除工具，走 web UI 或 REST `DELETE /experiences/:id`）。
+
+**建议采纳回路（作者侧）**：`intentSuggestion`/`domainSuggestion` 的 `verdict='suggested'` 且建议值贴切时，用 `update_experience` 顺手采纳——`intent`/`domains`/`env`/`expiresAt` 是**元数据字段，更新不触发 verified 回落**（只有 `title`/`summary`/`content`/`signals` 四个内容字段才回落），采纳成本≈0，不必攒着。domain 建议值应与检索响应里的 `availableDomains` 既有词表对齐；建议值是词表外新拼法时先三思（孤儿标签风险，见 §5 domains 条）。
+
+**怎么读 confidence（作者与终审人同款）**：verdict 是标签，**confidence 才是正文**。`keep` + 低置信（<~0.6）= **弃权票**（"没把握反对现状"），不读作"取值合适"的背书——开放词表 facet 上尤其要警惕"找不到更好才保持现状"这一形态；`admit` + 低置信同理，只表示"不拦"，不表示"看好"。终审人终审后对照 judgment（suppression 已解除）时按同一尺子读——人审与机判的分歧本身就是校准数据，攒着，将来是否调 rubric / 是否上门槛靠它说话。
 
 **数据出域提示**：开启即意味着**条目文本（title/summary/content 摘录 ≤2000 字符、signals/domains/env/intent）会发送到第三方云 API**——这是运营者的决策；条目涉及不可外送的内部系统时，保持 `none` 是完全合法的配置。
 
@@ -179,8 +183,8 @@ updatedAt: 2026-09-26
 
 ## 10. 相关文档
 
-- [`../SKILL.md`](../SKILL.md) — 平台总入口（认证 / Actor 模型 / MCP 接入）；§6.4 工具表有同款六工具条目
-- 平台文档 `docs/experience-base.md` — 设计与匹配契约**唯一事实源**（分类学/匹配语义/威胁模型/判别服务/维护触发器）
+- [`../SKILL.md`](../SKILL.md) — 平台总入口（认证 / Actor 模型 / MCP 接入）；六工具的分组导航见主文件 §6.4
+- 平台文档 `docs/modules/experience-base.md` — 设计与匹配契约**唯一事实源**（分类学/匹配语义/威胁模型/判别服务/维护触发器）
 - 部署运营者向（启用判别、成本、排障、web UI）：仓库 `docs/experience-base.md` / `docs/experience-base.zh-CN.md` 用户指南
 
-> **维护触发器**：经验库字段/枚举/端点/工具、quality 状态机、终审规则、判别 provider 集任一变更 → 回本文件同步（事实源以线上设计文档与实时 API schema 为准）。
+> **维护触发器**：经验库字段/枚举/端点/工具、quality 状态机、终审规则、判别 provider 集任一变更 → 回本文件同步（事实源以线上设计文档与实时 API schema 为准）；本文件只写现行版本行为，历史变更归 git log 与 release notes。

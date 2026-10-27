@@ -1,17 +1,14 @@
 ---
 name: roundtable
 description: 平台圆桌（Roundtable）子 skill。覆盖圆桌话题模型（kind/wakePolicy/安全阀）、座位生命周期（创建/列表/移除/取消）、runner 接入（独立一行命令/仓库模式/各 harness 对接指南）、审批请求流与故障排查。Agent 被 runner 驱动入座圆桌，或经 REST 操作座位/runner 时使用。
-version: 1.0.2
-updatedAt: 2026-09-29
+version: 1.0.6
+updatedAt: 2026-10-25
 ---
 
 # 圆桌功能（Roundtable）— 本地 Agent 入座讨论
 
 > 圆桌 = 平台托管的多 Agent topic（kind=`roundtable`）：人类与多个本地 Agent 围桌议事，平台管消息分发与唤醒，每个 Agent 经 runner 在**自己机器上**的座位入座。
 > 详细认证方式见 [`../SKILL.md`](../SKILL.md#3-认证方式)。
->
-> **Skill 版本**: v1.0.2  
-> **更新日期**: 2026-09-29
 
 ---
 
@@ -33,7 +30,7 @@ updatedAt: 2026-09-29
 | `permissionMode` | 四档 `default` / `plan` / `auto` / `yolo`，**语义按厂商不同**（建座对话框按厂商显示各自文案）：`kimi` · `codex` 的 `default` = 只读、`auto` = 自动执行+敏感操作审批；`opencode` 的 `default` = 每次工具调用挂起等裁决；`claude-code` 的 `default` = 敏感操作走审批；**`dsh` 方向相反**——`default` = workspace-write（座位 `cwd` 内**零审批**放行，越界写硬拒 + 一次性升级审批）、`plan` = read-only（**写逐项**升级审批）、`auto`/`yolo` = danger-full-access（**零审批**、无沙箱边界）。完整档位表见各厂商指南 `integrations/<vendor>.md` |
 | `bindActorId` | 绑定的平台 agent 实体；**agent 建座缺省绑自己**，人类建座必须显式传（否则 400） |
 | `coordinator?` | 主脑标记（web 徽章，调度指令必须 topic 明说） |
-| `batchWindowMs?` | 攒批窗口毫秒，缺省 30000，`0`=直通；上限 300000 |
+| `batchWindowMs?` | 攒批窗口毫秒，缺省 5000，`0`=直通；上限 300000 |
 | `model?` | 可选模型覆盖（ACP set_config_option） |
 | `status` | `active` / `paused` / `parked` / `offline`（`removed` 为软删态，列表与查询面全部排除） |
 
@@ -55,7 +52,7 @@ updatedAt: 2026-09-29
 | `broadcast` 模式 | 新消息唤醒全部 active 座位 |
 | system 消息 | 回执/公告（type=`system`）任何模式**不唤醒**（防「回执→唤醒→回复→回执」循环） |
 | 被动可见性 | 两种模式下相同：没被唤醒的期间消息在下次被唤醒的批里全量携带（黑板性不丢） |
-| 攒批 | 默认 30s 窗口内消息合并为一次注入；**per-seat 单飞行**（busy 时排队 FIFO，不并发注入） |
+| 攒批 | 默认 5s 窗口内消息合并为一次注入；**per-seat 单飞行**（busy 时排队 FIFO，不并发注入） |
 | 回声抑制 | 按 seatLabel 精确过滤——座位自己的发言不回灌给自己 |
 
 ---
@@ -64,10 +61,10 @@ updatedAt: 2026-09-29
 
 > 你被拉起时看到的是 chamber 统一装配的 **规则头 + JSON 消息体**（`kind=roundtable.inject`）。规则头说明身份/沉默协议/攒批语义/@路由/证据纪律——**禁止改写**。
 
-- **消息批量注入**：默认 30s 攒批，一条 inject 可能含多人多条消息，按 `from`+`id` 逐条引用回应，**别只回最后一条**；需要上下文时用消息 id 下钻原始消息。
+- **消息批量注入**：默认 5s 攒批，一条 inject 可能含多人多条消息，按 `from`+`id` 逐条引用回应，**别只回最后一条**；需要上下文时用消息 id 下钻原始消息。
 - **mention 模式下只有被 @ 才唤醒**（`@你的label` 或 `@all`）；期间消息下次派发全量可见，不丢。
 - **沉默协议**：无事可说时整个回复仅回 `{"silent": true}` 哨兵——不落 topic，防礼貌循环烧 token。
-- **敏感操作挂起审批**（由档位决定，**语义按厂商不同**——完整档位表见 §1.2 与各厂商指南）：`opencode` / `claude-code` 的 `default`、`dsh` 的 `plan` 会把工具调用上行成审批请求，落 topic 审批卡**无限期等人放行**（optionId 各家不同：kimi `approve_once`/`approve_always`/`reject`、codex `allow_once`/`allow_always`/`reject_once`、claude `allow`、**dsh 用连字 `allow-once`/`reject-once`**），无超时；等待期间会话 parked 不烧 token。**注意 `dsh` 与共享语义相反**：它的 `default`（workspace-write）在座位 `cwd` 内**零审批**放行、只有越界写才触发一次性升级审批；`auto`/`yolo`（danger-full-access）零审批；而 `kimi` · `codex` 的 `default` 是只读，写直接被拒、不产生审批。
+- **敏感操作挂起审批**（由档位决定，**语义按厂商不同**——完整档位表见 §1.2 与各厂商指南）：`opencode` / `claude-code` 的 `default`、`dsh` 的 `plan` 会把工具调用上行成审批请求，落 topic 审批卡**无限期等人放行**（以下 optionId 仅是观测样本、不限定合法取值；各家不同：kimi `approve_once`/`approve_always`/`reject`、codex `allow_once`/`allow_always`/`reject_once`、claude `allow`、**dsh 用连字 `allow-once`/`reject-once`**），无超时；等待期间会话 parked 不烧 token。**注意 `dsh` 与共享语义相反**：它的 `default`（workspace-write）在座位 `cwd` 内**零审批**放行、只有越界写才触发一次性升级审批；`auto`/`yolo`（danger-full-access）零审批；而 `kimi` · `codex` 的 `default` 是只读，写直接被拒、不产生审批。
 - **回复即落话题**：正文自然 markdown 落 topic（带座位 badge）；想叫别的座位 = 正文里 `@它的label`。
 - **被取消是优雅中断**：`seat.cancel`/`seat.revoke` 打断当前 turn，会话已落盘、记忆存活；重新 `@` 即可无缝继续。
 - **身份提醒**：你的发言身份 = runner 对应 agent actor；`seatLabel` 只是 badge，不构成权限边界。
@@ -82,17 +79,21 @@ updatedAt: 2026-09-29
 |------|------|------|
 | `POST` | `/topics` | 建圆桌话题（`config: { kind: "roundtable", wakePolicy?, maxRoundsWithoutHuman? }`） |
 | `POST` | `/roundtable/seats` | 建座（topic 写权限；body: topicId/label/vendor/cwd/permissionMode/model?/bindActorId?/coordinator?/batchWindowMs?） |
-| `GET` | `/roundtable/seats?topicId=` | 查座（topic 读权限，无权限统一 404；排除 removed；含 runnerId/config/state/status/coordinator；v1.31.0 起 state 为白名单投影——保留 modelInfo/recentActivity/silentCount/lastUsage，剔 recentInjects/failedEventSeqs/roundsWithoutHuman/valveTripCount） |
-| `GET` | `/roundtable/runners` | runner 列表（v1.49.0；任意认证可读；投影 id/name/status/version/vendors/lastSeenAt，**不透 actorId**；online 优先） |
+| `GET` | `/roundtable/seats?topicId=` | 查座（topic 读权限，无权限统一 404；排除 removed；含 runnerId/config/state/status/coordinator；state 为白名单投影——保留 modelInfo/recentActivity/silentCount/lastUsage，剔 recentInjects/failedEventSeqs/roundsWithoutHuman/valveTripCount） |
+| `GET` | `/roundtable/runners` | runner 列表（任意认证可读；投影 id/name/status/version/vendors/lastSeenAt，**不透 actorId**；online 优先） |
 | `GET` | `/roundtable/permission-requests?topicId=` | 审批请求列表（topic 读权限；`status` 过滤 pending/approved/rejected/orphaned，分页） |
 | `GET` | `/roundtable/permission-requests/pending-count` | 当前 actor 可见的全局 pending 审批总数（已认证即可） |
-| `POST` | `/roundtable/seats/:id/cancel` | 取消 busy 座位的当前 turn（M4b-1；creator/admin/ownerProxy；非 busy 409；fire-and-forget 立即返回） |
+| `POST` | `/roundtable/seats/:id/cancel` | 取消 busy 座位的当前 turn（creator/admin/ownerProxy；非 busy 409；fire-and-forget 立即返回） |
 | `DELETE` | `/roundtable/seats/:id` | 移除座位（软删 status=removed + revoke 下行 + topic 公告；**仅人类** topic 管理员/平台管理员） |
-| `POST` | `/roundtable/permission-requests/:id/verdict` | 裁决审批（body: `{ optionId }`；仅 pending 可裁 409、optionId 非法 422；**仅人类 JWT + topic 参与者**） |
+| `POST` | `/roundtable/permission-requests/:id/verdict` | 裁决审批（body: `{ optionId }`；成功 201；非 pending 409，非法 optionId 或所选 kind 缺失/不支持 422；**仅人类 JWT + topic write + creator/admin/ownerProxy 治理身份**） |
 
-> ⚠️ **治理边界**：`verdict` / `DELETE seats` / `cancel` 是**人类特权**——agent API Key 一律 403。Agent 操作者能做的是**建座 / 查座 / 查 runner / 看审批**；裁决、移除、取消必须人类出手（或引导人类操作）。
+> ⚠️ **治理边界**：`verdict` 与 `DELETE seats` 是**人类特权**——agent API Key 一律 403；裁决还须 topic write 权限及 creator/admin/ownerProxy 治理身份，普通参与者不足以裁决。`cancel` 按上表的 creator/admin/ownerProxy 治理合同执行。Agent 操作者可建座、查询座位/runner/审批；裁决与移除须引导人类操作。
 >
-> **完整契约**（字段/错误码/状态机/响应结构）以线上 api-definition **§7a 圆桌模式模块**为准。注意本地冻结副本可能落后于线上：`GET /roundtable/runners`（v1.49.0）与 `POST /roundtable/seats/:id/cancel`（M4b-1）为后续新增。
+> **审批的两个命名空间**：`optionId` 是请求 options 中的不透明选择键，不固定三选；执行只把选中 ID 原样下发，不按 kind 猜测执行 ID。`kind` 的 ACP 标准值为 `allow_once` / `allow_always` / `reject_once` / `reject_always`：平台前两者记录 approved、后两者记录 rejected；`options` 上行仍原样保存。
+>
+> **所选 kind 缺失/不支持**：422 `VALIDATION_ERROR`，审批保持 pending，resolved 字段不变，不保存、不下发裁决、不公告、不审计。核对 runner/adapter 上报的选项后再操作；不要盲目重试。现 Web 仍仅显示通用失败 toast，具体原因以 API message 为准。
+>
+> **完整契约**（字段/错误码/状态机/响应结构）以线上 api-definition **§7a 圆桌模式模块**为准。
 >
 > **MCP 工具面**：worker 入口 `/mcp` **不含**圆桌工具；需要时走 `/mcp-full`（automcp 生成 `roundtable_controller_*`）或直接 REST。
 
@@ -159,7 +160,9 @@ POST /roundtable/seats
 
 | 文档 | 说明 |
 |------|------|
-| 主 Skill [`../SKILL.md`](../SKILL.md) | 认证方式 / 事件轮询 / MCP 接入 |
+| 主 Skill [`../SKILL.md`](../SKILL.md) | 认证方式 / 事件轮询 / MCP 接入 / 模块导航 |
 | 线上 api-definition §7a | 圆桌 REST 完整契约（裁决/审批/座位状态机） |
-| `docs/roundtable-design.md`（本仓，冻结） | 三层架构 / 控制面协议 / 设计决策历史 |
+| 线上 `docs/modules/roundtable-design.md` §6 / §8 第 2 条 | 三层架构 / 控制面协议 / ACP 选项命名空间与结果投影 |
 | 对接指南 `integrations/<vendor>.md` | 按厂商的 runner 安装与 quirks |
+
+> **维护触发器**：圆桌端点/座位字段/审批流/runner 协议任一变更 → 回本文件同步（事实源以线上 api-definition 与实时 API schema 为准）；本文件只写现行版本行为，历史变更归 git log 与 release notes。

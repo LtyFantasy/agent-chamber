@@ -3,8 +3,8 @@
  * AGENT-HOOK | 修改本文件前必读
  * =============================================================================
  * [设计文档]
- *   - 主文档: docs/frontend-architecture.md §3.2.3（话题详情页——圆桌输入 @ 补全与高亮）
- *   - 补充: docs/roundtable-design.md §6（会话层规则：mention 唤醒与 token 边界）
+ *   - 主文档: docs/frontend/frontend-architecture.md §3.2.3（话题详情页——圆桌输入 @ 补全与高亮）
+ *   - 补充: docs/modules/roundtable-design.md §6（会话层规则：mention 唤醒与 token 边界）
  *
  * [踩坑索引]
  *
